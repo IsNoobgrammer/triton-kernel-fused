@@ -260,7 +260,9 @@ def bench_liger_ce(N=4096, H=512, V=81000):
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
     w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
     lab = torch.randint(0, V, (N,), device=DEV)
-    liger = lambda h, ww: LFLCE.apply(h, ww, lab)             # (_input, weight, target)
+    def liger(h, ww):                                         # (_input, weight, target)
+        out = LFLCE.apply(h, ww, lab)
+        return out[0] if isinstance(out, (tuple, list)) else out   # Liger returns (loss, z_loss)
     eager = lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab)
     a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
     b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
@@ -323,6 +325,10 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
 
 # ───────── Cut Cross Entropy (Apple cut_cross_entropy — the canonical CCE ours is styled after) ─────────
 def bench_cce(N=4096, H=512, V=81000):
+    if torch.cuda.get_device_capability()[0] < 8:
+        print("\n=== Cut Cross Entropy ===\n  SKIPPED — CCE's kernel needs ~96KB shared memory (sm_80+);"
+              " T4/sm_75 has 64KB → OutOfResources. CCE is Ampere/Hopper-only.")
+        return
     try:
         from cut_cross_entropy import linear_cross_entropy as cce_lce
     except Exception as ex:

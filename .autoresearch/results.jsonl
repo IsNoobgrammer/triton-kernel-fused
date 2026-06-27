@@ -4,3 +4,13 @@
 {"round": 1, "gpu": "T4", "compile": true, "kernel": "ce_384MB", "fwdbwd_x": 0.74, "mem_x_less": 0.77, "grad_rel": 1.07e-2, "pass": true}
 {"round": 1, "gpu": "T4", "compile": true, "kernel": "ce_1GB", "fwdbwd_x": 0.74, "mem_x_less": 0.83, "grad_rel": 1.07e-2, "pass": true}
 {"round": 1, "gpu": "T4", "compile": true, "kernel": "ce_128MB", "fwdbwd_x": 0.68, "mem_x_less": 1.11, "grad_rel": 1.07e-2, "pass": true, "verdict": "CE REDUNDANT under compile — inductor already chunks cross_entropy, so ~no time AND ~no memory edge; demote to no-compile fallback"}
+{"round": 2, "gpu": "T4", "compile": true, "note": "kernel runs eager Triton; only baseline compiled"}
+{"round": 2, "kernel": "moe_per_expert", "fwdbwd_x": 2.26, "bwd_x": 3.09, "grad_rel": 9.1e-4, "pass": true, "verdict": "WIN (fwd noisy/throttle; bwd 3.09x solid)"}
+{"round": 2, "kernel": "swiglu_ours", "fwdbwd_x": 0.96, "verdict": "LOSES to compile"}
+{"round": 2, "kernel": "swiglu_liger", "fwdbwd_x": 0.97, "verdict": "LOSES to compile — famous external kernel also can't beat inductor"}
+{"round": 2, "kernel": "swiglu_bassrehab_fwd_only", "fwd_x": 0.95, "out_rel": 4.29e-4, "verdict": "LOSES (fwd); output matches"}
+{"round": 2, "kernel": "ce_ours", "fwdbwd_x": 0.41, "verdict": "LOSES (worse once kernel run eager, not compiled)"}
+{"round": 2, "kernel": "ce_liger", "status": "bench-bug-fixed (returns tuple)"}
+{"round": 2, "kernel": "ce_cce", "status": "CANNOT RUN on T4 — needs 96KB shared mem (sm_80+); Turing has 64KB. Ampere/Hopper-only."}
+{"round": 2, "kernel": "moe_bassrehab_fwd_only", "fwd_x": 0.12, "out_rel": 7.65e-1, "verdict": "slow + output MISMATCH on T4"}
+{"round": 2, "CONCLUSION": "Cross-validated: Liger + bassrehab + CCE ALSO fail to beat torch.compile on T4 (SwiGLU ~0.95-0.97x; CCE cannot run). Only MoE per-expert (data-dependent routing) wins. Not our incompetence — universal on T4+compile."}
