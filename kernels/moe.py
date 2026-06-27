@@ -281,8 +281,15 @@ def moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, a
 # of autograd-native ops, so no custom backward — IF torch._grouped_mm is differentiable. Requires
 # torch with _grouped_mm (>= ~2.5/2.8); raises otherwise (the bench catches it and reports FAILED).
 def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
+    # NOTE (measured T4, round 1): torch._grouped_mm is **bf16/fp8-only** and needs bf16 tensor
+    # cores → **sm_80+ (Ampere/Hopper) only**. On Turing (T4, sm_75) it cannot run; we hard-skip.
+    # Where it DOES run, the grouped GEMM is cuBLAS + the whole dispatch is GPU-resident (cumsum
+    # offsets, no .tolist()/Python loop). GEMMs go through bf16 (cast in/out); grad flows through
+    # _grouped_mm (autograd-native). UNTESTED end-to-end — no sm_80+ box in the loop yet.
     if not hasattr(torch, "_grouped_mm"):
         raise RuntimeError("torch._grouped_mm unavailable in this torch build")
+    if torch.cuda.get_device_capability(hidden.device)[0] < 8:
+        raise RuntimeError("torch._grouped_mm needs bf16 tensor cores (sm_80+); skipped on this GPU")
     N, H = hidden.shape
     E = gate_up_proj.shape[0]
     flat_t = torch.arange(N, device=hidden.device).unsqueeze(1).expand_as(top_k_indices).flatten()
@@ -293,9 +300,10 @@ def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_
     offs = counts.cumsum(0).to(torch.int32)                               # GPU end-exclusive offsets
     row_act = torch.repeat_interleave(act_codes, counts).to(torch.int32)  # GPU
     x_s = hidden[st].contiguous()                                         # (M,H)
-    gate_up = torch._grouped_mm(x_s, gate_up_proj.transpose(-2, -1), offs=offs)   # (M,2I)
-    inter = BatchedGLU.apply(gate_up, row_act)                            # (M,I)
-    eo = torch._grouped_mm(inter, down_proj.transpose(-2, -1), offs=offs)         # (M,H)
+    bf = torch.bfloat16
+    gate_up = torch._grouped_mm(x_s.to(bf), gate_up_proj.transpose(-2, -1).to(bf), offs=offs).to(hidden.dtype)
+    inter = BatchedGLU.apply(gate_up, row_act)                            # (M,I) in model dtype
+    eo = torch._grouped_mm(inter.to(bf), down_proj.transpose(-2, -1).to(bf), offs=offs).to(hidden.dtype)
     out = torch.zeros(N, H, device=hidden.device, dtype=hidden.dtype)
     out.index_add_(0, st, eo * sw.unsqueeze(-1))
     return out

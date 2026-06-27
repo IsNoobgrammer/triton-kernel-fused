@@ -26,7 +26,29 @@
 WATCH on T4: does `grouped_cublas` exist + grad-pass + beat per-expert's 2.85×? Does any CE budget
 push fwd+bwd toward ≥1.0×?
 
+## Round 1 RESULTS (T4, compiled) — convergence
+- **MoE per-expert = 2.87× fwd+bwd, grad PASS. The SOLE durable win on T4+compile.** Keep.
+- MoE grouped (tl.dot) = 0.10× — dead on Turing (confirmed). Disabled sm_<80.
+- **MoE grouped_cublas FAILED**: `torch._grouped_mm` is **bf16/fp8-only + needs sm_80+** tensor
+  cores → cannot run on T4 (sm_75). It's an **Ampere/Hopper-only** path. Made it bf16 + arch-gated
+  (clean skip on Turing); UNTESTED (no sm_80+ box in the loop). This is THE lever if we leave T4.
+- **CE = REDUNDANT under compile.** All budgets ~0.74× time AND the memory edge is gone:
+  inductor's compiled `cross_entropy` already chunks, so 384MB/1GB use *more* mem than compiled
+  eager; only 128MB squeaks 1.11× less. The old "1.34× less" was vs *un*-compiled eager. → CE is a
+  no-compile fallback, not a win. **Close the CE optimization thread.**
+
+## Verdict / where the loop stands
+On **T4 + torch.compile**, the repo's one production-grade win is **MoE per-expert**. Everything
+else is either redundant under compile (CE, SwiGLU, XSA, conv) or off-arch for Turing (both grouped
+paths). MoE per-expert at 2.87× is likely near the T4 ceiling for the cuBLAS-loop approach — the only
+clear path past it is a **bf16 grouped GEMM on Ampere/Hopper** (grouped_cublas), a different GPU.
+Remaining T4 lever for per-expert (marginal): make dispatch fully GPU-resident (kill the one
+`.tolist()` + Python schedule) — but it already wins *with* that sync, so expect small gains.
+
 ## Lessons (do not relearn)
+- `torch._grouped_mm` = bf16/fp8 + sm_80+ ONLY. Useless on Turing. Right tool on Hopper/Ampere.
+- Under torch.compile, inductor already chunks cross_entropy → hand-rolled chunked CE has no edge.
+- The MoE win survives compile ONLY because compile can't fuse data-dependent routing.
 - tl.dot GEMM never beats cuBLAS on Turing. Don't tune it — replace it.
 - Measure only vs COMPILED eager on T4. Ampere/eager numbers mislead.
 - A faster kernel that fails grad_rel < 1.5e-2 is a fail, not a win.

@@ -257,8 +257,12 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
         kfb, efb = _stats(kstep, estep, leaves)
         return kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
 
-    for vname, vfn in [("per-expert", moe_per_expert), ("grouped", moe_grouped),
-                       ("grouped_cublas", moe_grouped_cublas)]:
+    variants = [("per-expert", moe_per_expert), ("grouped", moe_grouped)]
+    if torch.cuda.get_device_capability()[0] >= 8:
+        variants.append(("grouped_cublas", moe_grouped_cublas))   # bf16/sm_80+ only — see moe.py
+    else:
+        print("\n=== MoE grouped_cublas ===\n  SKIPPED — torch._grouped_mm is bf16/sm_80+; this GPU is sm_<80 (Turing).")
+    for vname, vfn in variants:
         try:
             _report(f"MoE {vname} vs eager", *run(vfn))
         except Exception as ex:

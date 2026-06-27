@@ -1,0 +1,6 @@
+{"round": 1, "gpu": "T4", "compile": true, "kernel": "moe_per_expert", "fwdbwd_x": 2.87, "mem_x_less": 1.08, "grad_rel": 1.17e-3, "pass": true, "verdict": "KEEP — sole durable win on T4+compile"}
+{"round": 1, "gpu": "T4", "compile": true, "kernel": "moe_grouped_tldot", "fwdbwd_x": 0.10, "mem_x_less": 0.80, "grad_rel": 9.8e-4, "pass": true, "verdict": "DEAD on Turing (tl.dot); auto-disabled sm_<80"}
+{"round": 1, "gpu": "T4", "compile": true, "kernel": "moe_grouped_cublas", "status": "FAILED", "reason": "torch._grouped_mm is bf16/fp8-only + needs sm_80+ tensor cores; not runnable on T4 (sm_75)", "verdict": "Ampere/Hopper-only candidate; arch-gated off Turing"}
+{"round": 1, "gpu": "T4", "compile": true, "kernel": "ce_384MB", "fwdbwd_x": 0.74, "mem_x_less": 0.77, "grad_rel": 1.07e-2, "pass": true}
+{"round": 1, "gpu": "T4", "compile": true, "kernel": "ce_1GB", "fwdbwd_x": 0.74, "mem_x_less": 0.83, "grad_rel": 1.07e-2, "pass": true}
+{"round": 1, "gpu": "T4", "compile": true, "kernel": "ce_128MB", "fwdbwd_x": 0.68, "mem_x_less": 1.11, "grad_rel": 1.07e-2, "pass": true, "verdict": "CE REDUNDANT under compile — inductor already chunks cross_entropy, so ~no time AND ~no memory edge; demote to no-compile fallback"}

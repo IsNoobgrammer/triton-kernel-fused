@@ -14,14 +14,15 @@
     "ce":             {"fwdbwd_x": 0.61, "fwd_x": 0.93, "bwd_x": 0.52, "mem_x_less": 1.34, "kernel_ms": 71.754, "eager_ms": 43.909, "grad_rel": 8.0e-4}
   },
   "best": {
-    "moe_per_expert_fwdbwd_x": 2.85,
-    "ce_fwdbwd_x": 0.61,
-    "ce_mem_x_less": 1.34
+    "moe_per_expert_fwdbwd_x": 2.87,
+    "ce": "REDUNDANT under compile (inductor chunks CE) — no time/mem edge; demoted to fallback"
   },
   "objectives": {
-    "moe_per_expert": "fwd+bwd > 2.85x AND GPU-resident (no host sync in hot path)",
-    "ce": "fwd+bwd >= 0.9x compiled eager, mem still >= 1.3x less, grad_rel < 1.5e-2"
+    "moe_per_expert": "push past 2.87x on T4 (likely near ceiling) and/or fully GPU-resident dispatch",
+    "ce": "CLOSED — redundant under torch.compile",
+    "grouped_cublas": "Ampere/Hopper-only (bf16 + sm_80+); validate when off Turing"
   },
-  "round": 0,
-  "tried": []
+  "round": 1,
+  "verdict_after_round_1": "MoE per-expert is the sole T4+compile win (2.87x). CE redundant under compile. Both grouped paths off-arch for Turing (tl.dot dead; _grouped_mm is bf16/sm_80+).",
+  "tried": ["moe_per_expert(2.87x KEEP)", "moe_grouped_tldot(0.10x dead)", "moe_grouped_cublas(FAILED bf16/sm_80+)", "ce_384/1GB/128MB(~0.74x, no mem edge, REDUNDANT)"]
 }
