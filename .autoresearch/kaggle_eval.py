@@ -23,8 +23,8 @@ def _run(cmd, **kw):
 
 if not os.path.isdir(REPO):
     _run(["git", "clone", "-q", URL, REPO])
-# outsourced reference kernels: Liger (pip) + bassrehab (self-clones in the bench)
-_run([sys.executable, "-m", "pip", "install", "-q", "liger-kernel"])
+# outsourced reference kernels: Liger + Cut-Cross-Entropy (pip); bassrehab self-clones in the bench
+_run([sys.executable, "-m", "pip", "install", "-q", "liger-kernel", "cut-cross-entropy"])
 _run(["git", "-C", REPO, "fetch", "-q", "--all"])
 _run(["git", "-C", REPO, "checkout", "-q", BRANCH])
 _run(["git", "-C", REPO, "reset", "--hard", "-q", f"origin/{BRANCH}"])

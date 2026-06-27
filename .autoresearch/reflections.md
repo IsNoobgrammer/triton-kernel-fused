@@ -56,7 +56,23 @@ bassrehab self-clones (blanks its __init__ to dodge the eager broken-import bug)
 WATCH: if Liger/bassrehab ALSO lose to compiled eager on T4 → confirms "compile already does this"
 is universal, not our incompetence. If they WIN → our kernels are subpar; adopt their approach.
 
+## Round 2 partial (T4) — data + 2 bugs found
+Data (compiled eager baseline): MoE per-expert **2.98×** (winner, stable), grouped 0.10× (dead),
+grouped_cublas cleanly SKIPPED (sm_<80), CE ~0.75× + no mem edge (redundant confirmed), SwiGLU 0.96×.
+- **BUG 1**: Liger SwiGLU CRASHED the whole run — torch.compile can't compile Liger's
+  autograd.Function ("leaf Variable ... in-place op"), and the main loop only caught OOM → aborted
+  everything after SwiGLU. FIX: main loop now catches ALL exceptions per-bench (one crash never
+  aborts the sweep).
+- **BUG 2 (methodology)**: I was compiling the KERNEL side too. Wrong — you don't wrap a hand-written
+  autograd.Function in torch.compile (unrepresentative + triggers the Liger crash). FIX: compile
+  ONLY the eager baseline; kernels run native Triton (eager). Liger's own benches do this.
+Round 2b pushed with both fixes + added Cut-Cross-Entropy (Apple cut_cross_entropy) and bassrehab
+SwiGLU (auto fwd-only detect). Re-run to get Liger/CCE/bassrehab numbers cleanly.
+
 ## Lessons (do not relearn)
+- Do NOT torch.compile a custom autograd.Function — unrepresentative AND crashes some (Liger).
+  Compile only the eager baseline; run the kernel as its native Triton.
+- Every contender in its own try/except — one crash must not abort the sweep.
 - `torch._grouped_mm` = bf16/fp8 + sm_80+ ONLY. Useless on Turing. Right tool on Hopper/Ampere.
 - Under torch.compile, inductor already chunks cross_entropy → hand-rolled chunked CE has no edge.
 - The MoE win survives compile ONLY because compile can't fuse data-dependent routing.

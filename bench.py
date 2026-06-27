@@ -8,12 +8,13 @@ its PyTorch-eager equivalent, plus a grad-equivalence check.
 Timing: triton.testing.do_bench (median ms) after explicit warmup. Speedup = eager / kernel
 (>1 = kernel faster). Grad check: max|Δ| of every input grad vs eager, same upstream cotangent.
 
---compile (industry-standard steady-state): wraps the kernel AND eager forwards in
-torch.compile. Compilation + Triton autotune happen during the warmup runs, so they are NOT
-counted in the reported step time — you get the post-compile steady-state cost. This is the
-fair baseline for the fused kernels (compiled eager fuses the elementwise ops; e.g. compiled
-standard CE narrows the fused-CE time gap to ~tie while fused-CE keeps the memory win).
-torch.compile is broken on some local setups; run --compile on the target GPU (T4 / Hopper).
+--compile (industry-standard steady-state): wraps ONLY the EAGER baseline in torch.compile —
+the kernel runs as its native Triton (eager). This is the correct, fair comparison: "does the
+hand-written kernel beat what torch.compile gives PyTorch for free?" We do NOT compile the kernel
+itself — wrapping a custom autograd.Function in torch.compile is both unrepresentative and crashes
+some (e.g. Liger SiLUMul: "leaf Variable ... in-place operation"). Compilation + Triton autotune
+run during warmup, excluded from the timed step. torch.compile is broken on some local setups; run
+--compile on the target GPU (T4 / Hopper).
 
 ⚠️ Numbers are GPU-specific. Triton tl.dot GEMMs are far slower on Turing (T4, sm_75) than
 on Ampere+; re-run on YOUR target GPU. The printed header states the GPU.
@@ -117,7 +118,7 @@ def bench_swiglu(M=8192, I=768):
     fused_swiglu(a).backward(G); eager(b).backward(G)
     gabs, grel = _gdiff([(a.grad, b.grad)])
 
-    K = _c(fused_swiglu); E = _c(eager)
+    K = fused_swiglu; E = _c(eager)   # kernel runs native Triton (eager); only the baseline is compiled
     kf = _fwd_ms(lambda: K(gu))
     ef = _fwd_ms(lambda: E(gu))
     x = gu.clone().requires_grad_(True)
@@ -155,7 +156,7 @@ def bench_ce(N=4096, H=512, V=81000):
             bb = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
             eager(bb, wb).backward()
             gabs, grel = _gdiff([(a.grad, bb.grad), (wa.grad, wb.grad)])
-            K = _c(lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
+            K = (lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
             kf = _fwd_ms(lambda: K(hid, w))
             h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
             kstep = lambda: K(h2, w2).backward()
@@ -183,7 +184,7 @@ def bench_xsa(B=8, Hq=8, S=1024, D=128, Hkv=2):
     fused_xsa(ya, va).backward(G); eager(yb, vb).backward(G)
     gabs, grel = _gdiff([(ya.grad, yb.grad), (va.grad, vb.grad)])
 
-    K = _c(fused_xsa); E = _c(eager)
+    K = fused_xsa; E = _c(eager)
     kf = _fwd_ms(lambda: K(Y, V))
     ef = _fwd_ms(lambda: E(Y, V))
     y2 = Y.clone().requires_grad_(True); v2 = V.clone().requires_grad_(True)
@@ -211,7 +212,7 @@ def bench_conv_router(B=8, S=1024, H=512, E=11, K=4):
     causal_conv1d_router(xa, wa).backward(G); eager(xb, wb).backward(G)
     gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
 
-    kfn = _c(causal_conv1d_router); efn = _c(eager)   # not 'E' — E is the expert count here
+    kfn = causal_conv1d_router; efn = _c(eager)   # not 'E' — E is the expert count here
     kf = _fwd_ms(lambda: kfn(x, w))
     ef = _fwd_ms(lambda: efn(x, w))
     x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
@@ -240,7 +241,7 @@ def bench_liger_swiglu(M=8192, I=768):
     gb = gate.clone().requires_grad_(True); ub = up.clone().requires_grad_(True)
     liger(ga, ua).backward(G); eager(gb, ub).backward(G)
     gabs, grel = _gdiff([(ga.grad, gb.grad), (ua.grad, ub.grad)])
-    K = _c(liger); Eg = _c(eager)
+    K = liger; Eg = _c(eager)
     kf = _fwd_ms(lambda: K(gate, up)); ef = _fwd_ms(lambda: Eg(gate, up))
     g2 = gate.clone().requires_grad_(True); u2 = up.clone().requires_grad_(True)
     kstep = lambda: (K(g2, u2) * G).sum().backward()
@@ -265,7 +266,7 @@ def bench_liger_ce(N=4096, H=512, V=81000):
     b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
     liger(a, wa).backward(); eager(b, wb).backward()
     gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])
-    K = _c(liger); Eg = _c(eager)
+    K = liger; Eg = _c(eager)
     kf = _fwd_ms(lambda: K(hid, w)); ef = _fwd_ms(lambda: Eg(hid, w))
     h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
     kstep = lambda: K(h2, w2).backward()
@@ -297,7 +298,7 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
         he, ge, de, we = mk(); (moe_eager(he, idx, we, ge, de, act_codes) * G).sum().backward()
         gabs, grel = _gdiff([(hk.grad, he.grad), (gk.grad, ge.grad), (dk.grad, de.grad), (wk.grad, we.grad)])
         # timing (compiled forwards under --compile)
-        K = _c(variant); Eg = _c(moe_eager)
+        K = variant; Eg = _c(moe_eager)
         kf = _fwd_ms(lambda: K(hid, idx, wt_full, gup, dwn, act_codes))
         ef = _fwd_ms(lambda: Eg(hid, idx, wt_full, gup, dwn, act_codes))
         h2 = hid.clone().requires_grad_(True); g2 = gup.clone().requires_grad_(True)
@@ -320,26 +321,107 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
             print(f"\n=== MoE {vname} vs eager ===\n  FAILED: {type(ex).__name__}: {ex}")
 
 
-# ───────── outsourced MoE (bassrehab/triton-kernels) — forward-only ─────────
-def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
-    """bassrehab/triton-kernels fused_moe_forward (forward-only, standard SwiGLU, does its own
-    routing) vs a compiled-eager standard-SwiGLU MoE forward. Forward speed + output match only
-    (no backward — their kernel has none). Clones the repo on first use; SKIPs if unavailable."""
+# ───────── Cut Cross Entropy (Apple cut_cross_entropy — the canonical CCE ours is styled after) ─────────
+def bench_cce(N=4096, H=512, V=81000):
+    try:
+        from cut_cross_entropy import linear_cross_entropy as cce_lce
+    except Exception as ex:
+        print(f"\n=== Cut Cross Entropy ===\n  SKIPPED — cut_cross_entropy not installed ({ex}). `pip install cut-cross-entropy`.")
+        return
+    hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
+    w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
+    lab = torch.randint(0, V, (N,), device=DEV)
+    cce = lambda h, ww: cce_lce(h, ww, lab)                  # (embeddings, classifier, targets)
+    eager = lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab)
+    a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+    b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+    cce(a, wa).backward(); eager(b, wb).backward()
+    gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])   # CCE filters small grads -> grad_rel may be higher
+    K = cce; Eg = _c(eager)
+    kf = _fwd_ms(lambda: K(hid, w)); ef = _fwd_ms(lambda: Eg(hid, w))
+    h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+    kstep = lambda: K(h2, w2).backward()
+    estep = lambda: Eg(h2, w2).backward()
+    kfb, efb = _stats(kstep, estep, [h2, w2])
+    _report("Cut Cross Entropy (N=%d H=%d V=%d)" % (N, H, V), kf, ef, max(kfb - kf, 0.0),
+            max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+
+
+# ───────── outsourced kernels (bassrehab/triton-kernels) — forward-only kernels ─────────
+def _ensure_bassrehab():
+    """Make triton_kernels (bassrehab) importable: clone on first use, blank its __init__s to dodge
+    the eager broken-import bug. Raises on failure (callers catch)."""
     import os, sys, tempfile, subprocess
     try:
-        try:
-            from triton_kernels.moe.fused_moe import fused_moe_forward
-        except Exception:
-            BR = os.path.join(tempfile.gettempdir(), "bassrehab_triton_kernels")
-            if not os.path.isdir(BR):
-                subprocess.run(["git", "clone", "--depth", "1", "-q",
-                                "https://github.com/bassrehab/triton-kernels", BR], check=True)
-            for p in ("triton_kernels/__init__.py", "triton_kernels/moe/__init__.py"):
-                fp = os.path.join(BR, p)
-                if os.path.exists(fp):
-                    open(fp, "w").close()                 # blank: dodge eager broken top-level imports
-            sys.path.insert(0, BR)
-            from triton_kernels.moe.fused_moe import fused_moe_forward
+        import triton_kernels.swiglu  # noqa: F401
+        return
+    except Exception:
+        pass
+    BR = os.path.join(tempfile.gettempdir(), "bassrehab_triton_kernels")
+    if not os.path.isdir(BR):
+        subprocess.run(["git", "clone", "--depth", "1", "-q",
+                        "https://github.com/bassrehab/triton-kernels", BR], check=True)
+    for p in ("triton_kernels/__init__.py", "triton_kernels/moe/__init__.py"):
+        fp = os.path.join(BR, p)
+        if os.path.exists(fp):
+            open(fp, "w").close()
+    if BR not in sys.path:
+        sys.path.insert(0, BR)
+    import triton_kernels.swiglu  # noqa: F401
+
+
+def bench_bassrehab_swiglu(M=8192, I=768):
+    """bassrehab swiglu_fused(gate, up). Auto-detects backward: full fwd+bwd if differentiable,
+    else forward-only (output match + fwd speed)."""
+    try:
+        _ensure_bassrehab()
+        from triton_kernels.swiglu import swiglu_fused
+    except Exception as ex:
+        print(f"\n=== bassrehab SwiGLU ===\n  SKIPPED — couldn't import ({type(ex).__name__}: {ex}).")
+        return
+    gate = torch.randn(M, I, device=DEV, dtype=DTYPE)
+    up = torch.randn(M, I, device=DEV, dtype=DTYPE)
+    G = torch.randn(M, I, device=DEV, dtype=DTYPE)
+    eager = lambda g, u: F.silu(g) * u
+    ga = gate.clone().requires_grad_(True); ua = up.clone().requires_grad_(True)
+    try:
+        probe = swiglu_fused(ga, ua)
+        has_bwd = bool(probe.requires_grad)
+    except Exception as ex:
+        print(f"\n=== bassrehab SwiGLU ===\n  FAILED forward: {type(ex).__name__}: {ex}")
+        return
+    if has_bwd:
+        gb = gate.clone().requires_grad_(True); ub = up.clone().requires_grad_(True)
+        probe.backward(G); eager(gb, ub).backward(G)
+        gabs, grel = _gdiff([(ga.grad, gb.grad), (ua.grad, ub.grad)])
+        K = (lambda g, u: swiglu_fused(g, u)); Eg = _c(eager)
+        kf = _fwd_ms(lambda: K(gate, up)); ef = _fwd_ms(lambda: Eg(gate, up))
+        g2 = gate.clone().requires_grad_(True); u2 = up.clone().requires_grad_(True)
+        kstep = lambda: (K(g2, u2) * G).sum().backward()
+        estep = lambda: (Eg(g2, u2) * G).sum().backward()
+        kfb, efb = _stats(kstep, estep, [g2, u2])
+        _report("bassrehab SwiGLU (M=%d I=%d)" % (M, I), kf, ef, max(kfb - kf, 0.0),
+                max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+    else:
+        with torch.no_grad():
+            ko = swiglu_fused(gate, up); eo = eager(gate, up)
+        match = (ko.float() - eo.float()).abs().max().item() / (eo.float().abs().max().item() + 1e-9)
+        K = (lambda: swiglu_fused(gate, up)); Eg = _c(lambda: eager(gate, up))
+        kf = _fwd_ms(K); ef = _fwd_ms(Eg)
+        print(f"\n=== bassrehab SwiGLU (FORWARD-ONLY, M=%d I=%d) ===" % (M, I))
+        print(f"  forward      kernel {kf:7.3f} ms | eager {ef:7.3f} ms | {ef/kf:5.2f}x")
+        print(f"  output rel-max vs eager: {match:.2e}  ({'MATCH' if match < 5e-2 else 'MISMATCH'})  [no backward]")
+        if JSON_OUT:
+            print("@@RESULT " + json.dumps({"name": "bassrehab_swiglu_fwd_only",
+                                            "fwd_x": round(ef / kf, 3), "out_rel": float(f"{match:.2e}"), "backward": False}))
+
+
+def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
+    """bassrehab fused_moe_forward (forward-only, standard SwiGLU, self-routing) vs compiled-eager
+    standard-SwiGLU MoE forward. Forward speed + output match only (no backward in their kernel)."""
+    try:
+        _ensure_bassrehab()
+        from triton_kernels.moe.fused_moe import fused_moe_forward
     except Exception as ex:
         print(f"\n=== bassrehab fused MoE (fwd-only) ===\n  SKIPPED — couldn't import ({type(ex).__name__}: {ex}).")
         return
@@ -371,7 +453,7 @@ def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
         with torch.no_grad():
             ko = kfwd(); eo = eager(x)
         match = (ko.float() - eo.float()).abs().max().item() / (eo.float().abs().max().item() + 1e-9)
-        K = _c(kfwd)
+        K = kfwd
         Eg = _c(eager)
         kf = _fwd_ms(K)
         ef = _fwd_ms(lambda: Eg(x))
@@ -390,7 +472,7 @@ def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
 
 BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
-           "bassrehab": bench_bassrehab_moe}
+           "cce": bench_cce, "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu}
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
@@ -402,10 +484,15 @@ if __name__ == "__main__":
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
     # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR
     # the famous external ones — beat torch.compile on this GPU?" (xsa/conv named-only.)
-    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "bassrehab"]
+    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "cce",
+                     "bassrehab_swiglu", "bassrehab"]
     for name in which:
         try:
             BENCHES[name]()
         except torch.cuda.OutOfMemoryError:
             print(f"\n=== {name} ===\n  OOM at this shape (eager baseline likely materialized full logits). Try smaller.")
+            torch.cuda.empty_cache()
+        except Exception as ex:
+            # one crashing contender must never abort the sweep
+            print(f"\n=== {name} ===\n  CRASHED: {type(ex).__name__}: {str(ex).splitlines()[0] if str(ex) else ex}")
             torch.cuda.empty_cache()
