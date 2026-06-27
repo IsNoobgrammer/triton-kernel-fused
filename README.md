@@ -11,6 +11,15 @@ from kernels import fused_swiglu, fused_linear_cross_entropy, fused_xsa, causal_
 Every kernel is wrapped in a `torch.autograd.Function` (trains normally) and is
 grad-equivalent to eager within fp16 tolerance (relative error < 1.5e-2, verified by `bench.py`).
 
+> **Honest headline (measured on T4 vs `torch.compile`, not vs slow eager).** If you train with
+> `torch.compile`, only **two** of these beat what the compiler gives you for free:
+> **`moe` (per-expert)** — ~2.9× faster, because `torch.compile` can't fuse data-dependent routing —
+> and **`fused_linear_cross_entropy`** — ~1.3× *less memory* (the one thing that lets large-vocab CE
+> fit when it would otherwise OOM; it's a touch *slower* than compiled CE). The elementwise kernels
+> (SwiGLU, XSA, conv-router) **tie or lose** under compile — inductor already fuses those ops — so
+> they're kept only as **no-`torch.compile` fallbacks**. The grouped-MoE `tl.dot` path is a disaster
+> on Turing and is **auto-disabled on sm_<80**. See [Reality check](#reality-check-vs-torchcompile-on-t4).
+
 ## Getting started
 
 **To use the kernels in your own project:** copy the `kernels/` folder in — no install needed. They
@@ -183,6 +192,25 @@ Notes:
   stands** — and it's the only path that fits when standard CE OOMs (large N × large vocab).
 - conv-router grad_w has large *absolute* error (~0.25) but ~7e-4 *relative* (TF32 `tl.dot`
   long-reduction order); grad_x is exact.
+
+## Reality check: vs `torch.compile` on T4
+
+Measured **Tesla T4, fp16, `--compile` (both sides compiled)**, fwd+bwd — the production setting:
+
+| kernel | fwd+bwd vs compiled eager | peak mem | verdict |
+|---|---|---|---|
+| **MoE per-expert** | **2.85×** | 1.08× less | **keep — real speed win** (compile can't fuse routing) |
+| fused-linear CE | 0.61× (slower) | **1.34× less** | **keep — memory/OOM only**, not for speed |
+| SwiGLU | 0.96× | 1.0× | fallback only — inductor fuses it free |
+| XSA | 0.89× | 1.0× | fallback only |
+| causal-conv1d router | 0.75× | 1.23× less | fallback only — inductor uses cuDNN conv |
+| MoE grouped | **0.10×** | 0.80× | **disabled on Turing** (tl.dot cliff); Ampere+ only |
+
+Takeaway: under `torch.compile`, hand-written **elementwise** Triton kernels don't beat inductor — it
+already fuses those, on-GPU, and our `autograd.Function` is an opaque graph-break that can even block
+inductor from fusing across it. The wins are where compile **structurally can't help**: data-dependent
+MoE dispatch (speed) and not materializing the (N,V) logits (memory). The Ampere/eager table above
+overstates the elementwise kernels — trust this one for a compiled pipeline.
 
 ## A note on `triton.autotune`
 

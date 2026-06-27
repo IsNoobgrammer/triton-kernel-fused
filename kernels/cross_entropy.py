@@ -88,17 +88,19 @@ class _CECublasChunked(torch.autograd.Function):
         ig = ctx.ignore_index
         N, Hd = hidden.shape
         V = weight.shape[0]
-        sc = float(grad_out / n_valid)
+        # Keep the loss-mean scale on-GPU (0-d tensor) — no float()/.item() host sync / graph break.
+        # Applied AFTER the GEMMs: (g·scale)@W == (g@W)·scale (linear), so grad-exact.
+        sc = grad_out / n_valid
         gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype)
         gw = torch.zeros(V, Hd, device=hidden.device, dtype=torch.float32)
         C = _chunk_rows(N, V)
         for i in range(0, N, C):
             hc = hidden[i:i + C]; labc = labels[i:i + C]; lsec = lse[i:i + C]
             logits = torch.mm(hc, weight.t())                            # cuBLAS recompute (C,V)
-            g = _grad_logits_inplace(logits, lsec, labc, sc, ig)         # in-place (softmax-onehot)*sc
+            g = _grad_logits_inplace(logits, lsec, labc, 1.0, ig)        # in-place (softmax - onehot), unscaled
             gh[i:i + C] = torch.mm(g, weight)
             gw += torch.mm(g.t(), hc).float()
-        return gh, gw.to(weight.dtype), None, None
+        return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None
 
 
 def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100):

@@ -296,8 +296,11 @@ def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
 
 
 def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
-    """Auto: grouped at >= GROUPED_MIN_TOKENS rows (N*top_k), else per-expert."""
-    if top_k_indices.numel() >= GROUPED_MIN_TOKENS:
+    """Auto: grouped at >= GROUPED_MIN_TOKENS rows (N*top_k) on Ampere+ (sm_80+), else per-expert.
+    The grouped path's tl.dot GEMMs are catastrophic on Turing (T4, sm_75) — measured ~0.1x vs
+    compiled eager — so it is NEVER chosen on sm_<80. per-expert (cuBLAS) wins there."""
+    cap_major = torch.cuda.get_device_capability(hidden.device)[0]
+    if top_k_indices.numel() >= GROUPED_MIN_TOKENS and cap_major >= 8:
         return moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
     return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
 
