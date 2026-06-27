@@ -18,6 +18,7 @@ import triton
 from triton.testing import do_bench
 
 from kernels import fused_swiglu, fused_linear_cross_entropy, fused_xsa, causal_conv1d_router
+from kernels.moe import moe_per_expert, moe_grouped, moe_eager
 
 DTYPE = torch.float16
 DEV = "cuda"
@@ -171,7 +172,49 @@ def bench_conv_router(B=8, S=1024, H=512, E=11, K=4):
             kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
 
 
-BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router}
+# ───────────────────────── MoE (PolyGLU) ─────────────────────────
+def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
+    # act_codes: PolyGLU groups of 3 (SiLU/ReLU²/Tanh)
+    act_codes = torch.tensor([i % 3 for i in range(E)], device=DEV, dtype=torch.int32)
+    hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
+    gup = (torch.randn(E, 2 * I, H, device=DEV, dtype=DTYPE) * 0.02)
+    dwn = (torch.randn(E, H, I, device=DEV, dtype=DTYPE) * 0.02)
+    logits = torch.randn(N, E, device=DEV, dtype=DTYPE)
+    wt_full, idx = torch.topk(torch.softmax(logits.float(), -1), top_k, dim=-1)
+    wt_full = wt_full.to(DTYPE)
+    print(f"\n(MoE: N={N} rows*top_k={N*top_k} {'>=' if N*top_k>=4096 else '<'} GROUPED_MIN_TOKENS={4096}; H={H} I={I} E={E} k={top_k})")
+
+    def run(variant):
+        # grad check vs eager (shared cotangent G)
+        G = torch.randn(N, H, device=DEV, dtype=DTYPE)
+        def mk():
+            return (hid.clone().requires_grad_(True), gup.clone().requires_grad_(True),
+                    dwn.clone().requires_grad_(True), wt_full.clone().requires_grad_(True))
+        hk, gk, dk, wk = mk(); (variant(hk, idx, wk, gk, dk, act_codes) * G).sum().backward()
+        he, ge, de, we = mk(); (moe_eager(he, idx, we, ge, de, act_codes) * G).sum().backward()
+        gabs, grel = _gdiff([(hk.grad, he.grad), (gk.grad, ge.grad), (dk.grad, de.grad), (wk.grad, we.grad)])
+        # timing
+        kf = _fwd_ms(lambda: variant(hid, idx, wt_full, gup, dwn, act_codes))
+        ef = _fwd_ms(lambda: moe_eager(hid, idx, wt_full, gup, dwn, act_codes))
+        h2 = hid.clone().requires_grad_(True); g2 = gup.clone().requires_grad_(True)
+        d2 = dwn.clone().requires_grad_(True); w2 = wt_full.clone().requires_grad_(True)
+        leaves = [h2, g2, d2, w2]
+        kb = _bwd_ms(lambda: (variant(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
+        eb = _bwd_ms(lambda: (moe_eager(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
+        kstep = lambda: (variant(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
+        estep = lambda: (moe_eager(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
+        kfb, efb = _stats(kstep, estep, leaves)
+        return kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
+
+    for vname, vfn in [("per-expert", moe_per_expert), ("grouped", moe_grouped)]:
+        try:
+            _report(f"MoE {vname} vs eager", *run(vfn))
+        except Exception as ex:
+            print(f"\n=== MoE {vname} vs eager ===\n  FAILED: {type(ex).__name__}: {ex}")
+
+
+BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router,
+           "moe": bench_moe}
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
