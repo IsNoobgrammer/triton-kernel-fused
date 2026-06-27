@@ -19,6 +19,7 @@ torch.compile is broken on some local setups; run --compile on the target GPU (T
 on Ampere+; re-run on YOUR target GPU. The printed header states the GPU.
 """
 import sys
+import json
 import torch
 import torch.nn.functional as F
 import triton
@@ -30,6 +31,7 @@ from kernels.moe import moe_per_expert, moe_grouped, moe_eager
 DTYPE = torch.float16
 DEV = "cuda"
 COMPILE = False   # set by --compile in __main__
+JSON_OUT = False  # set by --json in __main__ (emits one @@RESULT line per kernel for the loop harness)
 
 
 def _c(fn):
@@ -79,6 +81,12 @@ def _report(name, kf, ef, kb, eb, kfb, efb, gabs, grel, peak_k, peak_e):
     print(f"  fwd+bwd      kernel {kfb:7.3f} ms | eager {efb:7.3f} ms | {efb/kfb:5.2f}x")
     print(f"  peak mem     kernel {peak_k:6.0f} MB | eager {peak_e:6.0f} MB | {peak_e/max(peak_k,1):5.2f}x less")
     print(f"  grad vs eager: abs {gabs:.2e} | rel {grel:.2e}  ({'PASS' if grel < 1.5e-2 else 'CHECK'})")
+    if JSON_OUT:
+        print("@@RESULT " + json.dumps({
+            "name": name, "fwd_x": round(ef / kf, 3), "bwd_x": round(eb / kb, 3),
+            "fwdbwd_x": round(efb / kfb, 3), "mem_x_less": round(peak_e / max(peak_k, 1), 3),
+            "kernel_ms": round(kfb, 3), "eager_ms": round(efb, 3),
+            "grad_rel": float(f"{grel:.2e}"), "pass": grel < 1.5e-2}))
 
 
 def _peak(step):
@@ -249,7 +257,8 @@ BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": ben
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
     COMPILE = "--compile" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--compile"]
+    JSON_OUT = "--json" in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json")]
     print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
     which = args or list(BENCHES)
