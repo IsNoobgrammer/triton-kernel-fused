@@ -1,0 +1,12 @@
+{
+  "typeCheckingMode": "off",
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "reportAttributeAccessIssue": false,
+  "reportOperatorIssue": false,
+  "reportCallIssue": false,
+  "reportReturnType": false,
+  "reportArgumentType": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalOperand": false
+}

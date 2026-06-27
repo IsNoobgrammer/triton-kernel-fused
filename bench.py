@@ -251,12 +251,12 @@ def bench_liger_swiglu(M=8192, I=768):
             kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
 
 
-def bench_liger_ce(N=4096, H=512, V=81000, big_chunk=False):
-    """big_chunk=True: scope-patch Liger's FLCE chunk math to force ONE chunk (materializes full
-    (BT,V) logits like compiled eager) — tests whether Liger's slowness is just its tiny default
-    chunk (=next_power_of_2(cdiv(BT, cdiv(V,H))) = 32 here → ~128 chunks). Patch only rebinds the
-    `triton` NAME inside Liger's FLCE module (its inner CE kernel lives in another module, untouched)
-    and is restored in finally."""
+def bench_liger_ce(N=4096, H=512, V=81000, force_chunk=None):
+    """force_chunk=C: scope-patch Liger's FLCE so its chunk_size = C rows (=> ceil(N/C) chunks).
+    Maps the memory<->speed trade: Liger's default tiny chunk (next_power_of_2(cdiv(BT,cdiv(V,H)))
+    = 32 here -> ~128 chunks) is slow; bigger chunks approach compiled-eager speed but spend more
+    memory. The patch only rebinds the `triton` NAME in Liger's FLCE module (its inner CE kernel
+    is a different module, untouched) and is restored in finally. force_chunk=None -> Liger default."""
     try:
         import liger_kernel.ops.fused_linear_cross_entropy as _flce
         from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction as LFLCE
@@ -264,11 +264,11 @@ def bench_liger_ce(N=4096, H=512, V=81000, big_chunk=False):
         print(f"\n=== Liger CE ===\n  SKIPPED — liger_kernel not installed ({ex}). `pip install liger-kernel`.")
         return
 
-    class _ShimTriton:                       # delegates to real triton; forces a huge chunk
+    class _ShimTriton:                       # delegates to real triton; pins chunk_size = force_chunk
         def __getattr__(self, n): return getattr(triton, n)
-        def next_power_of_2(self, _x): return 1 << 30
+        def next_power_of_2(self, _x): return force_chunk
     _orig = _flce.triton
-    if big_chunk:
+    if force_chunk is not None:
         _flce.triton = _ShimTriton()
     try:
         hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
@@ -288,15 +288,23 @@ def bench_liger_ce(N=4096, H=512, V=81000, big_chunk=False):
         kstep = lambda: K(h2, w2).backward()
         estep = lambda: Eg(h2, w2).backward()
         kfb, efb = _stats(kstep, estep, [h2, w2])
-        tag = "Liger CE BIG-CHUNK (1 chunk)" if big_chunk else "Liger fused-linear CE"
-        _report("%s (N=%d H=%d V=%d)" % (tag, N, H, V), kf, ef, max(kfb - kf, 0.0),
+        if force_chunk is None:
+            tag = "Liger CE (default chunk)"
+        else:
+            tag = "Liger CE chunk=%d (%d chunks)" % (force_chunk, -(-N // force_chunk))
+        _report("%s (N=%d V=%d)" % (tag, N, V), kf, ef, max(kfb - kf, 0.0),
                 max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
     finally:
         _flce.triton = _orig                 # always restore
 
 
-def bench_liger_ce_big(N=4096, H=512, V=81000):
-    bench_liger_ce(N, H, V, big_chunk=True)
+def bench_liger_ce_sweep(N=4096, H=512, V=81000):
+    """Sweep Liger CE chunk size to map the memory<->speed curve: small chunk = slow + low mem,
+    big chunk = ~compile speed + higher mem."""
+    print(f"\n--- Liger CE chunk-size sweep (N={N} V={V}); default heuristic chunk = 32 ---")
+    for c in (4096, 2048, 1024, 512, 256, 128, 64, 32):
+        if c <= N:
+            bench_liger_ce(N, H, V, force_chunk=c)
 
 
 # ───────────────────────── MoE (PolyGLU) ─────────────────────────
@@ -476,7 +484,7 @@ def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
 BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
            "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
-           "liger_ce_big": bench_liger_ce_big}
+           "liger_ce_sweep": bench_liger_ce_sweep}
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
@@ -488,7 +496,7 @@ if __name__ == "__main__":
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
     # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR
     # the famous external ones — beat torch.compile on this GPU?" (xsa/conv named-only.)
-    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "liger_ce_big",
+    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "liger_ce_sweep",
                      "bassrehab_swiglu", "bassrehab"]
     for name in which:
         try:
