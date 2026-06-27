@@ -514,8 +514,10 @@ if __name__ == "__main__":
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
     # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR
     # the famous external ones — beat torch.compile on this GPU?" (xsa/conv named-only.)
-    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "liger_ce_big", "cce",
-                     "bassrehab_swiglu", "bassrehab"]
+    # cce LAST: its one-time autotune sweep (CCE_AUTOTUNE=1, needed to fit T4 shared mem) is slow,
+    # so everything fast — incl. liger_ce_big — prints before you wait on it.
+    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "liger_ce_big",
+                     "bassrehab_swiglu", "bassrehab", "cce"]
     for name in which:
         try:
             BENCHES[name]()
