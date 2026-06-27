@@ -45,6 +45,17 @@ clear path past it is a **bf16 grouped GEMM on Ampere/Hopper** (grouped_cublas),
 Remaining T4 lever for per-expert (marginal): make dispatch fully GPU-resident (kill the one
 `.tolist()` + Python schedule) — but it already wins *with* that sync, so expect small gains.
 
+## Round 2 (outsourced kernels — do THEY beat compile?) — pushed, awaiting T4
+Control test before concluding "hand-written kernels are pointless under compile": bench the famous
+EXTERNAL kernels in the same --compile harness vs compiled eager.
+- **Liger SwiGLU** + **Liger fused-linear CE** (`liger-kernel`, full fwd+bwd, canonical reference).
+- **bassrehab/triton-kernels** `fused_moe_forward` (FORWARD-ONLY, standard SwiGLU, self-routing) vs
+  compiled-eager MoE forward — forward speed + output-match only (no backward in their kernel).
+Default run now = moe, ce, swiglu, liger_swiglu, liger_ce, bassrehab. Harness pip-installs liger;
+bassrehab self-clones (blanks its __init__ to dodge the eager broken-import bug).
+WATCH: if Liger/bassrehab ALSO lose to compiled eager on T4 → confirms "compile already does this"
+is universal, not our incompetence. If they WIN → our kernels are subpar; adopt their approach.
+
 ## Lessons (do not relearn)
 - `torch._grouped_mm` = bf16/fp8 + sm_80+ ONLY. Useless on Turing. Right tool on Hopper/Ampere.
 - Under torch.compile, inductor already chunks cross_entropy → hand-rolled chunked CE has no edge.

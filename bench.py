@@ -224,6 +224,57 @@ def bench_conv_router(B=8, S=1024, H=512, E=11, K=4):
             kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
 
 
+# ───────── outsourced reference kernels (Liger) — do THEY beat compiled eager? ─────────
+def bench_liger_swiglu(M=8192, I=768):
+    try:
+        from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+    except Exception as ex:
+        print(f"\n=== Liger SwiGLU ===\n  SKIPPED — liger_kernel not installed ({ex}). `pip install liger-kernel`.")
+        return
+    gate = torch.randn(M, I, device=DEV, dtype=DTYPE)
+    up = torch.randn(M, I, device=DEV, dtype=DTYPE)
+    G = torch.randn(M, I, device=DEV, dtype=DTYPE)
+    liger = lambda g, u: LigerSiLUMulFunction.apply(g, u)
+    eager = lambda g, u: F.silu(g) * u
+    ga = gate.clone().requires_grad_(True); ua = up.clone().requires_grad_(True)
+    gb = gate.clone().requires_grad_(True); ub = up.clone().requires_grad_(True)
+    liger(ga, ua).backward(G); eager(gb, ub).backward(G)
+    gabs, grel = _gdiff([(ga.grad, gb.grad), (ua.grad, ub.grad)])
+    K = _c(liger); Eg = _c(eager)
+    kf = _fwd_ms(lambda: K(gate, up)); ef = _fwd_ms(lambda: Eg(gate, up))
+    g2 = gate.clone().requires_grad_(True); u2 = up.clone().requires_grad_(True)
+    kstep = lambda: (K(g2, u2) * G).sum().backward()
+    estep = lambda: (Eg(g2, u2) * G).sum().backward()
+    kfb, efb = _stats(kstep, estep, [g2, u2])
+    _report("Liger SwiGLU (M=%d I=%d)" % (M, I), kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0),
+            kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+
+
+def bench_liger_ce(N=4096, H=512, V=81000):
+    try:
+        from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction as LFLCE
+    except Exception as ex:
+        print(f"\n=== Liger CE ===\n  SKIPPED — liger_kernel not installed ({ex}). `pip install liger-kernel`.")
+        return
+    hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
+    w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
+    lab = torch.randint(0, V, (N,), device=DEV)
+    liger = lambda h, ww: LFLCE.apply(h, ww, lab)             # (_input, weight, target)
+    eager = lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab)
+    a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+    b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+    liger(a, wa).backward(); eager(b, wb).backward()
+    gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])
+    K = _c(liger); Eg = _c(eager)
+    kf = _fwd_ms(lambda: K(hid, w)); ef = _fwd_ms(lambda: Eg(hid, w))
+    h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+    kstep = lambda: K(h2, w2).backward()
+    estep = lambda: Eg(h2, w2).backward()
+    kfb, efb = _stats(kstep, estep, [h2, w2])
+    _report("Liger fused-linear CE (N=%d H=%d V=%d)" % (N, H, V), kf, ef, max(kfb - kf, 0.0),
+            max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+
+
 # ───────────────────────── MoE (PolyGLU) ─────────────────────────
 def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
     # act_codes: PolyGLU groups of 3 (SiLU/ReLU²/Tanh)
@@ -269,8 +320,77 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
             print(f"\n=== MoE {vname} vs eager ===\n  FAILED: {type(ex).__name__}: {ex}")
 
 
+# ───────── outsourced MoE (bassrehab/triton-kernels) — forward-only ─────────
+def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
+    """bassrehab/triton-kernels fused_moe_forward (forward-only, standard SwiGLU, does its own
+    routing) vs a compiled-eager standard-SwiGLU MoE forward. Forward speed + output match only
+    (no backward — their kernel has none). Clones the repo on first use; SKIPs if unavailable."""
+    import os, sys, tempfile, subprocess
+    try:
+        try:
+            from triton_kernels.moe.fused_moe import fused_moe_forward
+        except Exception:
+            BR = os.path.join(tempfile.gettempdir(), "bassrehab_triton_kernels")
+            if not os.path.isdir(BR):
+                subprocess.run(["git", "clone", "--depth", "1", "-q",
+                                "https://github.com/bassrehab/triton-kernels", BR], check=True)
+            for p in ("triton_kernels/__init__.py", "triton_kernels/moe/__init__.py"):
+                fp = os.path.join(BR, p)
+                if os.path.exists(fp):
+                    open(fp, "w").close()                 # blank: dodge eager broken top-level imports
+            sys.path.insert(0, BR)
+            from triton_kernels.moe.fused_moe import fused_moe_forward
+    except Exception as ex:
+        print(f"\n=== bassrehab fused MoE (fwd-only) ===\n  SKIPPED — couldn't import ({type(ex).__name__}: {ex}).")
+        return
+
+    x = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
+    rw = torch.randn(E, H, device=DEV, dtype=DTYPE) * 0.02
+    wg = torch.randn(E, FFN, H, device=DEV, dtype=DTYPE) * 0.02
+    wu = torch.randn(E, FFN, H, device=DEV, dtype=DTYPE) * 0.02
+    wd = torch.randn(E, H, FFN, device=DEV, dtype=DTYPE) * 0.02
+
+    def eager(xx):
+        probs = torch.softmax(xx @ rw.t(), dim=-1).float()
+        tw, idx = torch.topk(probs, top_k, dim=-1)
+        tw = (tw / tw.sum(-1, keepdim=True)).to(xx.dtype)
+        out = torch.zeros_like(xx)
+        for e in range(E):
+            hit = (idx == e)
+            rows = hit.any(-1)
+            if not bool(rows.any()):
+                continue
+            we = (tw * hit).sum(-1)[rows]
+            xe = xx[rows]
+            h = F.silu(xe @ wg[e].t()) * (xe @ wu[e].t())
+            out[rows] += (h @ wd[e].t()) * we.unsqueeze(-1)
+        return out
+
+    try:
+        kfwd = lambda: fused_moe_forward(x, rw, wg, wu, wd, E, top_k, gating="softmax")[0]
+        with torch.no_grad():
+            ko = kfwd(); eo = eager(x)
+        match = (ko.float() - eo.float()).abs().max().item() / (eo.float().abs().max().item() + 1e-9)
+        K = _c(kfwd)
+        Eg = _c(eager)
+        kf = _fwd_ms(K)
+        ef = _fwd_ms(lambda: Eg(x))
+        peak_k = _peak(lambda: K()); peak_e = _peak(lambda: Eg(x))
+        print(f"\n=== bassrehab fused MoE (FORWARD-ONLY, N={N} H={H} FFN={FFN} E={E} k={top_k}) ===")
+        print(f"  forward      kernel {kf:7.3f} ms | eager {ef:7.3f} ms | {ef/kf:5.2f}x")
+        print(f"  peak mem     kernel {peak_k:6.0f} MB | eager {peak_e:6.0f} MB | {peak_e/max(peak_k,1):5.2f}x less")
+        print(f"  output rel-max vs eager: {match:.2e}  ({'MATCH' if match < 5e-2 else 'MISMATCH'})  [no backward]")
+        if JSON_OUT:
+            print("@@RESULT " + json.dumps({"name": "bassrehab_moe_fwd_only", "fwd_x": round(ef / kf, 3),
+                                            "mem_x_less": round(peak_e / max(peak_k, 1), 3),
+                                            "out_rel": float(f"{match:.2e}"), "backward": False}))
+    except Exception as ex:
+        print(f"\n=== bassrehab fused MoE (fwd-only) ===\n  FAILED: {type(ex).__name__}: {ex}")
+
+
 BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router,
-           "moe": bench_moe}
+           "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
+           "bassrehab": bench_bassrehab_moe}
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
@@ -279,9 +399,10 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if a not in ("--compile", "--json")]
     print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
-    # Default run = the loop targets (MoE + CE candidate sweeps). swiglu/xsa/conv are no-compile
-    # fallbacks (they lose to compiled inductor) — bench them only if named explicitly.
-    which = args or ["moe", "ce"]
+    # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
+    # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR
+    # the famous external ones — beat torch.compile on this GPU?" (xsa/conv named-only.)
+    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "bassrehab"]
     for name in which:
         try:
             BENCHES[name]()
