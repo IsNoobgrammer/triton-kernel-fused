@@ -58,16 +58,17 @@ def _grad_logits_inplace(logits, lse, labels, scale, ignore_index):
     return logits
 
 
-def _chunk_rows(N, V):
-    return max(512, min(N, _BWD_LOGITS_BUDGET // (V * 2)))
+def _chunk_rows(N, V, budget=None):
+    return max(512, min(N, (budget or _BWD_LOGITS_BUDGET) // (V * 2)))
 
 
 class _CECublasChunked(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, ignore_index):
+    def forward(ctx, hidden, weight, labels, ignore_index, budget):
         N, Hd = hidden.shape
         V = weight.shape[0]
-        C = _chunk_rows(N, V)
+        C = _chunk_rows(N, V, budget)
+        ctx.budget = budget
         lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
         tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
         safe = labels.clamp(min=0)
@@ -93,17 +94,18 @@ class _CECublasChunked(torch.autograd.Function):
         sc = grad_out / n_valid
         gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype)
         gw = torch.zeros(V, Hd, device=hidden.device, dtype=torch.float32)
-        C = _chunk_rows(N, V)
+        C = _chunk_rows(N, V, ctx.budget)
         for i in range(0, N, C):
             hc = hidden[i:i + C]; labc = labels[i:i + C]; lsec = lse[i:i + C]
             logits = torch.mm(hc, weight.t())                            # cuBLAS recompute (C,V)
             g = _grad_logits_inplace(logits, lsec, labc, 1.0, ig)        # in-place (softmax - onehot), unscaled
             gh[i:i + C] = torch.mm(g, weight)
             gw += torch.mm(g.t(), hc).float()
-        return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None
+        return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None, None
 
 
-def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100):
+def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, bwd_logits_budget=None):
     """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
-    Never materializes (N,V); cuBLAS speed at bounded (chunk,V) memory."""
-    return _CECublasChunked.apply(hidden, weight, labels, ignore_index)
+    Never materializes (N,V); cuBLAS speed at bounded (chunk,V) memory. bwd_logits_budget (bytes)
+    overrides the (chunk,V) transient budget: larger = fewer cuBLAS launches, more peak memory."""
+    return _CECublasChunked.apply(hidden, weight, labels, ignore_index, bwd_logits_budget)

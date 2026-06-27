@@ -46,7 +46,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-__all__ = ["moe", "moe_per_expert", "moe_grouped", "moe_eager", "BatchedGLU", "GROUPED_MIN_TOKENS"]
+__all__ = ["moe", "moe_per_expert", "moe_grouped", "moe_grouped_cublas", "moe_eager",
+           "BatchedGLU", "GROUPED_MIN_TOKENS"]
 
 GROUPED_MIN_TOKENS = 4096
 SCHED_BLOCK_M = 64
@@ -272,6 +273,32 @@ def moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, a
     """Block-scheduled grouped-GEMM PolyGLU MoE. hidden (N,H), indices/weights (N,k),
     gate_up_proj (E,2I,H), down_proj (E,H,I), act_codes (E,) int32 -> (N,H)."""
     return _GroupedMoE.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
+
+
+# ── candidate: grouped GEMM via torch._grouped_mm (cuBLAS, GPU-resident, no host sync) ──
+# This is the Turing candidate: a cuBLAS grouped GEMM instead of the slow tl.dot one, with the
+# dispatch built entirely on-GPU (cumsum offsets, no .tolist()/Python schedule loop). Composition
+# of autograd-native ops, so no custom backward — IF torch._grouped_mm is differentiable. Requires
+# torch with _grouped_mm (>= ~2.5/2.8); raises otherwise (the bench catches it and reports FAILED).
+def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
+    if not hasattr(torch, "_grouped_mm"):
+        raise RuntimeError("torch._grouped_mm unavailable in this torch build")
+    N, H = hidden.shape
+    E = gate_up_proj.shape[0]
+    flat_t = torch.arange(N, device=hidden.device).unsqueeze(1).expand_as(top_k_indices).flatten()
+    sorted_e, order = top_k_indices.flatten().sort()
+    st = flat_t[order]
+    sw = top_k_weights.flatten()[order]
+    counts = torch.bincount(sorted_e, minlength=E)                        # GPU
+    offs = counts.cumsum(0).to(torch.int32)                               # GPU end-exclusive offsets
+    row_act = torch.repeat_interleave(act_codes, counts).to(torch.int32)  # GPU
+    x_s = hidden[st].contiguous()                                         # (M,H)
+    gate_up = torch._grouped_mm(x_s, gate_up_proj.transpose(-2, -1), offs=offs)   # (M,2I)
+    inter = BatchedGLU.apply(gate_up, row_act)                            # (M,I)
+    eo = torch._grouped_mm(inter, down_proj.transpose(-2, -1), offs=offs)         # (M,H)
+    out = torch.zeros(N, H, device=hidden.device, dtype=hidden.dtype)
+    out.index_add_(0, st, eo * sw.unsqueeze(-1))
+    return out
 
 
 # ───────────────────────── per-expert path (composition, autograd-native) ─────────────────────────

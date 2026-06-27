@@ -26,7 +26,7 @@ import triton
 from triton.testing import do_bench
 
 from kernels import fused_swiglu, fused_linear_cross_entropy, fused_xsa, causal_conv1d_router
-from kernels.moe import moe_per_expert, moe_grouped, moe_eager
+from kernels.moe import moe_per_expert, moe_grouped, moe_grouped_cublas, moe_eager
 
 DTYPE = torch.float16
 DEV = "cuda"
@@ -52,6 +52,13 @@ def _stats(kernel_step, eager_step, leaves):
     _warm(kernel_step); _warm(eager_step)
     return (do_bench(kernel_step, grad_to_none=leaves),
             do_bench(eager_step, grad_to_none=leaves))
+
+
+def _step_ms(step, leaves):
+    """Time one full fwd+bwd step (fresh graph each call) after warmup. Backward is derived as
+    (fwd+bwd − fwd) by the caller — reliable under torch.compile, unlike retain_graph re-backward."""
+    _warm(step)
+    return do_bench(step, grad_to_none=leaves)
 
 
 def _fwd_ms(fn):
@@ -123,7 +130,7 @@ def bench_swiglu(M=8192, I=768):
             _peak(kstep), _peak(estep))
 
 
-# ─────────────────── fused-linear CE ───────────────────
+# ─────────────────── fused-linear CE (chunk-budget candidate sweep) ───────────────────
 def bench_ce(N=4096, H=512, V=81000):
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
     w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
@@ -133,22 +140,30 @@ def bench_ce(N=4096, H=512, V=81000):
         # fair fp16 baseline: fp16 GEMM (as in a real autocast model), CE math in fp32
         return F.cross_entropy((h @ ww.t()).float(), lab)
 
-    a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
-    b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
-    fused_linear_cross_entropy(a, wa, lab).backward(); eager(b, wb).backward()
-    gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])
+    print(f"\n(CE: N={N} H={H} V={V}  — eager = compiled F.cross_entropy)")
+    Eg = _c(eager)
+    ef = _fwd_ms(lambda: Eg(hid, w))
+    he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
+    estep = lambda: Eg(he, we).backward()
+    efb = _step_ms(estep, [he, we]); peak_e = _peak(estep)
 
-    K = _c(fused_linear_cross_entropy); E = _c(eager)
-    kf = _fwd_ms(lambda: K(hid, w, lab))
-    ef = _fwd_ms(lambda: E(hid, w))
-    h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: K(h2, w2, lab), [h2, w2])
-    eb = _bwd_ms(lambda: E(h2, w2), [h2, w2])
-    kstep = lambda: K(h2, w2, lab).backward()
-    estep = lambda: E(h2, w2).backward()
-    kfb, efb = _stats(kstep, estep, [h2, w2])
-    _report("fused-linear CE (N=%d H=%d V=%d)" % (N, H, V), kf, ef, kb, eb, kfb, efb, gabs, grel,
-            _peak(kstep), _peak(estep))
+    MB = 1024 * 1024
+    for vname, budget in [("ce_384MB", 384 * MB), ("ce_1GB", 1024 * MB), ("ce_128MB", 128 * MB)]:
+        try:
+            a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+            fused_linear_cross_entropy(a, wa, lab, bwd_logits_budget=budget).backward()
+            bb = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+            eager(bb, wb).backward()
+            gabs, grel = _gdiff([(a.grad, bb.grad), (wa.grad, wb.grad)])
+            K = _c(lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
+            kf = _fwd_ms(lambda: K(hid, w))
+            h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+            kstep = lambda: K(h2, w2).backward()
+            kfb = _step_ms(kstep, [h2, w2])
+            _report(f"CE {vname} (N={N} V={V})", kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0),
+                    kfb, efb, gabs, grel, _peak(kstep), peak_e)
+        except Exception as ex:
+            print(f"\n=== CE {vname} ===\n  FAILED: {type(ex).__name__}: {ex}")
 
 
 # ───────────────────────── XSA ─────────────────────────
@@ -237,14 +252,13 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
         h2 = hid.clone().requires_grad_(True); g2 = gup.clone().requires_grad_(True)
         d2 = dwn.clone().requires_grad_(True); w2 = wt_full.clone().requires_grad_(True)
         leaves = [h2, g2, d2, w2]
-        kb = _bwd_ms(lambda: (K(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
-        eb = _bwd_ms(lambda: (Eg(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
         kstep = lambda: (K(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
         estep = lambda: (Eg(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
         kfb, efb = _stats(kstep, estep, leaves)
-        return kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
+        return kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
 
-    for vname, vfn in [("per-expert", moe_per_expert), ("grouped", moe_grouped)]:
+    for vname, vfn in [("per-expert", moe_per_expert), ("grouped", moe_grouped),
+                       ("grouped_cublas", moe_grouped_cublas)]:
         try:
             _report(f"MoE {vname} vs eager", *run(vfn))
         except Exception as ex:
@@ -261,7 +275,9 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if a not in ("--compile", "--json")]
     print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
-    which = args or list(BENCHES)
+    # Default run = the loop targets (MoE + CE candidate sweeps). swiglu/xsa/conv are no-compile
+    # fallbacks (they lose to compiled inductor) — bench them only if named explicitly.
+    which = args or ["moe", "ce"]
     for name in which:
         try:
             BENCHES[name]()
