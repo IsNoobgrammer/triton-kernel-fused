@@ -14,3 +14,10 @@
 {"round": 2, "kernel": "ce_cce", "status": "CANNOT RUN on T4 — needs 96KB shared mem (sm_80+); Turing has 64KB. Ampere/Hopper-only."}
 {"round": 2, "kernel": "moe_bassrehab_fwd_only", "fwd_x": 0.12, "out_rel": 7.65e-1, "verdict": "slow + output MISMATCH on T4"}
 {"round": 2, "CONCLUSION": "Cross-validated: Liger + bassrehab + CCE ALSO fail to beat torch.compile on T4 (SwiGLU ~0.95-0.97x; CCE cannot run). Only MoE per-expert (data-dependent routing) wins. Not our incompetence — universal on T4+compile."}
+{"round": 3, "gpu": "T4", "compile": true, "kernel": "moe_per_expert", "fwdbwd_x": 2.04, "bwd_x": 2.69, "mem_x_less": 1.03, "pass": true, "verdict": "WIN (fwd throttle-noisy)"}
+{"round": 3, "kernel": "swiglu_ours", "fwdbwd_x": 0.96, "kernel2": "swiglu_liger", "fwdbwd_x2": 0.97, "kernel3": "swiglu_bassrehab_fwd", "fwd_x3": 0.96, "verdict": "ALL three SwiGLUs lose to compile"}
+{"round": 3, "kernel": "ce_ours", "fwdbwd_x": 0.42, "mem_note": "uses MORE mem (2412 vs 1609) — our CE is memory-INEFFICIENT vs Liger"}
+{"round": 3, "kernel": "ce_liger", "fwdbwd_x": 0.10, "mem_x_less": 2.01, "verdict": "10x slower but 2x less mem — pure memory-for-speed trade"}
+{"round": 3, "kernel": "ce_cce", "fwdbwd_x": 0.08, "mem_x_less": 2.73, "verdict": "REMOVED — catastrophic 0.08x on T4 (Ampere/Hopper-targeted); 2.7x less mem not worth 12x slowdown"}
+{"round": 3, "kernel": "moe_bassrehab_fwd", "fwd_x": 0.12, "out_rel": 7.7e-1, "verdict": "slow + output mismatch on T4"}
+{"round": 3, "FINDING": "CE kernels (ours/Liger/CCE) all LOSE on time (0.08-0.42x) but Liger/CCE WIN big on memory (2-2.7x less) — pure memory-for-speed trade, only worth it when OOM-bound. Ours is BOTH slower AND more memory-hungry than Liger (2412 vs 972MB) — our CE is the worst of the CE kernels. MoE per-expert remains sole time-win. CCE removed (worst)."}

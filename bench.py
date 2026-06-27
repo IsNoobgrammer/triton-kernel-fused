@@ -344,36 +344,10 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
             print(f"\n=== MoE {vname} vs eager ===\n  FAILED: {type(ex).__name__}: {ex}")
 
 
-# ───────── Cut Cross Entropy (Apple cut_cross_entropy — the canonical CCE ours is styled after) ─────────
-def bench_cce(N=4096, H=512, V=81000):
-    # CCE's default (CCE_AUTOTUNE=0) uses ONE fixed config needing ~96KB shared mem -> OOM on T4
-    # (64KB). Enabling autotune turns on early_config_prune, which drops configs over the device
-    # shared-mem limit AND caps num_stages<=2 on Turing -> picks a T4-fitting config. Must be set
-    # BEFORE importing the CCE kernels.
-    import os
-    os.environ["CCE_AUTOTUNE"] = "1"
-    try:
-        from cut_cross_entropy import linear_cross_entropy as cce_lce
-    except Exception as ex:
-        print(f"\n=== Cut Cross Entropy ===\n  SKIPPED — cut_cross_entropy not installed ({ex}). `pip install cut-cross-entropy`.")
-        return
-    hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
-    w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
-    lab = torch.randint(0, V, (N,), device=DEV)
-    cce = lambda h, ww: cce_lce(h, ww, lab)                  # (embeddings, classifier, targets)
-    eager = lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab)
-    a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
-    b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
-    cce(a, wa).backward(); eager(b, wb).backward()
-    gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])   # CCE filters small grads -> grad_rel may be higher
-    K = cce; Eg = _c(eager)
-    kf = _fwd_ms(lambda: K(hid, w)); ef = _fwd_ms(lambda: Eg(hid, w))
-    h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
-    kstep = lambda: K(h2, w2).backward()
-    estep = lambda: Eg(h2, w2).backward()
-    kfb, efb = _stats(kstep, estep, [h2, w2])
-    _report("Cut Cross Entropy (N=%d H=%d V=%d)" % (N, H, V), kf, ef, max(kfb - kf, 0.0),
-            max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+# NOTE: Cut Cross Entropy (Apple cut_cross_entropy) was benched and REMOVED — on T4 it's
+# fwd+bwd 0.08x (catastrophic; CCE targets Ampere/Hopper, its T4-fitting autotune config is
+# terrible) despite 2.7x less memory. Same family as our CE/Liger CE: a memory-for-speed trade
+# that loses hard on time vs compiled eager. Not worth the slow autotune to re-confirm.
 
 
 # ───────── outsourced kernels (bassrehab/triton-kernels) — forward-only kernels ─────────
@@ -501,7 +475,7 @@ def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
 
 BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
-           "cce": bench_cce, "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
+           "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
            "liger_ce_big": bench_liger_ce_big}
 
 if __name__ == "__main__":
@@ -514,10 +488,8 @@ if __name__ == "__main__":
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
     # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR
     # the famous external ones — beat torch.compile on this GPU?" (xsa/conv named-only.)
-    # cce LAST: its one-time autotune sweep (CCE_AUTOTUNE=1, needed to fit T4 shared mem) is slow,
-    # so everything fast — incl. liger_ce_big — prints before you wait on it.
     which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "liger_ce_big",
-                     "bassrehab_swiglu", "bassrehab", "cce"]
+                     "bassrehab_swiglu", "bassrehab"]
     for name in which:
         try:
             BENCHES[name]()
