@@ -1,0 +1,35 @@
+[project]
+name = "triton-kernel-fused"
+version = "0.1.0"
+description = "Drop-in fused Triton kernels (fwd+bwd): SwiGLU, fused-linear CE, XSA, causal-conv1d router, PolyGLU MoE."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4.0",
+    # triton ships in the torch wheel on Windows; on Linux it's a separate wheel.
+    "triton>=3.0.0; sys_platform == 'linux'",
+]
+
+# Run the bench/examples from a fresh clone with uv:
+#   uv sync                       # creates .venv, installs torch (cu124) + triton + this package
+#   uv run python bench.py
+#   uv run python examples/moe_usage.py
+# Already have a CUDA torch + triton env? Skip all this — just `python bench.py` from the repo root,
+# or copy the `kernels/` folder into your project (the kernels need no install to be imported).
+
+# Pull CUDA torch (cu124) from the official PyTorch index instead of CPU-only PyPI wheels.
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kernels"]

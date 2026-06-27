@@ -11,6 +11,28 @@ from kernels import fused_swiglu, fused_linear_cross_entropy, fused_xsa, causal_
 Every kernel is wrapped in a `torch.autograd.Function` (trains normally) and is
 grad-equivalent to eager within fp16 tolerance (relative error < 1.5e-2, verified by `bench.py`).
 
+## Getting started
+
+**To use the kernels in your own project:** copy the `kernels/` folder in — no install needed. They
+import with just a CUDA `torch` + `triton` already in your env.
+
+**To clone this repo and run the bench / examples** (needs a CUDA GPU):
+
+```bash
+# Option A — uv (sets up everything from scratch, incl. CUDA torch + triton):
+uv sync
+uv run python bench.py                     # all kernels, eager baseline
+uv run python bench.py --compile           # torch.compile steady-state (run on the target GPU)
+uv run python examples/moe_usage.py
+
+# Option B — you already have a CUDA torch + triton env: just run from the repo root
+python bench.py
+```
+
+`uv sync` pulls CUDA (cu124) torch from the official PyTorch index (configured in `pyproject.toml`)
+plus triton, and installs `kernels` as an importable package. On Windows, triton ships inside the
+torch wheel; on Linux it's a separate wheel (declared as a dependency).
+
 ## The kernels
 
 | Kernel | Replaces | What it fuses |
