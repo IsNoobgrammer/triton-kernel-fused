@@ -1,15 +1,22 @@
 """3-phase benchmark (forward / backward / forward+backward) of every fused kernel vs
 its PyTorch-eager equivalent, plus a grad-equivalence check.
 
-    python bench.py            # all kernels, default shapes, fp16
-    python bench.py swiglu     # one kernel
+    python bench.py                 # all kernels, default shapes, fp16, eager baseline
+    python bench.py swiglu moe      # selected kernels
+    python bench.py --compile       # torch.compile BOTH kernel and eager forwards
 
-Timing: triton.testing.do_bench (median ms). Speedup = eager / kernel (>1 = kernel faster).
-Grad check: max|Δ| of every input grad vs eager, same upstream cotangent.
+Timing: triton.testing.do_bench (median ms) after explicit warmup. Speedup = eager / kernel
+(>1 = kernel faster). Grad check: max|Δ| of every input grad vs eager, same upstream cotangent.
+
+--compile (industry-standard steady-state): wraps the kernel AND eager forwards in
+torch.compile. Compilation + Triton autotune happen during the warmup runs, so they are NOT
+counted in the reported step time — you get the post-compile steady-state cost. This is the
+fair baseline for the fused kernels (compiled eager fuses the elementwise ops; e.g. compiled
+standard CE narrows the fused-CE time gap to ~tie while fused-CE keeps the memory win).
+torch.compile is broken on some local setups; run --compile on the target GPU (T4 / Hopper).
 
 ⚠️ Numbers are GPU-specific. Triton tl.dot GEMMs are far slower on Turing (T4, sm_75) than
-on Ampere+; re-run on YOUR target GPU before trusting any speedup. The printed header states
-the GPU these numbers came from.
+on Ampere+; re-run on YOUR target GPU. The printed header states the GPU.
 """
 import sys
 import torch
@@ -22,23 +29,40 @@ from kernels.moe import moe_per_expert, moe_grouped, moe_eager
 
 DTYPE = torch.float16
 DEV = "cuda"
+COMPILE = False   # set by --compile in __main__
+
+
+def _c(fn):
+    """torch.compile(fn) when --compile is set, else fn unchanged. Compilation + autotune run
+    during the warmup passes in the timing helpers, so they are excluded from the timed step."""
+    return torch.compile(fn) if COMPILE else fn
+
+
+def _warm(fn, n=4):
+    """Run fn a few times + sync so compilation/autotune is done before timing (excluded from it)."""
+    for _ in range(n):
+        fn()
+    torch.cuda.synchronize()
 
 
 def _stats(kernel_step, eager_step, leaves):
     """Return (kernel_ms, eager_ms) for a full fwd+bwd step, zeroing leaf grads each iter."""
-    k = do_bench(kernel_step, grad_to_none=leaves)
-    e = do_bench(eager_step, grad_to_none=leaves)
-    return k, e
+    _warm(kernel_step); _warm(eager_step)
+    return (do_bench(kernel_step, grad_to_none=leaves),
+            do_bench(eager_step, grad_to_none=leaves))
 
 
 def _fwd_ms(fn):
     with torch.no_grad():
+        _warm(fn)
         return do_bench(fn)
 
 
 def _bwd_ms(make_loss, leaves):
     loss = make_loss()
-    return do_bench(lambda: loss.backward(retain_graph=True), grad_to_none=leaves)
+    step = lambda: loss.backward(retain_graph=True)
+    _warm(step)
+    return do_bench(step, grad_to_none=leaves)
 
 
 def _gdiff(pairs):
@@ -58,6 +82,7 @@ def _report(name, kf, ef, kb, eb, kfb, efb, gabs, grel, peak_k, peak_e):
 
 
 def _peak(step):
+    _warm(step, 2)                                      # compile/autotune cached before measuring
     torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     step(); torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated() / 1e6
@@ -77,13 +102,14 @@ def bench_swiglu(M=8192, I=768):
     fused_swiglu(a).backward(G); eager(b).backward(G)
     gabs, grel = _gdiff([(a.grad, b.grad)])
 
-    kf = _fwd_ms(lambda: fused_swiglu(gu))
-    ef = _fwd_ms(lambda: eager(gu))
+    K = _c(fused_swiglu); E = _c(eager)
+    kf = _fwd_ms(lambda: K(gu))
+    ef = _fwd_ms(lambda: E(gu))
     x = gu.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: (fused_swiglu(x) * G).sum(), [x])
-    eb = _bwd_ms(lambda: (eager(x) * G).sum(), [x])
-    kstep = lambda: (fused_swiglu(x) * G).sum().backward()
-    estep = lambda: (eager(x) * G).sum().backward()
+    kb = _bwd_ms(lambda: (K(x) * G).sum(), [x])
+    eb = _bwd_ms(lambda: (E(x) * G).sum(), [x])
+    kstep = lambda: (K(x) * G).sum().backward()
+    estep = lambda: (E(x) * G).sum().backward()
     kfb, efb = _stats(kstep, estep, [x])
     _report("SwiGLU activation (M=%d I=%d)" % (M, I), kf, ef, kb, eb, kfb, efb, gabs, grel,
             _peak(kstep), _peak(estep))
@@ -104,13 +130,14 @@ def bench_ce(N=4096, H=512, V=81000):
     fused_linear_cross_entropy(a, wa, lab).backward(); eager(b, wb).backward()
     gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])
 
-    kf = _fwd_ms(lambda: fused_linear_cross_entropy(hid, w, lab))
-    ef = _fwd_ms(lambda: eager(hid, w))
+    K = _c(fused_linear_cross_entropy); E = _c(eager)
+    kf = _fwd_ms(lambda: K(hid, w, lab))
+    ef = _fwd_ms(lambda: E(hid, w))
     h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: fused_linear_cross_entropy(h2, w2, lab), [h2, w2])
-    eb = _bwd_ms(lambda: eager(h2, w2), [h2, w2])
-    kstep = lambda: fused_linear_cross_entropy(h2, w2, lab).backward()
-    estep = lambda: eager(h2, w2).backward()
+    kb = _bwd_ms(lambda: K(h2, w2, lab), [h2, w2])
+    eb = _bwd_ms(lambda: E(h2, w2), [h2, w2])
+    kstep = lambda: K(h2, w2, lab).backward()
+    estep = lambda: E(h2, w2).backward()
     kfb, efb = _stats(kstep, estep, [h2, w2])
     _report("fused-linear CE (N=%d H=%d V=%d)" % (N, H, V), kf, ef, kb, eb, kfb, efb, gabs, grel,
             _peak(kstep), _peak(estep))
@@ -133,13 +160,14 @@ def bench_xsa(B=8, Hq=8, S=1024, D=128, Hkv=2):
     fused_xsa(ya, va).backward(G); eager(yb, vb).backward(G)
     gabs, grel = _gdiff([(ya.grad, yb.grad), (va.grad, vb.grad)])
 
-    kf = _fwd_ms(lambda: fused_xsa(Y, V))
-    ef = _fwd_ms(lambda: eager(Y, V))
+    K = _c(fused_xsa); E = _c(eager)
+    kf = _fwd_ms(lambda: K(Y, V))
+    ef = _fwd_ms(lambda: E(Y, V))
     y2 = Y.clone().requires_grad_(True); v2 = V.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: (fused_xsa(y2, v2) * G).sum(), [y2, v2])
-    eb = _bwd_ms(lambda: (eager(y2, v2) * G).sum(), [y2, v2])
-    kstep = lambda: (fused_xsa(y2, v2) * G).sum().backward()
-    estep = lambda: (eager(y2, v2) * G).sum().backward()
+    kb = _bwd_ms(lambda: (K(y2, v2) * G).sum(), [y2, v2])
+    eb = _bwd_ms(lambda: (E(y2, v2) * G).sum(), [y2, v2])
+    kstep = lambda: (K(y2, v2) * G).sum().backward()
+    estep = lambda: (E(y2, v2) * G).sum().backward()
     kfb, efb = _stats(kstep, estep, [y2, v2])
     _report("XSA (B=%d Hq=%d S=%d D=%d Hkv=%d)" % (B, Hq, S, D, Hkv), kf, ef, kb, eb, kfb, efb, gabs, grel,
             _peak(kstep), _peak(estep))
@@ -160,13 +188,14 @@ def bench_conv_router(B=8, S=1024, H=512, E=11, K=4):
     causal_conv1d_router(xa, wa).backward(G); eager(xb, wb).backward(G)
     gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
 
-    kf = _fwd_ms(lambda: causal_conv1d_router(x, w))
-    ef = _fwd_ms(lambda: eager(x, w))
+    kfn = _c(causal_conv1d_router); efn = _c(eager)   # not 'E' — E is the expert count here
+    kf = _fwd_ms(lambda: kfn(x, w))
+    ef = _fwd_ms(lambda: efn(x, w))
     x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: (causal_conv1d_router(x2, w2) * G).sum(), [x2, w2])
-    eb = _bwd_ms(lambda: (eager(x2, w2) * G).sum(), [x2, w2])
-    kstep = lambda: (causal_conv1d_router(x2, w2) * G).sum().backward()
-    estep = lambda: (eager(x2, w2) * G).sum().backward()
+    kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
+    eb = _bwd_ms(lambda: (efn(x2, w2) * G).sum(), [x2, w2])
+    kstep = lambda: (kfn(x2, w2) * G).sum().backward()
+    estep = lambda: (efn(x2, w2) * G).sum().backward()
     kfb, efb = _stats(kstep, estep, [x2, w2])
     _report("causal-conv1d router (B=%d S=%d H=%d E=%d K=%d)" % (B, S, H, E, K),
             kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
@@ -193,16 +222,17 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
         hk, gk, dk, wk = mk(); (variant(hk, idx, wk, gk, dk, act_codes) * G).sum().backward()
         he, ge, de, we = mk(); (moe_eager(he, idx, we, ge, de, act_codes) * G).sum().backward()
         gabs, grel = _gdiff([(hk.grad, he.grad), (gk.grad, ge.grad), (dk.grad, de.grad), (wk.grad, we.grad)])
-        # timing
-        kf = _fwd_ms(lambda: variant(hid, idx, wt_full, gup, dwn, act_codes))
-        ef = _fwd_ms(lambda: moe_eager(hid, idx, wt_full, gup, dwn, act_codes))
+        # timing (compiled forwards under --compile)
+        K = _c(variant); Eg = _c(moe_eager)
+        kf = _fwd_ms(lambda: K(hid, idx, wt_full, gup, dwn, act_codes))
+        ef = _fwd_ms(lambda: Eg(hid, idx, wt_full, gup, dwn, act_codes))
         h2 = hid.clone().requires_grad_(True); g2 = gup.clone().requires_grad_(True)
         d2 = dwn.clone().requires_grad_(True); w2 = wt_full.clone().requires_grad_(True)
         leaves = [h2, g2, d2, w2]
-        kb = _bwd_ms(lambda: (variant(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
-        eb = _bwd_ms(lambda: (moe_eager(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
-        kstep = lambda: (variant(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
-        estep = lambda: (moe_eager(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
+        kb = _bwd_ms(lambda: (K(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
+        eb = _bwd_ms(lambda: (Eg(h2, idx, w2, g2, d2, act_codes) * G).sum(), leaves)
+        kstep = lambda: (K(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
+        estep = lambda: (Eg(h2, idx, w2, g2, d2, act_codes) * G).sum().backward()
         kfb, efb = _stats(kstep, estep, leaves)
         return kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
 
@@ -218,8 +248,11 @@ BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": ben
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
-    print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | triton {triton.__version__}")
-    which = sys.argv[1:] or list(BENCHES)
+    COMPILE = "--compile" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--compile"]
+    print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
+          f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
+    which = args or list(BENCHES)
     for name in which:
         try:
             BENCHES[name]()

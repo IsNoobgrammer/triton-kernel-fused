@@ -122,10 +122,20 @@ is unfused elementwise kernels + an intermediate HBM write; (c) **zero GEMM batc
 each under-utilizing the device. The fused paths kill all three: one sort instead of E masks, a
 fused-activation Triton kernel, and (grouped) a single batched GEMM.
 
+Runnable examples for the MoE kernel (auto-dispatch, forcing a path, and a full `nn.Module` MoE
+layer with a training step) are in [`examples/moe_usage.py`](examples/moe_usage.py).
+
 ## Benchmarks
 
 `python bench.py` runs all five (or `python bench.py swiglu ce xsa conv moe`): forward / backward /
 forward+backward via `triton.testing.do_bench`, plus a grad-equivalence check and peak memory.
+
+**`--compile`** (`python bench.py --compile`) wraps the kernel **and** eager forwards in
+`torch.compile`. Compilation + Triton autotune happen during warmup, so they are excluded from the
+timed step — you get the post-compile steady-state cost (industry-standard). Use this to get honest
+numbers on your GPU, and to compare against the *compiled* eager baseline (e.g. compiled standard CE
+closes most of the fused-CE time gap, while fused-CE keeps the memory win). `torch.compile` is broken
+on some local setups — run `--compile` on the target GPU (T4 / Hopper).
 
 fp16, torch 2.6 / triton 3.7 — speedup = eager ÷ kernel. Re-run on your own hardware: `python bench.py`.
 
@@ -151,6 +161,16 @@ Notes:
   stands** — and it's the only path that fits when standard CE OOMs (large N × large vocab).
 - conv-router grad_w has large *absolute* error (~0.25) but ~7e-4 *relative* (TF32 `tl.dot`
   long-reduction order); grad_x is exact.
+
+## A note on `triton.autotune`
+
+These kernels **do** use `@triton.autotune` — but only keyed on *shape-stable* dimensions
+(`K`, `N`, `H`, `I`), never on the per-step-varying token count `M`. That distinction matters for
+MoE: autotuning on `M` would re-tune (and stall) every step because each expert's token count
+changes per batch, and for the grouped path `BLOCK_M` is **pinned** to the tile schedule (autotuning
+it would corrupt the precomputed tiling). So: autotune the dense/fixed dims, keep `BLOCK_M` fixed,
+never key on `M`. The first call per new shape pays the tuning cost; with `--compile` that happens
+during warmup and is excluded from the timed step.
 
 ## Requirements
 
