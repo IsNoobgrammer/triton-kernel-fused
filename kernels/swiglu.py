@@ -108,6 +108,11 @@ class FusedSwiGLU(torch.autograd.Function):
         grad_gate_up = torch.empty_like(gate_up)
         if M == 0:
             return grad_gate_up
+        # NOTE: NOT in-place. Liger writes grads into the saved buffers (saves a (M,2I) alloc), but
+        # that only works because Liger does NOT autotune. Our kernel IS autotuned, and autotune
+        # benchmarks it ~10x on the same buffer — an in-place backward gets overwritten on trial 1
+        # and reads garbage after -> NaN. So we allocate a fresh grad buffer. (Verified: in-place
+        # gave NaN under autotune.) Marginal memory edge not worth dropping autotune on a fallback.
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(I, meta["BLOCK_I"]))
         _swiglu_bwd_kernel[grid](grad_output, gate_up, grad_gate_up, M, I,
                                  grad_output.stride(0), grad_output.stride(1),

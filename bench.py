@@ -325,10 +325,12 @@ def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
 
 # ───────── Cut Cross Entropy (Apple cut_cross_entropy — the canonical CCE ours is styled after) ─────────
 def bench_cce(N=4096, H=512, V=81000):
-    if torch.cuda.get_device_capability()[0] < 8:
-        print("\n=== Cut Cross Entropy ===\n  SKIPPED — CCE's kernel needs ~96KB shared memory (sm_80+);"
-              " T4/sm_75 has 64KB → OutOfResources. CCE is Ampere/Hopper-only.")
-        return
+    # CCE's default (CCE_AUTOTUNE=0) uses ONE fixed config needing ~96KB shared mem -> OOM on T4
+    # (64KB). Enabling autotune turns on early_config_prune, which drops configs over the device
+    # shared-mem limit AND caps num_stages<=2 on Turing -> picks a T4-fitting config. Must be set
+    # BEFORE importing the CCE kernels.
+    import os
+    os.environ["CCE_AUTOTUNE"] = "1"
     try:
         from cut_cross_entropy import linear_cross_entropy as cce_lce
     except Exception as ex:

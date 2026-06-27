@@ -79,3 +79,20 @@ SwiGLU (auto fwd-only detect). Re-run to get Liger/CCE/bassrehab numbers cleanly
 - tl.dot GEMM never beats cuBLAS on Turing. Don't tune it — replace it.
 - Measure only vs COMPILED eager on T4. Ampere/eager numbers mislead.
 - A faster kernel that fails grad_rel < 1.5e-2 is a fail, not a win.
+
+## Round 3 (user pushback — investigated, not gated)
+- **CCE on T4 = FIXABLE**: root cause was `CCE_AUTOTUNE=0` (default) → no early_config_prune → one
+  fixed config needs 96KB shared mem > T4's 64KB. Set `CCE_AUTOTUNE=1` → prune drops over-budget
+  configs + caps num_stages<=2 on Turing → runs. (Was wrong to gate it off; now enabled.)
+- **Why Liger SwiGLU uses less mem than compile despite being SLOWER**: Liger recomputes silu in
+  backward and writes grads IN-PLACE into the saved input buffers (its comment: "recomputation to
+  save memory") → no grad allocation. Speed and memory are separate axes; Liger trades a hair of
+  recompute for ~6% mem, still 3% slower than compiled eager.
+- **Tried matching it (in-place backward in OUR swiglu) → NaN**. Our bwd kernel is @triton.autotune;
+  autotune benchmarks it ~10x on the SAME buffer, so an in-place write corrupts trial 2+. Liger
+  avoids this by NOT autotuning. In-place + autotune are incompatible. Reverted — marginal mem win
+  not worth dropping autotune on a kernel that loses to compile on speed anyway.
+- **Why ours can't beat compile on elementwise (1x)**: for memory-bound elementwise ops inductor is
+  already at the HBM bandwidth ceiling — no fusion left to reclaim; a hand kernel just pays ~4%
+  launch/codegen overhead. You don't out-code the compiler on trivial ops. Confirmed across ours +
+  Liger + bassrehab (all ~0.95-0.97x).
