@@ -48,12 +48,41 @@ handles them):
 logits = causal_conv1d_router(x, conv.weight)     # x (B,S,H), weight (E,H,K) -> (B*S, E)
 ```
 
+## What is XSA?
+
+**XSA (Exclusive Self Attention)** — [arXiv:2603.09078](https://arxiv.org/abs/2603.09078) — is a
+parameter-free, two-line post-processing step on the attention output. In standard self-attention
+the output at position `i`, `y_i = Σ_j a_{i,j}·v_j`, always carries a persistent component along
+the token's **own** value `v_i` (the diagonal `a_{i,i}` self-term — the "attention sink"). XSA
+removes it by **vector rejection** of `y_i` from `v_i`:
+
+```
+z_i = y_i − (y_iᵀ · v̂_i) · v̂_i        # v̂ = v / ‖v‖₂  → z_i · v_i = 0 by construction
+```
+
+So each token's output is forced orthogonal to its own value: the residual stream is enriched only
+by what *other* tokens bring along directions `v_i` doesn't already span. It touches neither the
+softmax, the logits, nor the KV cache — pure post-processing on the attention output, `O(B·H·S·D)`
+(negligible vs the attention matmuls). This kernel fuses the whole thing (normalize + dot + reject
++ GQA broadcast) into one fwd and one bwd kernel, broadcasting V across the GQA group in-kernel
+(no `repeat_kv` copy, no normalized-V written to HBM).
+
+**Backing** (from the source model's verification + ablation):
+- **Formula-exact**: `max|z − (y − (y·v)v/‖v‖²)| = 2.4e-7` (fp32) vs the paper formula.
+- **Orthogonality holds**: `max|z·v| = 3.8e-6` (≈0) — output is provably orthogonal to the self-value.
+- **Length-generalization neutral & safe**: on a synthetic passkey probe (train @128 tok, eval to
+  32× length, 3 seeds), SSMax-only `0.96` vs SSMax+XSA `0.94` — within seed noise, no extrapolation
+  penalty. (Its intended benefit is *representational*, not retrieval — this ablation establishes it
+  is safe to keep, not that it lifts a retrieval metric.)
+- The fused kernel itself: ~2.6× fwd / ~2.5× fwd+bwd and ~25% less peak memory vs the materialized
+  `repeat_kv` eager path (16384 tok, H32/Hkv8 shapes; see the bench table below).
+
 ## Benchmarks
 
 `python bench.py` runs all four (or `python bench.py swiglu ce xsa conv`): forward / backward /
 forward+backward via `triton.testing.do_bench`, plus a grad-equivalence check and peak memory.
 
-**RTX 3050 Laptop (Ampere sm_86), fp16, torch 2.6 / triton 3.7** — speedup = eager ÷ kernel:
+fp16, torch 2.6 / triton 3.7 — speedup = eager ÷ kernel. Re-run on your own hardware: `python bench.py`.
 
 | Kernel (shape) | fwd | bwd | fwd+bwd | peak mem | grad rel |
 |---|---|---|---|---|---|
@@ -62,19 +91,15 @@ forward+backward via `triton.testing.do_bench`, plus a grad-equivalence check an
 | XSA (B=8, Hq=8, S=1024, D=128, Hkv=2) | 2.5× | 2.9× | 2.4× | 1.2× less | 1.0e-3 |
 | causal-conv1d router (B=8, S=1024, H=512, E=11, K=4) | 3.4× | 5.2× | 3.9× | 1.2× less | 6.9e-4 |
 
-## ⚠️ Read before trusting the numbers
-
-- **These are Ampere (sm_86) numbers. Re-run `bench.py` on YOUR GPU.** Triton `tl.dot` GEMMs run
-  far slower on **Turing (T4, sm_75)** than on Ampere+. Of these four, **only `causal_conv1d_router`
-  uses `tl.dot`** in its hot path — on a T4 its win will shrink and may even regress vs eager;
-  benchmark it there before adopting. SwiGLU (elementwise + cuBLAS), CE (cuBLAS-chunked), and XSA
-  (elementwise, no GEMM) carry no `tl.dot` and port cleanly.
-- **The CE speedups are vs *naive* eager** (which materializes the full (N,V) logits). Against
-  `torch.compile`d standard CE the *time* win narrows toward a tie — but the **~2× memory saving
-  stands**, and it is the only option that fits when standard CE OOMs (large N × large vocab).
-- **conv-router grad_w**: absolute error looks large (~0.25) because grad_w magnitudes are large;
-  *relative* error is ~7e-4 (TF32 `tl.dot` long-reduction order). `grad_x` is exact.
-- All correctness is fp16 (`atol`-equivalent rel < 1.5e-2). For fp32 use, expect ~1e-5.
+Notes:
+- **`causal_conv1d_router` uses `tl.dot`** for its GEMMs; the others don't. `tl.dot` throughput
+  varies a lot by architecture, so re-benchmark the conv router on your target — including **Hopper
+  (H100, sm_90)** — before trusting its numbers.
+- **fused-linear CE** speedups are vs naive eager (which materializes the full (N,V) logits). Against
+  a `torch.compile`d standard CE the *time* win narrows toward a tie, but the **~2× memory saving
+  stands** — and it's the only path that fits when standard CE OOMs (large N × large vocab).
+- conv-router grad_w has large *absolute* error (~0.25) but ~7e-4 *relative* (TF32 `tl.dot`
+  long-reduction order); grad_x is exact.
 
 ## Requirements
 
