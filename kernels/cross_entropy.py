@@ -2,15 +2,18 @@
 
 Standard CE on an LM head materializes the full (N, V) logits — at vocab 80k+ and 16k
 tokens that is the memory bottleneck (and often OOMs). This fuses the LM-head GEMM with
-the softmax-CE so the (N, V) logits are NEVER materialized: the forward streams logits
-in row-chunks via cuBLAS and keeps only `lse` (N,); the backward recomputes each chunk's
-logits (cuBLAS), turns them into grad-logits in-place with a single Triton kernel
-(softmax - onehot, scaled), then forms grad_hidden / grad_weight via cuBLAS. Peak memory
-is bounded by one (chunk, V) transient instead of the full (N, V).
+the softmax-CE so the (N, V) logits are NEVER materialized: the forward streams logits in
+row-chunks via cuBLAS. CE's gradient w.r.t. logits = (softmax - onehot)/n needs only the
+logits + labels (the loss is scalar -> the upstream grad is a scalar), so the DEFAULT
+"fused" path computes the FULL gradient inside the forward chunk loop while each logit
+chunk is live (one Triton kernel does lse + writes grad in place), forms grad_hidden /
+grad_weight via cuBLAS, then DISCARDS the chunk. Backward is a scalar scale. 3 GEMMs over
+the data, NO recompute. Peak memory is bounded by one (chunk, V) transient + the grad
+accumulators, not the full (N, V).
 
-Speed: ties torch-compiled standard CE (both cuBLAS-bound) while using ~chunk-sized memory;
-it is the only path that fits when standard CE OOMs. Grad-exact vs F.cross_entropy
-(loss Δ~4e-6, grad Δ~4e-9).
+Speed: matches Liger's fused-linear CE (the recompute variant lost to it by an extra GEMM);
+the only path that fits when standard CE OOMs. Grad-exact vs F.cross_entropy (loss Δ~1e-6,
+grad rel <1.2e-2 fp16; bit-identical to the recompute variant).
 
 Drop-in (replaces `F.cross_entropy(hidden @ lm_head.weight.T, labels)`):
     from kernels.cross_entropy import fused_linear_cross_entropy
@@ -80,6 +83,40 @@ def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_
     tl.store(Lse_ptr + row, m + tl.log(s))
     safe_lab = tl.where(lab == ignore_index, 0, lab)
     tl.store(Tgt_ptr + row, tl.load(L_ptr + row * s_n + safe_lab * s_v).to(tl.float32))
+
+
+@triton.jit
+def _fwd_reduce_grad_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, scale, ignore_index,
+                            BLOCK_V: tl.constexpr):
+    # FUSED forward+grad in ONE launch, one program per row. Pass 1: online-softmax over V -> lse
+    # (fp32 registers) + gather target logit. Pass 2: re-stream V and OVERWRITE the logit buffer
+    # in place with grad = (softmax - onehot) * scale. So the (chunk,V) buffer is reused as the
+    # grad-logit buffer (no second alloc) and the two HBM round-trips happen in one kernel — Liger
+    # does these as separate steps. Used by the fused-fwd+bwd path so backward never recomputes.
+    row = tl.program_id(0)
+    lab = tl.load(Lab_ptr + row)
+    m = -float("inf")
+    s = 0.0
+    for v0 in range(0, V, BLOCK_V):                       # pass 1: lse
+        offs = v0 + tl.arange(0, BLOCK_V)
+        x = tl.load(L_ptr + row * s_n + offs * s_v, mask=offs < V, other=-float("inf")).to(tl.float32)
+        m_new = tl.maximum(m, tl.max(x, 0))
+        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), 0)
+        m = m_new
+    lse = m + tl.log(s)
+    tl.store(Lse_ptr + row, lse)
+    safe_lab = tl.where(lab == ignore_index, 0, lab)
+    # target logit read BEFORE pass 2 overwrites the buffer
+    tl.store(Tgt_ptr + row, tl.load(L_ptr + row * s_n + safe_lab * s_v).to(tl.float32))
+    is_valid = lab != ignore_index
+    for v0 in range(0, V, BLOCK_V):                       # pass 2: write grad in place
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < V
+        lptr = L_ptr + row * s_n + offs * s_v
+        x = tl.load(lptr, mask=vmask, other=0.0).to(tl.float32)
+        g = (tl.exp(x - lse) - tl.where(offs == lab, 1.0, 0.0)) * scale
+        g = tl.where(is_valid, g, 0.0)
+        tl.store(lptr, g.to(L_ptr.dtype.element_ty), mask=vmask)
 
 
 @triton.jit
@@ -246,24 +283,67 @@ class _CECublasChunked(torch.autograd.Function):
         return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None, None
 
 
+class _CEFusedFwdBwd(torch.autograd.Function):
+    # FUSED forward+backward (Liger-style): CE's grad w.r.t. logits = (softmax - onehot)/n needs
+    # ONLY logits + labels (loss is scalar -> the upstream grad is just a scalar multiplier), so the
+    # whole gradient is computed in the FORWARD chunk loop while logits are live, then the logit
+    # buffer is discarded. No (N,V) ever stored, NO backward recompute GEMM. GEMMs per chunk = 3
+    # (logits, grad_h, grad_w) -> 3 total over the data, vs recompute's 4. grad_h/grad_w (unscaled
+    # by 1/n) are stashed; backward just multiplies by grad_out/n_valid (scalar). This is the path
+    # that drops the recompute tax that made the split fwd/bwd version lose to Liger.
+    @staticmethod
+    def forward(ctx, hidden, weight, labels, ignore_index, budget):
+        N, Hd = hidden.shape
+        V = weight.shape[0]
+        C = _chunk_rows(N, V, budget)
+        lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
+        tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
+        gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype)
+        gw = torch.zeros(V, Hd, device=hidden.device, dtype=torch.float32)
+        for i in range(0, N, C):
+            cl = min(C, N - i)
+            hc = hidden[i:i + C]
+            logits = torch.mm(hc, weight.t())                            # GEMM 1: (C,V) fp16
+            # one fused launch: online-softmax -> lse+target, then OVERWRITE logits in place with
+            # the (unscaled) grad-logits g = softmax - onehot. logits IS g after this call.
+            _fwd_reduce_grad_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
+                                           cl, V, logits.stride(0), logits.stride(1), 1.0,
+                                           ignore_index, BLOCK_V=1024)
+            gh[i:i + C] = torch.mm(logits, weight)                       # GEMM 2: (C,H)
+            gw.add_(torch.mm(logits.t(), hc))                           # GEMM 3: (V,H), fp32 accum
+        valid = labels != ignore_index
+        n_valid = valid.sum().clamp(min=1)
+        loss = ((lse - tgt) * valid).sum() / n_valid
+        ctx.save_for_backward(gh, gw, n_valid, weight)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        gh, gw, n_valid, weight = ctx.saved_tensors
+        sc = grad_out / n_valid                                          # scalar: loss-mean + upstream
+        return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None, None
+
+
 def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, bwd_logits_budget=None,
-                               bwd_mode="recompute"):
+                               bwd_mode="fused"):
     """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
     Never materializes (N,V); cuBLAS speed at bounded (chunk,V) memory.
 
-    bwd_mode: "recompute" (default, RECOMMENDED) recomputes the logit GEMM in backward (3 GEMMs,
-    lowest memory). "int8" saves logits as int8 and dequantizes in backward (2 GEMMs) — ⚠️ MEASURED
-    DOMINATED on T4 V=81000: only ~10% faster (the per-row-int8 forward needs a 2nd (N,V) pass that
-    eats most of the saved GEMM) BUT holds the (N,V) int8 (1.3GB) so peak is ~2x WORSE than recompute
-    (2633 vs 1305 MB) — it breaks the keep-memory goal and it's approximate. Kept opt-in for non-T4 /
-    research only; do NOT use it to save memory. The proxy (small V) overstated it; T4 refuted it.
+    bwd_mode:
+    - "fused" (DEFAULT): compute the full gradient in the FORWARD chunk loop (CE grad needs only
+      logits+labels), discard each logit chunk, stash grad_h/grad_w. Backward is a scalar scale.
+      3 GEMMs, NO recompute — this is the path that matches/beats Liger's fused-linear CE.
+    - "recompute": forward keeps only lse, backward recomputes the logit GEMM (4 GEMMs total). The
+      extra GEMM is a pure latency tax with no memory upside over "fused" — kept for A/B + history.
+    - "int8": saves logits as int8, dequantizes in backward (2 GEMMs). ⚠️ MEASURED DOMINATED on T4
+      (holds (N,V) int8 -> ~2x worse peak, approximate). Opt-in for research only.
 
-    `bwd_logits_budget` (bytes) caps the (chunk,V) transient. ⚠️ MEASURED on T4: chunk size barely
-    affects LATENCY (the backward is dominated by the recompute GEMM, not chunk overhead) — one-shot
-    and 3-chunk backward are within 2%. So it is purely a MEMORY dial, with a small latency tax only
-    at very small chunks: 384MB ≈ 0.58x compiled @ 2.35x less mem; 128MB ≈ 0.49x @ 3.5x less mem.
-    **Do NOT use one-shot** (budget >= N*V*2): it spends ~compiled's memory for NO speed gain (the
-    recompute GEMM is there regardless) — strictly dominated by 384MB. Default 384MB is the sweet
-    spot. To cut LATENCY you must remove the recompute GEMM itself (see the int8-saved-logits path)."""
-    fn = _CEInt8 if bwd_mode == "int8" else _CECublasChunked
+    `bwd_logits_budget` (bytes) caps the (chunk,V) transient -> MEMORY dial. T4-tuned default 192MB
+    (chunk ~1242 at V=81000). Chunk size barely moves latency (GEMM-bound); lower it for less peak."""
+    if bwd_mode == "int8":
+        fn = _CEInt8
+    elif bwd_mode == "recompute":
+        fn = _CECublasChunked
+    else:                                       # "fused" — default, no backward recompute
+        fn = _CEFusedFwdBwd
     return fn.apply(hidden, weight, labels, ignore_index, bwd_logits_budget)

@@ -589,8 +589,8 @@ def bench_ce_oom():
 
 
 def bench_ce_sweep(N=16384, H=512, V=81000):
-    """Sweep recompute-mode chunk budget 128..512MB (step 64) at ce_fit to find the memory/latency
-    sweet spot. recompute only (int8/one-shot are dead). Reports fwd+bwd ms, peak, x-vs-compiled."""
+    """Sweep the default FUSED-fwd+bwd CE chunk budget 128..512MB (step 64) at ce_fit. Fused = grad
+    computed in forward, no recompute (vs Liger). Reports fwd+bwd ms, peak, x-vs-compiled."""
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
     w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
     lab = torch.randint(0, V, (N,), device=DEV)
