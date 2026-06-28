@@ -1,7 +1,11 @@
 """3-phase benchmark (forward / backward / forward+backward) of every fused kernel vs
 its PyTorch-eager equivalent, plus a grad-equivalence check.
 
-    python bench.py                 # all kernels, default shapes, fp16, eager baseline
+    python bench.py                 # all kernels, fp16. Default shapes = BiBo's REAL training step:
+                                    #   16384 tokens (B16*S1024), hidden 512, vocab 81000,
+                                    #   dense-MLP I=1024, MoE I=768/E=9/k=2, attn Hq4/Hkv2/D128.
+                                    # At 16384 tok the (N,V) logit matrix is ~2.65 GB fp16 — the
+                                    # regime where never-materializing CE actually matters.
     python bench.py swiglu moe      # selected kernels
     python bench.py --compile       # measure vs torch.compile'd eager (industry steady-state)
     python bench.py --compile --dump-triton swiglu   # ALSO print inductor's generated Triton to
@@ -115,7 +119,7 @@ def _peak(step):
 
 
 # ───────────────────────── SwiGLU ─────────────────────────
-def bench_swiglu(M=8192, I=768):
+def bench_swiglu(M=16384, I=1024):   # BiBo dense-MLP: B16*S1024 tokens, intermediate_size=1024
     gu = torch.randn(M, 2 * I, device=DEV, dtype=DTYPE)
     G = torch.randn(M, I, device=DEV, dtype=DTYPE)
 
@@ -142,7 +146,7 @@ def bench_swiglu(M=8192, I=768):
 
 
 # ─────────────────── fused-linear CE (chunk-budget candidate sweep) ───────────────────
-def bench_ce(N=4096, H=512, V=81000):
+def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidden 512, vocab 81000
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
     w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
     lab = torch.randint(0, V, (N,), device=DEV)
@@ -178,7 +182,7 @@ def bench_ce(N=4096, H=512, V=81000):
 
 
 # ───────────────────────── XSA ─────────────────────────
-def bench_xsa(B=8, Hq=8, S=1024, D=128, Hkv=2):
+def bench_xsa(B=16, Hq=4, S=1024, D=128, Hkv=2):   # BiBo training: batch 16, 4 q-heads / 2 kv-heads, head_dim 128
     Y = torch.randn(B, Hq, S, D, device=DEV, dtype=DTYPE)
     V = torch.randn(B, Hkv, S, D, device=DEV, dtype=DTYPE)
     G = torch.randn(B, Hq, S, D, device=DEV, dtype=DTYPE)
@@ -208,7 +212,7 @@ def bench_xsa(B=8, Hq=8, S=1024, D=128, Hkv=2):
 
 
 # ─────────────── causal-conv1d router ───────────────
-def bench_conv_router(B=8, S=1024, H=512, E=11, K=4):
+def bench_conv_router(B=16, S=1024, H=512, E=11, K=4):   # BiBo training: batch 16, 11 routed experts
     x = torch.randn(B, S, H, device=DEV, dtype=DTYPE)
     w = torch.randn(E, H, K, device=DEV, dtype=DTYPE) * 0.02
     G = torch.randn(B * S, E, device=DEV, dtype=DTYPE)
@@ -236,7 +240,7 @@ def bench_conv_router(B=8, S=1024, H=512, E=11, K=4):
 
 
 # ───────── outsourced reference kernels (Liger) — do THEY beat compiled eager? ─────────
-def bench_liger_swiglu(M=8192, I=768):
+def bench_liger_swiglu(M=16384, I=1024):
     try:
         from liger_kernel.ops.swiglu import LigerSiLUMulFunction
     except Exception as ex:
@@ -261,7 +265,7 @@ def bench_liger_swiglu(M=8192, I=768):
             kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
 
 
-def bench_liger_ce(N=4096, H=512, V=81000, force_chunk=None):
+def bench_liger_ce(N=16384, H=512, V=81000, force_chunk=None):
     """force_chunk=C: scope-patch Liger's FLCE so its chunk_size = C rows (=> ceil(N/C) chunks).
     Maps the memory<->speed trade: Liger's default tiny chunk (next_power_of_2(cdiv(BT,cdiv(V,H)))
     = 32 here -> ~128 chunks) is slow; bigger chunks approach compiled-eager speed but spend more
@@ -308,17 +312,17 @@ def bench_liger_ce(N=4096, H=512, V=81000, force_chunk=None):
         _flce.triton = _orig                 # always restore
 
 
-def bench_liger_ce_sweep(N=4096, H=512, V=81000):
+def bench_liger_ce_sweep(N=16384, H=512, V=81000):
     """Sweep Liger CE chunk size to map the memory<->speed curve: small chunk = slow + low mem,
     big chunk = ~compile speed + higher mem."""
     print(f"\n--- Liger CE chunk-size sweep (N={N} V={V}); default heuristic chunk = 32 ---")
-    for c in (4096, 2048, 1024, 512, 256, 128, 64, 32):
+    for c in (16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32):
         if c <= N:
             bench_liger_ce(N, H, V, force_chunk=c)
 
 
 # ───────────────────────── MoE (PolyGLU) ─────────────────────────
-def bench_moe(N=8192, H=512, I=768, E=9, top_k=2):
+def bench_moe(N=16384, H=512, I=768, E=9, top_k=2):   # BiBo training: 16384 tokens, moe_intermediate 768, 9 GLU experts
     # act_codes: PolyGLU groups of 3 (SiLU/ReLU²/Tanh)
     act_codes = torch.tensor([i % 3 for i in range(E)], device=DEV, dtype=torch.int32)
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
@@ -391,7 +395,7 @@ def _ensure_bassrehab():
     import triton_kernels.swiglu  # noqa: F401
 
 
-def bench_bassrehab_swiglu(M=8192, I=768):
+def bench_bassrehab_swiglu(M=16384, I=1024):
     """bassrehab swiglu_fused(gate, up). Auto-detects backward: full fwd+bwd if differentiable,
     else forward-only (output match + fwd speed)."""
     try:
@@ -437,7 +441,7 @@ def bench_bassrehab_swiglu(M=8192, I=768):
                                             "fwd_x": round(ef / kf, 3), "out_rel": float(f"{match:.2e}"), "backward": False}))
 
 
-def bench_bassrehab_moe(N=8192, H=512, FFN=768, E=9, top_k=2):
+def bench_bassrehab_moe(N=16384, H=512, FFN=768, E=9, top_k=2):
     """bassrehab fused_moe_forward (forward-only, standard SwiGLU, self-routing) vs compiled-eager
     standard-SwiGLU MoE forward. Forward speed + output match only (no backward in their kernel)."""
     try:
