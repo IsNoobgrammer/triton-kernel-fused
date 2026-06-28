@@ -3,7 +3,9 @@ its PyTorch-eager equivalent, plus a grad-equivalence check.
 
     python bench.py                 # all kernels, default shapes, fp16, eager baseline
     python bench.py swiglu moe      # selected kernels
-    python bench.py --compile       # torch.compile BOTH kernel and eager forwards
+    python bench.py --compile       # measure vs torch.compile'd eager (industry steady-state)
+    python bench.py --compile --dump-triton swiglu   # ALSO print inductor's generated Triton to
+                                                     # stderr — read it, then hand-iterate to beat it
 
 Timing: triton.testing.do_bench (median ms) after explicit warmup. Speedup = eager / kernel
 (>1 = kernel faster). Grad check: max|Δ| of every input grad vs eager, same upstream cotangent.
@@ -19,8 +21,16 @@ run during warmup, excluded from the timed step. torch.compile is broken on some
 ⚠️ Numbers are GPU-specific. Triton tl.dot GEMMs are far slower on Turing (T4, sm_75) than
 on Ampere+; re-run on YOUR target GPU. The printed header states the GPU.
 """
+import os
 import sys
 import json
+# --dump-triton: make inductor PRINT the Triton it generates for each compiled fn (to stderr).
+# This is the forum tactic (marksaroufim): compile is a great *starting point* for a kernel — read
+# its generated Triton and hand-iterate from there. Must be set BEFORE `import torch`. Implies
+# --compile (only compiled fns emit code). On Kaggle: `python bench.py --compile --dump-triton swiglu`
+# then read the `# kernel ...` blocks in stderr — that's inductor's kernel for you to beat.
+if "--dump-triton" in sys.argv:
+    os.environ["TORCH_LOGS"] = "output_code"
 import torch
 import torch.nn.functional as F
 import triton
@@ -490,7 +500,9 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
     COMPILE = "--compile" in sys.argv
     JSON_OUT = "--json" in sys.argv
-    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json")]
+    if "--dump-triton" in sys.argv:
+        COMPILE = True  # dumping is meaningless without compiled fns
+    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json", "--dump-triton")]
     print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
