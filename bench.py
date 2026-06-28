@@ -595,7 +595,7 @@ def bench_ce_sweep(N=16384, H=512, V=81000):
     w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
     lab = torch.randint(0, V, (N,), device=DEV)
     MB = 1024 * 1024
-    print(f"\n(CE chunk sweep: N={N} V={V} H={H}, recompute mode, 128..512MB step 64)")
+    print(f"\n(CE chunk sweep: N={N} V={V} H={H}, fused-fwd+bwd mode, 128..512MB step 64)")
     efb = peak_e = float("nan"); eager_ok = False
     try:
         Eg = _c(lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab))

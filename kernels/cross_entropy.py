@@ -86,40 +86,6 @@ def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_
 
 
 @triton.jit
-def _fwd_reduce_grad_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, scale, ignore_index,
-                            BLOCK_V: tl.constexpr):
-    # FUSED forward+grad in ONE launch, one program per row. Pass 1: online-softmax over V -> lse
-    # (fp32 registers) + gather target logit. Pass 2: re-stream V and OVERWRITE the logit buffer
-    # in place with grad = (softmax - onehot) * scale. So the (chunk,V) buffer is reused as the
-    # grad-logit buffer (no second alloc) and the two HBM round-trips happen in one kernel — Liger
-    # does these as separate steps. Used by the fused-fwd+bwd path so backward never recomputes.
-    row = tl.program_id(0)
-    lab = tl.load(Lab_ptr + row)
-    m = -float("inf")
-    s = 0.0
-    for v0 in range(0, V, BLOCK_V):                       # pass 1: lse
-        offs = v0 + tl.arange(0, BLOCK_V)
-        x = tl.load(L_ptr + row * s_n + offs * s_v, mask=offs < V, other=-float("inf")).to(tl.float32)
-        m_new = tl.maximum(m, tl.max(x, 0))
-        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), 0)
-        m = m_new
-    lse = m + tl.log(s)
-    tl.store(Lse_ptr + row, lse)
-    safe_lab = tl.where(lab == ignore_index, 0, lab)
-    # target logit read BEFORE pass 2 overwrites the buffer
-    tl.store(Tgt_ptr + row, tl.load(L_ptr + row * s_n + safe_lab * s_v).to(tl.float32))
-    is_valid = lab != ignore_index
-    for v0 in range(0, V, BLOCK_V):                       # pass 2: write grad in place
-        offs = v0 + tl.arange(0, BLOCK_V)
-        vmask = offs < V
-        lptr = L_ptr + row * s_n + offs * s_v
-        x = tl.load(lptr, mask=vmask, other=0.0).to(tl.float32)
-        g = (tl.exp(x - lse) - tl.where(offs == lab, 1.0, 0.0)) * scale
-        g = tl.where(is_valid, g, 0.0)
-        tl.store(lptr, g.to(L_ptr.dtype.element_ty), mask=vmask)
-
-
-@triton.jit
 def _dequant_grad_kernel(Q_ptr, QS_ptr, Lse_ptr, Lab_ptr, G_ptr, M, Vv, ignore_index,
                          s_qm, s_qv, s_gm, s_gv, BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr):
     # int8 path backward: dequantize logit = q * qscale[row] (NO recompute GEMM), then
@@ -304,11 +270,16 @@ class _CEFusedFwdBwd(torch.autograd.Function):
             cl = min(C, N - i)
             hc = hidden[i:i + C]
             logits = torch.mm(hc, weight.t())                            # GEMM 1: (C,V) fp16
-            # one fused launch: online-softmax -> lse+target, then OVERWRITE logits in place with
-            # the (unscaled) grad-logits g = softmax - onehot. logits IS g after this call.
-            _fwd_reduce_grad_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
-                                           cl, V, logits.stride(0), logits.stride(1), 1.0,
-                                           ignore_index, BLOCK_V=1024)
+            # grad-in-forward, NO recompute. Two well-occupied launches beat one per-row double-pass
+            # on T4: (1) _fwd_reduce = per-row online-softmax -> lse+target (per-row is intrinsic to
+            # the reduction); (2) _grad_logits_inplace = 2D grid (chunk/32 x V/256 programs) that
+            # OVERWRITES logits in place with grad = softmax-onehot. The 2D grid saturates the SMs;
+            # the fused one-program-per-row kernel (only `chunk` programs, V streamed twice serially)
+            # was launch/occupancy-bound on T4 and lost to Liger. logits IS grad after step (2).
+            _fwd_reduce_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
+                                      cl, V, logits.stride(0), logits.stride(1), ignore_index,
+                                      BLOCK_V=1024)
+            _grad_logits_inplace(logits, lse[i:i + C], labels[i:i + C], 1.0, ignore_index)
             gh[i:i + C] = torch.mm(logits, weight)                       # GEMM 2: (C,H)
             gw.add_(torch.mm(logits.t(), hc))                           # GEMM 3: (V,H), fp32 accum
         valid = labels != ignore_index
