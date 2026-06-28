@@ -425,16 +425,20 @@ def bench_liger_ce_sweep(N=16384, H=512, V=81000):
 
 
 # ───────────────────────── MoE (PolyGLU) ─────────────────────────
-def bench_moe(N=16384, H=512, I=768, E=9, top_k=2):   # BiBo training: 16384 tokens, moe_intermediate 768, 9 GLU experts
-    # act_codes: PolyGLU groups of 3 (SiLU/ReLU²/Tanh)
-    act_codes = torch.tensor([i % 3 for i in range(E)], device=DEV, dtype=torch.int32)
+def bench_moe(N=16384, H=512, I=768, E_glu=9, n_special=2, top_k=2):   # BiBo STACK: 9 PolyGLU + Identity + Zero = 11 routed
+    # BiBo's real routed layout: 9 GLU experts (PolyGLU groups of 3: SiLU/ReLU²/Tanh) + 2 param-free
+    # specials (Identity=weighted passthrough, Zero=noop). act_codes: 0/1/2=GLU (weight slot), 3=Identity,
+    # 4=Zero. The specials are nearly free AND absorb ~n_special/E of routings -> the GLU GEMMs get
+    # smaller M, so the stack is slightly CHEAPER than E_glu-all-GLU at the same token budget.
+    E = E_glu + n_special
+    act_codes = torch.tensor([i % 3 for i in range(E_glu)] + [3, 4][:n_special], device=DEV, dtype=torch.int32)
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
-    gup = (torch.randn(E, 2 * I, H, device=DEV, dtype=DTYPE) * 0.02)
-    dwn = (torch.randn(E, H, I, device=DEV, dtype=DTYPE) * 0.02)
-    logits = torch.randn(N, E, device=DEV, dtype=DTYPE)
+    gup = (torch.randn(E_glu, 2 * I, H, device=DEV, dtype=DTYPE) * 0.02)   # weights only for the GLU experts
+    dwn = (torch.randn(E_glu, H, I, device=DEV, dtype=DTYPE) * 0.02)
+    logits = torch.randn(N, E, device=DEV, dtype=DTYPE)                   # routing over all 11
     wt_full, idx = torch.topk(torch.softmax(logits.float(), -1), top_k, dim=-1)
     wt_full = wt_full.to(DTYPE)
-    print(f"\n(MoE: N={N} rows*top_k={N*top_k} {'>=' if N*top_k>=4096 else '<'} GROUPED_MIN_TOKENS={4096}; H={H} I={I} E={E} k={top_k})")
+    print(f"\n(MoE STACK: N={N} rows*top_k={N*top_k}; H={H} I={I} E={E} routed = {E_glu} GLU + Identity + Zero; k={top_k})")
     print("  BASELINE = compiled `moe_eager` (per-expert mask + loop + weighted scatter) = the "
           "Qwen3MoE / HF compute pattern, under torch.compile. 'x' columns are vs THAT (the real bar).")
 

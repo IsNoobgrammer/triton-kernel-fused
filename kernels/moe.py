@@ -377,7 +377,8 @@ class _PerExpertMoE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes):
         N, H = hidden.shape
-        E = gate_up_proj.shape[0]
+        E = act_codes.shape[0]                  # total routed experts (GLU + specials)
+        codes = act_codes.tolist()              # 0/1/2 = GLU (weight slot e), 3 = Identity, 4 = Zero
         top_k = idx.shape[1]; dev = hidden.device
         st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
@@ -391,20 +392,26 @@ class _PerExpertMoE(torch.autograd.Function):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
-            gu = x_s[s:en] @ gate_up_proj[e].t()
+            if codes[e] == 4:                                            # Zero expert: contributes nothing
+                continue
+            if codes[e] == 3:                                            # Identity: weighted passthrough of input
+                _combine_scatter(x_s[s:en], sw[s:en], st[s:en], out)
+                continue
+            gu = x_s[s:en] @ gate_up_proj[e].t()                         # GLU expert; weight slot = e (GLU first)
             it = _glu_fwd(gu, row_act[s:en])
             eo = it @ down_proj[e].t()
             gate_up_l[e] = gu; inter_l[e] = it; eo_l[e] = eo
             _combine_scatter(eo, sw[s:en], st[s:en], out)   # fused (eo*w)->fp32 scatter (1 kernel, was mul+cast+index_add)
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj)
         ctx.lists = (gate_up_l, inter_l, eo_l); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
+        ctx.codes = codes
         return out.to(hidden.dtype)
 
     @staticmethod
     def backward(ctx, grad_out):
         x_s, st, sw, order, row_act, gate_up_proj, down_proj = ctx.saved_tensors
         gate_up_l, inter_l, eo_l = ctx.lists
-        N, H, top_k, E = ctx.shapes; bounds = ctx.bounds
+        N, H, top_k, E = ctx.shapes; bounds = ctx.bounds; codes = ctx.codes
         M = st.numel()
         grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
@@ -413,6 +420,13 @@ class _PerExpertMoE(torch.autograd.Function):
         for e in range(E):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
+                continue
+            if codes[e] == 4:                                          # Zero: no grad
+                continue
+            if codes[e] == 3:                                          # Identity: out=w*input -> dx=w*go, dw=sum(go*input)
+                ge, gw = _combine_bwd(grad_out, x_s[s:en], sw[s:en], st[s:en])
+                grad_w_s[s:en] = gw.to(grad_out.dtype)
+                grad_hidden.index_add_(0, st[s:en], ge)
                 continue
             it = inter_l[e]                                            # (m,I)
             # fused combine bwd: gather grad_out[tok], emit grad_eo=go*w and grad_w=sum_h(go*eo)
@@ -457,15 +471,21 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
     """Hand-written MoE: per-expert boolean mask (GPU sync each iter), unfused activation,
     E tiny GEMMs. Correct, and deliberately the slow baseline the fused paths beat."""
     N, H = hidden.shape
-    E, twoI, _ = gate_up_proj.shape
+    twoI = gate_up_proj.shape[1]
     I = twoI // 2
-    codes = act_codes.tolist()
+    codes = act_codes.tolist()          # 0/1/2 = GLU (weight slot e), 3 = Identity, 4 = Zero
+    E = len(codes)                       # total routed experts (GLU + specials)
     out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):
         rows = (top_k_indices == e).any(-1)
         if not bool(rows.any()):
             continue
         w = (top_k_weights * (top_k_indices == e)).sum(-1)[rows]
+        if codes[e] == 4:                                                # Zero: contributes nothing
+            continue
+        if codes[e] == 3:                                                # Identity: weighted passthrough
+            out[rows] += (hidden[rows] * w.unsqueeze(-1)).float()
+            continue
         gate_up = hidden[rows] @ gate_up_proj[e].t()
         inter = _act_eager(gate_up[:, :I], codes[e]) * gate_up[:, I:]
         out[rows] += ((inter @ down_proj[e].t()) * w.unsqueeze(-1)).float()
