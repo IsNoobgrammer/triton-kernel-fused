@@ -27,97 +27,79 @@ import triton.language as tl
 __all__ = ["fused_swiglu", "FusedSwiGLUMLP", "FusedSwiGLU"]
 
 
-_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_I": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 16, "BLOCK_I": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_I": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_I": 256}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_I": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_I": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 64, "BLOCK_I": 256}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_I": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_I": 128}, num_warps=8, num_stages=2),
-]
+# These kernels ARE torch.compile/inductor's own generated SwiGLU kernels, lifted verbatim from
+# `TORCH_LOGS=output_code` and run as plain Triton. We benchmarked our hand-written 2D-tiled+autotune
+# version against this on a T4 + an RTX 3050: inductor's 1D-flat pattern is faster on BOTH (fwd ~4%,
+# fwd+bwd ~0.5%, every run) and simpler. SwiGLU is a memory-bound streaming op (2 loads, 1 store, zero
+# reuse → SRAM/tiling buys nothing), so the only lever is the access pattern, and the compiler already
+# nailed it. We adopted its kernel rather than keep losing to it. One generalization: inductor baked
+# the static shapes in as literals (so it can magic-number-fold the % and //); we pass `I` as a
+# `tl.constexpr` for the same constant-folding at any I. Assumes a contiguous row-major (M,2I) input.
 
 
-@triton.autotune(configs=_CONFIGS, key=["M", "I"])
 @triton.jit
-def _swiglu_fwd_kernel(GateUp_ptr, Out_ptr, M, I,
-                       s_gu_m, s_gu_i, s_o_m, s_o_i,
-                       BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_i = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
-    mask = (offs_m < M)[:, None] & (offs_i < I)[None, :]
-    gate = tl.load(GateUp_ptr + offs_m[:, None] * s_gu_m + offs_i[None, :] * s_gu_i,
-                   mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(GateUp_ptr + offs_m[:, None] * s_gu_m + (I + offs_i)[None, :] * s_gu_i,
-                 mask=mask, other=0.0).to(tl.float32)
-    res = (gate * (1.0 / (1.0 + tl.exp(-gate)))) * up
-    tl.store(Out_ptr + offs_m[:, None] * s_o_m + offs_i[None, :] * s_o_i,
-             res.to(Out_ptr.dtype.element_ty), mask=mask)
+def _swiglu_fwd_kernel(GateUp_ptr, Out_ptr, n_out, I: tl.constexpr, XBLOCK: tl.constexpr):
+    # 1D flat over the (M,I) OUTPUT. gate/up read from the (M,2I) input by stride
+    # (col + 2I*row) and (I + col + 2I*row) — no slice materialized. 2 loads, 1 store (the floor).
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)
+    xmask = xindex < n_out
+    x0 = xindex % I
+    x1 = xindex // I
+    gate = tl.load(GateUp_ptr + (x0 + 2 * I * x1), xmask, other=0.0).to(tl.float32)
+    up = tl.load(GateUp_ptr + (I + x0 + 2 * I * x1), xmask, other=0.0).to(tl.float32)
+    res = gate * tl.sigmoid(gate) * up
+    tl.store(Out_ptr + xindex, res.to(Out_ptr.dtype.element_ty), xmask)
 
 
-@triton.autotune(configs=_CONFIGS, key=["M", "I"])
 @triton.jit
-def _swiglu_bwd_kernel(GradOut_ptr, GateUp_ptr, GradGateUp_ptr, M, I,
-                       s_go_m, s_go_i, s_gu_m, s_gu_i, s_ggu_m, s_ggu_i,
-                       BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_i = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
-    mask = (offs_m < M)[:, None] & (offs_i < I)[None, :]
-    grad_out = tl.load(GradOut_ptr + offs_m[:, None] * s_go_m + offs_i[None, :] * s_go_i,
-                       mask=mask, other=0.0).to(tl.float32)
-    gate = tl.load(GateUp_ptr + offs_m[:, None] * s_gu_m + offs_i[None, :] * s_gu_i,
-                   mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(GateUp_ptr + offs_m[:, None] * s_gu_m + (I + offs_i)[None, :] * s_gu_i,
-                 mask=mask, other=0.0).to(tl.float32)
-    sig = 1.0 / (1.0 + tl.exp(-gate))
-    silu = gate * sig
-    grad_up = grad_out * silu
-    dsilu = sig * (1.0 + gate * (1.0 - sig))
-    grad_gate = grad_out * up * dsilu
-    tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + offs_i[None, :] * s_ggu_i,
-             grad_gate, mask=mask)
-    tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + (I + offs_i)[None, :] * s_ggu_i,
-             grad_up, mask=mask)
+def _swiglu_bwd_kernel(GradOut_ptr, GateUp_ptr, GradGateUp_ptr, n_full, I: tl.constexpr,
+                       XBLOCK: tl.constexpr):
+    # 1D flat over the FULL (M,2I) grad, ONE where-branched pass, single store. up-half (col>=I):
+    # grad_up = grad_out*silu(gate); gate-half (col<I): grad_gate = grad_out*up*sig*(1+gate*(1-sig)).
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)
+    xmask = xindex < n_full
+    x0 = xindex % (2 * I)
+    x1 = xindex // (2 * I)
+    is_up = x0 >= I
+    g_up = tl.load(GradOut_ptr + (x0 - I + I * x1), is_up & xmask, other=0.0).to(tl.float32)
+    gate_u = tl.load(GateUp_ptr + (xindex - I), is_up & xmask, other=0.0).to(tl.float32)
+    grad_up = tl.where(is_up, g_up * gate_u * tl.sigmoid(gate_u), 0.0)
+    is_gate = x0 < I
+    g_g = tl.load(GradOut_ptr + (x0 + I * x1), is_gate & xmask, other=0.0).to(tl.float32)
+    up_g = tl.load(GateUp_ptr + (xindex + I), is_gate & xmask, other=0.0).to(tl.float32)
+    gate_g = tl.load(GateUp_ptr + xindex, is_gate & xmask, other=0.0).to(tl.float32)
+    sig = tl.sigmoid(gate_g)
+    dsilu = sig * (1.0 + gate_g * (1.0 - sig))
+    grad_gate = tl.where(is_gate, g_g * up_g * dsilu, 0.0)
+    tl.store(GradGateUp_ptr + xindex,
+             (grad_up + grad_gate).to(GradGateUp_ptr.dtype.element_ty), xmask)
 
 
 class FusedSwiGLU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate_up):
+        gate_up = gate_up.contiguous()  # 1D-flat kernel assumes row-major (M,2I)
         ctx.save_for_backward(gate_up)
         M = gate_up.shape[0]
         I = gate_up.shape[1] // 2
         out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
-        if M == 0:
-            return out
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(I, meta["BLOCK_I"]))
-        _swiglu_fwd_kernel[grid](gate_up, out, M, I,
-                                 gate_up.stride(0), gate_up.stride(1), out.stride(0), out.stride(1))
+        n = M * I
+        if n:
+            _swiglu_fwd_kernel[(triton.cdiv(n, 1024),)](gate_up, out, n, I, XBLOCK=1024)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
         gate_up, = ctx.saved_tensors
-        M = gate_up.shape[0]
-        I = gate_up.shape[1] // 2
+        M, twoI = gate_up.shape
+        I = twoI // 2
         grad_gate_up = torch.empty_like(gate_up)
-        if M == 0:
-            return grad_gate_up
-        # NOTE: NOT in-place. Liger writes grads into the saved buffers (saves a (M,2I) alloc), but
-        # that only works because Liger does NOT autotune. Our kernel IS autotuned, and autotune
-        # benchmarks it ~10x on the same buffer — an in-place backward gets overwritten on trial 1
-        # and reads garbage after -> NaN. So we allocate a fresh grad buffer. (Verified: in-place
-        # gave NaN under autotune.) Marginal memory edge not worth dropping autotune on a fallback.
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(I, meta["BLOCK_I"]))
-        _swiglu_bwd_kernel[grid](grad_output, gate_up, grad_gate_up, M, I,
-                                 grad_output.stride(0), grad_output.stride(1),
-                                 gate_up.stride(0), gate_up.stride(1),
-                                 grad_gate_up.stride(0), grad_gate_up.stride(1))
+        n = M * twoI
+        if n:
+            _swiglu_bwd_kernel[(triton.cdiv(n, 1024),)](grad_output.contiguous(), gate_up,
+                                                        grad_gate_up, n, I, XBLOCK=1024)
         return grad_gate_up
 
 
