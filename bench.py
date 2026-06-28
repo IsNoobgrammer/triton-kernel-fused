@@ -40,7 +40,7 @@ import torch.nn.functional as F
 import triton
 from triton.testing import do_bench
 
-from kernels import fused_swiglu, fused_linear_cross_entropy, fused_xsa, causal_conv1d_router
+from kernels import fused_linear_cross_entropy, fused_xsa, causal_conv1d_router
 from kernels.moe import moe_per_expert, moe_grouped, moe_grouped_cublas, moe_eager
 
 DTYPE = torch.float16
@@ -116,33 +116,6 @@ def _peak(step):
     torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     step(); torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated() / 1e6
-
-
-# ───────────────────────── SwiGLU ─────────────────────────
-def bench_swiglu(M=16384, I=1024):   # BiBo dense-MLP: B16*S1024 tokens, intermediate_size=1024
-    gu = torch.randn(M, 2 * I, device=DEV, dtype=DTYPE)
-    G = torch.randn(M, I, device=DEV, dtype=DTYPE)
-
-    def eager(t):
-        gate, up = t[:, :I], t[:, I:]
-        return F.silu(gate) * up
-
-    # grad check (shared cotangent)
-    a = gu.clone().requires_grad_(True); b = gu.clone().requires_grad_(True)
-    fused_swiglu(a).backward(G); eager(b).backward(G)
-    gabs, grel = _gdiff([(a.grad, b.grad)])
-
-    K = fused_swiglu; E = _c(eager)   # kernel runs native Triton (eager); only the baseline is compiled
-    kf = _fwd_ms(lambda: K(gu))
-    ef = _fwd_ms(lambda: E(gu))
-    x = gu.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: (K(x) * G).sum(), [x])
-    eb = _bwd_ms(lambda: (E(x) * G).sum(), [x])
-    kstep = lambda: (K(x) * G).sum().backward()
-    estep = lambda: (E(x) * G).sum().backward()
-    kfb, efb = _stats(kstep, estep, [x])
-    _report("SwiGLU activation (M=%d I=%d)" % (M, I), kf, ef, kb, eb, kfb, efb, gabs, grel,
-            _peak(kstep), _peak(estep))
 
 
 # ─────────────────── fused-linear CE (chunk-budget candidate sweep) ───────────────────
@@ -327,10 +300,13 @@ def bench_liger_ce(N=16384, H=512, V=81000, force_chunk=None):
             out = LFLCE.apply(h, ww, lab)
             return out[0] if isinstance(out, (tuple, list)) else out   # Liger returns (loss, z_loss)
         eager = lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab)
-        a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
-        b = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
-        liger(a, wa).backward(); eager(b, wb).backward()
+        # grad check on a small slice — the full-N fp32 (N,V) reference OOMs a T4 by design
+        Nc = min(N, 2048); labc = lab[:Nc]
+        a = hid[:Nc].clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+        b = hid[:Nc].clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+        liger(a, wa).backward(); F.cross_entropy((b @ wb.t()).float(), labc).backward()
         gabs, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])
+        del a, wa, b, wb; torch.cuda.empty_cache()
         K = liger; Eg = _c(eager)
         kf = _fwd_ms(lambda: K(hid, w)); ef = _fwd_ms(lambda: Eg(hid, w))
         h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
@@ -348,12 +324,73 @@ def bench_liger_ce(N=16384, H=512, V=81000, force_chunk=None):
 
 
 def bench_liger_ce_sweep(N=16384, H=512, V=81000):
-    """Sweep Liger CE chunk size to map the memory<->speed curve: small chunk = slow + low mem,
-    big chunk = ~compile speed + higher mem."""
-    print(f"\n--- Liger CE chunk-size sweep (N={N} V={V}); default heuristic chunk = 32 ---")
-    for c in (16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32):
-        if c <= N:
-            bench_liger_ce(N, H, V, force_chunk=c)
+    """Liger CE swept on the SAME memory-budget grid as bench_ce_sweep (128..512MB step 64), so it
+    overlays directly on ours + compiled: each budget -> Liger chunk_rows = budget//(V*2) (the same
+    sizing our chunked CE uses), driven via the next_power_of_2 shim. Compact one-line-per-budget:
+    fwd+bwd ms, peak MB, x-vs-compiled, x-less-mem, grad PASS/CHECK. Answers 'is Liger better than
+    ours at equal memory?' on one table."""
+    try:
+        import liger_kernel.ops.fused_linear_cross_entropy as _flce
+        from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction as LFLCE
+    except Exception as ex:
+        print(f"\n=== Liger CE sweep ===\n  SKIPPED — liger_kernel not installed ({ex}). `pip install liger-kernel`.")
+        return
+    hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
+    w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
+    lab = torch.randint(0, V, (N,), device=DEV)
+    MB = 1024 * 1024
+    print(f"\n(Liger CE chunk sweep: N={N} V={V} H={H}, 128..512MB step 64 — same grid as ce_sweep)")
+    # compiled-eager baseline (same as ce_sweep) — best-effort
+    efb = peak_e = float("nan"); eager_ok = False
+    try:
+        Eg = _c(lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab))
+        he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
+        estep = lambda: Eg(he, we).backward()
+        efb = _step_ms(estep, [he, we]); peak_e = _peak(estep); eager_ok = True
+        print(f"  compiled baseline: fwd+bwd {efb:8.2f} ms | peak {peak_e:6.0f} MB")
+        del he, we
+    except torch.cuda.OutOfMemoryError:
+        print("  compiled eager OOM — reporting Liger standalone ms/peak only")
+    torch.cuda.empty_cache()
+
+    class _ShimTriton:                       # delegates to real triton; pins chunk_size = `rows`
+        def __init__(self, rows): self.rows = rows
+        def __getattr__(self, n): return getattr(triton, n)
+        def next_power_of_2(self, _x): return self.rows
+    _orig = _flce.triton
+    Nc = min(N, 2048)
+    labc = lab[:Nc]
+
+    def liger(h, ww, labels):
+        out = LFLCE.apply(h, ww, labels)
+        return out[0] if isinstance(out, (tuple, list)) else out   # Liger returns (loss, z_loss)
+
+    for mb in range(128, 512 + 1, 64):
+        rows = max(1, (mb * MB) // (V * 2))
+        _flce.triton = _ShimTriton(rows)
+        try:
+            # grad check vs eager fp32 CE on a small slice (full-N fp32 ref OOMs by design)
+            a = hid[:Nc].clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+            liger(a, wa, labc).backward()
+            b = hid[:Nc].clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+            F.cross_entropy((b @ wb.t()).float(), labc).backward()
+            _, grel = _gdiff([(a.grad, b.grad), (wa.grad, wb.grad)])
+            del a, wa, b, wb; torch.cuda.empty_cache()
+
+            h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+            kstep = lambda: liger(h2, w2, lab).backward()
+            kfb = _step_ms(kstep, [h2, w2]); peak_k = _peak(kstep)
+            lat = f"{efb / kfb:.2f}x" if eager_ok else "  n/a"
+            memx = f"{peak_e / max(peak_k, 1):.2f}x less" if eager_ok else ""
+            pf = "PASS" if grel < 1.5e-2 else "CHECK"
+            print(f"  {mb:3d}MB (chunk {rows:5d}): fwd+bwd {kfb:8.2f} ms | peak {peak_k:6.0f} MB | "
+                  f"{lat} compiled | {memx} | grad {pf}")
+            del h2, w2; torch.cuda.empty_cache()
+        except Exception as ex:
+            print(f"  {mb:3d}MB: FAILED {type(ex).__name__}: {str(ex).splitlines()[0]}")
+            torch.cuda.empty_cache()
+        finally:
+            _flce.triton = _orig                 # always restore
 
 
 # ───────────────────────── MoE (PolyGLU) ─────────────────────────
@@ -580,7 +617,7 @@ def bench_ce_sweep(N=16384, H=512, V=81000):
             torch.cuda.empty_cache()
 
 
-BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
+BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
            "ce_sweep": bench_ce_sweep,
            "xsa": bench_xsa, "conv": bench_conv_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
@@ -599,7 +636,7 @@ if __name__ == "__main__":
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
     # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR
     # the famous external ones — beat torch.compile on this GPU?" (xsa/conv named-only.)
-    which = args or ["moe", "ce", "swiglu", "liger_swiglu", "liger_ce", "liger_ce_sweep",
+    which = args or ["moe", "ce", "liger_swiglu", "liger_ce", "liger_ce_sweep",
                      "bassrehab_swiglu", "bassrehab"]
     for name in which:
         try:

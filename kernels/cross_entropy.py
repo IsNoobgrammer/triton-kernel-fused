@@ -24,9 +24,11 @@ import triton.language as tl
 
 __all__ = ["fused_linear_cross_entropy"]
 
-# (chunk, V) fp16 transient budget. 384 MiB -> chunk ~2485 at V=81000. Lower for less peak
-# memory at the cost of a few more cuBLAS launches; raise if you have headroom.
-_BWD_LOGITS_BUDGET = 384 * 1024 * 1024
+# (chunk, V) fp16 transient budget. 192 MiB -> chunk ~1242 at V=81000. T4-tuned default: the
+# T4 ce_fit sweep (128..512MB step 64) put 192MB at the latency knee — fastest budget in all 3
+# runs (0.57x compiled, stable) AND 3.40x less peak; bigger budgets are both slower and heavier.
+# Lower for less peak memory at the cost of a few more cuBLAS launches; raise if you have headroom.
+_BWD_LOGITS_BUDGET = 192 * 1024 * 1024
 
 
 @triton.jit
