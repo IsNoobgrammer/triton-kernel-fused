@@ -365,8 +365,13 @@ def bench_liger_ce_sweep(N=16384, H=512, V=81000):
         out = LFLCE.apply(h, ww, labels)
         return out[0] if isinstance(out, (tuple, list)) else out   # Liger returns (loss, z_loss)
 
-    for mb in range(128, 512 + 1, 64):
-        rows = max(1, (mb * MB) // (V * 2))
+    # Liger's inner CE kernel uses chunk_size as a Triton BLOCK_SIZE constexpr -> it MUST be a power
+    # of 2 (a non-pow2 chunk is a CompilationError). So we can't hit arbitrary MB budgets like our
+    # kernel can; we sweep the pow2 chunk sizes whose (chunk,V) fp16 transient fits under the 512MB
+    # ceiling ({256,512,1024,2048}; 4096 = 663MB > ceiling) and report each one's MEASURED peak, so
+    # it still overlays on ce_sweep by the memory axis. This IS Liger's real memory<->speed frontier.
+    for rows in (256, 512, 1024, 2048):
+        approx_mb = rows * V * 2 // MB
         _flce.triton = _ShimTriton(rows)
         try:
             # grad check vs eager fp32 CE on a small slice (full-N fp32 ref OOMs by design)
@@ -383,11 +388,11 @@ def bench_liger_ce_sweep(N=16384, H=512, V=81000):
             lat = f"{efb / kfb:.2f}x" if eager_ok else "  n/a"
             memx = f"{peak_e / max(peak_k, 1):.2f}x less" if eager_ok else ""
             pf = "PASS" if grel < 1.5e-2 else "CHECK"
-            print(f"  {mb:3d}MB (chunk {rows:5d}): fwd+bwd {kfb:8.2f} ms | peak {peak_k:6.0f} MB | "
+            print(f"  chunk {rows:5d} (~{approx_mb:3d}MB): fwd+bwd {kfb:8.2f} ms | peak {peak_k:6.0f} MB | "
                   f"{lat} compiled | {memx} | grad {pf}")
             del h2, w2; torch.cuda.empty_cache()
         except Exception as ex:
-            print(f"  {mb:3d}MB: FAILED {type(ex).__name__}: {str(ex).splitlines()[0]}")
+            print(f"  chunk {rows:5d}: FAILED {type(ex).__name__}: {str(ex).splitlines()[0]}")
             torch.cuda.empty_cache()
         finally:
             _flce.triton = _orig                 # always restore
