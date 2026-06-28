@@ -322,57 +322,52 @@ class _PerExpertMoE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes):
         N, H = hidden.shape
-        E = gate_up_proj.shape[0]; I = gate_up_proj.shape[1] // 2
+        E = gate_up_proj.shape[0]
         top_k = idx.shape[1]; dev = hidden.device
         st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
-        M = st.numel()
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
         counts_t = torch.tensor(counts, device=dev)
         row_act = torch.repeat_interleave(act_codes, counts_t).to(torch.int32)   # (M,) once, no per-expert contiguous
-        gate_up_all = torch.empty(M, 2 * I, device=dev, dtype=hidden.dtype)
-        inter_all = torch.empty(M, I, device=dev, dtype=hidden.dtype)
-        eo_all = torch.empty(M, H, device=dev, dtype=hidden.dtype)
+        # per-expert activations kept as LISTS — the GEMM outputs ARE the storage; no contiguous
+        # buffer + slice-copy (that was a pure DtoD-memcpy + memory tax).
+        gate_up_l = [None] * E; inter_l = [None] * E; eo_l = [None] * E
         out = torch.zeros(N, H, device=dev, dtype=torch.float32)          # fp32 accumulate (MiMo)
         for e in range(E):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
             gu = x_s[s:en] @ gate_up_proj[e].t()
-            gate_up_all[s:en] = gu
             it = _glu_fwd(gu, row_act[s:en])
-            inter_all[s:en] = it
             eo = it @ down_proj[e].t()
-            eo_all[s:en] = eo
+            gate_up_l[e] = gu; inter_l[e] = it; eo_l[e] = eo
             out.index_add_(0, st[s:en], (eo * sw[s:en].unsqueeze(-1)).float())
-        ctx.save_for_backward(x_s, gate_up_all, inter_all, eo_all, st, sw, order, row_act,
-                              gate_up_proj, down_proj)
-        ctx.bounds = bounds; ctx.shapes = (N, H, I, top_k, E)
+        ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj)
+        ctx.lists = (gate_up_l, inter_l, eo_l); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
         return out.to(hidden.dtype)
 
     @staticmethod
     def backward(ctx, grad_out):
-        (x_s, gate_up_all, inter_all, eo_all, st, sw, order, row_act,
-         gate_up_proj, down_proj) = ctx.saved_tensors
-        N, H, I, top_k, E = ctx.shapes; bounds = ctx.bounds
+        x_s, st, sw, order, row_act, gate_up_proj, down_proj = ctx.saved_tensors
+        gate_up_l, inter_l, eo_l = ctx.lists
+        N, H, top_k, E = ctx.shapes; bounds = ctx.bounds
         go_s = grad_out.index_select(0, st)                              # (M,H)
-        grad_w_s = (go_s.float() * eo_all.float()).sum(-1).to(grad_out.dtype)   # (M,) grad wrt combine weight
-        grad_eo = go_s * sw.unsqueeze(-1)                               # (M,H)
+        M = st.numel()
+        grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
         grad_down_proj = torch.zeros_like(down_proj)
-        grad_x_s = torch.empty_like(x_s)
+        grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
         for e in range(E):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
-            ge = grad_eo[s:en]                                          # (m,H)
-            it = inter_all[s:en]                                        # (m,I)
+            go_e = go_s[s:en]; it = inter_l[e]                          # (m,H), (m,I)
+            grad_w_s[s:en] = (go_e.float() * eo_l[e].float()).sum(-1).to(grad_out.dtype)
+            ge = go_e * sw[s:en].unsqueeze(-1)                          # (m,H)
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
             grad_down_proj[e] = ge.t() @ it                            # (H,m)@(m,I) -> (H,I)
-            grad_gate_up = _glu_bwd(grad_inter, gate_up_all[s:en], row_act[s:en])   # (m,2I)
-            grad_x_s[s:en] = grad_gate_up @ gate_up_proj[e]            # (m,2I)@(2I,H) -> (m,H)
+            grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en])   # (m,2I)
             grad_gate_up_proj[e] = grad_gate_up.t() @ x_s[s:en]        # (2I,m)@(m,H) -> (2I,H)
-        grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
-        grad_hidden.index_add_(0, st, grad_x_s)                         # ONE scatter (vs 9 autograd adds)
+            grad_hidden.index_add_(0, st[s:en], grad_gate_up @ gate_up_proj[e])  # scatter dX straight in
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
         grad_wt[order] = grad_w_s
         return grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj, None
