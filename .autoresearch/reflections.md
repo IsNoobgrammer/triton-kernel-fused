@@ -187,3 +187,23 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
   only if T4 shows the conv itself can ~tie cuDNN; else the honest answer is "use ref (cuDNN) and only
   the glue fusion is ours to win."
 - AWAIT: `python bench.py --compile router` on T4.
+
+## Round 4 iter1 T4 verdict + iter2 (the win) — 2026-06-28
+- **readonce REFUTED on T4** (fwd 0.33x): the H-outer/K-inner reorder wrecked tl.dot pipelining on
+  Turing; x (~1MB/batch) was already L2-resident so there was no HBM traffic to save. Ampere yellow
+  flag was right. REMOVED. Lesson: don't reorder loops to "save" traffic that the cache already serves
+  — you only perturb the MMA schedule. (Same class as prior local≠T4 traps.)
+- **Profiler nailed the real structure** (the marksaroufim payoff): our tl.dot conv is ~2.5x slower
+  than cuDNN (fwd kernel 862us vs cudnn_convolution 296us; bwd dx+dw 1610us vs cuDNN
+  convolution_backward 643us). The dump calling cuDNN was correct — stop reimplementing the conv.
+- **Two measured edges:** (1) ref's UNCOMPILED cuDNN backward BEATS compiled (1.20x) — inductor's
+  compiled bwd adds a 137us constant_pad_nd_3 + scatter kernels. (2) aten::topk = ~295us + gatherTopK
+  216us is a FLAT tax on every path INCLUDING compiled (a general bitonic kernel for top-2-of-11).
+- **iter2 = cudnn backend** (data-justified, not guessed): F.conv1d (autograd gives cuDNN
+  convolution_backward free = the 1.20x bwd) + `FusedTop2Epilogue` — ONE Triton kernel doing
+  sigmoid+bias+top-k-argmax+unbiased-gather (BLOCK_N rows/program, vectorized argmax over E=11),
+  killing the native topk+gather. This is THE structural edge: compile MUST call native topk; we fuse
+  a bespoke top-2-of-11 (~free). Local: correct, grad_rel 3.4e-4. AWAIT T4 — expect first conv WIN.
+- **General lesson reinforced**: the conv-router win (like MoE routing, XSA read-once) comes from
+  fusing/replacing the op the compiler is FORCED to leave as a separate library call (topk), NOT from
+  out-computing cuDNN. Find the native-op seam, not the GEMM.

@@ -33,7 +33,7 @@ import triton.language as tl
 # Reuse the transpose-free conv backward kernels (identical math) — don't duplicate.
 from .causal_conv1d_router import _conv_router_dx_kernel, _conv_router_dw_kernel
 
-__all__ = ["fused_router", "router_bias_update", "FusedConvRouter", "FusedConvRouterReadOnce"]
+__all__ = ["fused_router", "router_bias_update", "FusedConvRouter", "FusedTop2Epilogue"]
 
 
 @triton.autotune(
@@ -80,62 +80,13 @@ def _conv_router_fwd_sigmoid_kernel(
              acc.to(Out_ptr.dtype.element_ty), mask=mask_s[:, None] & mask_e[None, :])
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_S": 64, "BLOCK_H": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_S": 128, "BLOCK_H": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_S": 64, "BLOCK_H": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_S": 128, "BLOCK_H": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_S": 256, "BLOCK_H": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_S": 256, "BLOCK_H": 64}, num_warps=8, num_stages=2),
-    ],
-    key=["H"],
-)
-@triton.jit
-def _conv_router_fwd_sigmoid_readonce_kernel(
-    X_ptr, W_ptr, Out_ptr, B, S, H,
-    sxb, sxs, sxh, swe, swh, swk, som, soe,
-    K: tl.constexpr, E: tl.constexpr, BLOCK_E: tl.constexpr,
-    BLOCK_S: tl.constexpr, BLOCK_H: tl.constexpr, APPLY_SIGMOID: tl.constexpr,
-):
-    # Identical math to _conv_router_fwd_sigmoid_kernel, ONE change: H-loop OUTER, K-loop INNER.
-    # The K causal taps read overlapping shifted windows of the SAME h-block (src = s-(K-1)+k); doing
-    # all K taps of an h-block back-to-back keeps those rows hot in L1/L2 -> x reread from cache, not
-    # HBM (k-outer sweeps all H between taps, blowing the working set past L1). Attack on tldot's fwd.
-    pid_b = tl.program_id(0)
-    pid_s = tl.program_id(1)
-    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    offs_e = tl.arange(0, BLOCK_E)
-    mask_s = offs_s < S
-    mask_e = offs_e < E
-    acc = tl.zeros((BLOCK_S, BLOCK_E), dtype=tl.float32)
-    for h0 in range(0, H, BLOCK_H):
-        offs_h = h0 + tl.arange(0, BLOCK_H)
-        mask_h = offs_h < H
-        for k in tl.static_range(K):
-            src = offs_s - (K - 1) + k
-            mask_src = (src >= 0) & mask_s
-            xv = tl.load(X_ptr + pid_b * sxb + src[:, None] * sxs + offs_h[None, :] * sxh,
-                         mask=mask_src[:, None] & mask_h[None, :], other=0.0)
-            wv = tl.load(W_ptr + offs_e[:, None] * swe + offs_h[None, :] * swh + k * swk,
-                         mask=mask_e[:, None] & mask_h[None, :], other=0.0)
-            acc += tl.dot(xv, tl.trans(wv))
-    if APPLY_SIGMOID:
-        acc = 1.0 / (1.0 + tl.exp(-acc))
-    out_row = pid_b * S + offs_s
-    tl.store(Out_ptr + out_row[:, None] * som + offs_e[None, :] * soe,
-             acc.to(Out_ptr.dtype.element_ty), mask=mask_s[:, None] & mask_e[None, :])
-
-
-def _conv_router_scores(x, weight, apply_sigmoid=True, readonce=False):
-    """x (B,S,H), weight (E,H,K) -> scores (B*S, E) fp32 (sigmoid(causal_conv) when apply_sigmoid).
-    readonce=True uses the H-outer/K-inner cache-reuse variant (same output)."""
+def _conv_router_scores(x, weight, apply_sigmoid=True):
+    """x (B,S,H), weight (E,H,K) -> scores (B*S, E) fp32 (sigmoid(causal_conv) when apply_sigmoid)."""
     B, S, Hd = x.shape
     E, _, K = weight.shape
     out = torch.empty(B * S, E, device=x.device, dtype=torch.float32)
     grid = lambda meta: (B, triton.cdiv(S, meta["BLOCK_S"]))
-    kern = _conv_router_fwd_sigmoid_readonce_kernel if readonce else _conv_router_fwd_sigmoid_kernel
-    kern[grid](
+    _conv_router_fwd_sigmoid_kernel[grid](
         x, weight, out, B, S, Hd,
         x.stride(0), x.stride(1), x.stride(2),
         weight.stride(0), weight.stride(1), weight.stride(2),
@@ -211,29 +162,6 @@ class FusedConvRouter(torch.autograd.Function):
         return gx, gw, None, None, None   # x, weight, bias, top_k, num_experts
 
 
-class FusedConvRouterReadOnce(torch.autograd.Function):
-    """Same whole-router fusion as FusedConvRouter, but the fused conv+sigmoid forward uses the
-    H-outer/K-inner cache-reuse kernel (x reread from L1/L2 across the K taps, not HBM). Backward is
-    identical (shared kernels). The attack on tldot's 0.67x forward — confirm the edge on T4."""
-
-    @staticmethod
-    def forward(ctx, x, weight, bias, top_k, num_experts):
-        scores = _conv_router_scores(x, weight, apply_sigmoid=True, readonce=True)
-        sel = scores + bias if bias is not None else scores
-        _, idx = torch.topk(sel, top_k, dim=-1)
-        weights = scores.gather(-1, idx)
-        counts = _count_experts(idx, num_experts)
-        ctx.save_for_backward(x, weight, scores, idx)
-        ctx.mark_non_differentiable(idx, counts)
-        return idx, weights, counts
-
-    @staticmethod
-    def backward(ctx, grad_idx, grad_weights, grad_counts):
-        x, weight, scores, idx = ctx.saved_tensors
-        gx, gw = _conv_router_grads(x, weight, scores, idx, grad_weights)
-        return gx, gw, None, None, None
-
-
 class FusedConvRouterCuBLAS(torch.autograd.Function):
     """Same whole-router fusion, but the conv is K cuBLAS GEMMs on the NATIVE (B,S,H) layout —
     NO transpose, NO pad materialization (the two HBM round-trips F.conv1d/cuDNN can't avoid).
@@ -282,6 +210,83 @@ class FusedConvRouterCuBLAS(torch.autograd.Function):
         return gx.to(x.dtype), gw, None, None, None
 
 
+@triton.jit
+def _router_epilogue_kernel(Logit_ptr, Bias_ptr, Idx_ptr, W_ptr, N, sln, sle,
+                            HAS_BIAS: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
+                            BLOCK_N: tl.constexpr, BLOCK_E: tl.constexpr):
+    """Fused router epilogue: sigmoid + (selection)bias + top-k argmax + unbiased gather, in ONE pass.
+    Replaces [sigmoid, add, torch.topk, gather] — the native topk is a ~295us general bitonic kernel
+    for top-2-of-11; a bespoke argmax over E=11 is ~free, and compile CANNOT fuse a native topk.
+    BLOCK_N rows/program (vectorized argmax over E) for occupancy. sel = scores+bias picks; weights
+    = scores (UNBIASED) gathered at the picks. logits read fp16, computed fp32 (matches eager)."""
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_e = tl.arange(0, BLOCK_E)
+    mask_n = offs_n < N
+    mask_e = offs_e < E
+    logit = tl.load(Logit_ptr + offs_n[:, None] * sln + offs_e[None, :] * sle,
+                    mask=mask_n[:, None] & mask_e[None, :], other=0.0).to(tl.float32)
+    scores = 1.0 / (1.0 + tl.exp(-logit))
+    sel = scores
+    if HAS_BIAS:
+        b = tl.load(Bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
+        sel = sel + b[None, :]
+    sel = tl.where(mask_e[None, :], sel, -1e30)            # mask padded experts out of the argmax
+    for k in tl.static_range(TOPK):
+        am = tl.argmax(sel, axis=1)                        # (BLOCK_N,) — top expert this round
+        onehot = offs_e[None, :] == am[:, None]
+        w_k = tl.sum(tl.where(onehot, scores, 0.0), axis=1)   # unbiased score at the pick
+        tl.store(Idx_ptr + offs_n * TOPK + k, am.to(tl.int64), mask=mask_n)
+        tl.store(W_ptr + offs_n * TOPK + k, w_k, mask=mask_n)
+        sel = tl.where(onehot, -1e30, sel)                 # remove the pick, next round finds the next
+    return
+
+
+class FusedTop2Epilogue(torch.autograd.Function):
+    """conv logits (B*S,E) -> (idx (B*S,k) long, weights (B*S,k) fp32 UNBIASED) in one fused kernel.
+    Forward kills native topk+gather+sigmoid; backward = scatter grad into picked slots * sigmoid'.
+    grad flows back to `logits` -> autograd routes it through F.conv1d (cuDNN convolution_backward)."""
+
+    @staticmethod
+    def forward(ctx, logits, bias, top_k):
+        N, E = logits.shape
+        idx = torch.empty(N, top_k, device=logits.device, dtype=torch.long)
+        w = torch.empty(N, top_k, device=logits.device, dtype=torch.float32)
+        BLOCK_N = 128
+        grid = (triton.cdiv(N, BLOCK_N),)
+        _router_epilogue_kernel[grid](
+            logits, bias if bias is not None else logits, idx, w, N,
+            logits.stride(0), logits.stride(1),
+            HAS_BIAS=bias is not None, E=E, TOPK=top_k,
+            BLOCK_N=BLOCK_N, BLOCK_E=max(16, triton.next_power_of_2(E)))
+        ctx.save_for_backward(logits, idx)
+        ctx.mark_non_differentiable(idx)
+        return idx, w
+
+    @staticmethod
+    def backward(ctx, grad_idx, grad_w):
+        logits, idx = ctx.saved_tensors
+        scores = torch.sigmoid(logits.float())
+        grad_scores = torch.zeros_like(scores)
+        grad_scores.scatter_add_(-1, idx, grad_w.float())             # picks distinct -> no contention
+        grad_logits = grad_scores * scores * (1.0 - scores)           # sigmoid'
+        return grad_logits.to(logits.dtype), None, None
+
+
+def _cudnn_router(x, weight, bias, top_k, num_experts):
+    """WIN backend (Round 4): cuDNN conv (autograd -> cuDNN convolution_backward, the fast bwd ref
+    proved at 1.20x) + the FUSED top-k epilogue (kills the ~295us native topk + gather). Combines the
+    two T4-measured edges. norm stays eager (in fused_router)."""
+    import torch.nn.functional as F
+    B, S, H = x.shape
+    E, _, K = weight.shape
+    xp = F.pad(x.transpose(1, 2), (K - 1, 0))                         # (B,H,S+K-1) for cuDNN NCHW
+    logits = F.conv1d(xp, weight).transpose(1, 2).reshape(B * S, E)   # cuDNN -> (B*S,E), autograd-tracked
+    idx, weights = FusedTop2Epilogue.apply(logits, bias, top_k)
+    counts = _count_experts(idx, num_experts)
+    return idx, weights, counts
+
+
 def _ref_router(x, weight, bias, top_k, num_experts):
     """REFERENCE backend = the torch.compile dump's recipe, hand-assembled and UNCOMPILED: cuDNN
     conv (the extern op inductor itself falls back to) + plain torch glue. Pure-autograd (no custom
@@ -300,8 +305,8 @@ def _ref_router(x, weight, bias, top_k, num_experts):
     return idx, weights, counts
 
 
-_BACKENDS = {"tldot": FusedConvRouter, "readonce": FusedConvRouterReadOnce,
-             "cublas": FusedConvRouterCuBLAS}
+_BACKENDS = {"tldot": FusedConvRouter, "cublas": FusedConvRouterCuBLAS}
+_FN_BACKENDS = {"ref": _ref_router, "cudnn": _cudnn_router}   # plain-autograd backends (cuDNN conv)
 
 
 def fused_router(x, conv_weight, bias, top_k, num_experts,
@@ -314,8 +319,8 @@ def fused_router(x, conv_weight, bias, top_k, num_experts,
     or (..., counts (E,) int32) if return_counts. norm_topk_prob/routed_scaling applied in eager.
     """
     B, S, _ = x.shape
-    if backend == "ref":
-        idx, w, counts = _ref_router(x, conv_weight, bias, top_k, num_experts)
+    if backend in _FN_BACKENDS:
+        idx, w, counts = _FN_BACKENDS[backend](x, conv_weight, bias, top_k, num_experts)
     else:
         idx, w, counts = _BACKENDS[backend].apply(x, conv_weight, bias, top_k, num_experts)
     if top_k > 1 and norm_topk_prob:

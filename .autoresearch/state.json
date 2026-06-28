@@ -10,9 +10,10 @@
                  "tldot": "current fused transpose-free Triton (incumbent best)",
                  "readonce": "tldot fwd with H-outer/K-inner loop reorder (iter-1 attack)",
                  "cublas": "kept in code, dropped from sweep (dominated)"},
-    "iter1_local": "ALL correct (idx 1.0, cnt ok, nan-free, grad PASS). readonce fwd SLOWER than tldot on Ampere (reorder no help; x L2-resident). AWAIT T4.",
-    "iter2_planned": "fuse top-2-of-11 + gather + norm into conv epilogue (scores stay in-register, never HBM) = the glue compile can't fuse; build only if T4 shows conv can ~tie cuDNN",
-    "status": "iter1 built + local-correct; AWAIT T4 triangulation"
+    "iter1_T4": "ref fwdbwd 0.84x (bwd 1.20x WIN), tldot 0.71x, readonce 0.33x fwd REFUTED+REMOVED. Profiler: our tl.dot conv ~2.5x slower than cuDNN; aten::topk ~295us FLAT tax on all paths incl compiled.",
+    "iter2_cudnn": "BUILT: cuDNN conv (autograd convolution_backward = ref's 1.20x bwd) + FusedTop2Epilogue Triton kernel (sigmoid+bias+topk-argmax+gather, kills native topk). Local correct grad_rel 3.4e-4. AWAIT T4.",
+    "best_so_far_T4": "ref bwd 1.20x; cudnn expected fwd+bwd >1.0x (first conv WIN) pending T4",
+    "status": "iter2 cudnn built + local-correct; AWAIT T4 `bench.py --compile router`"
   },
   "objective": "minimize our CE fwd+bwd latency vs the Liger fused-linear-CE baseline at matched memory, grad_rel < 1.5e-2",
   "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous; correctness + relative latency only — does NOT predict T4 occupancy)",
