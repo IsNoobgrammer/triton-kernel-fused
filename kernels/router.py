@@ -157,15 +157,68 @@ class FusedConvRouter(torch.autograd.Function):
         return gx, gw, None, None, None   # x, weight, bias, top_k, num_experts
 
 
+class FusedConvRouterCuBLAS(torch.autograd.Function):
+    """Same whole-router fusion, but the conv is K cuBLAS GEMMs on the NATIVE (B,S,H) layout —
+    NO transpose, NO pad materialization (the two HBM round-trips F.conv1d/cuDNN can't avoid).
+
+        logits[:, K-1-k:, :] += x[:, :S-(K-1-k), :] @ W[:,:,k].T     for k in 0..K-1   (causal)
+
+    GEMMs run in x.dtype (fp16 tensor cores on T4), accumulated in an fp32 buffer. This is the
+    CE/MoE lever (cuBLAS > tl.dot on Turing) applied to the router. Epilogue (sigmoid/scatter/
+    sigmoid') is the fused glue; topk/gather/count identical to the tl.dot path."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, top_k, num_experts):
+        B, S, H = x.shape
+        E, _, K = weight.shape
+        logits = torch.zeros(B, S, E, device=x.device, dtype=torch.float32)
+        for k in range(K):
+            d = K - 1 - k                                            # causal shift for tap k
+            logits[:, d:, :] += (x[:, :S - d, :] @ weight[:, :, k].t()).float()
+        scores = torch.sigmoid(logits)
+        sel = scores + bias if bias is not None else scores
+        _, idx = torch.topk(sel, top_k, dim=-1)
+        weights = scores.gather(-1, idx)
+        counts = _count_experts(idx, num_experts)
+        ctx.save_for_backward(x, weight, scores, idx)
+        ctx.mark_non_differentiable(idx, counts)
+        return idx, weights, counts
+
+    @staticmethod
+    def backward(ctx, grad_idx, grad_weights, grad_counts):
+        x, weight, scores, idx = ctx.saved_tensors
+        B, S, H = x.shape
+        E, _, K = weight.shape
+        grad_scores = torch.zeros_like(scores)
+        grad_scores.scatter_add_(-1, idx, grad_weights.float())
+        grad_logits = grad_scores * scores * (1.0 - scores)          # (B,S,E) fp32
+        gl = grad_logits.to(x.dtype)                                 # cast once for fp16 tensor cores
+        gx = torch.zeros(B, S, H, device=x.device, dtype=torch.float32)
+        gw = torch.empty(E, H, K, device=x.device, dtype=weight.dtype)
+        for k in range(K):
+            d = K - 1 - k
+            # grad_x[:, :S-d] += grad_logits[:, d:] @ W[:,:,k]   (E,H), fp16 GEMM, fp32 accumulate
+            gx[:, :S - d, :] += (gl[:, d:, :] @ weight[:, :, k]).float()
+            # grad_w[:,:,k] = (Σ_bs gl·x) = gl[:,d:]ᵀ @ x[:,:S-d] as ONE (E,N)x(N,H) cuBLAS GEMM
+            # over N=B·(S-d) (fp16 in, fp32 internal accumulate). reshape copies the slice contiguous.
+            gw[:, :, k] = gl[:, d:, :].reshape(-1, E).t() @ x[:, :S - d, :].reshape(-1, H)
+        return gx.to(x.dtype), gw, None, None, None
+
+
+_BACKENDS = {"tldot": FusedConvRouter, "cublas": FusedConvRouterCuBLAS}
+
+
 def fused_router(x, conv_weight, bias, top_k, num_experts,
-                 norm_topk_prob=True, routed_scaling_factor=1.0, return_counts=False):
+                 norm_topk_prob=True, routed_scaling_factor=1.0, return_counts=False,
+                 backend="cublas"):
     """Whole conv router. x (B,S,H), conv_weight (E,H,K) from nn.Conv1d(H,E,K), bias (E,) fp32 or None.
 
-    Returns (idx (B,S,k) long, norm_weights (B,S,k) fp32) — or (..., counts (E,) int32) if
-    return_counts. norm_topk_prob/routed_scaling applied in eager (autograd carries the Jacobian).
+    backend: 'cublas' (K cuBLAS GEMMs, native layout — the T4 path) or 'tldot' (one Triton conv,
+    transpose-free but loses on Turing). Returns (idx (B,S,k) long, norm_weights (B,S,k) fp32) —
+    or (..., counts (E,) int32) if return_counts. norm_topk_prob/routed_scaling applied in eager.
     """
     B, S, _ = x.shape
-    idx, w, counts = FusedConvRouter.apply(x, conv_weight, bias, top_k, num_experts)
+    idx, w, counts = _BACKENDS[backend].apply(x, conv_weight, bias, top_k, num_experts)
     if top_k > 1 and norm_topk_prob:
         w = w / (w.sum(-1, keepdim=True) + 1e-20)            # MiMo/DeepSeek-V3 top-k sum-to-1
     w = w * routed_scaling_factor                            # 1.0 = no-op (MiMo-V2.5)

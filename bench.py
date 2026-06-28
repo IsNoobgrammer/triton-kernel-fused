@@ -295,45 +295,42 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
         wt = wt / (wt.sum(-1, keepdim=True) + 1e-20)
         return idx, wt
 
-    # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 ──
-    # fp16 routing diverges ~0.03% (the fused path sigmoids fp32 logits, MORE precise than eager's
-    # fp16-rounded cuDNN logits), which scrambles grads on the few re-routed tokens. fp32 isolates
-    # the kernel math from that (idx becomes exact) — same methodology as the BiBo verification.
-    xf = x.float(); wf = w.float(); Gf = G.float()
-    xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)
-    xb = xf.clone().requires_grad_(True); wb = wf.clone().requires_grad_(True)
-    ik, wk, ck = fused_router(xa, wa, bias, top_k, E, return_counts=True)
-    ie, we = eager(xb, wb)
-    (wk * Gf).sum().backward(); (we * Gf).sum().backward()
-    gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
-    idx_agree = (ik.sort(-1).values == ie.sort(-1).values).float().mean().item()
-    cnt_ok = bool((ck == _count_experts(ik, E)).all().item()) and bool((ck == torch.bincount(ie.reshape(-1), minlength=E).int()).all().item())
-    print(f"  [fp32] idx-agree {idx_agree:.4f} | in-kernel count == bincount: {cnt_ok}")
+    efn = _c(lambda xx, ww: eager(xx, ww)[1])      # compiled-eager baseline (cuDNN conv + fused glue)
+    for backend in ("cublas", "tldot"):
+        # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 (idx exact, isolates math) ──
+        xf = x.float(); wf = w.float(); Gf = G.float()
+        xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)
+        xb = xf.clone().requires_grad_(True); wb = wf.clone().requires_grad_(True)
+        ik, wk, ck = fused_router(xa, wa, bias, top_k, E, return_counts=True, backend=backend)
+        ie, we = eager(xb, wb)
+        (wk * Gf).sum().backward(); (we * Gf).sum().backward()
+        gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
+        idx_agree = (ik.sort(-1).values == ie.sort(-1).values).float().mean().item()
+        cnt_ok = bool((ck == torch.bincount(ie.reshape(-1), minlength=E).int()).all().item())
+        nan = False
+        for _ in range(2):
+            xt = x.clone().requires_grad_(True); wt2 = w.clone().requires_grad_(True)
+            _, wo = fused_router(xt, wt2, bias, top_k, E, backend=backend)
+            (wo * G).sum().backward()
+            nan |= bool(wo.isnan().any() or xt.grad.isnan().any() or wt2.grad.isnan().any())
+        print(f"  [{backend}] [fp32] idx-agree {idx_agree:.4f} | count==bincount {cnt_ok} | NaN-free {not nan}")
 
-    # ── NaN-free 2-pass (Rule 2) ──
-    nan = False
-    for _ in range(2):
-        xt = x.clone().requires_grad_(True); wt2 = w.clone().requires_grad_(True)
-        _, wo = fused_router(xt, wt2, bias, top_k, E)
-        (wo * G).sum().backward()
-        nan |= bool(wo.isnan().any() or xt.grad.isnan().any() or wt2.grad.isnan().any())
-    print(f"  NaN-free 2-pass: {not nan}")
-
-    # ── 3-phase timing (Rule 3) vs compiled eager ──
-    kfn = lambda xx, ww: fused_router(xx, ww, bias, top_k, E)[1]
-    efn = _c(lambda xx, ww: eager(xx, ww)[1])
-    kf = _fwd_ms(lambda: kfn(x, w)); ef = _fwd_ms(lambda: efn(x, w))
-    x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
-    eb = _bwd_ms(lambda: (efn(x2, w2) * G).sum(), [x2, w2])
-    kstep = lambda: (kfn(x2, w2) * G).sum().backward()
-    estep = lambda: (efn(x2, w2) * G).sum().backward()
-    kfb, efb = _stats(kstep, estep, [x2, w2])
-    _report("FULL conv router (B=%d S=%d H=%d E=%d K=%d k=%d)" % (B, S, H, E, K, top_k),
-            kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+        # ── 3-phase timing (Rule 3) vs compiled eager ──
+        kfn = lambda xx, ww, b=backend: fused_router(xx, ww, bias, top_k, E, backend=b)[1]
+        kf = _fwd_ms(lambda: kfn(x, w)); ef = _fwd_ms(lambda: efn(x, w))
+        x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+        kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
+        eb = _bwd_ms(lambda: (efn(x2, w2) * G).sum(), [x2, w2])
+        kstep = lambda: (kfn(x2, w2) * G).sum().backward()
+        estep = lambda: (efn(x2, w2) * G).sum().backward()
+        kfb, efb = _stats(kstep, estep, [x2, w2])
+        _report("FULL conv router [%s] (B=%d S=%d H=%d E=%d K=%d k=%d)" % (backend, B, S, H, E, K, top_k),
+                kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+        if PROFILE:
+            _profile(f"fused router [{backend}] fwd+bwd", kstep, leaves=[x2, w2])
     if PROFILE:
-        _profile("fused router fwd+bwd", kstep, leaves=[x2, w2])
-        _profile("compiled-eager router fwd+bwd", estep, leaves=[x2, w2])
+        x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+        _profile("compiled-eager router fwd+bwd", lambda: (efn(x2, w2) * G).sum().backward(), leaves=[x2, w2])
 
 
 # ───────── outsourced reference kernels (Liger) — do THEY beat compiled eager? ─────────
