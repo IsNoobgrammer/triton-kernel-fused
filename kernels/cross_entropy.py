@@ -249,9 +249,12 @@ def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, bwd_lo
     """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
     Never materializes (N,V); cuBLAS speed at bounded (chunk,V) memory.
 
-    bwd_mode: "recompute" (default) recomputes the logit GEMM in backward (3 GEMMs, cheapest memory);
-    "int8" saves the logits quantized to int8 in forward and DEQUANTIZES in backward (2 GEMMs, faster,
-    holds ~N*V bytes of int8) — approximate, gated by grad_rel. See _CEInt8 / _CECublasChunked.
+    bwd_mode: "recompute" (default, RECOMMENDED) recomputes the logit GEMM in backward (3 GEMMs,
+    lowest memory). "int8" saves logits as int8 and dequantizes in backward (2 GEMMs) — ⚠️ MEASURED
+    DOMINATED on T4 V=81000: only ~10% faster (the per-row-int8 forward needs a 2nd (N,V) pass that
+    eats most of the saved GEMM) BUT holds the (N,V) int8 (1.3GB) so peak is ~2x WORSE than recompute
+    (2633 vs 1305 MB) — it breaks the keep-memory goal and it's approximate. Kept opt-in for non-T4 /
+    research only; do NOT use it to save memory. The proxy (small V) overstated it; T4 refuted it.
 
     `bwd_logits_budget` (bytes) caps the (chunk,V) transient. ⚠️ MEASURED on T4: chunk size barely
     affects LATENCY (the backward is dominated by the recompute GEMM, not chunk overhead) — one-shot
