@@ -327,7 +327,7 @@ def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
         row_act = act_codes[e:e + 1].expand(en - s).contiguous()   # contiguous: kernel indexes Act_ptr+offs_m (stride 1)
         inter = BatchedGLU.apply(gate_up, row_act)
         eo = inter @ down_proj[e].t()
-        out = out.index_add(0, tok, (eo * w.unsqueeze(-1)).float())
+        out = out.index_add_(0, tok, (eo * w.unsqueeze(-1)).float())  # in-place: no full-accumulator clone per expert
     return out.to(hidden.dtype)
 
 

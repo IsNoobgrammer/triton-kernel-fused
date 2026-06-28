@@ -8,6 +8,9 @@ its PyTorch-eager equivalent, plus a grad-equivalence check.
                                     # regime where never-materializing CE actually matters.
     python bench.py swiglu moe      # selected kernels
     python bench.py --compile       # measure vs torch.compile'd eager (industry steady-state)
+    python bench.py --compile --profile moe   # ALSO print a torch.profiler kernel breakdown for MoE:
+                                              # CUDA launches/iter + per-op self-CUDA time (the
+                                              # fusion-opportunity map — where time goes, what's fusable)
     python bench.py --compile --dump-triton swiglu   # ALSO print inductor's generated Triton to
                                                      # stderr — read it, then hand-iterate to beat it
 
@@ -47,6 +50,7 @@ DTYPE = torch.float16
 DEV = "cuda"
 COMPILE = False   # set by --compile in __main__
 JSON_OUT = False  # set by --json in __main__ (emits one @@RESULT line per kernel for the loop harness)
+PROFILE = False   # set by --profile: emit a torch.profiler kernel breakdown (launch count + per-op CUDA time)
 
 
 def _c(fn):
@@ -116,6 +120,34 @@ def _peak(step):
     torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     step(); torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated() / 1e6
+
+
+def _profile(label, step, iters=20, leaves=None):
+    """torch.profiler kernel breakdown for an already-built `step`. Prints CUDA kernel launches/iter
+    (the fusion-opportunity signal: fewer launches = more fused) + per-op self-CUDA time so you can
+    SEE where time goes and what's fusable, not infer it from inductor's output. leaves: zero their
+    grads each iter for a fwd+bwd step."""
+    from torch.profiler import profile, ProfilerActivity
+
+    def _dev_us(e):   # self device (CUDA) time, robust across torch versions
+        return getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0.0)
+
+    _warm(step, 3)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            if leaves:
+                for lf in leaves:
+                    lf.grad = None
+            step()
+        torch.cuda.synchronize()
+    ka = prof.key_averages()
+    n_launch = sum(e.count for e in ka if _dev_us(e) > 0) / iters   # device-side ops = kernel launches
+    print(f"\n  --- profile: {label}  (~{n_launch:.0f} CUDA kernel launches/iter; fewer = more fused) ---")
+    for key in ("self_device_time_total", "self_cuda_time_total", "cuda_time_total"):
+        try:
+            print(ka.table(sort_by=key, row_limit=15)); break
+        except Exception:
+            continue
 
 
 # ─────────────────── fused-linear CE (chunk-budget candidate sweep) ───────────────────
@@ -439,6 +471,20 @@ def bench_moe(N=16384, H=512, I=768, E=9, top_k=2):   # BiBo training: 16384 tok
         except Exception as ex:
             print(f"\n=== MoE {vname} ===\n  FAILED: {type(ex).__name__}: {ex}")
 
+    if PROFILE:
+        # Where does the time actually go on THIS GPU, and how many launches can we fuse away?
+        # Profile kernel fwd, compiled-eager fwd (launch-count contrast), and kernel fwd+bwd.
+        K = moe_per_expert; Eg = _c(moe_eager)
+        G = torch.randn(N, H, device=DEV, dtype=DTYPE)
+        with torch.no_grad():
+            _profile("per-expert FORWARD", lambda: K(hid, idx, wt_full, gup, dwn, act_codes))
+            _profile("compiled-eager FORWARD", lambda: Eg(hid, idx, wt_full, gup, dwn, act_codes))
+        h2 = hid.clone().requires_grad_(True); g2 = gup.clone().requires_grad_(True)
+        d2 = dwn.clone().requires_grad_(True); w2 = wt_full.clone().requires_grad_(True)
+        _profile("per-expert FWD+BWD",
+                 lambda: (K(h2, idx, w2, g2, d2, act_codes) * G).sum().backward(),
+                 leaves=[h2, g2, d2, w2])
+
 
 # NOTE: Cut Cross Entropy (Apple cut_cross_entropy) was benched and REMOVED — on T4 it's
 # fwd+bwd 0.08x (catastrophic; CCE targets Ampere/Hopper, its T4-fitting autotune config is
@@ -630,9 +676,10 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
     COMPILE = "--compile" in sys.argv
     JSON_OUT = "--json" in sys.argv
+    PROFILE = "--profile" in sys.argv
     if "--dump-triton" in sys.argv:
         COMPILE = True  # dumping is meaningless without compiled fns
-    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json", "--dump-triton")]
+    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json", "--dump-triton", "--profile")]
     print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
