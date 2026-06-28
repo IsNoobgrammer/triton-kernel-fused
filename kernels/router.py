@@ -292,15 +292,14 @@ class FusedConvRouterCuDNN(torch.autograd.Function):
     fused epilogue-bwd kernel. grad_x exact; grad_w = cuDNN's (bit-matches compiled's bwd)."""
 
     @staticmethod
-    def forward(ctx, x, weight, bias, top_k, num_experts, channels_last=False):
+    def forward(ctx, x, weight, bias, top_k, num_experts):
         import torch.nn.functional as F
         B, S, H = x.shape
         E, _, K = weight.shape
-        # channels_last=False (proven): force NCHW-contiguous (B,H,S) for cuDNN. channels_last=True
-        # (experiment): feed the STRIDED transpose view (H-stride==1) — x is natively (B,S,H)=NHWC, so
-        # cuDNN's *_nhwc kernel may SKIP the nchwToNhwc/nhwcToNchw transposes (~482us on T4) + the
-        # 16.8MB copy. Arch-dependent (regressed on Ampere) -> A/B on T4. Correct for either layout.
-        xc = x.transpose(1, 2) if channels_last else x.transpose(1, 2).contiguous()  # (B,H,S)
+        # NCHW-contiguous (B,H,S) for cuDNN. (Tried channels-last to skip cuDNN's ~482us nchwToNhwc
+        # transposes — T4-refuted: cuDNN copies to its layout anyway + the strided input ADDED copies
+        # and slowed convolution_backward 613->948us. The transpose tax isn't removable via cuDNN.)
+        xc = x.transpose(1, 2).contiguous()                     # (B,H,S) — ONE copy, reused in bwd
         conv = F.conv1d(xc, weight, padding=K - 1)[..., :S]      # (B,E,S) causal, no F.pad copy
         logits = conv.transpose(1, 2).reshape(B * S, E)          # (B*S,E)
         idx, weights = _epilogue_fwd(logits, bias, top_k)
@@ -329,15 +328,11 @@ class FusedConvRouterCuDNN(torch.autograd.Function):
         grad_full = F.pad(grad_logits.view(B, S, E).transpose(1, 2), (0, K - 1))   # (B,E,S+K-1)
         grad_xc, grad_w = torch.ops.aten.convolution_backward(
             grad_full, xc, weight, [0], [1], [K - 1], [1], False, [0], 1, [True, True, False])[:2]
-        return grad_xc.transpose(1, 2), grad_w, None, None, None, None   # +channels_last
+        return grad_xc.transpose(1, 2), grad_w, None, None, None   # (B,H,S)->(B,S,H)
 
 
 def _cudnn_router(x, weight, bias, top_k, num_experts):
-    return FusedConvRouterCuDNN.apply(x, weight, bias, top_k, num_experts, False)
-
-
-def _cudnn_cl_router(x, weight, bias, top_k, num_experts):
-    return FusedConvRouterCuDNN.apply(x, weight, bias, top_k, num_experts, True)
+    return FusedConvRouterCuDNN.apply(x, weight, bias, top_k, num_experts)
 
 
 def _ref_router(x, weight, bias, top_k, num_experts):
@@ -359,7 +354,7 @@ def _ref_router(x, weight, bias, top_k, num_experts):
 
 
 _BACKENDS = {"tldot": FusedConvRouter, "cublas": FusedConvRouterCuBLAS}
-_FN_BACKENDS = {"ref": _ref_router, "cudnn": _cudnn_router, "cudnn_cl": _cudnn_cl_router}
+_FN_BACKENDS = {"ref": _ref_router, "cudnn": _cudnn_router}   # plain-autograd backends (cuDNN conv)
 
 
 def fused_router(x, conv_weight, bias, top_k, num_experts,

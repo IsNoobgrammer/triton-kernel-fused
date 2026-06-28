@@ -261,3 +261,15 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - Honest ceiling: beyond the transpose tax, the conv fwd/bwd GEMMs (923us) are the cuDNN floor; only a
   bandwidth-optimal transpose-free Triton conv (fwd+bwd, 52us/105us floors, 6-15x headroom but hard —
   tl.dot attempt was 818us) beats that. That's the next stepping stone if cudnn_cl lands.
+
+## Round 4 — channels-last A/B REFUTED; cudnn 1.12x stands — 2026-06-28
+- `cudnn_cl` (channels-last to skip cuDNN transposes) LOST on T4: fwd+bwd 0.95x vs cudnn 1.12x (bwd
+  0.84x). Profile: nchwToNhwc STILL 6.31ms (identical to cudnn) — cuDNN copies to its own layout
+  regardless; the strided input just ADDED copies (13.2->20.0ms) + slowed convolution_backward
+  (613->948us). The double-transpose theory was wrong; the 482us transpose tax is NOT cuDNN-removable.
+- **Process win: ZERO regression.** Champion was kept as a SEPARATE backend (not overwritten), so the
+  failed gamble cost nothing. This is why you A/B on held-out instead of replacing the champion with an
+  unconfirmed change — exactly the discipline that saved us here. Dropped cudnn_cl, restored clean cudnn.
+- Confirmed ceiling for the cuDNN approach: conv fwd 312 + conv bwd 613 + transposes 482 are all cuDNN
+  and immovable from outside. The ONLY remaining lever is a transpose-free bandwidth-optimal Triton conv
+  (fwd+bwd; 52/105us floors vs cuDNN 312/613) — the hard rewrite. cudnn 1.12x is the shipped win.
