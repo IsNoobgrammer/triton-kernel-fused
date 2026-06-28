@@ -111,3 +111,8 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - Remaining gap (~1.44x) is the BACKWARD recompute GEMM = the deliberate memory price; can't remove
   without saving logits (= compiled's memory). So ~1.4x may be near the low-mem floor. Next levers:
   chunk-size tuning (fewer launches now fwd is light), grad-logit kernel tiling — expect small.
+
+## Round 2 cont. — #3 refuted, #1 (int8) is the real win
+- **#3 (one-shot budget) REFUTED by T4**: chunk count barely affects backward (recompute GEMM dominates, not chunk overhead). one-shot wastes memory for no speed. Kept budget as a pure MEMORY dial; corrected the docstring that oversold one-shot. The eval did its job — killed my wrong hypothesis.
+- **#1 (int8 saved-logits) = big latency win.** Save logits as int8+per-row-scale in fwd, DEQUANTIZE in bwd -> skip the recompute GEMM (3->2 GEMM). Naive torch quantize LOST (1.44x: abs/amax/div/round/to-int8 = ~5 passes + fp16 temps cost more than the GEMM saved). FUSING the quantize (absmax folded into the reduce kernel + one int8 write kernel) -> **1.09x latency (nearly ties compiled)**, grad PASS 1.2e-2, NaN-free. Same lesson as iter1: fuse the elementwise, never torch-op it.
+- int8 grad_rel 1.2e-2 is close to the 1.5e-2 gate (it IS ~the fp16 GEMM noise floor; compiled = 1.11e-2). If T4 V=81000 pushes it over, fallback = per-row-BLOCK scales (finer quant). Watch on T4.
