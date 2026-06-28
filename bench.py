@@ -184,7 +184,12 @@ def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidd
 
     # --- our chunked CE at full N (never materializes (N,V); should fit where eager can't) ---
     MB = 1024 * 1024
-    for vname, budget in [("ce_384MB", 384 * MB), ("ce_1GB", 1024 * MB), ("ce_128MB", 128 * MB)]:
+    # ce_oneshot = budget >= N*V*2 -> chunk==N, single pass: the latency<->memory DIAL at its
+    # fast/parity end (fwd tied to compiled, bwd at the pure 3-GEMM floor ~1.33x, ~compiled memory).
+    # 128MB = the max-memory-saving end. Sweep shows the whole frontier.
+    oneshot = (N * V * 2) + 64 * MB
+    for vname, budget in [("ce_oneshot", oneshot), ("ce_384MB", 384 * MB),
+                          ("ce_1GB", 1024 * MB), ("ce_128MB", 128 * MB)]:
         try:
             K = (lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
             kf = _fwd_ms(lambda: K(hid, w))

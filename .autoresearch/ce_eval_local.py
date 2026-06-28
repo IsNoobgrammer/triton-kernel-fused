@@ -74,6 +74,8 @@ def run(name, fn):
 print(f"GPU {torch.cuda.get_device_name(0)} | CE proxy N={N} V={V} H={H} | dtype={DT}")
 print(f"  (N,V) fp16 logits would be {N*V*2/MB:.0f} MB  — baseline materializes this, ours does not")
 base_ms, base_pk, _ = run("compiled (baseline)", lambda h, w, l: compiled_cross_entropy(h, w, l))
-for tag, bud in [("ours_384MB", 384 * MB), ("ours_128MB", 128 * MB), ("ours_64MB", 64 * MB)]:
+_oneshot = N * V * 2 + 64 * MB   # chunk==N: the fast/parity end of the dial (#3)
+for tag, bud in [("ours_oneshot", _oneshot), ("ours_384MB", 384 * MB), ("ours_128MB", 128 * MB),
+                 ("ours_64MB", 64 * MB)]:
     ms, pk, rel = run(tag, lambda h, w, l, _b=bud: fused_linear_cross_entropy(h, w, l, bwd_logits_budget=_b))
     print(f"      -> latency {ms/base_ms:.2f}x baseline | peak {base_pk/max(pk,1):.2f}x less than baseline")

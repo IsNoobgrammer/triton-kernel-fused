@@ -132,6 +132,14 @@ class _CECublasChunked(torch.autograd.Function):
 
 def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, bwd_logits_budget=None):
     """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
-    Never materializes (N,V); cuBLAS speed at bounded (chunk,V) memory. bwd_logits_budget (bytes)
-    overrides the (chunk,V) transient budget: larger = fewer cuBLAS launches, more peak memory."""
+    Never materializes (N,V); cuBLAS speed at bounded (chunk,V) memory.
+
+    `bwd_logits_budget` (bytes) IS the latency<->memory dial — it caps the (chunk,V) transient:
+      • SMALL (e.g. 128MB)  -> tiny chunks, MAX memory saving (e.g. 3.5x less than compiled),
+        more chunk overhead -> highest latency.
+      • LARGE / one-shot (>= N*V*2, i.e. chunk == N) -> a SINGLE pass: forward tied to compiled,
+        backward at the pure 3-GEMM floor (no per-chunk accumulation overhead) ~= 1.33x fwd+bwd vs
+        compiled, at ~compiled's memory (you materialize (N,V) once). This is the fastest setting and
+        the point to pick when the logits DO fit — same speed-region as compiled, still grad-exact.
+    Sweep it to trade memory for latency; there is no single right value. Default = 384MB."""
     return _CECublasChunked.apply(hidden, weight, labels, ignore_index, bwd_logits_budget)
