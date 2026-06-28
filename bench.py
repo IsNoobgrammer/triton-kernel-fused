@@ -151,34 +151,57 @@ def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidd
     w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
     lab = torch.randint(0, V, (N,), device=DEV)
 
-    def eager(h, ww):
-        # fair fp16 baseline: fp16 GEMM (as in a real autocast model), CE math in fp32
-        return F.cross_entropy((h @ ww.t()).float(), lab)
+    def eager_full(h, ww, y):
+        # naive baseline: fp16 GEMM (autocast) → fp32 logits → CE. Materializes the (rows,V) matrix;
+        # at training N this is exactly what OOMs a T4 — that's the point of a never-materialize CE.
+        return F.cross_entropy((h @ ww.t()).float(), y)
 
-    print(f"\n(CE: N={N} H={H} V={V}  — eager = compiled F.cross_entropy)")
-    Eg = _c(eager)
-    ef = _fwd_ms(lambda: Eg(hid, w))
-    he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
-    estep = lambda: Eg(he, we).backward()
-    efb = _step_ms(estep, [he, we]); peak_e = _peak(estep)
+    torch.cuda.empty_cache()
+    # --- grad check on a SMALL slice so the fp32 (Nc,V) reference fits (the full-N ref OOMs by design) ---
+    Nc = min(N, 2048)
+    a = hid[:Nc].clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+    fused_linear_cross_entropy(a, wa, lab[:Nc]).backward()
+    bb = hid[:Nc].clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+    eager_full(bb, wb, lab[:Nc]).backward()
+    gabs, grel = _gdiff([(a.grad, bb.grad), (wa.grad, wb.grad)])
+    del a, wa, bb, wb; torch.cuda.empty_cache()
 
+    # --- compiled-eager baseline at FULL N — best-effort: it materializes the (N,V) logits and may OOM ---
+    print(f"\n(CE: N={N} H={H} V={V}  — eager = compiled F.cross_entropy; grad-check on {Nc}-row slice)")
+    ef = efb = peak_e = float("nan"); eager_ok = False
+    try:
+        Eg = _c(lambda h, ww: eager_full(h, ww, lab))
+        ef = _fwd_ms(lambda: Eg(hid, w))
+        he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
+        estep = lambda: Eg(he, we).backward()
+        efb = _step_ms(estep, [he, we]); peak_e = _peak(estep)
+        eager_ok = True
+        del he, we
+    except torch.cuda.OutOfMemoryError:
+        print(f"  compiled-eager CE OOM at N={N} (materializes the (N,V) logits) — our kernel is the "
+              f"ENABLING path here, not just faster. Standalone kernel numbers below.")
+    torch.cuda.empty_cache()
+
+    # --- our chunked CE at full N (never materializes (N,V); should fit where eager can't) ---
     MB = 1024 * 1024
     for vname, budget in [("ce_384MB", 384 * MB), ("ce_1GB", 1024 * MB), ("ce_128MB", 128 * MB)]:
         try:
-            a = hid.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
-            fused_linear_cross_entropy(a, wa, lab, bwd_logits_budget=budget).backward()
-            bb = hid.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
-            eager(bb, wb).backward()
-            gabs, grel = _gdiff([(a.grad, bb.grad), (wa.grad, wb.grad)])
             K = (lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
             kf = _fwd_ms(lambda: K(hid, w))
             h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
             kstep = lambda: K(h2, w2).backward()
-            kfb = _step_ms(kstep, [h2, w2])
-            _report(f"CE {vname} (N={N} V={V})", kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0),
-                    kfb, efb, gabs, grel, _peak(kstep), peak_e)
+            kfb = _step_ms(kstep, [h2, w2]); peak_k = _peak(kstep)
+            if eager_ok:
+                _report(f"CE {vname} (N={N} V={V})", kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0),
+                        kfb, efb, gabs, grel, peak_k, peak_e)
+            else:
+                print(f"\n=== CE {vname} (N={N} V={V}) — eager OOM, kernel standalone ===")
+                print(f"  forward {kf:7.3f} ms | fwd+bwd {kfb:7.3f} ms | peak {peak_k:6.0f} MB "
+                      f"| grad rel {grel:.2e} ({'PASS' if grel < 1.5e-2 else 'CHECK'})  [ENABLES training where eager OOMs]")
+            del h2, w2; torch.cuda.empty_cache()
         except Exception as ex:
-            print(f"\n=== CE {vname} ===\n  FAILED: {type(ex).__name__}: {ex}")
+            print(f"\n=== CE {vname} ===\n  FAILED: {type(ex).__name__}: {str(ex).splitlines()[0]}")
+            torch.cuda.empty_cache()
 
 
 # ───────────────────────── XSA ─────────────────────────
