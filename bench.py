@@ -274,6 +274,68 @@ def bench_conv_router(B=16, S=1024, H=512, E=11, K=4):   # BiBo training: batch 
             kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
 
 
+def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv router: 11 experts, top-2
+    """WHOLE conv router (conv+sigmoid+bias-select+topk+gather+norm) as ONE fused op vs the same
+    pipeline in torch.compile'd eager. The fused win is the transpose-free conv + folded-away glue
+    (sigmoid/bias/gather) that compile can't pull out of cuDNN. Verifies grad_x/grad_w equivalence,
+    idx agreement, and that the in-kernel count == bincount. topk/norm stay eager on both sides."""
+    from kernels.router import fused_router, _count_experts
+    x = torch.randn(B, S, H, device=DEV, dtype=DTYPE)
+    w = torch.randn(E, H, K, device=DEV, dtype=DTYPE) * 0.02
+    bias = torch.zeros(E, device=DEV, dtype=torch.float32)
+    G = torch.randn(B, S, top_k, device=DEV, dtype=torch.float32)        # upstream grad on weights
+
+    def eager(xx, ww):
+        xp = F.pad(xx.transpose(1, 2), (K - 1, 0))
+        logits = F.conv1d(xp, ww).transpose(1, 2).reshape(B, S, E).float()
+        scores = torch.sigmoid(logits)
+        sel = scores + bias
+        _, idx = torch.topk(sel, top_k, dim=-1)
+        wt = scores.gather(-1, idx)
+        wt = wt / (wt.sum(-1, keepdim=True) + 1e-20)
+        return idx, wt
+
+    # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 ──
+    # fp16 routing diverges ~0.03% (the fused path sigmoids fp32 logits, MORE precise than eager's
+    # fp16-rounded cuDNN logits), which scrambles grads on the few re-routed tokens. fp32 isolates
+    # the kernel math from that (idx becomes exact) — same methodology as the BiBo verification.
+    xf = x.float(); wf = w.float(); Gf = G.float()
+    xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)
+    xb = xf.clone().requires_grad_(True); wb = wf.clone().requires_grad_(True)
+    ik, wk, ck = fused_router(xa, wa, bias, top_k, E, return_counts=True)
+    ie, we = eager(xb, wb)
+    (wk * Gf).sum().backward(); (we * Gf).sum().backward()
+    gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
+    idx_agree = (ik.sort(-1).values == ie.sort(-1).values).float().mean().item()
+    cnt_ok = bool((ck == _count_experts(ik, E)).all().item()) and bool((ck == torch.bincount(ie.reshape(-1), minlength=E).int()).all().item())
+    print(f"  [fp32] idx-agree {idx_agree:.4f} | in-kernel count == bincount: {cnt_ok}")
+
+    # ── NaN-free 2-pass (Rule 2) ──
+    nan = False
+    for _ in range(2):
+        xt = x.clone().requires_grad_(True); wt2 = w.clone().requires_grad_(True)
+        _, wo = fused_router(xt, wt2, bias, top_k, E)
+        (wo * G).sum().backward()
+        nan |= bool(wo.isnan().any() or xt.grad.isnan().any() or wt2.grad.isnan().any())
+    print(f"  NaN-free 2-pass: {not nan}")
+
+    # ── 3-phase timing (Rule 3) vs compiled eager ──
+    kfn = lambda xx, ww: fused_router(xx, ww, bias, top_k, E)[1]
+    efn = _c(lambda xx, ww: eager(xx, ww)[1])
+    kf = _fwd_ms(lambda: kfn(x, w)); ef = _fwd_ms(lambda: efn(x, w))
+    x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+    kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
+    eb = _bwd_ms(lambda: (efn(x2, w2) * G).sum(), [x2, w2])
+    kstep = lambda: (kfn(x2, w2) * G).sum().backward()
+    estep = lambda: (efn(x2, w2) * G).sum().backward()
+    kfb, efb = _stats(kstep, estep, [x2, w2])
+    _report("FULL conv router (B=%d S=%d H=%d E=%d K=%d k=%d)" % (B, S, H, E, K, top_k),
+            kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+    if PROFILE:
+        _profile("fused router fwd+bwd", kstep, leaves=[x2, w2])
+        _profile("compiled-eager router fwd+bwd", estep, leaves=[x2, w2])
+
+
 # ───────── outsourced reference kernels (Liger) — do THEY beat compiled eager? ─────────
 def bench_liger_swiglu(M=16384, I=1024):
     try:
@@ -674,7 +736,7 @@ def bench_ce_sweep(N=16384, H=512, V=81000):
 
 BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
            "ce_sweep": bench_ce_sweep,
-           "xsa": bench_xsa, "conv": bench_conv_router,
+           "xsa": bench_xsa, "conv": bench_conv_router, "router": bench_router_full,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
            "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
            "liger_ce_sweep": bench_liger_ce_sweep}
