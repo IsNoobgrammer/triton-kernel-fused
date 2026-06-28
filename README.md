@@ -11,14 +11,15 @@ from kernels import fused_linear_cross_entropy, fused_xsa, causal_conv1d_router,
 Every kernel is wrapped in a `torch.autograd.Function` (trains normally) and is
 grad-equivalent to eager within fp16 tolerance (relative error < 1.5e-2, verified by `bench.py`).
 
-> **Honest headline (measured on T4 vs `torch.compile`, not vs slow eager).** Two of these beat
+> **Honest headline (measured on T4 vs `torch.compile`, not vs slow eager).** Three of these beat
 > what the compiler gives you for free, for structural reasons compile can't touch:
-> **`moe` (per-expert)** — ~2.9× faster, because `torch.compile` can't fuse data-dependent routing —
-> and **`fused_linear_cross_entropy`** — the memory play that lets large-vocab CE fit when it would
+> **`moe` (per-expert)** — ~2.9× faster, because `torch.compile` can't fuse data-dependent routing;
+> **`fused_linear_cross_entropy`** — the memory play that lets large-vocab CE fit when it would
 > otherwise OOM, and which now also **beats Liger's fused-linear CE** (the standard for this op):
-> 260 ms vs 321 ms at 16k tok / vocab 81k on T4, with gradients *tighter* to fp32 than Liger's. The
-> elementwise kernels (XSA, conv-router) **tie or lose** under compile — inductor already fuses those
-> ops — so they're kept only as **no-`torch.compile` fallbacks**. (SwiGLU was dropped entirely:
+> 260 ms vs 321 ms at 16k tok / vocab 81k on T4, with gradients *tighter* to fp32 than Liger's; and
+> **`fused_xsa`** — **1.20× fwd / 1.15× fwd+bwd** vs inductor, because one fused kernel reads V once
+> while inductor's two kernels read it twice. `causal_conv1d_router` still **ties or loses** under
+> compile (inductor uses cuDNN), kept as a no-`torch.compile` fallback. (SwiGLU was dropped entirely:
 > `torch.compile`'s lifted SiLU-mul kernel matches a hand-written one, so we leave it to the compiler.)
 > The grouped-MoE `tl.dot` path is a disaster on Turing and is **auto-disabled on sm_<80**.
 > See [Reality check](#reality-check-vs-torchcompile-on-t4).
@@ -195,15 +196,18 @@ Measured **Tesla T4, fp16, `--compile` (both sides compiled)**, fwd+bwd — the 
 |---|---|---|---|
 | **MoE per-expert** | **2.85×** | 1.08× less | **keep — real speed win** (compile can't fuse routing) |
 | fused-linear CE (fused-fwd+bwd) | 0.76× (slower than compiled std CE) | **3.4× less** | **keep — memory/OOM, and beats Liger** (see below) |
-| XSA | 0.89× | 1.0× | fallback only |
+| **XSA** | **1.15×** (fwd 1.20×) | 1.0× | **keep — beats inductor** (one fused kernel reads V once vs inductor's two) |
 | causal-conv1d router | 0.75× | 1.23× less | fallback only — inductor uses cuDNN conv |
 | MoE grouped | **0.10×** | 0.80× | **disabled on Turing** (tl.dot cliff); Ampere+ only |
 
-Takeaway: under `torch.compile`, hand-written **elementwise** Triton kernels don't beat inductor — it
-already fuses those, on-GPU, and our `autograd.Function` is an opaque graph-break that can even block
-inductor from fusing across it. The wins are where compile **structurally can't help**: data-dependent
-MoE dispatch (speed) and not materializing the (N,V) logits (memory). The Ampere/eager table above
-overstates the elementwise kernels — trust this one for a compiled pipeline.
+Takeaway: under `torch.compile`, hand-written Triton beats inductor only where compile **structurally
+can't help**: data-dependent MoE dispatch (speed), not materializing the (N,V) logits (CE memory), and
+**XSA — where a single fused kernel reads V once and computes ‖v‖² inline, while inductor emits two
+kernels and reads V twice** (a ~15–20% traffic saving a graph can't recover, since it won't fuse a
+reduction's consumer back into the reduction). Pure *elementwise* ops with no such structure (SwiGLU;
+conv, where inductor calls cuDNN) tie or lose — inductor already fuses them at the bandwidth ceiling,
+and our `autograd.Function` is an opaque graph-break. The Ampere/eager table above overstates the
+elementwise kernels — trust this one for a compiled pipeline.
 
 ### Fused-linear CE vs Liger
 

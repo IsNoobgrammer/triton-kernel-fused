@@ -149,3 +149,23 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - CONVERGED (round 3): ship `_CEFusedFwdBwd` @192MB default. Beats Liger on speed AND grad accuracy;
   compiled std CE still fastest when logits fit (CE is the memory/OOM play). int8 + recompute REMOVED
   (dominated). Ported to BiBo `src/kernels/fused_ce.py`.
+
+## Round 3b (XSA beats inductor) — 2026-06-28
+- XSA was 0.86x fwd+bwd vs compiled (README "fallback only"). Diagnosed: the kernel launched
+  **one program per (b,kv,s) row, BLOCK_D=128**, doing cross-lane D-reductions — the SAME
+  fine-granularity occupancy trap as the CE one-pass kernel. Bandwidth-starved, not the op being hard.
+- **FIX = re-tile**: XBLOCK rows/program + vectorized D-reduction (axis=1), keep the single fused
+  kernel per phase. T4: **fwd 1.20x, fwd+bwd 1.15x** (was 0.36/0.86), grad PASS. BEATS inductor.
+- **Why it WINS (a real structural edge, unlike pure elementwise)**: our ONE fused kernel reads V
+  once + computes ‖v‖² inline; inductor emits TWO kernels and reads V twice (norm kernel, then main).
+  Traffic ~10 vs ~12 units (Hq4/Hkv2) → ~15-20% less. A graph can't recover this: inductor won't fuse
+  a reduction's consumer back into the reduction. Predicted ~15%, measured 20% on fwd.
+- Backward = 0.98x (tie) as predicted: more terms (grad_V accumulates over the group), no traffic edge.
+- **Lesson: "elementwise loses to compile" is NOT universal — it holds for ops with NO structural edge
+  (SwiGLU, conv). XSA has one (the shared-V reduction across the GQA group → read V once in a single
+  kernel). The re-tile is the same move that fixed CE: replace one-program-per-row with XBLOCK-rows +
+  vectorized inner reduction. Fine-grained per-row launches are the recurring T4 anti-pattern.**
+- **fwd+bwd-fusion line clarified**: ONE kernel for fwd+bwd is possible ONLY for terminal/scalar-loss
+  ops (CE — grad needs no upstream tensor). Mid-network ops (XSA, SwiGLU, MoE, conv) MUST run backward
+  as a separate phase (grad depends on the downstream grad_output, absent at forward) → max fusion =
+  one fused kernel PER phase, which XSA now has.
