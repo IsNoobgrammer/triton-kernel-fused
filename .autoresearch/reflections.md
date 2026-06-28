@@ -122,3 +122,30 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - Why: per-row int8 needs abs-max -> a 2nd full (N,V) forward pass (+33ms) that ate most of the -69ms backward GEMM saving (net only -36ms / 10%). And it HOLDS (N,V) int8 = 1.3GB -> peak 2x worse than recompute, breaking the keep-memory goal. Disqualified by the objective's memory constraint, not just slow.
 - **Lesson (GEPA opt-set-overfit): the proxy's small V cheapened both the extra forward pass AND the held int8 (131MB vs 1.3GB) — it flattered int8 on the exact axes T4 punished. A win on the opt-set is a hypothesis; the held-out (T4) is the verdict.** Always confirm latency+memory at true V before believing a quant win.
 - CE loop CONVERGED: ship recompute + fused-forward (iter1) + gw.add_ (iter2). fwd tied compiled, bwd at recompute floor, budget = memory dial (2.35x @384MB .. 3.5x @128MB less mem). int8 dead, one-shot dead.
+
+## Round 3 (NEW external baseline = Liger; "recompute floor" REFUTED) — 2026-06-28
+- Benched ours vs **Liger fused-linear CE** (`liger_ce_sweep`, same mem-budget grid as `ce_sweep`).
+  T4 verdict: **Liger BEAT our recompute path** at matched memory (Liger@2048 300ms/1083MB vs ours
+  ~372ms). Our "recompute GEMM is the irreducible floor" diagnosis (round-2 state.json) was WRONG.
+- **Why Liger wins / why our floor was self-inflicted**: CE's grad w.r.t. logits = (softmax-onehot)/n
+  needs ONLY logits+labels (loss scalar → upstream grad is a scalar). Liger computes the FULL grad in
+  the FORWARD chunk loop while logits are live → never stores (N,V), never recomputes. We had split
+  fwd(lse)/bwd(recompute) — the 4th GEMM was our design choice, not a law. **Lesson: an external SOTA
+  baseline is worth more than N self-comparisons — the local proxy only ever raced us against
+  ourselves, so it never exposed the wrong split.**
+- **FIX = `_CEFusedFwdBwd`**: grad-in-forward, no recompute (4→3 GEMM). T4: ours @192MB **260ms/904MB
+  beats Liger@1024 321ms/836MB (19% faster) AND Liger@2048 (faster, 180MB less)**. Pareto-ahead.
+- **Sub-trap (occupancy)**: first cut fused reduce+grad into ONE per-row kernel (V streamed twice
+  serially, only `chunk` programs) — LOCALLY 1.41x faster, but T4 LOST to Liger (launch/occupancy-
+  bound; latency *dropped* with bigger chunk = the tell). FIX: split into per-row `_fwd_reduce` (lse)
+  + 2D-grid `_grad_logits_inplace` (~chunk/32×V/256 programs) → saturates SMs → 400→260ms @128MB,
+  curve flattened (GEMM-bound). **Lesson: local (3050, small V) hides occupancy; a one-program-per-row
+  kernel over a huge V is launch-bound on the wider T4 — prefer 2D grids. Local ≠ T4, AGAIN.**
+- **Grads tighter than Liger**: ours grad_hidden rel 1.9e-3 vs Liger 1.1e-2 (vs fp32), grad_weight
+  7e-4 both, loss bit-identical to Liger / eager 1e-6. We out-accuracy the SOTA baseline too.
+- BMM/grouped-GEMM for the chunk GEMMs: REJECTED (analysis, not benched). Batching needs all chunk
+  operands resident = the full (N,V) = the memory we chunk to avoid; the fully-batched limit IS the
+  compiled baseline. And our chunk GEMMs are already large (M~1242), not launch-bound. No free lunch.
+- CONVERGED (round 3): ship `_CEFusedFwdBwd` @192MB default. Beats Liger on speed AND grad accuracy;
+  compiled std CE still fastest when logits fit (CE is the memory/OOM play). int8 + recompute REMOVED
+  (dominated). Ported to BiBo `src/kernels/fused_ce.py`.

@@ -1,23 +1,25 @@
 {
-  "round": 2,
-  "objective": "minimize our CE fwd+bwd latency vs lifted-compiled baseline, s.t. peak <= compiled peak (keep memory saving) AND grad_rel < 1.5e-2",
-  "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous)",
-  "eval_held_out": "python bench.py --compile ce_fit on Tesla T4 (N=16384 V=81000) — user runs",
+  "round": 3,
+  "objective": "minimize our CE fwd+bwd latency vs the Liger fused-linear-CE baseline at matched memory, grad_rel < 1.5e-2",
+  "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous; correctness + relative latency only — does NOT predict T4 occupancy)",
+  "eval_held_out": "python bench.py --compile ce_sweep liger_ce_sweep on Tesla T4 (N=16384 V=81000) — user runs",
   "grad_gate_rel": 0.015,
-  "baseline": {"name": "lifted compiled CE (ce_compiled.py): materialize (N,V) once, NO bwd recompute",
-               "local_proxy_ms": 48.8, "local_proxy_mb": 430, "t4_ce_fit_ms": 198, "t4_ce_fit_mb": 3072},
+  "baseline": {"name": "Liger LigerFusedLinearCrossEntropy (the SOTA external kernel for this niche)",
+               "t4_chunk1024_ms": 321, "t4_chunk1024_mb": 836,
+               "t4_chunk2048_ms": 283, "t4_chunk2048_mb": 1083,
+               "compiled_std_ce_t4_ms": 197, "compiled_std_ce_t4_mb": 3075},
   "best": {
-    "iter": 1,
-    "change": "fused online-softmax forward kernel (kill .float() (C,V) fp32 buffer; logsumexp+gather in 1 pass)",
-    "local_proxy": {"ours_128MB": {"ms": 70.5, "mb": 424, "lat_x": 1.44, "mem_x_less": 1.02},
-                    "ours_64MB": {"ms": 77.6, "mb": 328, "lat_x": 1.59, "mem_x_less": 1.31}},
-    "grad_rel": 1.1e-2,
-    "status": "KEEP on local opt-set; AWAITING T4 ce_fit held-out confirmation"
+    "name": "_CEFusedFwdBwd (grad-in-forward, no recompute; per-row _fwd_reduce + 2D-grid _grad_logits_inplace)",
+    "t4_192MB_ms": 260, "t4_192MB_mb": 904, "t4_192MB_x_compiled": 0.76,
+    "grad_hidden_rel_vs_fp32": 1.9e-3, "grad_weight_rel_vs_fp32": 7.1e-4, "loss_vs_liger": 0.0,
+    "status": "CONVERGED — beats Liger@1024 by 19% at +68MB AND Liger@2048 (faster, 180MB less); grads tighter to fp32 than Liger. Ported to BiBo src/kernels/fused_ce.py."
   },
-  "diagnosis": "After iter1 we are GEMM-COUNT bound: ours backward = 3 GEMM (recompute-logits + grad_h + grad_w) vs compiled 2 GEMM (saved logits, no recompute); fwd both = 1 GEMM + fused reduce. So ours 4 GEMM vs compiled 3 -> ~1.33x floor, matches observed 1.37-1.44x. The extra GEMM IS the memory price (recompute instead of save). Going below 1.33x REQUIRES saving logits = spending compiled's memory = violates keep-memory.",
-  "tried": ["iter0 baseline (1.88x @ parity)", "iter1 fused-fwd (1.44x @ parity, KEEP)"],
-  "open_levers": ["chunk-size/launch tuning (M2, expect small — already GEMM-bound)",
-                  "grad-logit kernel block tiling (M2, expect small)",
-                  "recompute=False fast mode = baseline path, for ce_fit where memory DOES fit (one auto-picking CE)"],
-  "stop_reasoning": "near recompute floor on low-mem path; further latency needs memory. Confirm iter1 on T4, then likely ship + add recompute=False fast-mode for the fits regime."
+  "diagnosis": "Round-2 'recompute GEMM is the irreducible floor' was REFUTED by the Liger baseline. CE grad needs only logits+labels (loss scalar -> scalar upstream grad), so the full gradient is computable in the FORWARD chunk loop -> no stored (N,V), no recompute (4 GEMM -> 3). The recompute was a self-inflicted design choice from splitting fwd(lse)/bwd. Occupancy sub-trap: a one-program-per-row fused reduce+grad kernel won locally but lost on T4 (launch-bound, V streamed serially); the 2D-grid grad kernel saturates the T4 SMs and is the real fix.",
+  "tried": ["iter0 baseline 1.88x", "iter1 fused-fwd 1.44x KEEP", "iter2 gw.add_ KEEP",
+            "one-shot budget REFUTED (T4)", "int8 saved-logits REFUTED (T4 opt-set overfit)",
+            "fused-fwd+bwd grad-in-forward KEEP (beats Liger)",
+            "one-pass per-row reduce+grad REVERTED (T4 occupancy)",
+            "BMM/grouped-GEMM for chunks REJECTED (needs full (N,V) resident = no memory win)"],
+  "removed": ["_CEInt8 + int8 kernels (dominated on T4)", "_CECublasChunked recompute (dominated by fused, no mem upside)", "fused_swiglu kernel (compile ties it)"],
+  "stop_reasoning": "CONVERGED. Ours Pareto-beats the SOTA external baseline (Liger) on speed AND grad accuracy at matched memory; compiled std CE remains fastest only when logits fit (CE is the memory/OOM play). No remaining lever clears Liger without spending the memory back (BMM = compiled). Shipped + ported to BiBo + docs updated."
 }

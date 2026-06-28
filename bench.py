@@ -155,23 +155,17 @@ def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidd
               f"ENABLING path here, not just faster. Standalone kernel numbers below.")
     torch.cuda.empty_cache()
 
-    # --- our chunked CE at full N: recompute (3 GEMM, cheap mem) vs int8 saved-logits (2 GEMM,
-    # faster, dequant instead of recompute). Each budget runs BOTH so you see the latency/mem tradeoff
-    # AND the int8 win side-by-side. grad_rel is checked PER MODE on the small slice (int8 is approx).
+    # --- our fused-fwd+bwd CE at full N (grad in forward, no recompute) at two budgets ---
     MB = 1024 * 1024
-    for vname, budget, mode in [("ce_384MB_recompute", 384 * MB, "recompute"),
-                                ("ce_384MB_int8", 384 * MB, "int8"),
-                                ("ce_128MB_recompute", 128 * MB, "recompute"),
-                                ("ce_128MB_int8", 128 * MB, "int8")]:
+    for vname, budget in [("ce_192MB", 192 * MB), ("ce_128MB", 128 * MB)]:
         try:
-            # per-mode grad check on the Nc-row slice (int8 quant error differs from recompute)
             a = hid[:Nc].clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
-            fused_linear_cross_entropy(a, wa, lab[:Nc], bwd_logits_budget=budget, bwd_mode=mode).backward()
+            fused_linear_cross_entropy(a, wa, lab[:Nc], bwd_logits_budget=budget).backward()
             bb = hid[:Nc].clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
             eager_full(bb, wb, lab[:Nc]).backward()
             gabs_m, grel_m = _gdiff([(a.grad, bb.grad), (wa.grad, wb.grad)])
             del a, wa, bb, wb; torch.cuda.empty_cache()
-            K = (lambda h, ww, _b=budget, _m=mode: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b, bwd_mode=_m))
+            K = (lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
             kf = _fwd_ms(lambda: K(hid, w))
             h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
             kstep = lambda: K(h2, w2).backward()

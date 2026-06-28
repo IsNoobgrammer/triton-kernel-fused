@@ -1,24 +1,27 @@
 # triton-kernel-fused
 
-Five standalone, drop-in **fused Triton kernels** (forward **and** backward), each a swap-in
+Four standalone, drop-in **fused Triton kernels** (forward **and** backward), each a swap-in
 replacement for its PyTorch-eager equivalent. No framework, no `pip install` — copy the
 `kernels/` folder into your project and import.
 
 ```python
-from kernels import fused_swiglu, fused_linear_cross_entropy, fused_xsa, causal_conv1d_router, moe
+from kernels import fused_linear_cross_entropy, fused_xsa, causal_conv1d_router, moe
 ```
 
 Every kernel is wrapped in a `torch.autograd.Function` (trains normally) and is
 grad-equivalent to eager within fp16 tolerance (relative error < 1.5e-2, verified by `bench.py`).
 
-> **Honest headline (measured on T4 vs `torch.compile`, not vs slow eager).** If you train with
-> `torch.compile`, only **two** of these beat what the compiler gives you for free:
+> **Honest headline (measured on T4 vs `torch.compile`, not vs slow eager).** Two of these beat
+> what the compiler gives you for free, for structural reasons compile can't touch:
 > **`moe` (per-expert)** — ~2.9× faster, because `torch.compile` can't fuse data-dependent routing —
-> and **`fused_linear_cross_entropy`** — ~1.3× *less memory* (the one thing that lets large-vocab CE
-> fit when it would otherwise OOM; it's a touch *slower* than compiled CE). The elementwise kernels
-> (SwiGLU, XSA, conv-router) **tie or lose** under compile — inductor already fuses those ops — so
-> they're kept only as **no-`torch.compile` fallbacks**. The grouped-MoE `tl.dot` path is a disaster
-> on Turing and is **auto-disabled on sm_<80**. See [Reality check](#reality-check-vs-torchcompile-on-t4).
+> and **`fused_linear_cross_entropy`** — the memory play that lets large-vocab CE fit when it would
+> otherwise OOM, and which now also **beats Liger's fused-linear CE** (the standard for this op):
+> 260 ms vs 321 ms at 16k tok / vocab 81k on T4, with gradients *tighter* to fp32 than Liger's. The
+> elementwise kernels (XSA, conv-router) **tie or lose** under compile — inductor already fuses those
+> ops — so they're kept only as **no-`torch.compile` fallbacks**. (SwiGLU was dropped entirely:
+> `torch.compile`'s lifted SiLU-mul kernel matches a hand-written one, so we leave it to the compiler.)
+> The grouped-MoE `tl.dot` path is a disaster on Turing and is **auto-disabled on sm_<80**.
+> See [Reality check](#reality-check-vs-torchcompile-on-t4).
 
 ## Getting started
 
@@ -46,27 +49,17 @@ torch wheel; on Linux it's a separate wheel (declared as a dependency).
 
 | Kernel | Replaces | What it fuses |
 |---|---|---|
-| `fused_swiglu(gate_up)` | `silu(gate) * up` | SwiGLU activation + gradient, one kernel each. GEMMs stay cuBLAS. |
-| `fused_linear_cross_entropy(hidden, weight, labels)` | `F.cross_entropy(hidden @ W.T, labels)` | LM-head GEMM + softmax-CE **without materializing the (N,V) logits** (cut-cross-entropy style, cuBLAS-chunked). |
+| `fused_linear_cross_entropy(hidden, weight, labels)` | `F.cross_entropy(hidden @ W.T, labels)` | LM-head GEMM + softmax-CE **without materializing the (N,V) logits** (cut-cross-entropy style); grad computed in the forward chunk loop, **no backward recompute**. Beats Liger. |
 | `fused_xsa(attn_out, value_states)` | Exclusive Self Attention rejection `y − (y·v̂)v̂` | normalize + dot + reject + GQA broadcast, one kernel each. No repeat_kv copy. |
 | `causal_conv1d_router(x, weight)` | `pad → F.conv1d → reshape` (causal) | causal conv1d projection in native (B,S,H) layout, transpose-free fwd + bwd. |
 | `moe(hidden, idx, weights, gate_up_proj, down_proj, act_codes)` | a hand-written PolyGLU MoE expert loop | the expert pipeline: dispatch → ragged GEMM + per-expert PolyGLU activation → weighted combine. Per-expert (cuBLAS + fused-act) and grouped-GEMM paths. |
 
 ## Usage
 
-**SwiGLU** — operate on a concatenated `gate_up` (M, 2·I), produced by one fused
-`gate_up_proj` (Linear → 2·I). Or use the bundled module:
-```python
-from kernels import fused_swiglu, FusedSwiGLUMLP
-out = fused_swiglu(gate_up)                       # (M, I)
-mlp = FusedSwiGLUMLP(hidden=512, intermediate_size=1408)   # drop-in nn.Module
-# port weights from a separate gate/up/down model:
-mlp.load_from_gate_up(m.gate_proj.weight, m.up_proj.weight, m.down_proj.weight)
-```
-
 **Fused-linear CE** — pass the pre-logit hidden states and the LM-head weight directly:
 ```python
 loss = fused_linear_cross_entropy(hidden, lm_head.weight, labels)   # hidden (N,H), weight (V,H)
+# bwd_logits_budget=192*1024*1024 (default) caps the (chunk,V) transient — the memory dial.
 ```
 
 **XSA** — apply after value aggregation, before `o_proj`:
@@ -158,7 +151,7 @@ layer with a training step) are in [`examples/moe_usage.py`](examples/moe_usage.
 
 ## Benchmarks
 
-`python bench.py` runs all five (or `python bench.py swiglu ce xsa conv moe`): forward / backward /
+`python bench.py` runs all four (or `python bench.py ce xsa conv moe`): forward / backward /
 forward+backward via `triton.testing.do_bench`, plus a grad-equivalence check and peak memory.
 
 **`--compile`** (`python bench.py --compile`) wraps the kernel **and** eager forwards in
@@ -172,7 +165,6 @@ fp16, torch 2.6 / triton 3.7 — speedup = eager ÷ kernel. Re-run on your own h
 
 | Kernel (shape) | fwd | bwd | fwd+bwd | peak mem | grad rel |
 |---|---|---|---|---|---|
-| SwiGLU (M=8192, I=768) | 2.1× | 5.2× | 3.4× | 1.2× less | 5.7e-4 |
 | fused-linear CE (N=4096, H=512, V=81000) | 5.0× | 8.4× | 7.1× | 2.1× less | 8.2e-4 |
 | XSA (B=8, Hq=8, S=1024, D=128, Hkv=2) | 2.5× | 2.9× | 2.4× | 1.2× less | 1.0e-3 |
 | causal-conv1d router (B=8, S=1024, H=512, E=11, K=4) | 3.4× | 5.2× | 3.9× | 1.2× less | 6.9e-4 |
@@ -188,8 +180,10 @@ Notes:
   is faster but uses ~1.2× more memory (it saves intermediates for the backward); `per-expert` is the
   guaranteed-correct, memory-lean path and the better choice at low token counts.
 - **fused-linear CE** speedups are vs naive eager (which materializes the full (N,V) logits). Against
-  a `torch.compile`d standard CE the *time* win narrows toward a tie, but the **~2× memory saving
-  stands** — and it's the only path that fits when standard CE OOMs (large N × large vocab).
+  a `torch.compile`d standard CE the *time* win narrows (compiled std CE is fastest when the logits
+  fit), but the **~3.4× memory saving stands** — and it's the only path that fits when standard CE
+  OOMs (large N × large vocab). The real comparison is **vs Liger's fused-linear CE** (same niche) —
+  see [CE vs Liger](#fused-linear-ce-vs-liger).
 - conv-router grad_w has large *absolute* error (~0.25) but ~7e-4 *relative* (TF32 `tl.dot`
   long-reduction order); grad_x is exact.
 
@@ -200,8 +194,7 @@ Measured **Tesla T4, fp16, `--compile` (both sides compiled)**, fwd+bwd — the 
 | kernel | fwd+bwd vs compiled eager | peak mem | verdict |
 |---|---|---|---|
 | **MoE per-expert** | **2.85×** | 1.08× less | **keep — real speed win** (compile can't fuse routing) |
-| fused-linear CE | 0.61× (slower) | **1.34× less** | **keep — memory/OOM only**, not for speed |
-| SwiGLU | 0.96× | 1.0× | fallback only — inductor fuses it free |
+| fused-linear CE (fused-fwd+bwd) | 0.76× (slower than compiled std CE) | **3.4× less** | **keep — memory/OOM, and beats Liger** (see below) |
 | XSA | 0.89× | 1.0× | fallback only |
 | causal-conv1d router | 0.75× | 1.23× less | fallback only — inductor uses cuDNN conv |
 | MoE grouped | **0.10×** | 0.80× | **disabled on Turing** (tl.dot cliff); Ampere+ only |
@@ -211,6 +204,27 @@ already fuses those, on-GPU, and our `autograd.Function` is an opaque graph-brea
 inductor from fusing across it. The wins are where compile **structurally can't help**: data-dependent
 MoE dispatch (speed) and not materializing the (N,V) logits (memory). The Ampere/eager table above
 overstates the elementwise kernels — trust this one for a compiled pipeline.
+
+### Fused-linear CE vs Liger
+
+At the LM-head, compiled standard CE wins on raw speed *when the logits fit*. The fused-linear CE
+exists for when they don't — and the established kernel for that niche is **Liger's
+`LigerFusedLinearCrossEntropy`**. Measured **T4, fp16, `--compile`, N=16384 (B16×S1024), V=81000,
+H=512**, fwd+bwd, compiled standard CE = 197 ms / 3075 MB as the reference:
+
+| kernel | fwd+bwd | peak mem | grad_hidden vs fp32 | grad_weight vs fp32 |
+|---|---|---|---|---|
+| **ours @192MB** | **260 ms** | **904 MB** (3.4× less) | **1.9e-3** | 7.1e-4 |
+| Liger @chunk1024 | 321 ms | 836 MB (3.7× less) | 1.1e-2 | 7.1e-4 |
+| Liger @chunk2048 | 283 ms | 1083 MB (2.8× less) | 1.1e-2 | 7.1e-4 |
+
+Ours @192MB is **19% faster than Liger@1024** at +68 MB, and **faster than Liger@2048 at 180 MB
+less** — Pareto-ahead either way. Loss is bit-identical to Liger and matches fp32 eager to 1e-6, and
+our `grad_hidden` is **~5× tighter to the fp32 reference** than Liger's (we compute the gradient in
+the forward chunk loop and overwrite the live logit tile in place — no recompute GEMM, and the
+softmax→grad path keeps more fp32 than Liger's). Reproduce: `python bench.py --compile ce_sweep liger_ce_sweep`.
+The 192 MB default is the T4 latency knee from `ce_sweep` (flat 260–264 ms across 192–384 MB; the
+curve is GEMM-bound, so a smaller budget just buys memory).
 
 ## A note on `triton.autotune`
 
