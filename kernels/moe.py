@@ -45,6 +45,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice   # hardware tanh (matches torch.tanh; stable, no overflow)
 
 __all__ = ["moe", "moe_per_expert", "moe_grouped", "moe_grouped_cublas", "moe_eager",
            "BatchedGLU", "GROUPED_MIN_TOKENS"]
@@ -66,7 +67,7 @@ def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Out_ptr, M, I, s_gu_m, s_gu_i, s_o_m, s
     at = tl.load(Act_ptr + offs_m, mask=mask_m, other=0)[:, None]
     silu = gate * (1.0 / (1.0 + tl.exp(-gate)))
     relu = tl.maximum(gate, 0.0)
-    tnh = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * gate))) - 1.0
+    tnh = libdevice.tanh(gate)
     act = tl.where(at == 0, silu, tl.where(at == 1, relu * relu, tnh))
     tl.store(Out_ptr + offs_m[:, None] * s_o_m + offs_i[None, :] * s_o_i,
              (act * up).to(Out_ptr.dtype.element_ty), mask=mask)
@@ -86,7 +87,7 @@ def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, GradGateUp_ptr, M, I,
     at = tl.load(Act_ptr + offs_m, mask=mask_m, other=0)[:, None]
     sig = 1.0 / (1.0 + tl.exp(-gate)); silu = gate * sig; dsilu = sig * (1.0 + gate * (1.0 - sig))
     relu = tl.maximum(gate, 0.0); relu2 = relu * relu; drelu2 = 2.0 * relu
-    tnh = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * gate))) - 1.0; dtanh = 1.0 - tnh * tnh
+    tnh = libdevice.tanh(gate); dtanh = 1.0 - tnh * tnh
     act = tl.where(at == 0, silu, tl.where(at == 1, relu2, tnh))
     dact = tl.where(at == 0, dsilu, tl.where(at == 1, drelu2, dtanh))
     tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + offs_i[None, :] * s_ggu_i, go * up * dact, mask=mask)
