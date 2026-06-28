@@ -96,12 +96,15 @@ def _conv_router_scores(x, weight, apply_sigmoid=True):
 
 
 @triton.autotune(
+    # SRAM-safe for T4 (sm_75, 64KB): operand tiles ~ (BLOCK_S+BLOCK_E)*BLOCK_C*2*num_stages bytes.
+    # BLOCK_C capped at 128 (a 128x512 fp16 tile = 128KB > 64KB crashes). This also means the merged
+    # contraction can't go "fat" on Turing -> expect ~tldot perf (SRAM-bound). All configs < 40KB.
     configs=[
-        triton.Config({"BLOCK_S": 64, "BLOCK_C": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_S": 128, "BLOCK_C": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_S": 128, "BLOCK_C": 512}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_S": 64, "BLOCK_C": 512}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_S": 256, "BLOCK_C": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_S": 64, "BLOCK_C": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 128, "BLOCK_C": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 64, "BLOCK_C": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 128, "BLOCK_C": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_S": 256, "BLOCK_C": 64}, num_warps=8, num_stages=1),
     ],
     key=["H"],
 )

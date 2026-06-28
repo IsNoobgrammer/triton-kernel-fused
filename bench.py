@@ -302,6 +302,7 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
     # the 0.83x backward (same convolution_backward as compiled but our glue was unfused). tldot/cublas
     # dropped from the sweep (dominated; tldot kept in code for the mem-bound case).
     for backend in ("ref", "cudnn", "tlconv"):
+      try:   # one backend crashing (e.g. a candidate over-budget on SRAM) must not abort the sweep
         # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 (idx exact, isolates math) ──
         xf = x.float(); wf = w.float(); Gf = G.float()
         fused_router(xf, wf, bias, top_k, E, backend=backend)   # warm autotune before the check
@@ -334,6 +335,9 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
                 kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
         if PROFILE:
             _profile(f"fused router [{backend}] fwd+bwd", kstep, leaves=[x2, w2])
+      except Exception as ex:
+        print(f"  [{backend}] CRASHED: {type(ex).__name__}: {str(ex).splitlines()[0] if str(ex) else ex}")
+        torch.cuda.empty_cache()
     if PROFILE:
         x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
         _profile("compiled-eager router fwd+bwd", lambda: (efn(x2, w2) * G).sum().backward(), leaves=[x2, w2])
