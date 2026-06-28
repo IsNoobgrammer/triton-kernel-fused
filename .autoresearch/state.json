@@ -11,9 +11,11 @@
                  "readonce": "tldot fwd with H-outer/K-inner loop reorder (iter-1 attack)",
                  "cublas": "kept in code, dropped from sweep (dominated)"},
     "iter1_T4": "ref fwdbwd 0.84x (bwd 1.20x WIN), tldot 0.71x, readonce 0.33x fwd REFUTED+REMOVED. Profiler: our tl.dot conv ~2.5x slower than cuDNN; aten::topk ~295us FLAT tax on all paths incl compiled.",
-    "iter2_cudnn": "BUILT: cuDNN conv (autograd convolution_backward = ref's 1.20x bwd) + FusedTop2Epilogue Triton kernel (sigmoid+bias+topk-argmax+gather, kills native topk). Local correct grad_rel 3.4e-4. AWAIT T4.",
-    "best_so_far_T4": "ref bwd 1.20x; cudnn expected fwd+bwd >1.0x (first conv WIN) pending T4",
-    "status": "iter2 cudnn built + local-correct; AWAIT T4 `bench.py --compile router`"
+    "iter2_T4": "cudnn fwd+bwd 0.97x (BEST backend; tldot 0.73, ref 0.85), grad_rel 2.2e-7 exact, mem parity. topk ELIMINATED from profile. TIES compiled (not a clear >1.0x win).",
+    "iter3": "cudnn micro-opt F.pad->conv1d(padding=K-1)[...,:S] (kills 16.8MB pad copy); default backend set to cudnn.",
+    "best": {"name": "cudnn backend (cuDNN conv + FusedTop2Epilogue)", "t4_fwdbwd_x": 0.97, "grad_rel": 2.2e-7, "mem_x": 1.00, "vs_tldot": "+33%", "status": "SHIP as default"},
+    "ceiling": "our Triton conv (818us) ~= compiled WHOLE forward (821us); cuDNN owns the conv (inductor punts to it); bwd = same convolution_backward on all paths (tie). topk was the only fuseable seam -> took it. >1.0x needs beating cuDNN = not available.",
+    "status": "CONVERGED. cudnn ties compile + exact grads + 33% over tldot; shipped as default. readonce refuted+removed. Optional final T4 confirm of iter3 micro-opt."
   },
   "objective": "minimize our CE fwd+bwd latency vs the Liger fused-linear-CE baseline at matched memory, grad_rel < 1.5e-2",
   "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous; correctness + relative latency only — does NOT predict T4 occupancy)",

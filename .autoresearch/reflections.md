@@ -207,3 +207,24 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - **General lesson reinforced**: the conv-router win (like MoE routing, XSA read-once) comes from
   fusing/replacing the op the compiler is FORCED to leave as a separate library call (topk), NOT from
   out-computing cuDNN. Find the native-op seam, not the GEMM.
+
+## Round 4 CONVERGED — cudnn ties compile at the topk seam — 2026-06-28
+- **cudnn T4 = 0.97x fwd+bwd** (best backend; tldot 0.73x, ref 0.85x), grad_rel 2.2e-7 (exact), mem
+  parity. The FusedTop2Epilogue eliminated aten::topk (gone from the profile). A real 33% jump over
+  tldot, now TYING compiled — but NOT a clear >1.0x speed win.
+- **Why >1.0x isn't reachable (profiler-proven, matches the prior-round pattern):** our Triton conv
+  kernel alone = 818us ~= compiled's WHOLE forward (821us). cuDNN owns the conv — inductor itself
+  punts to cuDNN (extern_kernels.convolution), so there's no Triton conv that beats it on T4. Backward
+  is the SAME convolution_backward (647us) on cudnn/ref/compiled -> tie by construction. The earlier
+  ref-bwd "1.20x" was baseline throttling noise (eager fwd swung 0.44-1.0x run-to-run).
+- **The win we DID get = the topk seam.** Like MoE (routing) and XSA (read-once), the edge is fusing
+  the op the compiler is FORCED to leave as a separate library call (torch.topk). Killing the ~295us
+  native topk + 216us gather is what closed 0.73 -> 0.97. There was exactly one such seam here.
+- iter3 micro-opt: F.pad -> conv1d(padding=K-1)[...,:S] (causal-equivalent, kills the 16.8MB pad
+  copy). Marginal. Set default backend = cudnn.
+- **SHIP cudnn** as the conv-router default: ties compile on speed, wins on grad accuracy (2.2e-7 vs
+  compiled's fp16) and on the tldot comparison. tldot kept for the mem-bound case (1.12x less mem).
+- **Lesson (reinforced):** on T4+compile you win at native-op seams (topk, data-dependent routing,
+  read-once reductions), NOT by out-computing cuDNN/cuBLAS. Profile FIRST to find the seam vs the
+  immovable library call — the marksaroufim dump tactic paid off twice this round (found cuDNN-is-the-
+  conv, found topk-is-the-tax). readonce (out-compute attempt) was the one refuted candidate.

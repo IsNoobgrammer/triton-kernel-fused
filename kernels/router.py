@@ -280,8 +280,11 @@ def _cudnn_router(x, weight, bias, top_k, num_experts):
     import torch.nn.functional as F
     B, S, H = x.shape
     E, _, K = weight.shape
-    xp = F.pad(x.transpose(1, 2), (K - 1, 0))                         # (B,H,S+K-1) for cuDNN NCHW
-    logits = F.conv1d(xp, weight).transpose(1, 2).reshape(B * S, E)   # cuDNN -> (B*S,E), autograd-tracked
+    # causal conv WITHOUT the explicit F.pad copy (~16.8MB aten::copy_): symmetric padding=K-1 then
+    # slice [..., :S] — outputs [0,S) only see the left pad, so this == left-pad+valid (causal). cuDNN
+    # does the pad internally; the K-1 extra output cols (0.3%) are a view-slice, no copy.
+    logits = F.conv1d(x.transpose(1, 2), weight, padding=K - 1)[..., :S]   # (B,E,S) cuDNN, autograd
+    logits = logits.transpose(1, 2).reshape(B * S, E)                # (B*S,E)
     idx, weights = FusedTop2Epilogue.apply(logits, bias, top_k)
     counts = _count_experts(idx, num_experts)
     return idx, weights, counts
@@ -311,12 +314,18 @@ _FN_BACKENDS = {"ref": _ref_router, "cudnn": _cudnn_router}   # plain-autograd b
 
 def fused_router(x, conv_weight, bias, top_k, num_experts,
                  norm_topk_prob=True, routed_scaling_factor=1.0, return_counts=False,
-                 backend="cublas"):
+                 backend="cudnn"):
     """Whole conv router. x (B,S,H), conv_weight (E,H,K) from nn.Conv1d(H,E,K), bias (E,) fp32 or None.
 
-    backend: 'cublas' (K cuBLAS GEMMs, native layout — the T4 path) or 'tldot' (one Triton conv,
-    transpose-free but loses on Turing). Returns (idx (B,S,k) long, norm_weights (B,S,k) fp32) —
-    or (..., counts (E,) int32) if return_counts. norm_topk_prob/routed_scaling applied in eager.
+    backend (T4 vs torch.compile, Round 4):
+      'cudnn'  — DEFAULT/best: cuDNN conv (autograd convolution_backward) + FusedTop2Epilogue (one
+                 Triton kernel killing the ~295us native topk+gather). Ties compiled on speed (~1.0x
+                 fwd+bwd), exact grads, mem parity. The conv itself can't beat cuDNN (inductor punts
+                 to cuDNN too), so the win is the fused topk seam — tie+better-grads is the ceiling.
+      'tldot'  — one transpose-free Triton conv; 0.73x speed but 1.12x LESS mem (pick when mem-bound).
+      'cublas' — K cuBLAS GEMMs, native layout; dominated (0.35x), kept for reference.
+    Returns (idx (B,S,k) long, norm_weights (B,S,k) fp32) — or (..., counts (E,) int32). norm_topk_prob
+    / routed_scaling applied in eager.
     """
     B, S, _ = x.shape
     if backend in _FN_BACKENDS:
