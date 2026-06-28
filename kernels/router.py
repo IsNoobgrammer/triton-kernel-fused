@@ -95,6 +95,68 @@ def _conv_router_scores(x, weight, apply_sigmoid=True):
     return out
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_S": 64, "BLOCK_C": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 128, "BLOCK_C": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 128, "BLOCK_C": 512}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_S": 64, "BLOCK_C": 512}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_S": 256, "BLOCK_C": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["H"],
+)
+@triton.jit
+def _conv_router_fwd_merged_kernel(
+    X_ptr, W2_ptr, Out_ptr, B, S, H,
+    sxb, sxs, sxh, sw2e, sw2c, som, soe,
+    K: tl.constexpr, E: tl.constexpr, KH: tl.constexpr, BLOCK_E: tl.constexpr,
+    BLOCK_S: tl.constexpr, BLOCK_C: tl.constexpr, APPLY_SIGMOID: tl.constexpr,
+):
+    # Transpose-free causal conv with the K taps FOLDED into one (k,h)=K*H contraction:
+    #   out[s,e] = sum_{c=0..KH-1} xim[s,c] * W2[e,c],  c=k*H+h,  xim[s,c]=x[s-(K-1)+k, h]
+    # vs the K separate skinny dots in _conv_router_fwd_sigmoid_kernel — fatter/fewer tl.dots over a
+    # contiguous 2048 K-dim (better MMA util on T4). x reread via the shifted gather (L2-served).
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_e = tl.arange(0, BLOCK_E)
+    mask_s = offs_s < S
+    mask_e = offs_e < E
+    acc = tl.zeros((BLOCK_S, BLOCK_E), dtype=tl.float32)
+    for c0 in range(0, KH, BLOCK_C):
+        offs_c = c0 + tl.arange(0, BLOCK_C)
+        kk = offs_c // H
+        hh = offs_c % H
+        src = offs_s[:, None] - (K - 1) + kk[None, :]
+        mc = offs_c < KH
+        xmask = (src >= 0) & mask_s[:, None] & mc[None, :]
+        xim = tl.load(X_ptr + pid_b * sxb + src * sxs + hh[None, :] * sxh, mask=xmask, other=0.0)
+        w2 = tl.load(W2_ptr + offs_e[:, None] * sw2e + offs_c[None, :] * sw2c,
+                     mask=mask_e[:, None] & mc[None, :], other=0.0)
+        acc += tl.dot(xim, tl.trans(w2))
+    if APPLY_SIGMOID:
+        acc = 1.0 / (1.0 + tl.exp(-acc))
+    out_row = pid_b * S + offs_s
+    tl.store(Out_ptr + out_row[:, None] * som + offs_e[None, :] * soe,
+             acc.to(Out_ptr.dtype.element_ty), mask=mask_s[:, None] & mask_e[None, :])
+
+
+def _conv_router_scores_merged(x, weight, apply_sigmoid=True):
+    """Transpose-free scores via the merged (k,h) contraction kernel. weight (E,H,K) -> W2 (E,K*H)
+    with c=k*H+h (one tiny permute+reshape). Same output as _conv_router_scores."""
+    B, S, Hd = x.shape
+    E, _, K = weight.shape
+    W2 = weight.permute(0, 2, 1).reshape(E, K * Hd).contiguous()   # (E,K,H)->(E,K*H), c=k*H+h
+    out = torch.empty(B * S, E, device=x.device, dtype=torch.float32)
+    grid = lambda meta: (B, triton.cdiv(S, meta["BLOCK_S"]))
+    _conv_router_fwd_merged_kernel[grid](
+        x, W2, out, B, S, Hd,
+        x.stride(0), x.stride(1), x.stride(2), W2.stride(0), W2.stride(1),
+        out.stride(0), out.stride(1),
+        K=K, E=E, KH=K * Hd, BLOCK_E=max(16, triton.next_power_of_2(E)), APPLY_SIGMOID=apply_sigmoid)
+    return out
+
+
 @triton.jit
 def _count_experts_kernel(Idx_ptr, Count_ptr, NK, E: tl.constexpr, BLOCK: tl.constexpr):
     """counts[e] += #{selected slots == e}. idx is (B*S*k,) flattened. atomic_add -> non-autograd."""
@@ -160,6 +222,29 @@ class FusedConvRouter(torch.autograd.Function):
         x, weight, scores, idx = ctx.saved_tensors
         gx, gw = _conv_router_grads(x, weight, scores, idx, grad_weights)
         return gx, gw, None, None, None   # x, weight, bias, top_k, num_experts
+
+
+class FusedConvRouterMerged(torch.autograd.Function):
+    """Round-5 iter1: same whole-router fusion as FusedConvRouter (transpose-free), but the forward
+    conv folds the K taps into ONE K*H contraction (_conv_router_fwd_merged_kernel). Backward shared
+    (transpose-free dx/dw). Candidate to beat cudnn's forward — A/B on T4, cudnn champion untouched."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, top_k, num_experts):
+        scores = _conv_router_scores_merged(x, weight, apply_sigmoid=True)
+        sel = scores + bias if bias is not None else scores
+        _, idx = torch.topk(sel, top_k, dim=-1)
+        weights = scores.gather(-1, idx)
+        counts = _count_experts(idx, num_experts)
+        ctx.save_for_backward(x, weight, scores, idx)
+        ctx.mark_non_differentiable(idx, counts)
+        return idx, weights, counts
+
+    @staticmethod
+    def backward(ctx, grad_idx, grad_weights, grad_counts):
+        x, weight, scores, idx = ctx.saved_tensors
+        gx, gw = _conv_router_grads(x, weight, scores, idx, grad_weights)
+        return gx, gw, None, None, None
 
 
 class FusedConvRouterCuBLAS(torch.autograd.Function):
@@ -353,7 +438,8 @@ def _ref_router(x, weight, bias, top_k, num_experts):
     return idx, weights, counts
 
 
-_BACKENDS = {"tldot": FusedConvRouter, "cublas": FusedConvRouterCuBLAS}
+_BACKENDS = {"tldot": FusedConvRouter, "tlconv": FusedConvRouterMerged,
+             "cublas": FusedConvRouterCuBLAS}
 _FN_BACKENDS = {"ref": _ref_router, "cudnn": _cudnn_router}   # plain-autograd backends (cuDNN conv)
 
 

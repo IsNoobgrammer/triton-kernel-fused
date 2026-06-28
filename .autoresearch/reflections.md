@@ -273,3 +273,17 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - Confirmed ceiling for the cuDNN approach: conv fwd 312 + conv bwd 613 + transposes 482 are all cuDNN
   and immovable from outside. The ONLY remaining lever is a transpose-free bandwidth-optimal Triton conv
   (fwd+bwd; 52/105us floors vs cuDNN 312/613) — the hard rewrite. cudnn 1.12x is the shipped win.
+
+## Round 5 OPENED — transpose-free Triton conv (beat cudnn 1.12x) — 2026-06-28
+- Shipped cudnn (1.12x) as default; BiBo parity PASS @ E=11 (parity_bibo.py: idx 1.0, weights 4.5e-8,
+  loss 8e-6, grads tight, bias update EXACT vs BiBoMoELayer.update_bias). Gate cleared before shipping.
+- Round 5 goal: beat cudnn by going transpose-free (kill the 482us cuDNN layout-transpose tax; op is
+  bandwidth-bound, 52us fwd / 105us bwd floors, cuDNN 6-16x off). Champion PROTECTED (separate backends,
+  A/B on T4) — the discipline that saved us when channels-last regressed.
+- **iter1 = `tlconv`**: merged-contraction forward (K taps folded into one K*H=2048 contraction, fatter
+  tl.dots vs tldot's K skinny-512 dots). Forward logits bit-identical to tldot (correct). Whether it's
+  FASTER than cuDNN's forward is a T4 question (tldot's fwd was 818us = 15x off floor; merged may or may
+  not close that — Ampere local can't predict Turing tl.dot).
+- Gotcha logged: triton @autotune can leave a stale output buffer during the FIRST correctness check
+  (cold cache) -> false grad CHECK. Fixed: bench warms autotune before the check. Kernel proven correct
+  in isolation regardless.
