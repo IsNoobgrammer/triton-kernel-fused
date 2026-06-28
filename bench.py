@@ -403,6 +403,8 @@ def bench_moe(N=16384, H=512, I=768, E=9, top_k=2):   # BiBo training: 16384 tok
     wt_full, idx = torch.topk(torch.softmax(logits.float(), -1), top_k, dim=-1)
     wt_full = wt_full.to(DTYPE)
     print(f"\n(MoE: N={N} rows*top_k={N*top_k} {'>=' if N*top_k>=4096 else '<'} GROUPED_MIN_TOKENS={4096}; H={H} I={I} E={E} k={top_k})")
+    print("  BASELINE = compiled `moe_eager` (per-expert mask + loop + weighted scatter) = the "
+          "Qwen3MoE / HF compute pattern, under torch.compile. 'x' columns are vs THAT (the real bar).")
 
     def run(variant):
         # grad check vs eager (shared cotangent G)
@@ -435,6 +437,14 @@ def bench_moe(N=16384, H=512, I=768, E=9, top_k=2):   # BiBo training: 16384 tok
             _report(f"MoE {vname} vs eager", *run(vfn))
         except Exception as ex:
             print(f"\n=== MoE {vname} vs eager ===\n  FAILED: {type(ex).__name__}: {ex}")
+
+    # External fused-MoE reference (bassrehab/triton-kernels, FORWARD-ONLY) — run in the same
+    # `--compile moe` command so the full picture (ours vs compiled-Qwen-style eager vs an external
+    # fused Triton MoE) is one invocation. Self-clones on first use; skipped cleanly if unavailable.
+    try:
+        bench_bassrehab_moe(N=N, H=H, FFN=I, E=E, top_k=top_k)
+    except Exception as ex:
+        print(f"\n=== bassrehab MoE (fwd-only ref) ===\n  SKIPPED: {type(ex).__name__}: {str(ex).splitlines()[0]}")
 
 
 # NOTE: Cut Cross Entropy (Apple cut_cross_entropy) was benched and REMOVED — on T4 it's
