@@ -242,8 +242,9 @@ class _GroupedMoE(torch.autograd.Function):
         gate_up = _grouped_mm(x_s, gate_up_proj, te, ts, e_end, 2 * I)
         inter = _glu_fwd(gate_up, row_act)
         eo = _grouped_mm(inter, down_proj, te, ts, e_end, H)
-        out = torch.zeros(ntok, H, device=dev, dtype=x.dtype)
-        out.index_add_(0, st, eo * sw.unsqueeze(-1))
+        out = torch.zeros(ntok, H, device=dev, dtype=torch.float32)   # fp32 accumulate (MiMo)
+        out.index_add_(0, st, (eo * sw.unsqueeze(-1)).float())
+        out = out.to(x.dtype)
         ctx.save_for_backward(x_s, gate_up, inter, eo, st, sw, order, te, ts, e_start, e_end,
                               row_act, gate_up_proj, down_proj)
         ctx.shapes = (ntok, H, I, top_k, E)
@@ -304,9 +305,9 @@ def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_
     gate_up = torch._grouped_mm(x_s.to(bf), gate_up_proj.transpose(-2, -1).to(bf), offs=offs).to(hidden.dtype)
     inter = BatchedGLU.apply(gate_up, row_act)                            # (M,I) in model dtype
     eo = torch._grouped_mm(inter.to(bf), down_proj.transpose(-2, -1).to(bf), offs=offs).to(hidden.dtype)
-    out = torch.zeros(N, H, device=hidden.device, dtype=hidden.dtype)
-    out.index_add_(0, st, eo * sw.unsqueeze(-1))
-    return out
+    out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
+    out.index_add_(0, st, (eo * sw.unsqueeze(-1)).float())
+    return out.to(hidden.dtype)
 
 
 # ───────────────────────── per-expert path (composition, autograd-native) ─────────────────────────
@@ -316,7 +317,7 @@ def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
     N, H = hidden.shape
     E = gate_up_proj.shape[0]
     st, sw, _order, _counts, bounds = _sort_by_expert(top_k_indices, top_k_weights, E)
-    out = torch.zeros(N, H, device=hidden.device, dtype=hidden.dtype)
+    out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):
         s, en = bounds[e], bounds[e + 1]
         if en == s:
@@ -326,8 +327,8 @@ def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
         row_act = act_codes[e:e + 1].expand(en - s).contiguous()   # contiguous: kernel indexes Act_ptr+offs_m (stride 1)
         inter = BatchedGLU.apply(gate_up, row_act)
         eo = inter @ down_proj[e].t()
-        out = out.index_add(0, tok, eo * w.unsqueeze(-1))
-    return out
+        out = out.index_add(0, tok, (eo * w.unsqueeze(-1)).float())
+    return out.to(hidden.dtype)
 
 
 def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
@@ -356,7 +357,7 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
     E, twoI, _ = gate_up_proj.shape
     I = twoI // 2
     codes = act_codes.tolist()
-    out = torch.zeros(N, H, device=hidden.device, dtype=hidden.dtype)
+    out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):
         rows = (top_k_indices == e).any(-1)
         if not bool(rows.any()):
@@ -364,5 +365,5 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
         w = (top_k_weights * (top_k_indices == e)).sum(-1)[rows]
         gate_up = hidden[rows] @ gate_up_proj[e].t()
         inter = _act_eager(gate_up[:, :I], codes[e]) * gate_up[:, I:]
-        out[rows] += (inter @ down_proj[e].t()) * w.unsqueeze(-1)
-    return out
+        out[rows] += ((inter @ down_proj[e].t()) * w.unsqueeze(-1)).float()
+    return out.to(hidden.dtype)

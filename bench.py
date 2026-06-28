@@ -427,24 +427,17 @@ def bench_moe(N=16384, H=512, I=768, E=9, top_k=2):   # BiBo training: 16384 tok
         kfb, efb = _stats(kstep, estep, leaves)
         return kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
 
-    variants = [("per-expert", moe_per_expert), ("grouped", moe_grouped)]
-    if torch.cuda.get_device_capability()[0] >= 8:
-        variants.append(("grouped_cublas", moe_grouped_cublas))   # bf16/sm_80+ only — see moe.py
-    else:
-        print("\n=== MoE grouped_cublas ===\n  SKIPPED — torch._grouped_mm is bf16/sm_80+; this GPU is sm_<80 (Turing).")
+    # Only the per-expert path runs by default. Baseline (the "eager" column) = compiled `moe_eager`
+    # = the Qwen3MoE / HF MoE compute pattern (mask + per-expert loop + index_add) under torch.compile.
+    # DISABLED (T4, useless): `grouped` (tl.dot — 0.07x, the Turing tl.dot cliff) and `bassrehab`
+    # (fwd-only, 0.09x AND wrong output rel 0.76). `grouped_cublas` is bf16/sm_80+ only. Re-enable
+    # grouped/bassrehab by hand if benching on Ampere+.
+    variants = [("per-expert", moe_per_expert)]
     for vname, vfn in variants:
         try:
-            _report(f"MoE {vname} vs eager", *run(vfn))
+            _report(f"MoE {vname} vs Qwen3MoE-eager (compiled)", *run(vfn))
         except Exception as ex:
-            print(f"\n=== MoE {vname} vs eager ===\n  FAILED: {type(ex).__name__}: {ex}")
-
-    # External fused-MoE reference (bassrehab/triton-kernels, FORWARD-ONLY) — run in the same
-    # `--compile moe` command so the full picture (ours vs compiled-Qwen-style eager vs an external
-    # fused Triton MoE) is one invocation. Self-clones on first use; skipped cleanly if unavailable.
-    try:
-        bench_bassrehab_moe(N=N, H=H, FFN=I, E=E, top_k=top_k)
-    except Exception as ex:
-        print(f"\n=== bassrehab MoE (fwd-only ref) ===\n  SKIPPED: {type(ex).__name__}: {str(ex).splitlines()[0]}")
+            print(f"\n=== MoE {vname} ===\n  FAILED: {type(ex).__name__}: {ex}")
 
 
 # NOTE: Cut Cross Entropy (Apple cut_cross_entropy) was benched and REMOVED — on T4 it's
