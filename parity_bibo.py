@@ -63,7 +63,7 @@ def main():
     idx_o, w_o, counts_o = fused_router(xo, wo_param, bias, top_k, E,
                                         norm_topk_prob=router.norm_topk_prob,
                                         routed_scaling_factor=router.routed_scaling_factor,
-                                        return_counts=True, backend="cudnn")
+                                        return_counts=True)
     dw_o = dense_weights(idx_o, w_o, E)
     loss_o = (dw_o * G).sum()
     loss_o.backward()

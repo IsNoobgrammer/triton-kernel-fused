@@ -4,39 +4,71 @@
     "objective": "max conv-router fwd+bwd x-vs-COMPILED-eager on T4, grad_rel<1.5e-2 idx-exact count-ok nan-free, mem<=compiled",
     "artifact": "kernels/router.py backends",
     "eval_verdict": "python bench.py --compile router on Tesla T4 (B16 S1024 H512 E11 K4 k2); baseline=compiled eager=the dump",
-    "eval_local": "python bench.py router on RTX 3050 (BiBo .venv) — CORRECTNESS + relative order ONLY, NOT T4-comparable",
-    "baseline_T4_prior": {"tldot_fwdbwd_x": 0.73, "cublas_fwdbwd_x": 0.35, "note": "both LOSE to compiled"},
-    "backends": {"ref": "dump recipe hand-built uncompiled (cuDNN conv+torch glue, pure-autograd)",
-                 "tldot": "current fused transpose-free Triton (incumbent best)",
-                 "readonce": "tldot fwd with H-outer/K-inner loop reorder (iter-1 attack)",
-                 "cublas": "kept in code, dropped from sweep (dominated)"},
+    "eval_local": "python bench.py router on RTX 3050 (BiBo .venv) \u2014 CORRECTNESS + relative order ONLY, NOT T4-comparable",
+    "baseline_T4_prior": {
+      "tldot_fwdbwd_x": 0.73,
+      "cublas_fwdbwd_x": 0.35,
+      "note": "both LOSE to compiled"
+    },
+    "backends": {
+      "ref": "dump recipe hand-built uncompiled (cuDNN conv+torch glue, pure-autograd)",
+      "tldot": "current fused transpose-free Triton (incumbent best)",
+      "readonce": "tldot fwd with H-outer/K-inner loop reorder (iter-1 attack)",
+      "cublas": "kept in code, dropped from sweep (dominated)"
+    },
     "iter1_T4": "ref fwdbwd 0.84x (bwd 1.20x WIN), tldot 0.71x, readonce 0.33x fwd REFUTED+REMOVED. Profiler: our tl.dot conv ~2.5x slower than cuDNN; aten::topk ~295us FLAT tax on all paths incl compiled.",
     "iter2_T4": "cudnn fwd+bwd 0.97x (BEST backend; tldot 0.73, ref 0.85), grad_rel 2.2e-7 exact, mem parity. topk ELIMINATED from profile. TIES compiled (not a clear >1.0x win).",
     "iter3": "cudnn micro-opt F.pad->conv1d(padding=K-1)[...,:S] (kills 16.8MB pad copy); default backend set to cudnn.",
-    "best": {"name": "cudnn backend (cuDNN conv + FusedTop2Epilogue)", "t4_fwdbwd_x": 0.97, "grad_rel": 2.2e-7, "mem_x": 1.00, "vs_tldot": "+33%", "status": "SHIP as default"},
+    "best": {
+      "name": "cudnn backend (cuDNN conv + FusedTop2Epilogue)",
+      "t4_fwdbwd_x": 0.97,
+      "grad_rel": 2.2e-07,
+      "mem_x": 1.0,
+      "vs_tldot": "+33%",
+      "status": "SHIP as default"
+    },
     "ceiling": "our Triton conv (818us) ~= compiled WHOLE forward (821us); cuDNN owns the conv (inductor punts to it); bwd = same convolution_backward on all paths (tie). topk was the only fuseable seam -> took it. >1.0x needs beating cuDNN = not available.",
-    "status": "CONVERGED. cudnn ties compile + exact grads + 33% over tldot; shipped as default. readonce refuted+removed. Optional final T4 confirm of iter3 micro-opt."
+    "status": "CLOSED+SHIPPED: cudnn 1.11-1.17x on T4, integrated into BiBo (router_type=conv). repo cleaned to cudnn-only; refuted approaches + Ampere/Hopper revisit in conv_router_findings.md",
+    "transpose_free_round": "CLOSED on T4 (64KB SRAM caps it). Documented for better hardware."
   },
   "objective": "minimize our CE fwd+bwd latency vs the Liger fused-linear-CE baseline at matched memory, grad_rel < 1.5e-2",
-  "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous; correctness + relative latency only — does NOT predict T4 occupancy)",
-  "eval_held_out": "python bench.py --compile ce_sweep liger_ce_sweep on Tesla T4 (N=16384 V=81000) — user runs",
+  "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous; correctness + relative latency only \u2014 does NOT predict T4 occupancy)",
+  "eval_held_out": "python bench.py --compile ce_sweep liger_ce_sweep on Tesla T4 (N=16384 V=81000) \u2014 user runs",
   "grad_gate_rel": 0.015,
-  "baseline": {"name": "Liger LigerFusedLinearCrossEntropy (the SOTA external kernel for this niche)",
-               "t4_chunk1024_ms": 321, "t4_chunk1024_mb": 836,
-               "t4_chunk2048_ms": 283, "t4_chunk2048_mb": 1083,
-               "compiled_std_ce_t4_ms": 197, "compiled_std_ce_t4_mb": 3075},
+  "baseline": {
+    "name": "Liger LigerFusedLinearCrossEntropy (the SOTA external kernel for this niche)",
+    "t4_chunk1024_ms": 321,
+    "t4_chunk1024_mb": 836,
+    "t4_chunk2048_ms": 283,
+    "t4_chunk2048_mb": 1083,
+    "compiled_std_ce_t4_ms": 197,
+    "compiled_std_ce_t4_mb": 3075
+  },
   "best": {
     "name": "_CEFusedFwdBwd (grad-in-forward, no recompute; per-row _fwd_reduce + 2D-grid _grad_logits_inplace)",
-    "t4_192MB_ms": 260, "t4_192MB_mb": 904, "t4_192MB_x_compiled": 0.76,
-    "grad_hidden_rel_vs_fp32": 1.9e-3, "grad_weight_rel_vs_fp32": 7.1e-4, "loss_vs_liger": 0.0,
-    "status": "CONVERGED — beats Liger@1024 by 19% at +68MB AND Liger@2048 (faster, 180MB less); grads tighter to fp32 than Liger. Ported to BiBo src/kernels/fused_ce.py."
+    "t4_192MB_ms": 260,
+    "t4_192MB_mb": 904,
+    "t4_192MB_x_compiled": 0.76,
+    "grad_hidden_rel_vs_fp32": 0.0019,
+    "grad_weight_rel_vs_fp32": 0.00071,
+    "loss_vs_liger": 0.0,
+    "status": "CONVERGED \u2014 beats Liger@1024 by 19% at +68MB AND Liger@2048 (faster, 180MB less); grads tighter to fp32 than Liger. Ported to BiBo src/kernels/fused_ce.py."
   },
   "diagnosis": "Round-2 'recompute GEMM is the irreducible floor' was REFUTED by the Liger baseline. CE grad needs only logits+labels (loss scalar -> scalar upstream grad), so the full gradient is computable in the FORWARD chunk loop -> no stored (N,V), no recompute (4 GEMM -> 3). The recompute was a self-inflicted design choice from splitting fwd(lse)/bwd. Occupancy sub-trap: a one-program-per-row fused reduce+grad kernel won locally but lost on T4 (launch-bound, V streamed serially); the 2D-grid grad kernel saturates the T4 SMs and is the real fix.",
-  "tried": ["iter0 baseline 1.88x", "iter1 fused-fwd 1.44x KEEP", "iter2 gw.add_ KEEP",
-            "one-shot budget REFUTED (T4)", "int8 saved-logits REFUTED (T4 opt-set overfit)",
-            "fused-fwd+bwd grad-in-forward KEEP (beats Liger)",
-            "one-pass per-row reduce+grad REVERTED (T4 occupancy)",
-            "BMM/grouped-GEMM for chunks REJECTED (needs full (N,V) resident = no memory win)"],
-  "removed": ["_CEInt8 + int8 kernels (dominated on T4)", "_CECublasChunked recompute (dominated by fused, no mem upside)", "fused_swiglu kernel (compile ties it)"],
+  "tried": [
+    "iter0 baseline 1.88x",
+    "iter1 fused-fwd 1.44x KEEP",
+    "iter2 gw.add_ KEEP",
+    "one-shot budget REFUTED (T4)",
+    "int8 saved-logits REFUTED (T4 opt-set overfit)",
+    "fused-fwd+bwd grad-in-forward KEEP (beats Liger)",
+    "one-pass per-row reduce+grad REVERTED (T4 occupancy)",
+    "BMM/grouped-GEMM for chunks REJECTED (needs full (N,V) resident = no memory win)"
+  ],
+  "removed": [
+    "_CEInt8 + int8 kernels (dominated on T4)",
+    "_CECublasChunked recompute (dominated by fused, no mem upside)",
+    "fused_swiglu kernel (compile ties it)"
+  ],
   "stop_reasoning": "CONVERGED. Ours Pareto-beats the SOTA external baseline (Liger) on speed AND grad accuracy at matched memory; compiled std CE remains fastest only when logits fit (CE is the memory/OOM play). No remaining lever clears Liger without spending the memory back (BMM = compiled). Shipped + ported to BiBo + docs updated."
 }

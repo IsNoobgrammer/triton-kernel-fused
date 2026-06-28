@@ -287,3 +287,16 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - Gotcha logged: triton @autotune can leave a stale output buffer during the FIRST correctness check
   (cold cache) -> false grad CHECK. Fixed: bench warms autotune before the check. Kernel proven correct
   in isolation regardless.
+
+## Round 5 CLOSED — cudnn shipped, repo cleaned to cudnn-only — 2026-06-28
+- tlconv (merged contraction) crashed on T4 (128x512 fp16 tile = 128KB > T4's 64KB SRAM); capped to
+  BLOCK_C<=128 it collapses to ~tldot (loses). T4's 64KB SRAM is the wall for every transpose-free
+  Triton conv attempt on Turing — the bandwidth headroom (fwd 52us / bwd 105us floors, cuDNN+compile
+  8-16x off) is real but NOT reachable on sm_75 (needs Ampere/Hopper SRAM).
+- **DECISION (user): keep cudnn only, remove all other backends, document the rest.** Done:
+  `kernels/router.py` is now cudnn-only (removed tldot/cublas/tlconv/ref + their kernels + the dx/dw
+  tl.dot imports). bench router = cudnn vs compiled. Full refuted-approaches ledger + the Ampere/Hopper
+  revisit plan written to `.autoresearch/conv_router_findings.md`. BiBo integration unchanged (already
+  cudnn-only). Parity PASS @ E=11 after cleanup.
+- Round 4-5 final: conv router = cudnn 1.11-1.17x on T4, shipped + integrated into BiBo
+  (router_type='conv' fast path). The transpose-free Triton conv round is documented for future GPUs.

@@ -296,19 +296,15 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
         return idx, wt
 
     efn = _c(lambda xx, ww: eager(xx, ww)[1])      # compiled-eager baseline (cuDNN conv + fused glue)
-    # Round 4: ref = dump recipe uncompiled (cuDNN + torch glue) | cudnn = THE WIN (cuDNN conv +
-    # fused top-k epilogue + MERGED backward: manual convolution_backward on saved-contiguous input +
-    # fused epilogue-bwd kernel). cudnn fwd already WINS (1.15x, topk fused away); merged bwd targets
-    # the 0.83x backward (same convolution_backward as compiled but our glue was unfused). tldot/cublas
-    # dropped from the sweep (dominated; tldot kept in code for the mem-bound case).
-    for backend in ("ref", "cudnn", "tlconv"):
-      try:   # one backend crashing (e.g. a candidate over-budget on SRAM) must not abort the sweep
+    # SHIPPED: the 'cudnn' fused router (cuDNN conv padding=K-1 + fused top-k epilogue + merged manual
+    # backward). T4 win 1.11-1.17x fwd+bwd, exact grads, mem parity. Other backends (tldot/cublas/
+    # readonce/tlconv/ref) were refuted on T4 and removed — see .autoresearch/reflections.md.
+    if True:
         # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 (idx exact, isolates math) ──
         xf = x.float(); wf = w.float(); Gf = G.float()
-        fused_router(xf, wf, bias, top_k, E, backend=backend)   # warm autotune before the check
         xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)
         xb = xf.clone().requires_grad_(True); wb = wf.clone().requires_grad_(True)
-        ik, wk, ck = fused_router(xa, wa, bias, top_k, E, return_counts=True, backend=backend)
+        ik, wk, ck = fused_router(xa, wa, bias, top_k, E, return_counts=True)
         ie, we = eager(xb, wb)
         (wk * Gf).sum().backward(); (we * Gf).sum().backward()
         gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
@@ -317,13 +313,13 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
         nan = False
         for _ in range(2):
             xt = x.clone().requires_grad_(True); wt2 = w.clone().requires_grad_(True)
-            _, wo = fused_router(xt, wt2, bias, top_k, E, backend=backend)
+            _, wo = fused_router(xt, wt2, bias, top_k, E)
             (wo * G).sum().backward()
             nan |= bool(wo.isnan().any() or xt.grad.isnan().any() or wt2.grad.isnan().any())
-        print(f"  [{backend}] [fp32] idx-agree {idx_agree:.4f} | count==bincount {cnt_ok} | NaN-free {not nan}")
+        print(f"  [cudnn] [fp32] idx-agree {idx_agree:.4f} | count==bincount {cnt_ok} | NaN-free {not nan}")
 
         # ── 3-phase timing (Rule 3) vs compiled eager ──
-        kfn = lambda xx, ww, b=backend: fused_router(xx, ww, bias, top_k, E, backend=b)[1]
+        kfn = lambda xx, ww: fused_router(xx, ww, bias, top_k, E)[1]
         kf = _fwd_ms(lambda: kfn(x, w)); ef = _fwd_ms(lambda: efn(x, w))
         x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
         kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
@@ -331,13 +327,10 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
         kstep = lambda: (kfn(x2, w2) * G).sum().backward()
         estep = lambda: (efn(x2, w2) * G).sum().backward()
         kfb, efb = _stats(kstep, estep, [x2, w2])
-        _report("FULL conv router [%s] (B=%d S=%d H=%d E=%d K=%d k=%d)" % (backend, B, S, H, E, K, top_k),
+        _report("FULL conv router [cudnn] (B=%d S=%d H=%d E=%d K=%d k=%d)" % (B, S, H, E, K, top_k),
                 kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
         if PROFILE:
-            _profile(f"fused router [{backend}] fwd+bwd", kstep, leaves=[x2, w2])
-      except Exception as ex:
-        print(f"  [{backend}] CRASHED: {type(ex).__name__}: {str(ex).splitlines()[0] if str(ex) else ex}")
-        torch.cuda.empty_cache()
+            _profile("fused router [cudnn] fwd+bwd", kstep, leaves=[x2, w2])
     if PROFILE:
         x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
         _profile("compiled-eager router fwd+bwd", lambda: (efn(x2, w2) * G).sum().backward(), leaves=[x2, w2])
