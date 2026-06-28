@@ -124,7 +124,9 @@ class _CECublasChunked(torch.autograd.Function):
             logits = torch.mm(hc, weight.t())                            # cuBLAS recompute (C,V)
             g = _grad_logits_inplace(logits, lsec, labc, 1.0, ig)        # in-place (softmax - onehot), unscaled
             gh[i:i + C] = torch.mm(g, weight)
-            gw += torch.mm(g.t(), hc).float()
+            # accumulate grad_weight in fp32 WITHOUT a (V,H) fp32 temp: add_ casts the fp16 mm
+            # result in its fused kernel (the old `.float()` materialized a 166MB temp PER chunk).
+            gw.add_(torch.mm(g.t(), hc))
         return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None, None
 
 
