@@ -518,7 +518,24 @@ def bench_bassrehab_moe(N=16384, H=512, FFN=768, E=9, top_k=2):
         print(f"\n=== bassrehab fused MoE (fwd-only) ===\n  FAILED: {type(ex).__name__}: {ex}")
 
 
-BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "xsa": bench_xsa, "conv": bench_conv_router,
+def bench_ce_fit():
+    """CONFIG A — compiled CE FITS. BiBo's current training step (N=16384, V=81000): the (N,V) fp16
+    logits = ~2.65 GB, compiled-eager peak ~3 GB on a 16 GB T4. Expectation: compile WINS (~2.3x
+    faster); our chunked CE is redundant here — its only edge is ~3x less peak at the 128MB budget.
+    Lesson: at today's scale, just let the compiler do CE."""
+    bench_ce(N=16384, H=512, V=81000)
+
+
+def bench_ce_oom():
+    """CONFIG B — compiled CE does NOT fit. Long-context roadmap (N=131072 = B16*S8192, V=81000):
+    the (N,V) fp16 logits alone = ~21 GB > 16 GB T4 -> compiled eager OOMs. Our chunked CE never
+    materializes (N,V) (peak ~1-2 GB at the 128MB budget) -> it's the ONLY path that runs. This is
+    the regime where fused-linear CE is the ENABLING kernel, not the faster one."""
+    bench_ce(N=131072, H=512, V=81000)
+
+
+BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
+           "xsa": bench_xsa, "conv": bench_conv_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
            "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
            "liger_ce_sweep": bench_liger_ce_sweep}
