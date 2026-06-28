@@ -169,3 +169,21 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
   ops (CE — grad needs no upstream tensor). Mid-network ops (XSA, SwiGLU, MoE, conv) MUST run backward
   as a separate phase (grad depends on the downstream grad_output, absent at forward) → max fusion =
   one fused kernel PER phase, which XSA now has.
+
+## Round 4 (the WHOLE conv router vs compile) — 2026-06-28
+- Dump diagnosis: compiled router = transpose+pad(Triton) -> **cuDNN extern conv** -> sigmoid/bias ->
+  native topk -> gather/sum/div. The compiler itself keeps the conv on cuDNN; only the cheap glue is
+  Triton. Op is tiny (369 MFLOP, ~16MB x) => fwd is LAUNCH/overhead-bound (5 kernels), not compute.
+- User chose "build reference, then attack". Built: `ref` (dump recipe hand-assembled, uncompiled,
+  pure-autograd -> cuDNN convolution_backward) + `readonce` (tldot fwd with H-outer/K-inner loop
+  reorder, hypothesis: K overlapping taps reread x from L1/L2 not HBM). Dropped `cublas` from sweep.
+- All three CORRECT locally (idx 1.0, count==bincount, NaN-free, grad PASS; ref bit-exact).
+- **Yellow flag (Ampere, weak proxy)**: readonce FWD = 1.394ms vs tldot 1.007ms — reorder HURT.
+  Likely x (1MB/batch) already fits the 4MB L2, so loop order doesn't change HBM traffic, only tl.dot
+  scheduling. If T4 confirms, the conv has NO compute edge over cuDNN -> pivot to ITER 2.
+- **ITER 2 (gated on T4)**: fuse top-2-of-11 + gather + norm INTO the conv epilogue (in-register,
+  scores never touch HBM) — the one thing the compiler CANNOT fuse (topk is a native op). This is the
+  real candidate structural edge (cf. MoE/XSA wins), stronger than the conv-compute reorder. Build
+  only if T4 shows the conv itself can ~tie cuDNN; else the honest answer is "use ref (cuDNN) and only
+  the glue fusion is ours to win."
+- AWAIT: `python bench.py --compile router` on T4.

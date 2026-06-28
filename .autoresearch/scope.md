@@ -1,55 +1,58 @@
-# Scope contract — Round 2: CE latency at fixed memory
+# Scope contract — Round 4: the WHOLE conv router vs torch.compile
 
-Semi-manual + local-proxy loop. NEW autonomous capability: the baseline is now **inductor's CE
-lifted to raw Triton** (`kernels/ce_compiled.py`), so it runs WITHOUT torch.compile → the loop can
-iterate **locally on the RTX 3050 at a proxy shape** (optimization set) and confirm on **T4 at
-ce_fit** (held-out). torch.compile stays broken locally; the lifted baseline sidesteps that.
+Semi-manual loop. Artifact = `kernels/router.py` conv-router backends. Compiler dump (inductor's
+generated Triton for the compiled eager router) is the STARTING POINT (marksaroufim tactic, cited in
+bench.py). Local = RTX 3050 (BiBo `.venv`, Ampere sm_86) for CORRECTNESS + relative ordering only;
+**T4 (Turing sm_75) + `--compile` is the only verdict** — local ≠ T4 on tl.dot/occupancy (proven
+every prior round).
 
 ## Real goal
-Our chunked fused-linear CE (`kernels/cross_entropy.py`) is the MEMORY/ENABLING kernel: it's the
-only CE that runs when the (N,V) logits don't fit (ce_oom, long-context). But at ce_fit it's ~2.3×
-SLOWER than compiled CE. Goal: **cut that latency gap while KEEPING the memory saving** — make the
-enabling kernel cheap enough that there's little penalty for using it, and a real win in the OOM
-regime where it's the only option.
+The conv router currently LOSES to torch.compile on T4: tldot 0.73x fwd+bwd, cublas 0.35x. Goal:
+get a hand-written backend to **≥1.0x vs compiled eager on T4** — or prove it can't and ship the
+honest reference. The repo thesis is "hand kernels beat compile where there's a structural edge"
+(MoE routing 2.x, XSA read-once 1.15x); find whether the conv router has one.
+
+## What the dump showed (diagnosis)
+- Compiled forward = transpose+pad (Triton) -> **cuDNN `extern_kernels.convolution`** -> sigmoid+bias
+  (Triton) -> native topk -> gather+sum+div (Triton). Backward = **cuDNN `convolution_backward`** + 3
+  tiny Triton kernels. The compiler did NOT write a Triton conv — it called cuDNN. The op is tiny
+  (369 MFLOP, ~16MB x); the 0.8ms fwd is LAUNCH/overhead-bound (5 kernels), not compute-bound.
+- tldot loses on fwd (0.67x): one fused transpose-free kernel but K=4 taps reload x + tl.dot runs a
+  skinny E=11->16 padded output. cublas catastrophic on bwd (0.26x): 4+8 Python-loop cuBLAS GEMMs
+  RMW-ing fp32 buffers. cublas DROPPED from the sweep (dominated by tldot).
 
 ## Frozen eval (the only ground truth)
-- **Optimization set (local, autonomous):** `.autoresearch/ce_eval_local.py` on the RTX 3050 at a
-  4GB-fitting proxy shape (N=4096, H=512, V=32000). Reports fwd+bwd ms, peak MB, grad_rel — for
-  BOTH `ce_compiled` (lifted baseline) and our kernel, as raw Triton (no compile).
-- **Held-out (manual, T4):** `python bench.py --compile ce_fit` on a Tesla T4 (N=16384, V=81000).
-  User runs + pastes. A local win must transfer here to be promoted.
-- Never edit the eval to flatter numbers. grad_rel < 1.5e-2 is the hard gate.
-
-## Baseline (frozen reference)
-- **Lifted compiled CE** (`ce_compiled.py`): materializes (N,V) fp16 ONCE in fwd, saves it, NO
-  backward recompute. This is exactly why compiled is fast + heavy. T4 ce_fit: ~198ms / 3072MB.
-- **Our kernel today** (T4 ce_fit): 384MB-budget 455ms / 2331MB; 128MB-budget 537ms / 989MB (3.1×
-  less mem). Local proxy baseline numbers recorded in state.json after first run.
+- **Held-out / verdict (T4):** `python bench.py --compile router` on Tesla T4. Baseline = compiled
+  eager (= the dump). Reports ref / tldot / readonce: fwd, bwd, fwd+bwd x-vs-compiled, peak mem,
+  grad_rel, idx-agree, count==bincount, NaN-free. User runs + pastes.
+- **Local (3050, correctness only):** `python bench.py router` (uncompiled baseline). idx-agree must
+  be 1.0000, count==bincount True, NaN-free True, grad PASS. Perf x-numbers here are NOT comparable
+  to T4 (uncompiled baseline + Ampere). Never edit the eval to flatter numbers.
 
 ## Objective
-**Minimize our CE fwd+bwd latency, SUBJECT TO: peak_mem ≤ our current low-mem peak (keep the ≥3×
-saving vs compiled) AND grad_rel < 1.5e-2.** Latency is the number to push; memory is a hard
-constraint, not a free variable. Report latency as ratio vs lifted-compiled baseline.
+Maximize fwd+bwd x-vs-compiled on T4, SUBJECT TO: grad_rel < 1.5e-2, idx-agree == 1.0,
+count==bincount, NaN-free, peak mem not worse than compiled.
 
-## In-scope changes (artifact = kernels/cross_entropy.py)
-- Fuse the forward: ONE online-softmax Triton kernel (read fp16, fp32-accumulate in registers,
-  gather target in same pass) → kill the `.float()` (C,V) fp32 buffer + the 3 separate passes.
-- Chunk-size / launch tuning within the memory budget (bigger chunks = fewer, larger cuBLAS GEMMs).
-- Backward grad-logit kernel internals (already in-place Triton) — tiling/warps/eviction.
-- A `recompute=False` "save-logits" fast mode = the baseline path, for when memory DOES fit
-  (ce_fit) — gives one CE call that auto-picks fast-when-fits / chunked-when-not.
+## In-scope (artifact = kernels/router.py + bench wiring)
+- `readonce` fwd kernel internals: tiling/loop-order/MMA shape/configs for the fused conv+sigmoid.
+- ITER 2 (gated on T4 data): fuse topk(top-2 of E=11) + gather + norm INTO the conv kernel epilogue
+  (in-register, scores never round-trip HBM) — the glue the compiler CANNOT fuse (topk is native).
+  This is the candidate structural edge. Build only if iter-1 shows the conv itself can ~tie cuDNN.
+- Backward dx/dw kernel tiling (shared `_conv_router_grads`).
 
 ## Constraints / invariants (hard)
-- The backward GEMM recompute is the PRICE of the memory saving — removing it (saving full logits)
-  is allowed ONLY in the explicit fast/`recompute=False` mode, never in the low-mem path.
-- grad_rel < 1.5e-2 vs eager F.cross_entropy, every candidate.
-- GPU-resident: no new `.item()/.tolist()/.float()`-scalar host syncs in the hot loop.
-- tl.dot GEMMs are DEAD on Turing (proven 0.10×) — keep all big GEMMs on cuBLAS; Triton only for
-  the elementwise/reduction fusion. Do NOT propose a tl.dot streaming-logit kernel.
+- tl.dot GEMMs are weak on Turing for big contractions — but here the conv is memory/launch-bound,
+  not a big GEMM, so tl.dot is plausibly fine; cuBLAS-per-tap (cublas backend) is worse (launch +
+  fp32 RMW). Keep the conv as ONE fused Triton kernel, not K GEMMs.
+- grad_rel < 1.5e-2 vs fp32 eager, every candidate. idx exact.
+- No host syncs (`.item()/.tolist()`) in the hot path.
 
-## Out of scope (decided, do not revisit)
-- Beating compiled CE on SPEED when logits fit — impossible without spending its memory (the
-  save-vs-recompute axis IS the memory axis). We compete on memory, tie-ish on latency at best.
-- CE is NOT memory-bound — it's GEMM-dominated (LM head ~1.36 TFLOP fwd). SRAM/tiling/warps help
-  only the softmax-reduction slice; don't expect them to touch the GEMM floor.
-- SwiGLU/XSA/conv as speed plays (lose to compile); MoE (separate round, already 1.74–2.85×).
+## Out of scope (decided)
+- The `cublas` backend as a speed play (dominated by tldot; kept in code, off the default sweep).
+- Beating cuDNN's conv COMPUTE with tl.dot or K cuBLAS GEMMs head-on — the op is tiny; the only
+  available edge is killing launches/HBM round-trips (transpose-free + glue fusion), not out-MACing
+  cuDNN.
+
+---
+(Prior rounds: R0 baselines; R1 MoE per-expert 2.87x sole win; R2 CE latency-at-memory; R3 CE beat
+Liger + XSA re-tile 1.15x — all CONVERGED/shipped. Full history in reflections.md + state.json.)

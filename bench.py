@@ -296,7 +296,11 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
         return idx, wt
 
     efn = _c(lambda xx, ww: eager(xx, ww)[1])      # compiled-eager baseline (cuDNN conv + fused glue)
-    for backend in ("cublas", "tldot"):
+    # Triangulation (Round 4): ref = dump recipe hand-built uncompiled (cuDNN + torch glue) | tldot =
+    # current fused transpose-free Triton | readonce = tldot with H-outer/K-inner cache reuse (the
+    # attack). Isolates "does transpose-free conv beat cuDNN" (readonce vs ref) from "how much is just
+    # inductor fusing glue" (ref vs compiled). cublas dropped from the sweep (dominated by tldot).
+    for backend in ("ref", "tldot", "readonce"):
         # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 (idx exact, isolates math) ──
         xf = x.float(); wf = w.float(); Gf = G.float()
         xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)

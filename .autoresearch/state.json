@@ -1,5 +1,19 @@
 {
-  "round": 3,
+  "round": 4,
+  "round4_conv_router": {
+    "objective": "max conv-router fwd+bwd x-vs-COMPILED-eager on T4, grad_rel<1.5e-2 idx-exact count-ok nan-free, mem<=compiled",
+    "artifact": "kernels/router.py backends",
+    "eval_verdict": "python bench.py --compile router on Tesla T4 (B16 S1024 H512 E11 K4 k2); baseline=compiled eager=the dump",
+    "eval_local": "python bench.py router on RTX 3050 (BiBo .venv) — CORRECTNESS + relative order ONLY, NOT T4-comparable",
+    "baseline_T4_prior": {"tldot_fwdbwd_x": 0.73, "cublas_fwdbwd_x": 0.35, "note": "both LOSE to compiled"},
+    "backends": {"ref": "dump recipe hand-built uncompiled (cuDNN conv+torch glue, pure-autograd)",
+                 "tldot": "current fused transpose-free Triton (incumbent best)",
+                 "readonce": "tldot fwd with H-outer/K-inner loop reorder (iter-1 attack)",
+                 "cublas": "kept in code, dropped from sweep (dominated)"},
+    "iter1_local": "ALL correct (idx 1.0, cnt ok, nan-free, grad PASS). readonce fwd SLOWER than tldot on Ampere (reorder no help; x L2-resident). AWAIT T4.",
+    "iter2_planned": "fuse top-2-of-11 + gather + norm into conv epilogue (scores stay in-register, never HBM) = the glue compile can't fuse; build only if T4 shows conv can ~tie cuDNN",
+    "status": "iter1 built + local-correct; AWAIT T4 triangulation"
+  },
   "objective": "minimize our CE fwd+bwd latency vs the Liger fused-linear-CE baseline at matched memory, grad_rel < 1.5e-2",
   "eval_opt_set": ".autoresearch/ce_eval_local.py on RTX 3050, proxy N=4096 V=32000 H=512 (autonomous; correctness + relative latency only — does NOT predict T4 occupancy)",
   "eval_held_out": "python bench.py --compile ce_sweep liger_ce_sweep on Tesla T4 (N=16384 V=81000) — user runs",
