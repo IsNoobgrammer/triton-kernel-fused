@@ -96,3 +96,18 @@ SwiGLU (auto fwd-only detect). Re-run to get Liger/CCE/bassrehab numbers cleanly
   already at the HBM bandwidth ceiling — no fusion left to reclaim; a hand kernel just pays ~4%
   launch/codegen overhead. You don't out-code the compiler on trivial ops. Confirmed across ours +
   Liger + bassrehab (all ~0.95-0.97x).
+
+## Round 2 (CE latency at fixed memory) — 2026-06-28
+Re-scoped: CE is the memory/ENABLING kernel (only CE that runs in ce_oom). Goal = cut its latency
+vs compiled WHILE keeping the memory saving. NEW: lifted inductor's CE to raw Triton
+(`ce_compiled.py`, materialize-once + no-bwd-recompute) so the loop runs LOCALLY (3050 proxy
+N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
+- **iter1 fused forward = clear KEEP.** Removing the `.float()` (C,V) fp32 buffer and fusing
+  logsumexp+gather into ONE online-softmax Triton kernel (read fp16, fp32-accum in registers) cut
+  mem-parity latency 1.88x->1.44x AND memory ~40% (64MB budget now 1.31x LESS mem than compiled,
+  was 1.01x). The `.float()` was doubling the chunk transient AND adding 2 extra passes. grad PASS.
+- Lesson: our old forward did mm->.float()->logsumexp->gather = 1 GEMM + 3 reduction passes + an
+  fp32 (C,V) alloc. The fp32 buffer is what made small-V proxy peak WORSE than compiled. Fuse first.
+- Remaining gap (~1.44x) is the BACKWARD recompute GEMM = the deliberate memory price; can't remove
+  without saving logits (= compiled's memory). So ~1.4x may be near the low-mem floor. Next levers:
+  chunk-size tuning (fewer launches now fwd is light), grad-logit kernel tiling — expect small.

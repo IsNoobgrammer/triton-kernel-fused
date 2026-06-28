@@ -1,55 +1,55 @@
-# Scope contract — kernel optimization loop (MoE + CE)
+# Scope contract — Round 2: CE latency at fixed memory
 
-Semi-manual autoresearch loop. The eval runs on a **Tesla T4** (Kaggle); the agent cannot run it
-locally (local = RTX 3050, torch.compile broken). Each round: agent commits a candidate → user runs
-`.autoresearch/kaggle_eval.py` on the T4 notebook → pastes the `@@RESULT` lines → agent keeps/kills.
+Semi-manual + local-proxy loop. NEW autonomous capability: the baseline is now **inductor's CE
+lifted to raw Triton** (`kernels/ce_compiled.py`), so it runs WITHOUT torch.compile → the loop can
+iterate **locally on the RTX 3050 at a proxy shape** (optimization set) and confirm on **T4 at
+ce_fit** (held-out). torch.compile stays broken locally; the lifted baseline sidesteps that.
 
 ## Real goal
-Make BiBo's training step faster / fit bigger on the **actual training GPU (T4, sm_75) under
-`torch.compile`** — not on paper, not on Ampere, not in eager. A kernel only earns its place if it
-beats what `torch.compile` already gives for free on T4.
+Our chunked fused-linear CE (`kernels/cross_entropy.py`) is the MEMORY/ENABLING kernel: it's the
+only CE that runs when the (N,V) logits don't fit (ce_oom, long-context). But at ce_fit it's ~2.3×
+SLOWER than compiled CE. Goal: **cut that latency gap while KEEPING the memory saving** — make the
+enabling kernel cheap enough that there's little penalty for using it, and a real win in the OOM
+regime where it's the only option.
 
 ## Frozen eval (the only ground truth)
-`python bench.py --compile --json moe ce` on a **Tesla T4**, fp16. Both kernel and eager are
-torch.compile'd; compile + autotune happen in warmup (excluded from the timed step). Reports
-fwd / bwd / fwd+bwd speedup vs **compiled eager**, peak memory, and grad-rel vs eager.
-**Never edit the eval to make numbers look better.** Shapes are pinned (see state.json baseline).
+- **Optimization set (local, autonomous):** `.autoresearch/ce_eval_local.py` on the RTX 3050 at a
+  4GB-fitting proxy shape (N=4096, H=512, V=32000). Reports fwd+bwd ms, peak MB, grad_rel — for
+  BOTH `ce_compiled` (lifted baseline) and our kernel, as raw Triton (no compile).
+- **Held-out (manual, T4):** `python bench.py --compile ce_fit` on a Tesla T4 (N=16384, V=81000).
+  User runs + pastes. A local win must transfer here to be promoted.
+- Never edit the eval to flatter numbers. grad_rel < 1.5e-2 is the hard gate.
 
-## Targets (artifacts that may change)
-- `kernels/moe.py` — MoE per-expert (the one speed win) + grouped (Ampere+ only).
-- `kernels/cross_entropy.py` — fused-linear CE (the memory win).
-- `kernels/swiglu.py` is in-scope ONLY as the MoE per-expert activation dependency.
+## Baseline (frozen reference)
+- **Lifted compiled CE** (`ce_compiled.py`): materializes (N,V) fp16 ONCE in fwd, saves it, NO
+  backward recompute. This is exactly why compiled is fast + heavy. T4 ce_fit: ~198ms / 3072MB.
+- **Our kernel today** (T4 ce_fit): 384MB-budget 455ms / 2331MB; 128MB-budget 537ms / 989MB (3.1×
+  less mem). Local proxy baseline numbers recorded in state.json after first run.
 
-## Objectives
-- **MoE per-expert**: push fwd+bwd beyond the 2.85× baseline AND make dispatch fully GPU-resident
-  (no `.tolist()` / Python schedule host syncs). Stretch: a Turing-fast grouped path via
-  `torch._grouped_mm` (torch 2.10 native cuBLAS grouped GEMM) to replace the dead tl.dot path.
-- **CE**: lift fwd+bwd from 0.61× toward ≥1.0× (tie compiled eager) WHILE keeping the ≥1.3× memory
-  win. Lever: cut the 3-GEMM backward recompute cost.
+## Objective
+**Minimize our CE fwd+bwd latency, SUBJECT TO: peak_mem ≤ our current low-mem peak (keep the ≥3×
+saving vs compiled) AND grad_rel < 1.5e-2.** Latency is the number to push; memory is a hard
+constraint, not a free variable. Report latency as ratio vs lifted-compiled baseline.
+
+## In-scope changes (artifact = kernels/cross_entropy.py)
+- Fuse the forward: ONE online-softmax Triton kernel (read fp16, fp32-accumulate in registers,
+  gather target in same pass) → kill the `.float()` (C,V) fp32 buffer + the 3 separate passes.
+- Chunk-size / launch tuning within the memory budget (bigger chunks = fewer, larger cuBLAS GEMMs).
+- Backward grad-logit kernel internals (already in-place Triton) — tiling/warps/eviction.
+- A `recompute=False` "save-logits" fast mode = the baseline path, for when memory DOES fit
+  (ce_fit) — gives one CE call that auto-picks fast-when-fits / chunked-when-not.
 
 ## Constraints / invariants (hard)
-- **Grad-equivalence**: every candidate must keep `grad_rel < 1.5e-2` vs eager (the bench gate). A
-  faster-but-wrong kernel is a fail.
-- **GPU-resident**: minimize host syncs (`.item()/.tolist()/float()/bool()`); they show up as
-  torch.compile graph breaks. This is an explicit goal, not just a nicety.
-- Don't touch the eval (`bench.py` measurement logic) to flatter results. Adding `--json` parsing is fine.
-- PolyGLU stays (per-expert act_codes: SiLU/ReLU²/Tanh).
+- The backward GEMM recompute is the PRICE of the memory saving — removing it (saving full logits)
+  is allowed ONLY in the explicit fast/`recompute=False` mode, never in the low-mem path.
+- grad_rel < 1.5e-2 vs eager F.cross_entropy, every candidate.
+- GPU-resident: no new `.item()/.tolist()/.float()`-scalar host syncs in the hot loop.
+- tl.dot GEMMs are DEAD on Turing (proven 0.10×) — keep all big GEMMs on cuBLAS; Triton only for
+  the elementwise/reduction fusion. Do NOT propose a tl.dot streaming-logit kernel.
 
 ## Out of scope (decided, do not revisit)
-- SwiGLU / XSA / causal-conv1d router as **speed** plays — they lose to compiled inductor on T4
-  (0.96× / 0.89× / 0.75×). Kept only as no-compile fallbacks; do NOT spend loop budget on them.
-- grouped MoE on Turing — tl.dot cliff (0.10×); auto-disabled on sm_<80. Only revisit via a
-  cuBLAS-backed grouped GEMM (`torch._grouped_mm`), never more tl.dot tuning.
-
-## Prior art (this session)
-- Triton `tl.dot` GEMMs are ~2% SoL on Turing vs cuBLAS ~50% (proven 3× in BiBo). Never bet on tl.dot
-  GEMM beating cuBLAS on T4.
-- torch.compile/inductor fuses elementwise ops as well as hand-written Triton; an `autograd.Function`
-  is an opaque graph break that can BLOCK inductor fusion. So fused-elementwise kernels rarely win
-  under compile.
-- The MoE per-expert win is real because compile graph-breaks on data-dependent routing.
-
-## Definition of done
-- MoE per-expert: GPU-resident (no host sync in the hot path) AND fwd+bwd ≥ current 2.85× on T4.
-- CE: fwd+bwd ≥ 0.9× compiled eager with memory still ≥ 1.3× less, grad-rel < 1.5e-2.
-- Each kept change verified on T4 via the frozen eval, grad gate green.
+- Beating compiled CE on SPEED when logits fit — impossible without spending its memory (the
+  save-vs-recompute axis IS the memory axis). We compete on memory, tie-ish on latency at best.
+- CE is NOT memory-bound — it's GEMM-dominated (LM head ~1.36 TFLOP fwd). SRAM/tiling/warps help
+  only the softmax-reduction slice; don't expect them to touch the GEMM floor.
+- SwiGLU/XSA/conv as speed plays (lose to compile); MoE (separate round, already 1.74–2.85×).

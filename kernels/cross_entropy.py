@@ -58,6 +58,28 @@ def _grad_logits_inplace(logits, lse, labels, scale, ignore_index):
     return logits
 
 
+@triton.jit
+def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_index,
+                       BLOCK_V: tl.constexpr):
+    # One program per row of a chunk. Online-softmax over V — reads the fp16 logits, accumulates
+    # max+sum in fp32 REGISTERS (never materializes an fp32 (C,V) buffer), and gathers the target
+    # logit in the SAME launch. Replaces the old .float() + torch.logsumexp + .gather (3 passes +
+    # an fp32 (C,V) alloc) with one streaming pass. This is the forward-latency/memory win.
+    row = tl.program_id(0)
+    lab = tl.load(Lab_ptr + row)
+    m = -float("inf")
+    s = 0.0
+    for v0 in range(0, V, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        x = tl.load(L_ptr + row * s_n + offs * s_v, mask=offs < V, other=-float("inf")).to(tl.float32)
+        m_new = tl.maximum(m, tl.max(x, 0))
+        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), 0)
+        m = m_new
+    tl.store(Lse_ptr + row, m + tl.log(s))
+    safe_lab = tl.where(lab == ignore_index, 0, lab)
+    tl.store(Tgt_ptr + row, tl.load(L_ptr + row * s_n + safe_lab * s_v).to(tl.float32))
+
+
 def _chunk_rows(N, V, budget=None):
     return max(512, min(N, (budget or _BWD_LOGITS_BUDGET) // (V * 2)))
 
@@ -71,12 +93,14 @@ class _CECublasChunked(torch.autograd.Function):
         ctx.budget = budget
         lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
         tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
-        safe = labels.clamp(min=0)
         with torch.no_grad():
             for i in range(0, N, C):
-                logits = torch.mm(hidden[i:i + C], weight.t()).float()   # cuBLAS (C,V)
-                lse[i:i + C] = torch.logsumexp(logits, dim=-1)
-                tgt[i:i + C] = logits.gather(1, safe[i:i + C, None]).squeeze(1)
+                cl = min(C, N - i)
+                logits = torch.mm(hidden[i:i + C], weight.t())           # cuBLAS (C,V) fp16 — no .float()
+                # one fused pass: online-softmax -> lse, + target gather. No fp32 (C,V) buffer.
+                _fwd_reduce_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
+                                          cl, V, logits.stride(0), logits.stride(1), ignore_index,
+                                          BLOCK_V=1024)
         valid = labels != ignore_index
         loss = ((lse - tgt) * valid).sum() / valid.sum().clamp(min=1)
         ctx.save_for_backward(hidden, weight, labels, lse, valid.sum().clamp(min=1))
