@@ -1,20 +1,19 @@
-"""triton-kernel-fused — drop-in fused Triton kernels (forward + backward).
+"""triton-kernel-fused — drop-in fused Triton kernels (forward + backward) for Turing/T4.
 
-    from kernels import fused_linear_cross_entropy, fused_xsa, causal_conv1d_router
+    from kernels import fused_linear_cross_entropy, fused_xsa, fused_router, moe
 
-SwiGLU is intentionally NOT here — torch.compile's lifted SiLU-mul kernel ties/beats a hand-written
-one (it was noise), so we leave dense-MLP activation to the compiler.
+Each kernel is a tested replacement for an eager PyTorch block, with a custom backward. They target
+the cases where torch.compile leaves performance on the table: data-dependent routing, terminal-loss
+fusion, read-once reductions, and native-op seams (e.g. top-k) the compiler must keep as library calls.
 """
 from .cross_entropy import fused_linear_cross_entropy
 from .xsa import fused_xsa, FusedXSA
-from .causal_conv1d_router import causal_conv1d_router, CausalConv1dRouter
 from .router import fused_router, router_bias_update, FusedConvRouterCuDNN
-from .moe import moe, moe_per_expert, moe_grouped, moe_eager, GROUPED_MIN_TOKENS
+from .moe import moe, moe_per_expert, moe_eager
 
 __all__ = [
     "fused_linear_cross_entropy",
     "fused_xsa", "FusedXSA",
-    "causal_conv1d_router", "CausalConv1dRouter",
     "fused_router", "router_bias_update", "FusedConvRouterCuDNN",
-    "moe", "moe_per_expert", "moe_grouped", "moe_eager", "GROUPED_MIN_TOKENS",
+    "moe", "moe_per_expert", "moe_eager",
 ]

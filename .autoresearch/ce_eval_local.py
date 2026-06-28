@@ -12,7 +12,7 @@ sys.path.insert(0, ".")
 import torch, torch.nn.functional as F
 from triton.testing import do_bench
 from kernels.cross_entropy import fused_linear_cross_entropy
-from kernels.ce_compiled import compiled_cross_entropy
+from ce_compiled import compiled_cross_entropy
 
 DEV, DT = "cuda", torch.float16
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 4096

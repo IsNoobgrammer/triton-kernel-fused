@@ -43,7 +43,7 @@ import torch.nn.functional as F
 import triton
 from triton.testing import do_bench
 
-from kernels import fused_linear_cross_entropy, fused_xsa, causal_conv1d_router
+from kernels import fused_linear_cross_entropy, fused_xsa
 from kernels.moe import moe_per_expert, moe_grouped, moe_grouped_cublas, moe_eager
 
 DTYPE = torch.float16
@@ -244,34 +244,6 @@ def bench_xsa(B=16, Hq=4, S=1024, D=128, Hkv=2):   # BiBo training: batch 16, 4 
     kfb, efb = _stats(kstep, estep, [y2, v2])
     _report("XSA (B=%d Hq=%d S=%d D=%d Hkv=%d)" % (B, Hq, S, D, Hkv), kf, ef, kb, eb, kfb, efb, gabs, grel,
             _peak(kstep), _peak(estep))
-
-
-# ─────────────── causal-conv1d router ───────────────
-def bench_conv_router(B=16, S=1024, H=512, E=11, K=4):   # BiBo training: batch 16, 11 routed experts
-    x = torch.randn(B, S, H, device=DEV, dtype=DTYPE)
-    w = torch.randn(E, H, K, device=DEV, dtype=DTYPE) * 0.02
-    G = torch.randn(B * S, E, device=DEV, dtype=DTYPE)
-
-    def eager(xx, ww):
-        xp = F.pad(xx.transpose(1, 2), (K - 1, 0))   # (B,H,S+K-1)
-        return F.conv1d(xp, ww).transpose(1, 2).reshape(B * S, E)   # (B*S,E)
-
-    xa = x.clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
-    xb = x.clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
-    causal_conv1d_router(xa, wa).backward(G); eager(xb, wb).backward(G)
-    gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
-
-    kfn = causal_conv1d_router; efn = _c(eager)   # not 'E' — E is the expert count here
-    kf = _fwd_ms(lambda: kfn(x, w))
-    ef = _fwd_ms(lambda: efn(x, w))
-    x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
-    kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
-    eb = _bwd_ms(lambda: (efn(x2, w2) * G).sum(), [x2, w2])
-    kstep = lambda: (kfn(x2, w2) * G).sum().backward()
-    estep = lambda: (efn(x2, w2) * G).sum().backward()
-    kfb, efb = _stats(kstep, estep, [x2, w2])
-    _report("causal-conv1d router (B=%d S=%d H=%d E=%d K=%d)" % (B, S, H, E, K),
-            kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
 
 
 def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv router: 11 experts, top-2
@@ -736,7 +708,7 @@ def bench_ce_sweep(N=16384, H=512, V=81000):
 
 BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
            "ce_sweep": bench_ce_sweep,
-           "xsa": bench_xsa, "conv": bench_conv_router, "router": bench_router_full,
+           "xsa": bench_xsa, "router": bench_router_full,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
            "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
            "liger_ce_sweep": bench_liger_ce_sweep}
