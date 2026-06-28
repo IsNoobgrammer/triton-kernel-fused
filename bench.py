@@ -301,7 +301,7 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
     # fused epilogue-bwd kernel). cudnn fwd already WINS (1.15x, topk fused away); merged bwd targets
     # the 0.83x backward (same convolution_backward as compiled but our glue was unfused). tldot/cublas
     # dropped from the sweep (dominated; tldot kept in code for the mem-bound case).
-    for backend in ("ref", "cudnn"):
+    for backend in ("ref", "cudnn", "cudnn_cl"):
         # ── grad equivalence (Rule 1) + idx/count agreement — in fp32 (idx exact, isolates math) ──
         xf = x.float(); wf = w.float(); Gf = G.float()
         xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)

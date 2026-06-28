@@ -244,3 +244,20 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
 - Lesson: don't accept a "tie" while a phase still carries unfused glue — the profiler's copy_/
   elementwise rows ARE the to-do list. And re-question a convergence when one phase is bandwidth-bound
   and far off the HBM floor.
+
+## Round 4 — FIRST WIN (cudnn 1.13x) + channels-last A/B — 2026-06-28
+- **cudnn = first overall conv-router WIN on T4: fwd 1.15x, bwd 1.16x, fwd+bwd 1.13x**, grad 3.1e-7
+  (exact), mem parity. The merged manual backward (convolution_backward direct + fused epilogue-bwd +
+  save-contiguous-once) flipped bwd 0.83->1.16x. Banked.
+- Profile (per-iter): 93% is cuDNN — conv_bwd 611us + conv_fwd 312us + **layout transposes 482us**
+  (nchwToNhwc 315 + nhwcToNchw 167). Our fused epilogue+norm = 25us (already minimal). Backward ~1.5x
+  forward is EXPECTED (2 grad GEMMs vs 1 fwd GEMM), not recompute waste — corrected the user's "save
+  fwd values" intuition: there's no recompute to cut; we already save the input.
+- **Next lever = the 482us transpose tax is a self-inflicted DOUBLE transpose**: x is natively
+  (B,S,H)=NHWC; we .contiguous() to NCHW; cuDNN converts BACK to NHWC for its sm75_..._nhwc kernel.
+  `cudnn_cl` feeds the channels-last strided view so cuDNN skips nchwToNhwc (+saves the 16.8MB copy).
+  REGRESSED on Ampere local (1.39->1.19) — but Ampere doesn't emit those explicit transposes; T4 does.
+  Classic local!=T4 -> A/B on T4, champion protected (don't overwrite the proven win with a gamble).
+- Honest ceiling: beyond the transpose tax, the conv fwd/bwd GEMMs (923us) are the cuDNN floor; only a
+  bandwidth-optimal transpose-free Triton conv (fwd+bwd, 52us/105us floors, 6-15x headroom but hard —
+  tl.dot attempt was 818us) beats that. That's the next stepping stone if cudnn_cl lands.
