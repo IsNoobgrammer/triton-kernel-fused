@@ -182,27 +182,34 @@ def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidd
               f"ENABLING path here, not just faster. Standalone kernel numbers below.")
     torch.cuda.empty_cache()
 
-    # --- our chunked CE at full N (never materializes (N,V); should fit where eager can't) ---
+    # --- our chunked CE at full N: recompute (3 GEMM, cheap mem) vs int8 saved-logits (2 GEMM,
+    # faster, dequant instead of recompute). Each budget runs BOTH so you see the latency/mem tradeoff
+    # AND the int8 win side-by-side. grad_rel is checked PER MODE on the small slice (int8 is approx).
     MB = 1024 * 1024
-    # ce_oneshot = budget >= N*V*2 -> chunk==N, single pass: the latency<->memory DIAL at its
-    # fast/parity end (fwd tied to compiled, bwd at the pure 3-GEMM floor ~1.33x, ~compiled memory).
-    # 128MB = the max-memory-saving end. Sweep shows the whole frontier.
-    oneshot = (N * V * 2) + 64 * MB
-    for vname, budget in [("ce_oneshot", oneshot), ("ce_384MB", 384 * MB),
-                          ("ce_1GB", 1024 * MB), ("ce_128MB", 128 * MB)]:
+    for vname, budget, mode in [("ce_384MB_recompute", 384 * MB, "recompute"),
+                                ("ce_384MB_int8", 384 * MB, "int8"),
+                                ("ce_128MB_recompute", 128 * MB, "recompute"),
+                                ("ce_128MB_int8", 128 * MB, "int8")]:
         try:
-            K = (lambda h, ww, _b=budget: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
+            # per-mode grad check on the Nc-row slice (int8 quant error differs from recompute)
+            a = hid[:Nc].clone().requires_grad_(True); wa = w.clone().requires_grad_(True)
+            fused_linear_cross_entropy(a, wa, lab[:Nc], bwd_logits_budget=budget, bwd_mode=mode).backward()
+            bb = hid[:Nc].clone().requires_grad_(True); wb = w.clone().requires_grad_(True)
+            eager_full(bb, wb, lab[:Nc]).backward()
+            gabs_m, grel_m = _gdiff([(a.grad, bb.grad), (wa.grad, wb.grad)])
+            del a, wa, bb, wb; torch.cuda.empty_cache()
+            K = (lambda h, ww, _b=budget, _m=mode: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b, bwd_mode=_m))
             kf = _fwd_ms(lambda: K(hid, w))
             h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
             kstep = lambda: K(h2, w2).backward()
             kfb = _step_ms(kstep, [h2, w2]); peak_k = _peak(kstep)
             if eager_ok:
                 _report(f"CE {vname} (N={N} V={V})", kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0),
-                        kfb, efb, gabs, grel, peak_k, peak_e)
+                        kfb, efb, gabs_m, grel_m, peak_k, peak_e)
             else:
                 print(f"\n=== CE {vname} (N={N} V={V}) — eager OOM, kernel standalone ===")
                 print(f"  forward {kf:7.3f} ms | fwd+bwd {kfb:7.3f} ms | peak {peak_k:6.0f} MB "
-                      f"| grad rel {grel:.2e} ({'PASS' if grel < 1.5e-2 else 'CHECK'})  [ENABLES training where eager OOMs]")
+                      f"| grad rel {grel_m:.2e} ({'PASS' if grel_m < 1.5e-2 else 'CHECK'})  [ENABLES training where eager OOMs]")
             del h2, w2; torch.cuda.empty_cache()
         except Exception as ex:
             print(f"\n=== CE {vname} ===\n  FAILED: {type(ex).__name__}: {str(ex).splitlines()[0]}")
