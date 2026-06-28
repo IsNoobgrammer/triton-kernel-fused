@@ -51,6 +51,7 @@ DEV = "cuda"
 COMPILE = False   # set by --compile in __main__
 JSON_OUT = False  # set by --json in __main__ (emits one @@RESULT line per kernel for the loop harness)
 PROFILE = False   # set by --profile: emit a torch.profiler kernel breakdown (launch count + per-op CUDA time)
+NO_SPECIAL = False  # set by --no-special: bench MoE with 0 special experts (E_glu all-GLU) for the A/B vs the stack
 
 
 def _c(fn):
@@ -430,6 +431,8 @@ def bench_moe(N=16384, H=512, I=768, E_glu=9, n_special=2, top_k=2):   # BiBo ST
     # specials (Identity=weighted passthrough, Zero=noop). act_codes: 0/1/2=GLU (weight slot), 3=Identity,
     # 4=Zero. The specials are nearly free AND absorb ~n_special/E of routings -> the GLU GEMMs get
     # smaller M, so the stack is slightly CHEAPER than E_glu-all-GLU at the same token budget.
+    if NO_SPECIAL:
+        n_special = 0
     E = E_glu + n_special
     act_codes = torch.tensor([i % 3 for i in range(E_glu)] + [3, 4][:n_special], device=DEV, dtype=torch.int32)
     hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
@@ -681,9 +684,10 @@ if __name__ == "__main__":
     COMPILE = "--compile" in sys.argv
     JSON_OUT = "--json" in sys.argv
     PROFILE = "--profile" in sys.argv
+    NO_SPECIAL = "--no-special" in sys.argv
     if "--dump-triton" in sys.argv:
         COMPILE = True  # dumping is meaningless without compiled fns
-    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json", "--dump-triton", "--profile")]
+    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json", "--dump-triton", "--profile", "--no-special")]
     print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
