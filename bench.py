@@ -546,7 +546,42 @@ def bench_ce_oom():
     bench_ce(N=131072, H=512, V=81000)
 
 
+def bench_ce_sweep(N=16384, H=512, V=81000):
+    """Sweep recompute-mode chunk budget 128..512MB (step 64) at ce_fit to find the memory/latency
+    sweet spot. recompute only (int8/one-shot are dead). Reports fwd+bwd ms, peak, x-vs-compiled."""
+    hid = torch.randn(N, H, device=DEV, dtype=DTYPE) * 0.1
+    w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
+    lab = torch.randint(0, V, (N,), device=DEV)
+    MB = 1024 * 1024
+    print(f"\n(CE chunk sweep: N={N} V={V} H={H}, recompute mode, 128..512MB step 64)")
+    efb = peak_e = float("nan"); eager_ok = False
+    try:
+        Eg = _c(lambda h, ww: F.cross_entropy((h @ ww.t()).float(), lab))
+        he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
+        estep = lambda: Eg(he, we).backward()
+        efb = _step_ms(estep, [he, we]); peak_e = _peak(estep); eager_ok = True
+        print(f"  compiled baseline: fwd+bwd {efb:8.2f} ms | peak {peak_e:6.0f} MB")
+        del he, we
+    except torch.cuda.OutOfMemoryError:
+        print("  compiled eager OOM — reporting kernel standalone ms/peak only")
+    torch.cuda.empty_cache()
+    for mb in range(128, 512 + 1, 64):
+        try:
+            K = (lambda h, ww, _b=mb * MB: fused_linear_cross_entropy(h, ww, lab, bwd_logits_budget=_b))
+            h2 = hid.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+            kstep = lambda: K(h2, w2).backward()
+            kfb = _step_ms(kstep, [h2, w2]); peak_k = _peak(kstep)
+            lat = f"{efb / kfb:.2f}x" if eager_ok else "  n/a"
+            memx = f"{peak_e / max(peak_k, 1):.2f}x less" if eager_ok else ""
+            print(f"  {mb:3d}MB: fwd+bwd {kfb:8.2f} ms | peak {peak_k:6.0f} MB | {lat} compiled | {memx}")
+            del h2, w2; torch.cuda.empty_cache()
+        except Exception as ex:
+            print(f"  {mb:3d}MB: FAILED {type(ex).__name__}: {str(ex).splitlines()[0]}")
+            torch.cuda.empty_cache()
+
+
 BENCHES = {"swiglu": bench_swiglu, "ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
+           "ce_sweep": bench_ce_sweep,
            "xsa": bench_xsa, "conv": bench_conv_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
            "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
