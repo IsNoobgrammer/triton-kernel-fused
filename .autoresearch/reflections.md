@@ -228,3 +228,19 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
   read-once reductions), NOT by out-computing cuDNN/cuBLAS. Profile FIRST to find the seam vs the
   immovable library call — the marksaroufim dump tactic paid off twice this round (found cuDNN-is-the-
   conv, found topk-is-the-tax). readonce (out-compute attempt) was the one refuted candidate.
+
+## Round 4 REOPENED — fwd wins, merging the backward — 2026-06-28
+- **I converged too early (corrected).** The iter3 micro-opt (F.pad -> conv1d(padding=K-1)) made the
+  cudnn FORWARD WIN on T4: 1.15x (0.703 vs 0.810ms), topk gone from the profile. The op is bandwidth-
+  bound (~52us fwd floor; compiled ~16x off) so there WAS headroom — anchoring on "can't beat cuDNN"
+  was wrong; cuDNN is itself far off the floor on this degenerate 11-channel conv.
+- **Backward 0.83x = the remaining gap.** Profiler: same convolution_backward (642us) as compiled, but
+  wrapped in ~700us of UNFUSED glue (aten::copy_ + elementwise dominate: autograd copies x->contiguous
+  twice, casts, transposes grad). compiled fuses it; our autograd path didn't.
+- **iter4 = merged backward** (`FusedConvRouterCuDNN`, custom autograd): save contiguous xc ONCE in
+  fwd (reused in bwd, not recopied) + call torch.ops.aten.convolution_backward DIRECTLY + fused
+  `_router_epilogue_bwd_kernel` (sigmoid'+scatter in one kernel). Local (uncompiled) bwd 0.96->1.28x,
+  fwd+bwd 1.17->1.41x. Correct (grad_rel 8.5e-5). AWAIT T4 — if bwd clears ~1.0x = first OVERALL win.
+- Lesson: don't accept a "tie" while a phase still carries unfused glue — the profiler's copy_/
+  elementwise rows ARE the to-do list. And re-question a convergence when one phase is bandwidth-bound
+  and far off the HBM floor.
