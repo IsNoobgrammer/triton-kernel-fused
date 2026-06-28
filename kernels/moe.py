@@ -310,6 +310,61 @@ def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_
     return out.to(hidden.dtype)
 
 
+# ───────────────────────── fused weighted scatter / gather (combine tail) ─────────────────────────
+# Forward combine per expert was: (eo * w).float() then index_add_ = 3 kernels (mul, cast, scatter)
+# + 2 transient (m,H) tensors. Fuse into ONE scatter kernel: read eo(fp16)+w, scale in fp32,
+# atomic-add into the fp32 out. Within an expert st[s:en] is UNIQUE (top-k = distinct experts),
+# so the fp32 atomics never contend -> bit-deterministic, equals index_add.
+@triton.jit
+def _combine_scatter_kernel(EO_ptr, W_ptr, Tok_ptr, Out_ptr, m, H, s_eo_m, s_eo_h, s_out_n, s_out_h,
+                            BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
+    pid_m = tl.program_id(0); pid_h = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_m = offs_m < m; mask = mask_m[:, None] & (offs_h < H)[None, :]
+    eo = tl.load(EO_ptr + offs_m[:, None] * s_eo_m + offs_h[None, :] * s_eo_h, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
+    tok = tl.load(Tok_ptr + offs_m, mask=mask_m, other=0)
+    tl.atomic_add(Out_ptr + tok[:, None] * s_out_n + offs_h[None, :] * s_out_h, eo * w, mask=mask)
+
+
+# Backward combine per expert: grad_eo = grad_out[tok] * w ; grad_w = sum_h(grad_out[tok] * eo).
+# One kernel: gather grad_out[tok], emit grad_eo (m,H) + grad_w (m,). Replaces gather+mul+mul+reduce.
+# BLOCK_H spans the full H (one block) so the grad_w row-reduction is complete (H<=~1024 fits).
+@triton.jit
+def _combine_bwd_kernel(GO_ptr, EO_ptr, W_ptr, Tok_ptr, GradEO_ptr, GradW_ptr, m, H,
+                        s_go_n, s_go_h, s_eo_m, s_eo_h, s_geo_m, s_geo_h,
+                        BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_h = tl.arange(0, BLOCK_H)
+    mask_m = offs_m < m; mask = mask_m[:, None] & (offs_h < H)[None, :]
+    tok = tl.load(Tok_ptr + offs_m, mask=mask_m, other=0)
+    go = tl.load(GO_ptr + tok[:, None] * s_go_n + offs_h[None, :] * s_go_h, mask=mask, other=0.0).to(tl.float32)
+    eo = tl.load(EO_ptr + offs_m[:, None] * s_eo_m + offs_h[None, :] * s_eo_h, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
+    tl.store(GradEO_ptr + offs_m[:, None] * s_geo_m + offs_h[None, :] * s_geo_h,
+             (go * w).to(GradEO_ptr.dtype.element_ty), mask=mask)
+    tl.store(GradW_ptr + offs_m, tl.sum(go * eo, axis=1), mask=mask_m)
+
+
+def _combine_scatter(eo, w, tok, out):
+    m, H = eo.shape
+    BLOCK_M = max(16, min(64, triton.next_power_of_2(m))); BLOCK_H = max(16, min(128, triton.next_power_of_2(H)))
+    grid = (triton.cdiv(m, BLOCK_M), triton.cdiv(H, BLOCK_H))
+    _combine_scatter_kernel[grid](eo, w, tok, out, m, H, eo.stride(0), eo.stride(1),
+                                  out.stride(0), out.stride(1), BLOCK_M=BLOCK_M, BLOCK_H=BLOCK_H)
+
+
+def _combine_bwd(grad_out, eo, w, tok):
+    m, H = eo.shape
+    grad_eo = torch.empty_like(eo)
+    grad_w = torch.empty(m, device=eo.device, dtype=torch.float32)   # fp32 reduction (MiMo)
+    BLOCK_M = 16; BLOCK_H = triton.next_power_of_2(H)
+    _combine_bwd_kernel[(triton.cdiv(m, BLOCK_M),)](grad_out, eo, w, tok, grad_eo, grad_w, m, H,
+                        grad_out.stride(0), grad_out.stride(1), eo.stride(0), eo.stride(1),
+                        grad_eo.stride(0), grad_eo.stride(1), BLOCK_M=BLOCK_M, BLOCK_H=BLOCK_H)
+    return grad_eo, grad_w
+
+
 # ───────────────────────── per-expert path (custom backward, cuBLAS GEMMs) ─────────────────────────
 class _PerExpertMoE(torch.autograd.Function):
     """Sorted dispatch + per-expert cuBLAS GEMMs + fused PolyGLU + weighted fp32 scatter, with a
@@ -340,7 +395,7 @@ class _PerExpertMoE(torch.autograd.Function):
             it = _glu_fwd(gu, row_act[s:en])
             eo = it @ down_proj[e].t()
             gate_up_l[e] = gu; inter_l[e] = it; eo_l[e] = eo
-            out.index_add_(0, st[s:en], (eo * sw[s:en].unsqueeze(-1)).float())
+            _combine_scatter(eo, sw[s:en], st[s:en], out)   # fused (eo*w)->fp32 scatter (1 kernel, was mul+cast+index_add)
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj)
         ctx.lists = (gate_up_l, inter_l, eo_l); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
         return out.to(hidden.dtype)
@@ -350,7 +405,6 @@ class _PerExpertMoE(torch.autograd.Function):
         x_s, st, sw, order, row_act, gate_up_proj, down_proj = ctx.saved_tensors
         gate_up_l, inter_l, eo_l = ctx.lists
         N, H, top_k, E = ctx.shapes; bounds = ctx.bounds
-        go_s = grad_out.index_select(0, st)                              # (M,H)
         M = st.numel()
         grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
@@ -360,9 +414,10 @@ class _PerExpertMoE(torch.autograd.Function):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
-            go_e = go_s[s:en]; it = inter_l[e]                          # (m,H), (m,I)
-            grad_w_s[s:en] = (go_e.float() * eo_l[e].float()).sum(-1).to(grad_out.dtype)
-            ge = go_e * sw[s:en].unsqueeze(-1)                          # (m,H)
+            it = inter_l[e]                                            # (m,I)
+            # fused combine bwd: gather grad_out[tok], emit grad_eo=go*w and grad_w=sum_h(go*eo)
+            ge, gw = _combine_bwd(grad_out, eo_l[e], sw[s:en], st[s:en])   # (m,H), (m,) fp32
+            grad_w_s[s:en] = gw.to(grad_out.dtype)
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
             grad_down_proj[e] = ge.t() @ it                            # (H,m)@(m,I) -> (H,I)
             grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en])   # (m,2I)
