@@ -183,18 +183,6 @@ python bench.py --compile moe        # PolyGLU MoE
 Run on the target GPU — kernel performance is architecture-specific, so numbers from one GPU class do
 not transfer to another.
 
-## Documentation
-
-The full docs — per-kernel API, the design rationale behind each win, and benchmarking guidance — live at
-**[isnoobgrammer.github.io/triton-kernel-fused](https://isnoobgrammer.github.io/triton-kernel-fused/)**.
-
-It is an [Astro Starlight](https://starlight.astro.build) site under [`docs/`](docs/), published to GitHub
-Pages automatically on every push to `master`. To preview or edit it locally:
-
-```bash
-cd docs && npm install && npm run dev      # http://localhost:4321/triton-kernel-fused
-```
-
 ## License
 
 MIT
