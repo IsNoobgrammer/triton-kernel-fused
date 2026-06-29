@@ -369,6 +369,61 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
         _profile("compiled-eager router fwd+bwd", lambda: (efn(x2, w2) * G).sum().backward(), leaves=[x2, w2])
 
 
+def bench_mlp_router(B=16, S=1024, H=512, E=11, top_k=2):    # linear (MLP) router: 11 experts, top-2
+    """Linear (MLP) MoE router (`mlp_router`) vs the same pipeline in torch.compile'd eager. Unlike the
+    conv router there's no cuDNN/layout tax to remove — the GEMM is cuBLAS on both sides — so the ONLY
+    edge is folding the native top-k seam (gatherTopK+bitonicSort) into one Triton epilogue. This A/B
+    answers whether that fusion alone clears compiled eager. Verifies grad_x/grad_w, idx, count."""
+    mlp_router, _count_experts = _arch_router.mlp_router, _arch_router._count_experts
+    x = torch.randn(B, S, H, device=DEV, dtype=DTYPE)
+    w = torch.randn(E, H, device=DEV, dtype=DTYPE) * 0.02     # nn.Linear(H,E) weight (E,H)
+    bias = torch.zeros(E, device=DEV, dtype=torch.float32)
+    G = torch.randn(B, S, top_k, device=DEV, dtype=torch.float32)
+
+    def eager(xx, ww):
+        logits = (xx.reshape(B * S, H) @ ww.t()).reshape(B, S, E).float()
+        scores = torch.sigmoid(logits)
+        sel = scores + bias
+        _, idx = torch.topk(sel, top_k, dim=-1)
+        wt = scores.gather(-1, idx)
+        wt = wt / (wt.sum(-1, keepdim=True) + 1e-20)
+        return idx, wt
+
+    efn = _c(lambda xx, ww: eager(xx, ww)[1])
+    # grad/idx/count equivalence in fp32 (isolates math), then 3-phase timing vs compiled eager
+    xf = x.float(); wf = w.float(); Gf = G.float()
+    xa = xf.clone().requires_grad_(True); wa = wf.clone().requires_grad_(True)
+    xb = xf.clone().requires_grad_(True); wb = wf.clone().requires_grad_(True)
+    ik, wk, ck = mlp_router(xa, wa, bias, top_k, E, return_counts=True)
+    ie, we = eager(xb, wb)
+    (wk * Gf).sum().backward(); (we * Gf).sum().backward()
+    gabs, grel = _gdiff([(xa.grad, xb.grad), (wa.grad, wb.grad)])
+    idx_agree = (ik.sort(-1).values == ie.sort(-1).values).float().mean().item()
+    cnt_ok = bool((ck == torch.bincount(ie.reshape(-1), minlength=E).int()).all().item())
+    nan = False
+    for _ in range(2):
+        xt = x.clone().requires_grad_(True); wt2 = w.clone().requires_grad_(True)
+        _, wo = mlp_router(xt, wt2, bias, top_k, E)
+        (wo * G).sum().backward()
+        nan |= bool(wo.isnan().any() or xt.grad.isnan().any() or wt2.grad.isnan().any())
+    print(f"  [mlp] idx-agree {idx_agree:.4f} | count==bincount {cnt_ok} | NaN-free {not nan}")
+
+    kfn = lambda xx, ww: mlp_router(xx, ww, bias, top_k, E)[1]
+    kf = _fwd_ms(lambda: kfn(x, w)); ef = _fwd_ms(lambda: efn(x, w))
+    x2 = x.clone().requires_grad_(True); w2 = w.clone().requires_grad_(True)
+    kb = _bwd_ms(lambda: (kfn(x2, w2) * G).sum(), [x2, w2])
+    eb = _bwd_ms(lambda: (efn(x2, w2) * G).sum(), [x2, w2])
+    kstep = lambda: (kfn(x2, w2) * G).sum().backward()
+    estep = lambda: (efn(x2, w2) * G).sum().backward()
+    kfb, efb = _stats(kstep, estep, [x2, w2])
+    _report("MLP router [mlp] (B=%d S=%d H=%d E=%d k=%d)" % (B, S, H, E, top_k),
+            kf, ef, kb, eb, kfb, efb, gabs, grel, _peak(kstep), _peak(estep))
+    if PROFILE:
+        _profile("mlp router fwd+bwd", kstep, leaves=[x2, w2])
+        x3 = x.clone().requires_grad_(True); w3 = w.clone().requires_grad_(True)
+        _profile("compiled-eager mlp router fwd+bwd", lambda: (efn(x3, w3) * G).sum().backward(), leaves=[x3, w3])
+
+
 # ───────── outsourced reference kernels (Liger) — do THEY beat compiled eager? ─────────
 def bench_liger_swiglu(M=16384, I=1024):
     try:
@@ -1045,7 +1100,7 @@ def bench_muon(layers=6):
 BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
            "muon": bench_muon, "muon_big": lambda: bench_muon(layers=24),
            "ce_sweep": bench_ce_sweep,
-           "xsa": bench_xsa, "router": bench_router_full,
+           "xsa": bench_xsa, "router": bench_router_full, "mlprouter": bench_mlp_router,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
            "bassrehab": bench_bassrehab_moe, "bassrehab_swiglu": bench_bassrehab_swiglu,
            "liger_ce_sweep": bench_liger_ce_sweep}

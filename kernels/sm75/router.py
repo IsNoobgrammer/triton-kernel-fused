@@ -25,7 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fused_router", "router_bias_update", "FusedConvRouterCuDNN"]
+__all__ = ["fused_router", "mlp_router", "router_bias_update",
+           "FusedConvRouterCuDNN", "FusedMLPRouter"]
 
 
 @triton.jit
@@ -156,6 +157,65 @@ class FusedConvRouterCuDNN(torch.autograd.Function):
         grad_xc, grad_w = torch.ops.aten.convolution_backward(
             grad_full, xc, weight, [0], [1], [K - 1], [1], False, [0], 1, [True, True, False])[:2]
         return grad_xc.transpose(1, 2), grad_w, None, None, None   # (B,H,S)->(B,S,H)
+
+
+class FusedMLPRouter(torch.autograd.Function):
+    """Linear (MLP) MoE router — the alternative to the conv router for stacks that route per-token with
+    no temporal mixing. logits = x @ Wᵀ (cuBLAS GEMM), then the SAME fused sigmoid + selection-bias +
+    top-k + unbiased-gather + in-kernel-count epilogue as the conv router. Returns (idx (B*S,k) long,
+    weights (B*S,k) fp32 UNBIASED, counts (E,) int32); only `weights` is differentiable.
+
+    Edge vs compiled eager = folding the native `torch.topk` seam (the ~1.26ms gatherTopK+bitonicSort the
+    compiler keeps as a library call) into one Triton epilogue. The GEMM stays cuBLAS — optimal for this
+    skinny (N,H)@(H,E) shape on every arch — so this is arch-agnostic (no conv, no layout transpose); both
+    sm75 and sm120 use it as-is. Correct-by-construction: GEMM + the proven epilogue kernels."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, top_k, num_experts):
+        B, S, H = x.shape
+        E = weight.shape[0]
+        xflat = x.reshape(B * S, H)
+        logits = (xflat @ weight.t()).float()                   # (N,E) fp32 logits (matches eager .float())
+        idx, weights = _epilogue_fwd(logits, bias, top_k)
+        counts = _count_experts(idx, num_experts)
+        ctx.save_for_backward(xflat, weight, logits, idx)
+        ctx.dims = (B, S, H, E, top_k)
+        ctx.mark_non_differentiable(idx, counts)
+        return idx, weights, counts
+
+    @staticmethod
+    def backward(ctx, grad_idx, grad_weights, grad_counts):
+        xflat, weight, logits, idx = ctx.saved_tensors
+        B, S, H, E, top_k = ctx.dims
+        N = B * S
+        grad_logits = torch.empty(N, E, device=xflat.device, dtype=torch.float32)
+        gw_in = grad_weights.contiguous()
+        BLOCK_N = 128
+        _router_epilogue_bwd_kernel[(triton.cdiv(N, BLOCK_N),)](
+            logits, idx, gw_in, grad_logits, N,
+            logits.stride(0), logits.stride(1), idx.stride(0), idx.stride(1),
+            gw_in.stride(0), gw_in.stride(1), grad_logits.stride(0), grad_logits.stride(1),
+            E=E, TOPK=top_k, BLOCK_N=BLOCK_N, BLOCK_E=max(16, triton.next_power_of_2(E)))
+        gl = grad_logits.to(weight.dtype)
+        grad_x = (gl @ weight).view(B, S, H)                    # (N,E)@(E,H) -> grad wrt x
+        grad_w = gl.t() @ xflat                                 # (E,N)@(N,H) -> grad wrt W (E,H)
+        return grad_x, grad_w, None, None, None
+
+
+def mlp_router(x, weight, bias, top_k, num_experts,
+               norm_topk_prob=True, routed_scaling_factor=1.0, return_counts=False):
+    """Linear (MLP) router. x (B,S,H), weight (E,H) from nn.Linear(H,E), bias (E,) fp32 or None. Same
+    API/semantics as `fused_router` (the conv variant) — drop-in for stacks that prefer per-token linear
+    routing over the causal conv. Returns (idx (B,S,k) long, norm_weights (B,S,k) fp32) — or (..., counts
+    (E,) int32) if return_counts. norm_topk_prob / routed_scaling applied in eager (autograd carries it)."""
+    B, S, _ = x.shape
+    idx, w, counts = FusedMLPRouter.apply(x, weight, bias, top_k, num_experts)
+    if top_k > 1 and norm_topk_prob:
+        w = w / (w.sum(-1, keepdim=True) + 1e-20)
+    w = w * routed_scaling_factor
+    idx = idx.view(B, S, top_k)
+    w = w.view(B, S, top_k)
+    return (idx, w, counts) if return_counts else (idx, w)
 
 
 def fused_router(x, conv_weight, bias, top_k, num_experts,

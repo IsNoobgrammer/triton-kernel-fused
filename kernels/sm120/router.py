@@ -25,10 +25,12 @@ import torch
 import triton
 import triton.language as tl
 
-from kernels.sm75.router import _count_experts, router_bias_update, FusedConvRouterCuDNN  # noqa: F401
+# MLP (linear) router is arch-agnostic (cuBLAS GEMM + the proven fused epilogue) — re-export sm75's as-is.
+from kernels.sm75.router import (_count_experts, router_bias_update, FusedConvRouterCuDNN,  # noqa: F401
+                                 mlp_router, FusedMLPRouter)
 
-__all__ = ["fused_router", "router_bias_update", "FusedConvRouterCuDNN",
-           "FusedConvRouterFused", "_count_experts"]
+__all__ = ["fused_router", "mlp_router", "router_bias_update", "FusedConvRouterCuDNN",
+           "FusedMLPRouter", "FusedConvRouterFused", "_count_experts"]
 
 
 @triton.jit
