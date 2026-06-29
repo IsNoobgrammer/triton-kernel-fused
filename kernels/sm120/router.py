@@ -136,7 +136,7 @@ class FusedConvRouterFused(torch.autograd.Function):
         idx = torch.empty(N, top_k, device=x.device, dtype=torch.long)
         wt = torch.empty(N, top_k, device=x.device, dtype=torch.float32)
         logits = torch.empty(N, E, device=x.device, dtype=torch.float32)
-        BLOCK_S = 64
+        BLOCK_S = 32                                       # (BLOCK_S, H=512) xk tile must fit 99KB SMEM
         BLOCK_E = max(16, triton.next_power_of_2(E))
         BLOCK_D = triton.next_power_of_2(H)
         grid = (B, triton.cdiv(S, BLOCK_S))
@@ -144,7 +144,8 @@ class FusedConvRouterFused(torch.autograd.Function):
             x, weight, bias if bias is not None else x, idx, wt, logits, S,
             x.stride(0), x.stride(1), x.stride(2), weight.stride(0), weight.stride(1), weight.stride(2),
             logits.stride(0), logits.stride(1), HAS_BIAS=bias is not None,
-            E=E, K=K, TOPK=top_k, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D)
+            E=E, K=K, TOPK=top_k, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D,
+            num_stages=1, num_warps=4)
         counts = _count_experts(idx, num_experts)
         ctx.save_for_backward(x, weight, logits, idx)
         ctx.dims = (B, S, H, E, K, top_k)
@@ -168,23 +169,25 @@ class FusedConvRouterFused(torch.autograd.Function):
             E=E, TOPK=top_k, BLOCK_N=BLOCK_N_EP, BLOCK_E=BLOCK_E)
 
         grad_x = torch.empty(B, S, H, device=x.device, dtype=x.dtype)
-        BLOCK_S = 64
+        BLOCK_S = 32
         BLOCK_D = 128                                      # tile H so the (BLOCK_S, BLOCK_D) acc stays small
         _conv_router_dx_kernel[(B, triton.cdiv(S, BLOCK_S), triton.cdiv(H, BLOCK_D))](
             grad_logits, weight, grad_x, S,
             grad_logits.stride(0), grad_logits.stride(1),
             weight.stride(0), weight.stride(1), weight.stride(2),
             grad_x.stride(0), grad_x.stride(1), grad_x.stride(2),
-            E=E, K=K, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D)
+            E=E, K=K, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D,
+            num_stages=2, num_warps=4)
 
         grad_w = torch.empty(E, H, K, device=x.device, dtype=weight.dtype)
         xflat = x.view(N, H)
-        BLOCK_H = 128
+        BLOCK_H = 64
         _conv_router_dw_kernel[(K, triton.cdiv(H, BLOCK_H))](
             grad_logits, xflat, grad_w, N, S,
             grad_logits.stride(0), grad_logits.stride(1), xflat.stride(0), xflat.stride(1),
             grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
-            E=E, H=H, BLOCK_E=BLOCK_E, BLOCK_H=BLOCK_H, BLOCK_N=128, K=K)
+            E=E, H=H, BLOCK_E=BLOCK_E, BLOCK_H=BLOCK_H, BLOCK_N=128, K=K,
+            num_stages=2, num_warps=4)
         return grad_x, grad_w, None, None, None
 
 
