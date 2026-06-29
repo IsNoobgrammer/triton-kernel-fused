@@ -6,9 +6,25 @@
     "artifact": "kernels/muon.py newton_schulz (ns_variant)",
     "diagnosis": "DtoD count (3760 ~= 188/step) tracks baddbmm count (4000 ~= 200/step) almost 1:1. torch.baddbmm(input,A,B) maps to a cuBLAS gemm C=alpha*A@B+beta*C that needs C pre-loaded with the bias -> PyTorch emits a DtoD MEMCPY of `input` per call. The axpy-fold (the kernel's original design) has a hidden bias-copy cost.",
     "candidate": "fused-bmm (ns_variant='bmm'): plain bmm (beta=0, no bias-copy) + IN-PLACE axpy on the cache-hot gemm output. B=bmm(A,A).mul_(c).add_(A,alpha=b); X=bmm(B,X).add_(X,alpha=a). Mathematically identical, and CLOSER to the full-fp32 reference (which already uses separate b*A+c*A@A) so parity should match/beat baddbmm. Lower transient too (no separate bias buffer).",
-    "predicted": "Memcpy DtoD ~-> 0 in the fused-bmm profile; some elementwise add_ kernels appear instead; net win bounded by overlap (compute-bound step may hide part of the 11%). Realistic 3-8%. Parity fused-bmm vs fp32 <= fused-mixed's. Mem gate PASS (<= baseline).",
-    "status": "DISPATCHED — awaiting T4 `bench.py --compile --profile muon` and `muon_big`",
-    "keep_gate": "fused-bmm: ms < fused-mixed beyond noise AND parity ~<= fused-mixed AND peak <= baseline. If win -> promote ns_variant='bmm' to default. Else revert."
+    "predicted": "Memcpy DtoD ~-> 0; realistic 3-8%; parity <= fused-mixed; mem PASS.",
+    "status": "RESOLVED — DISCARDED (refuted)",
+    "t4_result": "Memcpy DtoD VANISHED (mechanism confirmed) but traded for MORE work: add_ 173->477ms (5760 calls), mul_ +81ms, bmm count 2000->6000, launches 1786->2047. Net 78.7 vs 74.6 ms = 5% SLOWER (48t); tie (192t); parity 4.9e-5 vs 2.3e-5 (slightly worse). The baddbmm bias-copy is the CHEAPER option — folding the axpy into the gemm epilogue beats bmm + 2 separate elementwise passes on a compute-bound step. The fold was correct; reverted ns_variant entirely (in git).",
+    "decision": "DISCARD fused-bmm; revert NS to baddbmm-only. KEEP the mem gate + frontier ok/OVER annotation (permanent eval improvements)."
+  },
+  "muon_CONVERGED": {
+    "champion": "FusedMuon fused-mixed: fp32 master, fp16-NS, foreach + baddbmm + batched-state, ns_batch_elems=4M (mem-safe default), baddbmm NS.",
+    "t4": "48t ~1.09x (74.6 ms, 854 MB), 192t ~1.03-1.06x (noisy 330-347 ms, 3178 MB). Mem gate PASS both (854<=891, 3178<=3222). Parity fused-fp32 vs fp32 = 7e-7 PASS; fp16-NS stability PASS.",
+    "constraint": "peak mem <= baseline-mixed peak (hard gate).",
+    "exhausted_levers": {
+      "ns_batch_elems_64M": "1.16x/1.12x but OVER baseline mem (1146/3821 vs 891/3222) -> mem-gated OUT. Documented opt-in 'fast mode' for VRAM-rich hosts.",
+      "cuda_graph": "refuted R3 (compute-bound, not launch-bound)",
+      "bmm_inplace_axpy": "refuted R4 (baddbmm fold is cheaper)",
+      "tl_dot_gemm": "refuted prior (3x loss vs cuBLAS on Turing)",
+      "gemm_count": "recipe floor (5 NS iters x 3 matmuls; recipe math off-limits)",
+      "copy_14pct": "mixed-precision fp32<->fp16 gather/scatter — inherent to the realistic master-weights setup"
+    },
+    "remaining_speed_locked_behind_mem": "The only faster config (bigger batched GEMMs at 64M) costs more transient than baseline allows. Under mem<=baseline the step is converged at ~1.09x. To go faster you must either spend the memory (64M opt-in) or change the recipe (off-limits).",
+    "status": "CONVERGED under the mem gate. Champion shippable to BiBo. Reopen only if the mem constraint is relaxed (then 64M = 1.16x) or the recipe math opens up."
   },
   "muon_round3_cudagraph": {
     "objective": "minimize fused Muon step ms on T4 (baseline-mixed=1.00x); parity fused-fp32 vs full-fp32 < 1e-4, fp16-NS stability PASS, peak mem within reason",

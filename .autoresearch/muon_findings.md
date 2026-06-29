@@ -95,3 +95,17 @@ output. B = bmm(A,A).mul_(c).add_(A,alpha=b); X = bmm(B,X).add_(X,alpha=a). Same
 match/beat baddbmm (closer to the separate-op full-fp32 reference), lower transient. Predicted DtoD->~0,
 net 3-8% (overlap caps it since the step is compute-bound). STATUS: dispatched, awaiting T4. KEEP if
 faster beyond noise AND parity<=fused-mixed AND mem gate PASS -> then promote ns_variant='bmm' to default.
+
+### Round 4 RESULT — bmm REFUTED; converged under the mem gate
+fused-bmm: Memcpy DtoD VANISHED (mechanism confirmed — it WAS the baddbmm bias-copy) but traded for MORE
+work — add_ 173->477ms (5760 calls), mul_ +81ms, bmm count 2000->6000, launches 1786->2047. Net **78.7 vs
+74.6 ms = 5% SLOWER** (48t), tie (192t), parity slightly worse (4.9e-5 vs 2.3e-5). **The baddbmm bias-copy
+is the LESSER EVIL:** folding the axpy into the gemm epilogue (1 DtoD memcpy) beats bmm + 2 separate
+elementwise passes on a compute-bound step. The fold was right all along. Reverted ns_variant (in git).
+
+**CONVERGED under peak<=baseline.** Champion = fused-mixed @ 4M (baddbmm): 48t ~1.09x / 854 MB, 192t
+~1.03-1.06x / 3178 MB, both mem-PASS, parity 7e-7. Lever ledger: 64M = 1.16x/1.12x but mem-OVER (gated
+out, kept as opt-in fast-mode); CUDA-graph refuted (R3); bmm refuted (R4); tl.dot refuted (prior); GEMM
+count = recipe floor; copy_ 14% = inherent mixed-precision plumbing. The only remaining speed (bigger
+batched GEMMs) costs more transient than baseline allows. To go faster: relax the mem gate (-> 64M 1.16x)
+or open the recipe math (off-limits). Champion shippable to BiBo.

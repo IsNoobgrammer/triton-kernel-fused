@@ -907,9 +907,6 @@ def bench_muon(layers=6):
         ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32, fullgraph=True), compute_dtype=torch.float32)),
         ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)),
         ("fused-mixed",    lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)),
-        # bmm + in-place axpy NS: kills the per-baddbmm cuBLAS bias DtoD memcpy (~11% of the step on T4,
-        # DtoD count ~= baddbmm count). Same math, parity should match/beat fused-mixed; also lower transient.
-        ("fused-bmm",      lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, ns_variant="bmm")),
     ]
     res = {}
     for name, mk in variants:
@@ -924,7 +921,7 @@ def bench_muon(layers=6):
         print(f"    {name:16s} {t:9.2f} {den/t:8.2f}x {mem:9.0f} {d:14.2e}{tag}")
     print(f"    => fusion-only win (mixed vs mixed) = {den/res['fused-mixed'][0]:.2f}x")
     # MEMORY GATE (eval rule): a fused candidate is only valid if its peak <= baseline-mixed peak.
-    for name in ("fused-mixed", "fused-bmm"):
+    for name in ("fused-mixed",):
         if name in res:
             m = res[name][1]
             print(f"    mem gate: {name:12s} {m:6.0f} MB vs baseline {base_mem:.0f} MB  "
@@ -951,8 +948,6 @@ def bench_muon(layers=6):
             return opt.step
         _profile("fused-mixed step",
                  _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)))
-        _profile("fused-bmm step  (bmm + in-place axpy; Memcpy DtoD should drop ~to zero)",
-                 _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, ns_variant="bmm")))
         _profile(f"{'compiled ' if COMPILE else ''}baseline-mixed step",
                  _mk_step(lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)))
 
