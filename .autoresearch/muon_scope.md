@@ -14,6 +14,9 @@ kept if it ALSO passes: SV mean ~1, |Δp|/lr attribution flat ~0.2, NaN-free ove
 math (momentum→orthogonalize order, 0.2·√max(A,B) scale, decoupled WD, per-expert 3D batching).
 
 **Constraints / off-limits:**
+- HARD MEM GATE (added 2026-06-29): fused peak memory MUST be <= baseline-mixed peak. The speed knob
+  (ns_batch_elems) is now a CONSTRAINED objective — fastest cap whose peak still clears the gate. Enforced
+  in bench.py (mem gate PASS/FAIL + frontier ok/OVER). Killed the 64M default; default is 4M (mem-safe).
 - Do NOT change the recipe math. Bit-parity to the current eager Muon is the gate for the fp32 champion.
 - No Triton `tl.dot` GEMM (proven 3× loss vs cuBLAS; 512² won't fit T4 64KB SRAM) — settled prior round.
 - No cross-param shape-bucketing into one big bmm (reverted: 2× transient memory thrashed 4GB GPU).

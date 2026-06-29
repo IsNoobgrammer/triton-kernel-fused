@@ -907,27 +907,37 @@ def bench_muon(layers=6):
         ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32, fullgraph=True), compute_dtype=torch.float32)),
         ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)),
         ("fused-mixed",    lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)),
+        # bmm + in-place axpy NS: kills the per-baddbmm cuBLAS bias DtoD memcpy (~11% of the step on T4,
+        # DtoD count ~= baddbmm count). Same math, parity should match/beat fused-mixed; also lower transient.
+        ("fused-bmm",      lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, ns_variant="bmm")),
     ]
     res = {}
     for name, mk in variants:
         d = 0.0 if name == "full-fp32" else _muon_parity(mk, ref, shapes)
         res[name] = (_opt_ms(mk, shapes), _opt_peak(mk, shapes), d)
     den = res["baseline-mixed"][0]                              # speedup is vs the mixed baseline
+    base_mem = res["baseline-mixed"][1]                         # HARD GATE: our peak must stay <= this
     print(f"\n  single-GPU step ({'compiled ' if COMPILE else ''}baseline-mixed = 1.00x):")
     print(f"    {'variant':16s} {'ms':>9s} {'vs mixed':>9s} {'peak MB':>9s} {'|Δp| vs fp32':>14s}")
     for name, (t, mem, d) in res.items():
         tag = "  <- T4 path" if name == "fused-mixed" else ("  (parity ref)" if name == "full-fp32" else "")
         print(f"    {name:16s} {t:9.2f} {den/t:8.2f}x {mem:9.0f} {d:14.2e}{tag}")
     print(f"    => fusion-only win (mixed vs mixed) = {den/res['fused-mixed'][0]:.2f}x")
+    # MEMORY GATE (eval rule): a fused candidate is only valid if its peak <= baseline-mixed peak.
+    for name in ("fused-mixed", "fused-bmm"):
+        if name in res:
+            m = res[name][1]
+            print(f"    mem gate: {name:12s} {m:6.0f} MB vs baseline {base_mem:.0f} MB  "
+                  f"-> {'PASS' if m <= base_mem else 'FAIL (over baseline)'}")
 
-    # ns_batch_elems frontier: the speed<->memory knob. Smaller cap = lower peak + more launches
-    # (CPU-launch-bound); bigger = faster GEMMs + more transient memory. Pick the knee vs baseline.
-    print(f"\n  ns_batch_elems frontier (fused-mixed; baseline-mixed = {den:.1f} ms / {res['baseline-mixed'][1]:.0f} MB):")
+    # ns_batch_elems frontier: the speed<->memory knob. Smaller cap = lower peak + more launches; bigger =
+    # faster GEMMs + more transient memory. Pick the fastest knee that STILL passes the mem gate (<= base).
+    print(f"\n  ns_batch_elems frontier (fused-mixed; baseline-mixed = {den:.1f} ms / {base_mem:.0f} MB; ok = peak<=baseline):")
     for cap in (2 << 20, 4 << 20, 8 << 20, 16 << 20, 64 << 20, 1 << 34):
         mk = lambda ps, _c=cap: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, ns_batch_elems=_c)
         t, mem = _opt_ms(mk, shapes), _opt_peak(mk, shapes)
         label = "uncapped" if cap >= (1 << 33) else f"{cap >> 20}M"
-        print(f"    cap={label:>8s}: {t:8.2f} ms  {den/t:5.2f}x  {mem:7.0f} MB")
+        print(f"    cap={label:>8s}: {t:8.2f} ms  {den/t:5.2f}x  {mem:7.0f} MB  {'ok' if mem <= base_mem else 'OVER'}")
 
     # --profile: launch-count + per-op CUDA time for fused vs compiled-baseline step (the fusion signal —
     # foreach + baddbmm should issue FEWER launches than the unfused per-param baseline).
@@ -941,6 +951,8 @@ def bench_muon(layers=6):
             return opt.step
         _profile("fused-mixed step",
                  _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)))
+        _profile("fused-bmm step  (bmm + in-place axpy; Memcpy DtoD should drop ~to zero)",
+                 _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, ns_variant="bmm")))
         _profile(f"{'compiled ' if COMPILE else ''}baseline-mixed step",
                  _mk_step(lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)))
 

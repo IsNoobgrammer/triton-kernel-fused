@@ -30,13 +30,21 @@ _PE_COEFFS = (
 )
 
 
-def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
+def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7, variant="baddbmm"):
     """Orthogonalize G (drive singular values -> 1) via Polar-Express Newton-Schulz (per-iteration coeffs).
 
     2D weights are unsqueezed to (1,A,B); 3D stacked experts (E,A,B) batch over E. Normalization is fp32
     (an fp16 sum-of-squares of a ~unit 512^2 matrix overflows; fp32 is also strictly better than bf16's).
     The iteration GEMMs run in `ns_dtype` — bf16 (baseline) or fp16 (T4 tensor cores; cuBLAS accumulates
-    in fp32). baddbmm folds each iteration's axpy into the GEMM (3 GEMMs/iter, 0 pointwise kernels).
+    in fp32).
+
+    `variant` picks how the per-iteration axpy is applied (3 GEMMs/iter either way):
+      "baddbmm" — fold the axpy into a cuBLAS gemm (beta*input + alpha*A@B). LOOKS launch-optimal but
+        the gemm needs C pre-loaded with the bias, so PyTorch emits a DtoD MEMCPY of `input` per call —
+        Round-4 T4 profile showed this is ~11% of the step (DtoD count ~= baddbmm count).
+      "bmm" (default) — plain bmm (no bias, no copy) + IN-PLACE axpy on the cache-hot gemm output. Trades
+        the DtoD memcpy for an in-place add_. Also matches the full-fp32 reference math (separate b*A+c*A@A)
+        more closely than baddbmm's fused accumulate, so parity is as tight or tighter.
     """
     orig_dtype = G.dtype
     squeeze = G.ndim == 2
@@ -49,10 +57,16 @@ def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
     if transposed:
         X = X.transpose(1, 2)
     X = X.to(ns_dtype) / nrm.to(ns_dtype)                           # normalize; one contiguous ns_dtype tensor
-    for a, b, c in coeffs:
-        A = torch.bmm(X, X.transpose(1, 2))                          # XX^T  (transpose is a free cuBLAS flag)
-        B = torch.baddbmm(A, A, A, beta=b, alpha=c)                  # b*A + c*(A@A)  — axpy folded into the GEMM
-        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)                # a*X + B@X
+    if variant == "baddbmm":
+        for a, b, c in coeffs:
+            A = torch.bmm(X, X.transpose(1, 2))                      # XX^T  (transpose is a free cuBLAS flag)
+            B = torch.baddbmm(A, A, A, beta=b, alpha=c)              # b*A + c*(A@A)  — axpy folded (bias DtoD copy)
+            X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)            # a*X + B@X      — axpy folded (bias DtoD copy)
+    else:                                                            # "bmm": no cuBLAS bias-copy DtoD
+        for a, b, c in coeffs:
+            A = torch.bmm(X, X.transpose(1, 2))                      # XX^T
+            B = torch.bmm(A, A).mul_(c).add_(A, alpha=b)             # c*(A@A) + b*A  (in-place on the gemm out)
+            X = torch.bmm(B, X).add_(X, alpha=a)                     # B@X + a*X      (in-place on the gemm out)
     if transposed:
         X = X.transpose(1, 2)
     if squeeze:
@@ -70,18 +84,18 @@ class FusedMuon(optim.Optimizer):
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan",
-                 ns_batch_elems=64 * 1024 * 1024, use_graph=False, graph_warmup=3):
+                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, ns_variant="baddbmm"):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype
         self.scale_mode = scale_mode
-        # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params AND lets a whole
-        # 9-expert stack fall into ONE bmm instead of being row-chunked — bigger GEMMs = better T4 SM
-        # utilization (the step is GPU-COMPUTE-bound on the small fp16 GEMMs, not launch-bound). T4
-        # frontier: 64M is the knee — 1.16x/1.10x (48t/192t) vs 1.09x/1.06x at the old 4M cap, and matches
-        # uncapped speed at LESS transient memory (192t: 3830 vs 4521 MB). Lower it only on a tight-VRAM
-        # GPU where the larger per-step transient (peak 1155/3830 MB here) doesn't fit.
+        self.ns_variant = ns_variant      # "baddbmm" (fold axpy, bias DtoD copy) | "bmm" (no copy, in-place axpy)
+        # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
+        # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
+        # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
+        # (1155 vs 891 MB @48t) — so 4M is the default knee: 1.09x/1.05x at 862/3180 MB, both UNDER the
+        # baseline-mixed peak (891/3222 MB). Raise it only when you have VRAM headroom over the baseline.
         self.ns_batch_elems = ns_batch_elems
         # CUDA-graph capture (opt-in, OFF by default): captures momentum->NS->scatter as ONE graph and
         # replays it, with the grad-gather kept EAGER (reads current p.grad -> robust to grads rebinding
@@ -186,7 +200,7 @@ class FusedMuon(optim.Optimizer):
             mom_c, gbuf = w["mom_c"], w["gbuf"]
             mom_c.mul_(w["momentum"]).add_(gbuf)
             u = gbuf.add_(mom_c, alpha=w["momentum"]) if w["nesterov"] else mom_c
-            out = newton_schulz(u, self.coeffs, self.ns_dtype)
+            out = newton_schulz(u, self.coeffs, self.ns_dtype, variant=self.ns_variant)
             r, c = w["r"], w["c"]
             torch._foreach_add_(w["out_params"],
                                 [out[o:o + n].reshape(p.shape) for p, o, n in w["members"]],
@@ -263,7 +277,7 @@ class FusedMuon(optim.Optimizer):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
-                    out = newton_schulz(u, self.coeffs, self.ns_dtype)
+                    out = newton_schulz(u, self.coeffs, self.ns_dtype, variant=self.ns_variant)
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)

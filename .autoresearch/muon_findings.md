@@ -79,3 +79,19 @@ Consistent across both sizes and both runs, past noise. Champion is now fused-mi
 NEXT lever: Memcpy DtoD = 11% of CUDA (166ms, 3760 calls) is the only non-GEMM cost left and is present
 in BOTH profiles -> inherent to the NS math, likely a contiguity copy of a transposed bmm/baddbmm operand
 inside newton_schulz. Bounded ~11% ceiling. GEMM 62% is the recipe floor (tl.dot refuted).
+
+## Round 4 — kill the baddbmm bias-copy (DtoD) + NEW hard mem gate
+NEW INVARIANT (user): fused peak mem MUST be <= baseline-mixed peak. This RETROACTIVELY REJECTS Round-3's
+64M default (1155>891 @48t, 3830>3222 @192t) -> default reverted to 4M (862/3180 MB, both under baseline;
+1.09x/1.05x). Speed/mem is now a CONSTRAINED objective (fastest cap with peak<=baseline); enforced in
+bench.py (mem gate PASS/FAIL + frontier ok/OVER annotations).
+
+DIAGNOSIS (refined from the count correlation): DtoD ~188/step tracks baddbmm ~200/step ~1:1. torch.baddbmm
+maps to cuBLAS gemm C=alpha*A@B+beta*C which needs C pre-loaded with the bias -> a DtoD memcpy of `input`
+per baddbmm. The axpy-fold (the kernel's founding idea) carries a hidden bias-copy.
+
+CANDIDATE fused-bmm (ns_variant='bmm'): plain bmm (no bias copy) + IN-PLACE axpy on the cache-hot gemm
+output. B = bmm(A,A).mul_(c).add_(A,alpha=b); X = bmm(B,X).add_(X,alpha=a). Same math, parity should
+match/beat baddbmm (closer to the separate-op full-fp32 reference), lower transient. Predicted DtoD->~0,
+net 3-8% (overlap caps it since the step is compute-bound). STATUS: dispatched, awaiting T4. KEEP if
+faster beyond noise AND parity<=fused-mixed AND mem gate PASS -> then promote ns_variant='bmm' to default.

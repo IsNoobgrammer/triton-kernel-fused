@@ -1,5 +1,15 @@
 {
   "round": 4,
+  "muon_NEW_INVARIANT": "HARD MEM GATE (user, 2026-06-29): fused peak memory MUST stay <= baseline-mixed peak. Encoded in bench.py (mem gate PASS/FAIL line + frontier 'ok/OVER' annotation). This RETROACTIVELY REJECTS the Round-3 64M default (1155>891 @48t, 3830>3222 @192t) -> reverted default to 4M (862/3180 MB, both under baseline; 1.09x/1.05x). The speed/mem frontier is now a CONSTRAINED objective: fastest cap with peak<=baseline.",
+  "muon_round4_dtod": {
+    "objective": "cut the Memcpy DtoD (~11% of CUDA) while keeping peak mem <= baseline-mixed",
+    "artifact": "kernels/muon.py newton_schulz (ns_variant)",
+    "diagnosis": "DtoD count (3760 ~= 188/step) tracks baddbmm count (4000 ~= 200/step) almost 1:1. torch.baddbmm(input,A,B) maps to a cuBLAS gemm C=alpha*A@B+beta*C that needs C pre-loaded with the bias -> PyTorch emits a DtoD MEMCPY of `input` per call. The axpy-fold (the kernel's original design) has a hidden bias-copy cost.",
+    "candidate": "fused-bmm (ns_variant='bmm'): plain bmm (beta=0, no bias-copy) + IN-PLACE axpy on the cache-hot gemm output. B=bmm(A,A).mul_(c).add_(A,alpha=b); X=bmm(B,X).add_(X,alpha=a). Mathematically identical, and CLOSER to the full-fp32 reference (which already uses separate b*A+c*A@A) so parity should match/beat baddbmm. Lower transient too (no separate bias buffer).",
+    "predicted": "Memcpy DtoD ~-> 0 in the fused-bmm profile; some elementwise add_ kernels appear instead; net win bounded by overlap (compute-bound step may hide part of the 11%). Realistic 3-8%. Parity fused-bmm vs fp32 <= fused-mixed's. Mem gate PASS (<= baseline).",
+    "status": "DISPATCHED — awaiting T4 `bench.py --compile --profile muon` and `muon_big`",
+    "keep_gate": "fused-bmm: ms < fused-mixed beyond noise AND parity ~<= fused-mixed AND peak <= baseline. If win -> promote ns_variant='bmm' to default. Else revert."
+  },
   "muon_round3_cudagraph": {
     "objective": "minimize fused Muon step ms on T4 (baseline-mixed=1.00x); parity fused-fp32 vs full-fp32 < 1e-4, fp16-NS stability PASS, peak mem within reason",
     "artifact": "kernels/muon.py FusedMuon (use_graph path)",
