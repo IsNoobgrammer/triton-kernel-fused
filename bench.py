@@ -54,10 +54,11 @@ PROFILE = False   # set by --profile: emit a torch.profiler kernel breakdown (la
 NO_SPECIAL = False  # set by --no-special: bench MoE with 0 special experts (E_glu all-GLU) for the A/B vs the stack
 
 
-def _c(fn):
-    """torch.compile(fn) when --compile is set, else fn unchanged. Compilation + autotune run
-    during the warmup passes in the timing helpers, so they are excluded from the timed step."""
-    return torch.compile(fn) if COMPILE else fn
+def _c(fn, **kw):
+    """torch.compile(fn, **kw) when --compile is set, else fn unchanged. Compilation + autotune run
+    during the warmup passes in the timing helpers, so they are excluded from the timed step.
+    **kw forwards compile options (e.g. fullgraph=True) — used by the Muon NS baseline."""
+    return torch.compile(fn, **kw) if COMPILE else fn
 
 
 def _warm(fn, n=4):
@@ -903,8 +904,8 @@ def bench_muon(layers=6):
         if hasattr(_dyn.config, _attr):
             setattr(_dyn.config, _attr, 64)
     variants = [
-        ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32), compute_dtype=torch.float32)),
-        ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16), compute_dtype=torch.float16)),
+        ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32, fullgraph=True), compute_dtype=torch.float32)),
+        ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)),
         ("fused-mixed",    lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)),
         # CUDA-graph capture of the step: attacks the launch-bound "Command Buffer Full" (60-81% of the
         # step) by replaying momentum->NS->scatter as ONE launch + a few eager grad-gathers. Parity should
@@ -950,7 +951,7 @@ def bench_muon(layers=6):
         _profile("fused-graph step  (CUDA-graph; launches should collapse to ~gather + 1 replay)",
                  _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, use_graph=True)))
         _profile(f"{'compiled ' if COMPILE else ''}baseline-mixed step",
-                 _mk_step(lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16), compute_dtype=torch.float16)))
+                 _mk_step(lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)))
 
     # ── PHASE 3: DISTRIBUTED A (replicated) vs B (round-robin) — only under torchrun ──
     import torch.distributed as dist
