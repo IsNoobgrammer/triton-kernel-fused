@@ -1,14 +1,42 @@
-# triton-kernel-fused
+<div align="center">
 
-**Drop-in fused Triton kernels (forward _and_ backward) for transformer training on NVIDIA GPUs.**
+<img src="assets/logo.svg" alt="triton-kernel-fused logo" width="120" height="120" />
 
-Each kernel is a tested replacement for an eager PyTorch block, ships with a custom autograd backward,
-and is tuned and verified on the Turing / Tesla T4 class (`sm_75`). Correctness is the gate — numerical
-parity (forward output **and** gradients) against the eager reference is never traded for speed.
+<h1>triton-kernel-fused</h1>
+
+<p><b>Fused Triton kernels (forward <i>and</i> backward) that beat <code>torch.compile</code> where it structurally can — and don't pretend to where it can't.</b></p>
+
+<p>
+Drop-in replacements for eager PyTorch blocks in transformer training on NVIDIA GPUs.<br/>
+Tuned and verified on the Turing&nbsp;/&nbsp;Tesla&nbsp;T4 class (<code>sm_75</code>) — correctness is always the gate.
+</p>
+
+<p>
+<a href="https://isnoobgrammer.github.io/triton-kernel-fused/"><img src="https://img.shields.io/badge/Read_the_Docs-Live-7C3AED?style=for-the-badge&logo=astro&logoColor=white" alt="Documentation" /></a>
+&nbsp;
+<a href="#benchmarking"><img src="https://img.shields.io/badge/Benchmark-bench.py-1F2937?style=for-the-badge&logo=nvidia&logoColor=76B900" alt="Benchmark" /></a>
+&nbsp;
+<a href="https://github.com/IsNoobgrammer/triton-kernel-fused"><img src="https://img.shields.io/badge/Source-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub source" /></a>
+</p>
+
+<p>
+<img src="https://img.shields.io/badge/Triton-%E2%89%A53.0-2C2C2C?style=flat-square" alt="Triton >= 3.0" />
+<img src="https://img.shields.io/badge/PyTorch-%E2%89%A52.4-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch >= 2.4" />
+<img src="https://img.shields.io/badge/CUDA-Turing_sm__75-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA Turing sm_75" />
+<img src="https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python >= 3.10" />
+<img src="https://img.shields.io/badge/License-MIT-A78BFA?style=flat-square" alt="License: MIT" />
+</p>
+
+</div>
+
+---
+
+## Why these kernels
 
 These are **not** a general "compile everything" layer. `torch.compile` already saturates memory
-bandwidth on plain elementwise ops — you don't beat it there, and we don't try. These kernels target the
-places where the compiler *structurally* can't fuse:
+bandwidth on plain elementwise ops — you don't beat it there, and we don't try. Each kernel is a tested
+replacement for an eager PyTorch block, ships with a custom autograd backward, and targets the places
+where the compiler *structurally* can't fuse:
 
 - **data-dependent routing** (MoE dispatch) — the shape isn't known until runtime,
 - **terminal-loss fusion** (cross-entropy) — never materialize the giant `(N, V)` logits,
@@ -16,7 +44,7 @@ places where the compiler *structurally* can't fuse:
 - **native-op seams** (`topk` in the router) — ops the compiler must keep as separate library calls,
 - **launch-overhead collapse + bigger batched GEMMs** (Muon) — fuse N per-param launches into a few.
 
----
+Numerical parity (forward output **and** gradients) against the eager reference is never traded for speed.
 
 ## Kernels
 
@@ -157,18 +185,14 @@ not transfer to another.
 
 ## Documentation
 
-**[isnoobgrammer.github.io/triton-kernel-fused](https://isnoobgrammer.github.io/triton-kernel-fused/)**
+The full docs — per-kernel API, the design rationale behind each win, and benchmarking guidance — live at
+**[isnoobgrammer.github.io/triton-kernel-fused](https://isnoobgrammer.github.io/triton-kernel-fused/)**.
 
-Full docs — per-kernel API, the design rationale behind each win, and benchmarking guidance — are an
-[Astro Starlight](https://starlight.astro.build) site under [`docs/`](docs/), published to GitHub Pages
-automatically on every push to `master` (see [`.github/workflows/deploy-docs.yml`](.github/workflows/deploy-docs.yml)).
-
-To preview or edit the docs locally:
+It is an [Astro Starlight](https://starlight.astro.build) site under [`docs/`](docs/), published to GitHub
+Pages automatically on every push to `master`. To preview or edit it locally:
 
 ```bash
-cd docs
-npm install
-npm run dev       # local preview at http://localhost:4321/triton-kernel-fused
+cd docs && npm install && npm run dev      # http://localhost:4321/triton-kernel-fused
 ```
 
 ## License
