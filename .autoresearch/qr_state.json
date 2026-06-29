@@ -1,0 +1,17 @@
+{
+  "task": "qr_v2 batched compact-Householder QR (GPU MODE leaderboard 774)",
+  "artifact": "qr_challenge/submission.py::custom_kernel",
+  "eval": "qr_challenge/run_local.py (reproduces frozen reference.py gate + eval.py geomean)",
+  "objective": "minimize benchmark geomean (us) subject to 22/22 test gate PASS",
+  "dev_gpu": "RTX PRO 6000 Blackwell sm_120 (cc 12.0), torch 2.12.0+cu130",
+  "leaderboard_gpu": "B200 sm_100 (final ranking re-measured there)",
+  "leaderboard_top_us": {"gau.nernst": 1227.662, "10billiontokens": 1235.915, "dhu.randhar": 1279.334},
+  "baseline_geomean_us_sm120": 111900.551,
+  "best_geomean_us_sm120": 111900.551,
+  "best_submission": "RUN0 torch.geqrf (serial cuSOLVER)",
+  "run_number": 0,
+  "noise_note": "timing metric; eval early-stops at err/mean<0.001; treat <~2% geomean change as noise",
+  "plateau_counter": 0,
+  "stop_target_us_sm120": null,
+  "tried_ideas": ["RUN0: torch.geqrf baseline (serial batch, 111900us)"]
+}
