@@ -1,8 +1,9 @@
 ---
-title: "PolyGLU MoE combine"
-description: "Data-dependent expert dispatch + cuBLAS GEMMs + fused activation + weighted scatter — the routing edge the compiler can't fuse."
-keywords: ["moe", "mixture of experts", "polyglu", "expert dispatch", "data dependent routing", "per expert", "grouped gemm", "bibo"]
+title: PolyGLU MoE combine
+description: Data-dependent expert dispatch + cuBLAS GEMMs + fused activation + weighted scatter — the routing edge the compiler can't fuse.
 ---
+
+import { Aside } from '@astrojs/starlight/components';
 
 ```python
 from kernels import moe, moe_per_expert, moe_eager
@@ -13,11 +14,11 @@ dispatch each token to its experts, run the per-expert GEMMs and activation, and
 results back. The data-dependent dispatch is something `torch.compile` cannot fuse at all, which is why
 this is the largest win in the library.
 
-<Note>
+<Aside type="note">
 This kernel is shaped for the **PolyGLU** expert layout used in BiBo — a fused gate+up projection with
 per-expert activation codes. The per-expert dispatch machinery is general, but the activation set and the
 weight layout are opinionated. Adapt the `act_codes` and weight shapes to your model.
-</Note>
+</Aside>
 
 ## Why it wins
 
@@ -25,7 +26,7 @@ In a Mixture-of-Experts layer, the router decides which tokens go to which exper
 compiler plans a static graph, so it cannot fuse the dispatch, the per-expert cuBLAS GEMMs, the PolyGLU
 activation, and the weighted scatter into one data-dependent pass — it falls back to a masked loop with a
 GPU sync per expert and an unfused activation. This kernel does the whole thing in one fused path. It is the
-canonical [data-dependent routing](/concepts/the-structural-edge) edge.
+canonical data-dependent routing edge.
 
 ## Performance
 
@@ -50,7 +51,7 @@ moe(
 | Argument | Shape / type | Notes |
 |---|---|---|
 | `hidden` | `(N, H)` | Flattened token hidden states. |
-| `top_k_indices` | `(N, k)` int | Chosen expert ids — comes from your router (e.g. [`fused_router`](/kernels/router)). |
+| `top_k_indices` | `(N, k)` int | Chosen expert ids — comes from your router (e.g. [`fused_router`](/triton-kernel-fused/kernels/router/)). |
 | `top_k_weights` | `(N, k)` | Routing weights for the chosen experts. |
 | `gate_up_proj` | `(E, 2·I, H)` | Stacked fused gate+up projection, one per expert. |
 | `down_proj` | `(E, H, I)` | Stacked down projection, one per expert. |
@@ -68,11 +69,11 @@ The router stays in **your** model — this kernel only takes its top-k output a
 | `moe_per_expert` | small token counts; **all of Turing** | Sorted dispatch + cuBLAS GEMMs + fused PolyGLU + weighted scatter, with a manual backward. |
 | `moe_eager` | reference only | The slow masked-loop baseline the fused paths beat — keep for parity checks. |
 
-<Warning>
+<Aside type="caution">
 The grouped path's `tl.dot` GEMMs are **catastrophic on Turing** (~0.1× vs compiled eager on T4), so `moe`
 never selects it on `sm_<80`. On a T4 you always get the cuBLAS `moe_per_expert` path, which is the one
 that wins there.
-</Warning>
+</Aside>
 
 ## Usage
 
@@ -94,7 +95,7 @@ out = moe(hidden, idx, weights, gate_up, down, act_codes)   # (N, H)
 out.sum().backward()                                        # grads flow to the experts
 ```
 
-See [`examples/moe_usage.py`](https://github.com/IsNoobGrammer/triton-kernel-fused/blob/master/examples/moe_usage.py)
+See [`examples/moe_usage.py`](https://github.com/IsNoobgrammer/triton-kernel-fused/blob/master/examples/moe_usage.py)
 for a complete runnable example, including a full MoE layer wired up as an `nn.Module`.
 
 ## Benchmark

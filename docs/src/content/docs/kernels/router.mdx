@@ -1,8 +1,9 @@
 ---
-title: "Conv MoE router"
-description: "Conv -> sigmoid gate -> top-k -> gather fused into one epilogue (folding native topk) with a merged manual backward."
-keywords: ["moe router", "conv router", "topk", "sigmoid gate", "deepseek", "mimo", "cudnn", "load balancing", "bias update"]
+title: Conv MoE router
+description: Conv to sigmoid gate to top-k to gather fused into one epilogue (folding native topk) with a merged manual backward.
 ---
+
+import { Aside } from '@astrojs/starlight/components';
 
 ```python
 from kernels import fused_router, router_bias_update
@@ -13,20 +14,20 @@ add, top-k selection, and the gather of the chosen weights — all collapsed int
 fused Triton epilogue, with a merged manual backward. This is the sigmoid-gate routing used in
 MiMo-V2.5 / DeepSeek-V3-style models.
 
-<Note>
+<Aside type="note">
 This kernel is specific to a **conv router with a sigmoid gate**. If your model routes with a plain linear
 (MLP) gate, this kernel does not apply — use a standard `nn.Linear` + `topk` router (which `torch.compile`
 already handles well). Reach for this kernel only when your router is the conv variant.
-</Note>
+</Aside>
 
 ## Why it wins
 
 The router exposes two seams the compiler can't close:
 
 1. **The native `topk` seam.** `torch.topk` is a library call inductor must keep as a separate kernel — on
-   T4 it and its gather are ~36% of the compiled forward. The kernel replaces it with a bespoke top-2-of-11
-   argmax computed in-register in the epilogue, which is essentially free. This is the same
-   [native-op-seam](/concepts/the-structural-edge) edge as the MoE and XSA wins.
+   T4 it and its gather are ~36% of the compiled forward. The kernel replaces it with a bespoke
+   top-2-of-11 argmax computed in-register in the epilogue, which is essentially free. This is the same
+   native-op-seam edge as the MoE and XSA wins.
 2. **The backward glue.** cuDNN's `convolution_backward` is identical on every path; the gap was ~700µs of
    *unfused* glue around it (contiguity copies, casts, transposes). A custom backward — save the input
    contiguous once, call `convolution_backward` directly, and fuse the sigmoid derivative with the
@@ -70,10 +71,10 @@ fused_router(
 | `routed_scaling_factor` | float | Scales the routed weights; `1.0` is a no-op. |
 | `return_counts` | bool | Also return per-expert token counts for load balancing. |
 
-<Note>
+<Aside type="note">
 `norm_topk_prob` and `routed_scaling_factor` are applied in **eager** so that autograd carries their
 Jacobian correctly. The fused path covers the conv + sigmoid-gate + no-activation configuration.
-</Note>
+</Aside>
 
 ## Auxiliary-loss-free load balancing
 
@@ -95,18 +96,18 @@ router_bias_update(
 )
 ```
 
-<Warning>
+<Aside type="caution">
 In a distributed run, `counts` must be the **global** load. All-reduce it first
 (`dist.all_reduce(counts, op=SUM)`) before calling `router_bias_update` — the reduction cannot run inside a
 Triton kernel. Because `sign()` is scale-invariant, a SUM across ranks is fine and the update is identical
 on every rank.
-</Warning>
+</Aside>
 
 ## Usage
 
 ```python
 import torch
-from kernels import fused_router, router_bias_update
+from kernels import fused_router
 
 B, S, H, E, K = 16, 1024, 512, 11, 4
 x      = torch.randn(B, S, H, device="cuda", dtype=torch.float16)

@@ -1,8 +1,9 @@
 ---
-title: "Quickstart"
-description: "Install the kernels, import them, and run your first fused kernel in a few minutes."
-keywords: ["install", "quickstart", "triton", "cuda", "uv", "pytorch"]
+title: Quickstart
+description: Install the kernels, import them, and run your first fused kernel in a few minutes.
 ---
+
+import { Tabs, TabItem, Card, CardGrid, LinkCard, Aside } from '@astrojs/starlight/components';
 
 ## Requirements
 
@@ -14,7 +15,7 @@ keywords: ["install", "quickstart", "triton", "cuda", "uv", "pytorch"]
 ## Install
 
 <Tabs>
-  <Tab title="Copy the folder (no install)">
+  <TabItem label="Copy the folder (no install)">
     The kernels need no installation to be *used*. Copy the `kernels/` directory into your project and
     import it directly — it is a self-contained package with no build step.
 
@@ -25,26 +26,26 @@ keywords: ["install", "quickstart", "triton", "cuda", "uv", "pytorch"]
     ```python
     from kernels import fused_linear_cross_entropy, fused_xsa, FusedMuon, fused_router, moe
     ```
-  </Tab>
-  <Tab title="Run from a clone (uv)">
-    To run the benchmarks and examples from a fresh clone, [`uv`](https://docs.astral.sh/uv/) creates a
+  </TabItem>
+  <TabItem label="Run from a clone (uv)">
+    To run the benchmarks and examples from a fresh clone, [uv](https://docs.astral.sh/uv/) creates a
     virtual environment with the correct CUDA PyTorch wheel:
 
     ```bash
-    git clone https://github.com/IsNoobGrammer/triton-kernel-fused
+    git clone https://github.com/IsNoobgrammer/triton-kernel-fused
     cd triton-kernel-fused
     uv sync                 # creates .venv with CUDA torch (cu124) + triton
     uv run python bench.py
     ```
-  </Tab>
-  <Tab title="Existing CUDA environment">
+  </TabItem>
+  <TabItem label="Existing CUDA environment">
     If you already have a CUDA PyTorch + Triton environment, there is nothing to install — run directly
     from the repo root:
 
     ```bash
     python bench.py
     ```
-  </Tab>
+  </TabItem>
 </Tabs>
 
 ## Your first kernel
@@ -84,15 +85,19 @@ python bench.py --compile moe        # PolyGLU MoE
 ```
 
 Each run prints both a speed/memory comparison against the `torch.compile`'d baseline and a gradient
-parity check. See [Benchmarking](/concepts/benchmarking) for how to read the output.
+parity check. See [Benchmarking](/triton-kernel-fused/concepts/benchmarking/) for how to read the output.
 
 ## Where to go next
 
-<Columns cols={2}>
-  <Card title="The structural edge" icon="lightbulb" href="/concepts/the-structural-edge">
-    The design principle behind every kernel here.
-  </Card>
-  <Card title="Browse the kernels" icon="layer-group" href="/kernels/cross-entropy">
-    Per-kernel API, shapes, and tuning knobs.
-  </Card>
-</Columns>
+<CardGrid>
+  <LinkCard
+    title="The structural edge"
+    description="The design principle behind every kernel here."
+    href="/triton-kernel-fused/concepts/the-structural-edge/"
+  />
+  <LinkCard
+    title="Browse the kernels"
+    description="Per-kernel API, shapes, and tuning knobs."
+    href="/triton-kernel-fused/kernels/cross-entropy/"
+  />
+</CardGrid>

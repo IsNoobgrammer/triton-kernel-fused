@@ -1,8 +1,9 @@
 ---
-title: "Fused Muon"
-description: "Polar-Express Newton-Schulz Muon optimizer step, launch-overhead-fused with foreach + baddbmm, plus a bit-identical distributed variant for DDP."
-keywords: ["muon", "optimizer", "newton schulz", "polar express", "orthogonalization", "foreach", "baddbmm", "distributed", "ddp", "tensor cores"]
+title: Fused Muon
+description: Polar-Express Newton-Schulz Muon optimizer step, launch-overhead-fused with foreach + baddbmm, plus a bit-identical distributed variant for DDP.
 ---
+
+import { Aside } from '@astrojs/starlight/components';
 
 ```python
 from kernels import FusedMuon, DistributedMuon, newton_schulz
@@ -18,7 +19,7 @@ and batching same-shape work into larger GEMMs.
 
 This is **not** a Triton kernel — the step is GEMM-bound (Newton-Schulz is three matmuls per iteration,
 which is the algorithmic floor), and a hand-written `tl.dot` Newton-Schulz loses to cuBLAS on Turing. The
-wins are all [launch-overhead and batched-GEMM](/concepts/the-structural-edge) levers:
+wins are all launch-overhead and batched-GEMM levers:
 
 1. **`torch._foreach_*`** collapses the per-parameter momentum / Nesterov sweeps from `N × (several
    launches)` down to a handful.
@@ -29,12 +30,12 @@ wins are all [launch-overhead and batched-GEMM](/concepts/the-structural-edge) l
 4. **Same-shape parameters batch into one GEMM.** Many small 2D weights and stacked 3D expert weights are
    grouped so the Newton-Schulz runs as one larger, better-utilized matmul.
 
-<Note>
-Capturing the whole step as a CUDA graph was tried and **discarded**: it cut launches by more than half
-and erased "Command Buffer Full" from the profile, but wall-clock did not move — the step is
-GPU-compute-bound, not launch-bound. The capture path is kept as an opt-in (`use_graph=True`) for a
-genuinely launch-bound host, but it is off by default. See [the structural edge](/concepts/the-structural-edge).
-</Note>
+<Aside type="note">
+Capturing the whole step as a CUDA graph was tried and **discarded**: it cut launches by more than half and
+erased "Command Buffer Full" from the profile, but wall-clock did not move — the step is GPU-compute-bound,
+not launch-bound. The capture path is kept as an opt-in (`use_graph=True`) for a genuinely launch-bound
+host, but it is off by default.
+</Aside>
 
 ## Performance
 
@@ -47,7 +48,7 @@ memory gate** (fused peak memory must stay at or below the baseline's peak):
 | ~300M (192 tensors) | **~1.03–1.06×** | ≤ baseline |
 
 Parity vs the trusted reference is ~7e-7 (fp32 path). A faster setting exists if you can spend memory — see
-[Fast mode](#fast-mode-trading-memory-for-speed).
+[Fast mode](#fast-mode--trading-memory-for-speed).
 
 ## API
 
@@ -65,12 +66,12 @@ FusedMuon(
 )
 ```
 
-<Warning>
+<Aside type="caution">
 `FusedMuon` only steps **2D and 3D** parameters that have a gradient (3D stacked experts are orthogonalized
 per slice). Route 1D parameters (norms, biases), embeddings, and convolution kernels to a standard
 optimizer such as AdamW. The conventional Muon setup uses two parameter groups: Muon for the matrices,
 AdamW for everything else.
-</Warning>
+</Aside>
 
 ### Key arguments
 
@@ -129,7 +130,6 @@ update set.
 
 ```python
 from kernels import DistributedMuon
-import torch.distributed as dist
 
 opt = DistributedMuon(matrix_params, lr=0.02, weight_decay=0.01, process_group=None)
 ```

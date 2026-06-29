@@ -22,15 +22,15 @@ places where the compiler *structurally* can't fuse:
 
 | Kernel | Replaces | The edge `torch.compile` can't get | T4 result |
 |---|---|---|---|
-| [`fused_linear_cross_entropy`](docs/kernels/cross-entropy) | `lm_head` + `F.cross_entropy` | gradient computed in the forward chunk loop — **never materializes the `(N, V)` logits** | **~3.4× less peak memory** (trains where standard CE OOMs); matches Liger |
-| [`fused_xsa`](docs/kernels/xsa) | Exclusive Self-Attention correction | one fused kernel reads `V` **once** (the compiler emits two passes) | **~1.15×** fwd+bwd, grad-exact |
-| [`FusedMuon`](docs/kernels/muon) | Polar-Express Muon optimizer step | `foreach` + `baddbmm` collapse the per-param launch tax; experts batch into one GEMM | **~1.09×** (75M) / **~1.05×** (300M), peak mem ≤ baseline |
-| [`fused_router`](docs/kernels/router) | conv router (conv → sigmoid → bias → topk → gather) | fuses native `topk` into an in-register epilogue + a merged backward | **~1.11–1.17×** fwd+bwd, exact grads, mem parity |
-| [`moe`](docs/kernels/moe) | masked per-expert MoE combine | fuses data-dependent dispatch + cuBLAS GEMMs + activation + weighted scatter | **~2.87×** (the data-dependent edge survives compile) |
+| [`fused_linear_cross_entropy`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/cross-entropy/) | `lm_head` + `F.cross_entropy` | gradient computed in the forward chunk loop — **never materializes the `(N, V)` logits** | **~3.4× less peak memory** (trains where standard CE OOMs); matches Liger |
+| [`fused_xsa`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/xsa/) | Exclusive Self-Attention correction | one fused kernel reads `V` **once** (the compiler emits two passes) | **~1.15×** fwd+bwd, grad-exact |
+| [`FusedMuon`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/muon/) | Polar-Express Muon optimizer step | `foreach` + `baddbmm` collapse the per-param launch tax; experts batch into one GEMM | **~1.09×** (75M) / **~1.05×** (300M), peak mem ≤ baseline |
+| [`fused_router`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/router/) | conv router (conv → sigmoid → bias → topk → gather) | fuses native `topk` into an in-register epilogue + a merged backward | **~1.11–1.17×** fwd+bwd, exact grads, mem parity |
+| [`moe`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/moe/) | masked per-expert MoE combine | fuses data-dependent dispatch + cuBLAS GEMMs + activation + weighted scatter | **~2.87×** (the data-dependent edge survives compile) |
 
 > **Performance is architecture-specific.** All numbers above are measured on a Tesla T4 (`sm_75`)
 > against a `torch.compile`'d eager baseline. Numbers from one GPU class do not transfer to another —
-> always re-benchmark on your target hardware. See [Benchmarking](docs/concepts/benchmarking).
+> always re-benchmark on your target hardware. See [Benchmarking](https://isnoobgrammer.github.io/triton-kernel-fused/concepts/benchmarking/).
 
 `fused_router` documents a **conv** router (sigmoid-gate, no-activation) — see its page for which
 configurations are covered. `moe` is shaped for the **PolyGLU** expert layout (fused gate+up, per-expert
@@ -101,7 +101,7 @@ opt.zero_grad(set_to_none=True)
 
 `ns_dtype=torch.float16` is the T4 default (engages fp16 tensor cores); use `torch.float32` for a
 numerically-safe fallback, `torch.bfloat16` only on Ampere/Hopper. `DistributedMuon` gives a bit-identical
-round-robin variant for DDP. See the [Muon page](docs/kernels/muon) for `ns_batch_elems`, `scale_mode`,
+round-robin variant for DDP. See the [Muon page](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/muon/) for `ns_batch_elems`, `scale_mode`,
 and the opt-in fast mode.
 
 ### Conv MoE router (sigmoid gate)
@@ -157,11 +157,18 @@ not transfer to another.
 
 ## Documentation
 
-Full docs (per-kernel API, the design rationale behind each win, and benchmarking guidance) live in
-[`docs/`](docs/) and build with [Mintlify](https://mintlify.com):
+📖 **[isnoobgrammer.github.io/triton-kernel-fused](https://isnoobgrammer.github.io/triton-kernel-fused/)**
+
+Full docs — per-kernel API, the design rationale behind each win, and benchmarking guidance — are an
+[Astro Starlight](https://starlight.astro.build) site under [`docs/`](docs/), published to GitHub Pages
+automatically on every push to `master` (see [`.github/workflows/deploy-docs.yml`](.github/workflows/deploy-docs.yml)).
+
+To preview or edit the docs locally:
 
 ```bash
-cd docs && mint dev      # local preview at http://localhost:3000
+cd docs
+npm install
+npm run dev       # local preview at http://localhost:4321/triton-kernel-fused
 ```
 
 ## License

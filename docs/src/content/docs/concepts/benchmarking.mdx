@@ -1,8 +1,9 @@
 ---
-title: "Benchmarking"
-description: "How to benchmark the kernels honestly against a torch.compile baseline and read the output."
-keywords: ["benchmark", "torch.compile", "parity", "gradient check", "tesla t4", "memory"]
+title: Benchmarking
+description: How to benchmark the kernels honestly against a torch.compile baseline and read the output.
 ---
+
+import { Aside } from '@astrojs/starlight/components';
 
 Every performance claim in these docs comes from `bench.py`, which times each kernel against a
 `torch.compile`'d eager baseline — the realistic steady state a modern training stack runs in — and checks
@@ -27,10 +28,10 @@ Each run reports, for the forward and the backward separately and combined:
 - **Gradient parity** — the maximum absolute difference of every input gradient against the eager
   reference under the same upstream cotangent.
 
-<Tip>
+<Aside type="tip">
 The `--compile` flag compiles the *baseline* with `torch.compile` (using `fullgraph=True` where possible,
 the strongest and fairest bar). Drop it to compare against uncompiled eager instead.
-</Tip>
+</Aside>
 
 ## Reading the result honestly
 
@@ -44,11 +45,11 @@ Speed is not the only axis, and for some kernels it is not even the relevant one
 | `fused_router` | Speed at memory parity — ~1.11–1.17× forward+backward with exact gradients. |
 | `moe` | Speed by a wide margin — ~2.87×, because the data-dependent routing is something the compiler cannot fuse at all. |
 
-<Warning>
-**Numbers do not transfer across GPU classes.** Every figure in these docs is from a Tesla T4 (`sm_75`).
-Tensor-core support, SRAM size, and occupancy differ enough between Turing, Ampere, and Hopper that a
-kernel which wins on one can lose on another. Always run `bench.py` on the GPU you will actually train on.
-</Warning>
+<Aside type="caution" title="Numbers do not transfer across GPU classes">
+Every figure in these docs is from a Tesla T4 (`sm_75`). Tensor-core support, SRAM size, and occupancy
+differ enough between Turing, Ampere, and Hopper that a kernel which wins on one can lose on another. Always
+run `bench.py` on the GPU you will actually train on.
+</Aside>
 
 ## A note on local vs target hardware
 

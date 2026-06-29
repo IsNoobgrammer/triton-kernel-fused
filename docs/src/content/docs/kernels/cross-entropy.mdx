@@ -1,8 +1,9 @@
 ---
-title: "Fused-linear cross-entropy"
-description: "Fuses the LM-head GEMM with softmax cross-entropy so the (N, V) logits are never materialized — trains where standard CE OOMs."
-keywords: ["cross entropy", "fused linear cross entropy", "cut cross entropy", "liger", "lm head", "logits", "memory", "oom"]
+title: Fused-linear cross-entropy
+description: Fuses the LM-head GEMM with softmax cross-entropy so the (N, V) logits are never materialized — trains where standard CE OOMs.
 ---
+
+import { Aside } from '@astrojs/starlight/components';
 
 ```python
 from kernels import fused_linear_cross_entropy
@@ -15,9 +16,9 @@ intermediate entirely, so training runs where the standard path cannot.
 
 ## Why it wins
 
-Standard cross-entropy on an LM head allocates the full `(N, V)` logits. But cross-entropy's gradient
-with respect to the logits is `(softmax − onehot) / n`, which needs **only the logits and the labels** —
-and the loss is a scalar, so the upstream gradient is just a scalar multiplier.
+Standard cross-entropy on an LM head allocates the full `(N, V)` logits. But cross-entropy's gradient with
+respect to the logits is `(softmax − onehot) / n`, which needs **only the logits and the labels** — and
+the loss is a scalar, so the upstream gradient is just a scalar multiplier.
 
 The kernel exploits this. The forward pass streams logits in row-chunks via cuBLAS; for each live chunk, a
 single Triton kernel computes the log-sum-exp **and** writes the gradient in place, then forms
@@ -29,10 +30,11 @@ scale. The result:
 - **3 GEMMs** over the data (logits, `grad_hidden`, `grad_weight`), with **no backward recompute** — the
   recompute variant lost to Liger by an extra GEMM, so this fused forward+backward path drops it.
 
-<Note>
-This is the same class of edge as [terminal-loss fusion](/concepts/the-structural-edge): the win is
-**memory**, and memory is what lets the training step happen at all.
-</Note>
+<Aside type="note">
+This is the same class of edge as terminal-loss fusion described in
+[The structural edge](/triton-kernel-fused/concepts/the-structural-edge/): the win is **memory**, and
+memory is what lets the training step happen at all.
+</Aside>
 
 ## Performance
 

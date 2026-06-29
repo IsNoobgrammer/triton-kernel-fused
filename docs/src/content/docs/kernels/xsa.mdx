@@ -1,8 +1,9 @@
 ---
-title: "XSA correction"
-description: "Exclusive Self-Attention rejection fused into one forward and one backward kernel that reads V only once, with in-kernel GQA broadcast."
-keywords: ["xsa", "exclusive self attention", "attention", "gqa", "rejection", "read once", "triton"]
+title: XSA correction
+description: Exclusive Self-Attention rejection fused into one forward and one backward kernel that reads V only once, with in-kernel GQA broadcast.
 ---
+
+import { Aside } from '@astrojs/starlight/components';
 
 ```python
 from kernels import fused_xsa
@@ -24,8 +25,8 @@ The natural eager expression of XSA makes the compiler read `V` twice and materi
 never need to exist. The fused kernel:
 
 - **Reads `V` once.** The normalization, dot product, scale, and subtraction all happen in a single pass
-  with reductions accumulated in float32 in-register — a [read-once reduction](/concepts/the-structural-edge)
-  the compiler emits as two passes.
+  with reductions accumulated in float32 in-register — a read-once reduction the compiler emits as two
+  passes.
 - **Broadcasts GQA in-kernel.** When there are fewer key/value heads than query heads, `V` is broadcast
   across the query group inside the kernel (the SDPA `enable_gqa` style). The `(B, H, S, D)` `repeat_kv`
   copy and the normalized-`V` tensor are **never materialized**.

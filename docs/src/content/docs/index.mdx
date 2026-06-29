@@ -1,0 +1,92 @@
+---
+title: triton-kernel-fused
+description: Drop-in fused Triton kernels (forward + backward) for transformer training on NVIDIA GPUs — they beat torch.compile where it structurally can't fuse.
+template: splash
+hero:
+  tagline: Fused Triton kernels (forward and backward) that beat torch.compile where it structurally can't — and don't pretend to where it can.
+  actions:
+    - text: Quickstart
+      link: /triton-kernel-fused/quickstart/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/IsNoobgrammer/triton-kernel-fused
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard, Aside } from '@astrojs/starlight/components';
+
+A small library of **fused Triton kernels** — each with both a forward pass and a custom autograd
+backward — that drop in for an eager PyTorch block during transformer training. They are developed and
+tuned on the Turing / Tesla T4 class (`sm_75`), and correctness is always the gate: numerical parity of
+both the forward output and the gradients against the eager reference is never traded for speed.
+
+## What this is — and isn't
+
+This is **not** a "compile everything" layer. `torch.compile` already saturates HBM bandwidth on plain
+elementwise ops; you cannot beat it there, and this library does not try. Instead, every kernel here
+targets a place where the compiler *structurally* cannot fuse — a routing decision whose shape is only
+known at runtime, a loss that would have to materialize an enormous intermediate, a reduction the compiler
+insists on doing in two passes, or a native op it must keep as an opaque library call.
+
+## The kernels
+
+<CardGrid>
+  <LinkCard
+    title="Fused-linear cross-entropy"
+    description="Fuses the LM-head GEMM with softmax-CE so the (N, V) logits are never materialized. Trains where standard cross-entropy OOMs; matches Liger."
+    href="/triton-kernel-fused/kernels/cross-entropy/"
+  />
+  <LinkCard
+    title="XSA correction"
+    description="Exclusive Self-Attention rejection fused into one forward and one backward kernel that reads V only once, with in-kernel GQA broadcast."
+    href="/triton-kernel-fused/kernels/xsa/"
+  />
+  <LinkCard
+    title="Fused Muon"
+    description="Polar-Express Newton-Schulz optimizer step, launch-overhead-fused with foreach + baddbmm, plus a bit-identical distributed variant for DDP."
+    href="/triton-kernel-fused/kernels/muon/"
+  />
+  <LinkCard
+    title="Conv MoE router"
+    description="Conv to sigmoid gate to top-k to gather, fused into one epilogue (folding native topk) with a merged manual backward."
+    href="/triton-kernel-fused/kernels/router/"
+  />
+  <LinkCard
+    title="PolyGLU MoE combine"
+    description="Data-dependent expert dispatch + cuBLAS GEMMs + fused activation + weighted scatter — the routing edge the compiler can't fuse."
+    href="/triton-kernel-fused/kernels/moe/"
+  />
+</CardGrid>
+
+## Performance at a glance
+
+All numbers are measured on a **Tesla T4 (`sm_75`)** against a `torch.compile`'d eager baseline.
+
+| Kernel | T4 result vs `torch.compile` |
+|---|---|
+| `fused_linear_cross_entropy` | ~3.4× less peak memory (trains where standard CE OOMs); matches Liger |
+| `fused_xsa` | ~1.15× forward+backward, grad-exact |
+| `FusedMuon` | ~1.09× (75M params) / ~1.05× (300M), peak memory ≤ baseline |
+| `fused_router` | ~1.11–1.17× forward+backward, exact grads, memory parity |
+| `moe` | ~2.87× (the data-dependent routing edge survives compile) |
+
+<Aside type="caution" title="Numbers are architecture-specific">
+These figures were obtained on Turing (`sm_75`) and do not transfer to other GPU classes. Always
+re-benchmark on your own target hardware — see [Benchmarking](/triton-kernel-fused/concepts/benchmarking/).
+</Aside>
+
+## Next steps
+
+<CardGrid>
+  <LinkCard
+    title="Quickstart"
+    description="Install, import, and run your first fused kernel."
+    href="/triton-kernel-fused/quickstart/"
+  />
+  <LinkCard
+    title="The structural edge"
+    description="Why these specific kernels beat torch.compile — and why most kernels wouldn't."
+    href="/triton-kernel-fused/concepts/the-structural-edge/"
+  />
+</CardGrid>
