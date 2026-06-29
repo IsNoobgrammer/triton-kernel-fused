@@ -88,7 +88,7 @@ Or, with an existing CUDA PyTorch environment, just run `python bench.py` from t
 
 ```python
 import torch
-from kernels import fused_linear_cross_entropy
+from kernels.sm75 import fused_linear_cross_entropy
 
 hidden  = torch.randn(16384, 512, device="cuda", dtype=torch.float16, requires_grad=True)
 lm_head = torch.randn(81000, 512, device="cuda", dtype=torch.float16, requires_grad=True)
@@ -105,7 +105,7 @@ loss.backward()
 
 ```python
 import torch
-from kernels import fused_xsa
+from kernels.sm75 import fused_xsa
 
 attn_output  = torch.randn(16, 4, 1024, 128, device="cuda", dtype=torch.float16)  # (B, H, S, D)
 value_states = torch.randn(16, 2, 1024, 128, device="cuda", dtype=torch.float16)  # (B, Hkv, S, D), GQA
@@ -116,7 +116,7 @@ corrected = fused_xsa(attn_output, value_states)                                
 
 ```python
 import torch
-from kernels import FusedMuon
+from kernels.sm75 import FusedMuon
 
 # 2D/3D weights -> Muon; route 1D params (norms, biases) and embeddings to AdamW upstream.
 opt = FusedMuon(model.muon_params(), lr=0.02, momentum=0.95, weight_decay=0.01)
@@ -136,7 +136,7 @@ and the opt-in fast mode.
 
 ```python
 import torch
-from kernels import fused_router, router_bias_update
+from kernels.sm75 import fused_router, router_bias_update
 
 x      = torch.randn(16, 1024, 512, device="cuda", dtype=torch.float16)  # (B, S, H)
 weight = torch.randn(11, 512, 4, device="cuda", dtype=torch.float16)     # (E, H, K) — nn.Conv1d weight
@@ -153,7 +153,7 @@ router_bias_update(bias, counts, u=0.001)                                # b += 
 
 ```python
 import torch
-from kernels import moe
+from kernels.sm75 import moe
 
 # top-k indices/weights come from YOUR router; expert weights are stacked per expert:
 hidden    = torch.randn(16384, 512, device="cuda", dtype=torch.float16)    # (N, H)
@@ -182,6 +182,15 @@ python bench.py --compile moe        # PolyGLU MoE
 
 Run on the target GPU — kernel performance is architecture-specific, so numbers from one GPU class do
 not transfer to another.
+
+## Contributing
+
+Kernels are organized by **GPU architecture** under `kernels/<arch>/` (e.g. `kernels/sm75/` for Turing /
+Tesla T4). To add support for another GPU class — Ampere `sm80`, Hopper `sm90` — drop a self-contained
+kernel into the matching arch package and export it from that package's `__init__.py`. The full guide
+(design bar, correctness gate, benchmarking conventions, PR checklist) is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and on the
+[Contributing page](https://isnoobgrammer.github.io/triton-kernel-fused/contributing/).
 
 ## License
 

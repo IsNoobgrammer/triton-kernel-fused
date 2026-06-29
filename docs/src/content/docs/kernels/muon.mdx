@@ -6,7 +6,7 @@ description: Polar-Express Newton-Schulz Muon optimizer step, launch-overhead-fu
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels import FusedMuon, DistributedMuon, newton_schulz
+from kernels.sm75 import FusedMuon, DistributedMuon, newton_schulz
 ```
 
 A fused implementation of the **Muon** optimizer step using a Polar-Express Newton-Schulz
@@ -107,7 +107,7 @@ opt = FusedMuon(matrix_params, lr=0.02, ns_batch_elems=64 * 1024 * 1024)   # fas
 
 ```python
 import torch
-from kernels import FusedMuon
+from kernels.sm75 import FusedMuon
 
 # Two groups: matrices -> Muon, everything else -> AdamW.
 matrix_params = [p for n, p in model.named_parameters() if p.ndim in (2, 3) and "embed" not in n]
@@ -129,7 +129,7 @@ a FLOP-balanced subset of the parameters and broadcasts its packed updates; ever
 update set.
 
 ```python
-from kernels import DistributedMuon
+from kernels.sm75 import DistributedMuon
 
 opt = DistributedMuon(matrix_params, lr=0.02, weight_decay=0.01, process_group=None)
 ```
@@ -149,7 +149,7 @@ one dtype.
 The orthogonalization is exported on its own for direct use:
 
 ```python
-from kernels import newton_schulz
+from kernels.sm75 import newton_schulz
 
 G = torch.randn(512, 512, device="cuda", dtype=torch.float16)
 O = newton_schulz(G, ns_dtype=torch.float16)   # singular values driven toward 1

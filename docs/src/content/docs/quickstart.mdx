@@ -24,7 +24,7 @@ import { Tabs, TabItem, Card, CardGrid, LinkCard, Aside } from '@astrojs/starlig
     ```
 
     ```python
-    from kernels import fused_linear_cross_entropy, fused_xsa, FusedMuon, fused_router, moe
+    from kernels.sm75 import fused_linear_cross_entropy, fused_xsa, FusedMuon, fused_router, moe
     ```
   </TabItem>
   <TabItem label="Run from a clone (uv)">
@@ -56,7 +56,7 @@ it trains at vocabulary and sequence sizes where the standard path runs out of m
 
 ```python
 import torch
-from kernels import fused_linear_cross_entropy
+from kernels.sm75 import fused_linear_cross_entropy
 
 hidden  = torch.randn(16384, 512, device="cuda", dtype=torch.float16, requires_grad=True)
 lm_head = torch.randn(81000, 512, device="cuda", dtype=torch.float16, requires_grad=True)

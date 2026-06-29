@@ -43,8 +43,8 @@ import torch.nn.functional as F
 import triton
 from triton.testing import do_bench
 
-from kernels import fused_linear_cross_entropy, fused_xsa
-from kernels.moe import moe_per_expert, moe_grouped, moe_grouped_cublas, moe_eager
+from kernels.sm75 import fused_linear_cross_entropy, fused_xsa
+from kernels.sm75.moe import moe_per_expert, moe_grouped, moe_grouped_cublas, moe_eager
 
 DTYPE = torch.float16
 DEV = "cuda"
@@ -252,7 +252,7 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
     pipeline in torch.compile'd eager. The fused win is the transpose-free conv + folded-away glue
     (sigmoid/bias/gather) that compile can't pull out of cuDNN. Verifies grad_x/grad_w equivalence,
     idx agreement, and that the in-kernel count == bincount. topk/norm stay eager on both sides."""
-    from kernels.router import fused_router, _count_experts
+    from kernels.sm75.router import fused_router, _count_experts
     x = torch.randn(B, S, H, device=DEV, dtype=DTYPE)
     w = torch.randn(E, H, K, device=DEV, dtype=DTYPE) * 0.02
     bias = torch.zeros(E, device=DEV, dtype=torch.float32)
@@ -733,7 +733,7 @@ def _make_baseline_ns(ns_dtype):
     sum-of-squares overflows); the iteration GEMMs run in ns_dtype — so baseline-fp16 vs fused-fp16 is a
     fair same-precision fusion comparison. Plain fn so --compile can wrap it (compile WORKS for fp16/fp32
     on T4; it SKIPS bf16 — which is exactly why bf16 isn't a T4 baseline)."""
-    from kernels.muon import _PE_COEFFS
+    from kernels.sm75.muon import _PE_COEFFS
 
     def baseline_ns(G, coeffs=_PE_COEFFS, eps=1e-7):
         was_2d = G.ndim == 2
@@ -859,7 +859,7 @@ def bench_muon(layers=6):
     6 layers (~75M); `muon_big` = 24 layers (~300M) where the batched GEMMs dominate and the per-param
     CPU launch overhead amortizes (the regime that matters for real training).
     """
-    from kernels.muon import FusedMuon, DistributedMuon, newton_schulz
+    from kernels.sm75.muon import FusedMuon, DistributedMuon, newton_schulz
     shapes = _muon_shapes(layers=layers)
     nparam = sum(int(torch.tensor(s).prod()) for s in shapes)
     print(f"\n=== Muon (Polar-Express) — {len(shapes)} tensors, {nparam/1e6:.1f}M params ===")

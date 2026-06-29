@@ -6,7 +6,7 @@ description: Data-dependent expert dispatch + cuBLAS GEMMs + fused activation + 
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels import moe, moe_per_expert, moe_eager
+from kernels.sm75 import moe, moe_per_expert, moe_eager
 ```
 
 The MoE **combine** step: given a router's top-k indices and weights and a set of stacked expert weights,
@@ -79,7 +79,7 @@ that wins there.
 
 ```python
 import torch
-from kernels import moe
+from kernels.sm75 import moe
 
 N, H, I, E, k = 16384, 512, 768, 11, 2
 hidden    = torch.randn(N, H, device="cuda", dtype=torch.float16)

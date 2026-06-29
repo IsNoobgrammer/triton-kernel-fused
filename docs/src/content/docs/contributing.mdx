@@ -1,0 +1,112 @@
+---
+title: Contributing a kernel
+description: How the repo is organized by GPU architecture, and how to add a fused kernel for your arch (e.g. kernels/sm80) with the correctness and benchmarking conventions the project holds itself to.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+Kernels here are organized by **GPU architecture** — the CUDA compute capability of the hardware they are
+tuned for. Performance does not transfer across architectures (tensor-core support, SRAM size, and
+occupancy all differ), so each arch gets its own self-contained package and its own measured numbers.
+
+## Repository layout
+
+```
+kernels/
+  __init__.py          # namespace + AVAILABLE_ARCHS (no auto-import)
+  sm75/                # Turing / Tesla T4 — the reference arch
+    __init__.py        # the public API for this arch
+    cross_entropy.py  xsa.py  router.py  moe.py  muon.py
+  sm80/                # Ampere (A100, RTX 30xx) — add yours here
+  sm90/                # Hopper (H100) — ...
+```
+
+Each `kernels/sm<XX>/` package is **independent**: its kernel files do not import one another, and you
+import a kernel by naming its arch explicitly.
+
+```python
+from kernels.sm75 import fused_xsa, moe, FusedMuon       # the public API of an arch
+from kernels.sm75.moe import moe_grouped                  # advanced / private symbols
+```
+
+The arch number is the compute capability without the dot: `sm_7.5` → `sm75`, `sm_8.0` → `sm80`,
+`sm_9.0` → `sm90`. Check yours with `torch.cuda.get_device_capability()`.
+
+<Aside type="note">
+Today only `sm75` (Turing / Tesla T4) is populated — every number in these docs is measured there. Adding
+support for another GPU class is exactly the kind of contribution this layout is designed for.
+</Aside>
+
+## The bar: only fuse where the compiler structurally can't
+
+Before writing anything, read [The structural edge](/triton-kernel-fused/concepts/the-structural-edge/).
+The short version: `torch.compile` already saturates memory bandwidth on ordinary ops, so a kernel that
+reads and writes the same bytes will not be faster. A contribution earns its place only by exploiting an
+edge the compiler cannot reach — data-dependent routing, terminal-loss fusion, a read-once reduction, a
+native-op seam, or a launch-overhead/batched-GEMM collapse.
+
+<Aside type="caution">
+A kernel that ties `torch.compile` is not a contribution — it is maintenance burden. Identify the seam
+first, then fuse around it.
+</Aside>
+
+## Adding a kernel
+
+<Steps>
+
+1. **Locate (or create) your arch package.** If `kernels/sm80/` does not exist, create it with an
+   `__init__.py`, and add `"sm80"` to `AVAILABLE_ARCHS` in `kernels/__init__.py`.
+
+2. **Implement forward and backward.** Write the kernel as a `torch.autograd.Function` with a custom
+   `backward`, plus a thin public wrapper function (the API users call). Keep the file self-contained —
+   no imports from sibling kernel files.
+
+3. **Export the public API.** Add your public symbols to `kernels/sm80/__init__.py` and its `__all__`.
+   Keep private/advanced helpers importable from the module (`kernels.sm80.your_kernel`) but out of the
+   package's public surface.
+
+4. **Prove correctness — this is the gate.** Validate the forward output **and** every input gradient
+   against the eager reference under the same upstream cotangent. Correctness is never traded for speed; a
+   faster kernel that fails parity is a bug.
+
+5. **Add a benchmark.** Wire a `bench_<name>` entry into `bench.py` that compares your kernel against a
+   `torch.compile`'d eager baseline (`--compile`) and prints the parity check in the same run. See
+   [Benchmarking](/triton-kernel-fused/concepts/benchmarking/).
+
+6. **Measure on the target GPU.** A local machine is reliable for correctness only. Take every speed
+   verdict from the actual architecture you are claiming the number for, and label it with the GPU, dtype,
+   and shape.
+
+</Steps>
+
+## Conventions
+
+- **Numbers are arch-specific and must be labelled.** Every speed/memory claim states the GPU class
+  (`sm_75`), dtype, and problem shape. Do not quote a number measured on one arch for another.
+- **Protect the champion.** When optimizing an existing kernel, add the candidate as a *separate* path and
+  A/B it on the target GPU. Never overwrite a proven win with an unconfirmed change.
+- **Local proves correctness; the target GPU proves performance.** `tl.dot` scheduling, occupancy, and
+  library-call costs differ enough that a local result does not predict the target.
+- **Match the surrounding style.** Comment density, naming, and idiom should look like the existing
+  kernels in that arch package.
+
+## Pull request checklist
+
+- [ ] Kernel lives in the correct `kernels/sm<XX>/` package and is exported from its `__init__.py`.
+- [ ] Forward output and all gradients pass parity against the eager reference.
+- [ ] A `bench.py` entry compares against the `torch.compile` baseline and reports parity.
+- [ ] Speed/memory numbers are labelled with GPU class, dtype, and shape, and were measured on that GPU.
+- [ ] The kernel exploits a real structural seam (not a tie with `torch.compile`).
+- [ ] No emoji in code, comments, or docs.
+
+## Local development
+
+```bash
+git clone https://github.com/IsNoobgrammer/triton-kernel-fused
+cd triton-kernel-fused
+uv sync                              # CUDA torch (cu124) + triton
+uv run python bench.py --compile xsa # run a benchmark + parity check
+
+# Docs (this site):
+cd docs && npm install && npm run dev
+```

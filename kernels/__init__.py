@@ -1,21 +1,19 @@
-"""triton-kernel-fused — drop-in fused Triton kernels (forward + backward) for Turing/T4.
+"""triton-kernel-fused — drop-in fused Triton kernels (forward + backward) for transformer training.
 
-    from kernels import fused_linear_cross_entropy, fused_xsa, fused_router, moe
+Kernels are organized by **GPU architecture** (CUDA compute capability). Import from the package that
+matches the hardware you run on — performance is architecture-specific and the kernels are tuned per arch:
 
-Each kernel is a tested replacement for an eager PyTorch block, with a custom backward. They target
-the cases where torch.compile leaves performance on the table: data-dependent routing, terminal-loss
-fusion, read-once reductions, and native-op seams (e.g. top-k) the compiler must keep as library calls.
+    from kernels.sm75 import fused_linear_cross_entropy, fused_xsa, fused_router, moe, FusedMuon
+
+Available architectures:
+  - `kernels.sm75` — Turing / Tesla T4 (the reference arch; everything is tuned and verified here).
+
+To contribute kernels for another architecture (e.g. Ampere `sm_80`, Hopper `sm_90`), add a
+`kernels/sm<XX>/` package — see CONTRIBUTING.md.
 """
-from .cross_entropy import fused_linear_cross_entropy
-from .xsa import fused_xsa, FusedXSA
-from .router import fused_router, router_bias_update, FusedConvRouterCuDNN
-from .moe import moe, moe_per_expert, moe_eager
-from .muon import FusedMuon, DistributedMuon, newton_schulz
 
-__all__ = [
-    "fused_linear_cross_entropy",
-    "fused_xsa", "FusedXSA",
-    "fused_router", "router_bias_update", "FusedConvRouterCuDNN",
-    "moe", "moe_per_expert", "moe_eager",
-    "FusedMuon", "DistributedMuon", "newton_schulz",
-]
+# Compute-capability -> package-name mapping for the architectures shipped in this repo. This is a
+# directory of what exists; it does NOT auto-import (callers pick their arch explicitly).
+AVAILABLE_ARCHS = ("sm75",)
+
+__all__ = ["AVAILABLE_ARCHS"]

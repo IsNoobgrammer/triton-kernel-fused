@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 
 # reuse the same online-softmax reduction + grad-logit kernels as the chunked kernel (single source)
-from kernels.cross_entropy import _grad_logits_inplace, _fwd_reduce_kernel
+from kernels.sm75.cross_entropy import _grad_logits_inplace, _fwd_reduce_kernel
 
 __all__ = ["compiled_cross_entropy"]
 

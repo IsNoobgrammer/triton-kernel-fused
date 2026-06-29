@@ -16,7 +16,7 @@ the only path that fits when standard CE OOMs. Grad-exact vs F.cross_entropy (lo
 grad rel <1.2e-2 fp16; bit-identical to the recompute variant).
 
 Drop-in (replaces `F.cross_entropy(hidden @ lm_head.weight.T, labels)`):
-    from kernels.cross_entropy import fused_linear_cross_entropy
+    from kernels.sm75.cross_entropy import fused_linear_cross_entropy
     loss = fused_linear_cross_entropy(hidden, lm_head.weight, labels)   # hidden (N,H), weight (V,H)
 
 Supports ignore_index (default -100). Any vocab; H up to a few thousand.

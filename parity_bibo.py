@@ -11,7 +11,7 @@ Imports BiBo from ../BiBo (sibling dir). Compares the conv router end-to-end on 
 import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "BiBo")))
 import torch
-from kernels.router import fused_router, router_bias_update, _count_experts
+from kernels.sm75.router import fused_router, router_bias_update, _count_experts
 from src.configuration_bibo import BiBoConfig
 from src.modeling.ffn.router import BiBoMoERouter
 

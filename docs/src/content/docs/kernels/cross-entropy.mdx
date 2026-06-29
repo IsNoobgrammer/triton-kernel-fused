@@ -6,7 +6,7 @@ description: Fuses the LM-head GEMM with softmax cross-entropy so the (N, V) log
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels import fused_linear_cross_entropy
+from kernels.sm75 import fused_linear_cross_entropy
 ```
 
 A drop-in replacement for `F.cross_entropy(hidden @ lm_head.weight.T, labels)` that **never materializes
@@ -79,7 +79,7 @@ cost of a few more cuBLAS launches, and raise it only if you have headroom to sp
 
 ```python
 import torch
-from kernels import fused_linear_cross_entropy
+from kernels.sm75 import fused_linear_cross_entropy
 
 N, H, V = 16384, 512, 81000
 hidden  = torch.randn(N, H, device="cuda", dtype=torch.float16, requires_grad=True)

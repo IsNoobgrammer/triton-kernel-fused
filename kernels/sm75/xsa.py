@@ -13,7 +13,7 @@ forward and ONE backward kernel:
   - grad_Y = reject(grad_z, v_hat); grad_V analytic, accumulated over the group.
 
 Drop-in (apply after attention's value aggregation, before o_proj):
-    from kernels.xsa import fused_xsa
+    from kernels.sm75.xsa import fused_xsa
     attn_out = fused_xsa(attn_out, value_states)   # Y (B,H,S,D), V (B,Hkv,S,D)
 
 Grad-exact vs the eager rejection (fp16 atol ~1e-3).

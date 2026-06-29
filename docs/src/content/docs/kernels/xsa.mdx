@@ -6,7 +6,7 @@ description: Exclusive Self-Attention rejection fused into one forward and one b
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels import fused_xsa
+from kernels.sm75 import fused_xsa
 ```
 
 Exclusive Self-Attention (XSA, [arXiv:2603.09078](https://arxiv.org/abs/2603.09078)) removes, from each
@@ -65,7 +65,7 @@ Apply XSA after attention's value aggregation and before the output projection:
 
 ```python
 import torch
-from kernels import fused_xsa
+from kernels.sm75 import fused_xsa
 
 B, H, Hkv, S, D = 16, 4, 2, 1024, 128
 attn_output  = torch.randn(B, H,   S, D, device="cuda", dtype=torch.float16, requires_grad=True)

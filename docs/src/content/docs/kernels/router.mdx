@@ -6,7 +6,7 @@ description: Conv to sigmoid gate to top-k to gather fused into one epilogue (fo
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels import fused_router, router_bias_update
+from kernels.sm75 import fused_router, router_bias_update
 ```
 
 A fused **convolutional** MoE router: a 1D convolution over the sequence, a sigmoid gate, a selection-bias
@@ -82,7 +82,7 @@ Jacobian correctly. The fused path covers the conv + sigmoid-gate + no-activatio
 the DeepSeek-V3 heuristic bias update — a non-autograd, in-place nudge that pushes load toward the mean:
 
 ```python
-from kernels import fused_router, router_bias_update
+from kernels.sm75 import fused_router, router_bias_update
 
 idx, weights, counts = fused_router(x, weight, bias, top_k=2, num_experts=11, return_counts=True)
 router_bias_update(bias, counts, u=0.001)   # b += u * sign(mean_load - load)
@@ -107,7 +107,7 @@ on every rank.
 
 ```python
 import torch
-from kernels import fused_router
+from kernels.sm75 import fused_router
 
 B, S, H, E, K = 16, 1024, 512, 11, 4
 x      = torch.randn(B, S, H, device="cuda", dtype=torch.float16)

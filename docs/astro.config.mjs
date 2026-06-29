@@ -57,6 +57,10 @@ export default defineConfig({
             { label: 'PolyGLU MoE combine', link: '/kernels/moe/' },
           ],
         },
+        {
+          label: 'Contributing',
+          items: [{ label: 'Contributing a kernel', link: '/contributing/' }],
+        },
       ],
     }),
   ],

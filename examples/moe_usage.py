@@ -13,8 +13,8 @@ import torch.nn as nn
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kernels import moe, moe_per_expert
-from kernels.moe import moe_grouped, GROUPED_MIN_TOKENS   # advanced: explicit grouped path (sm_80+)
+from kernels.sm75 import moe, moe_per_expert
+from kernels.sm75.moe import moe_grouped, GROUPED_MIN_TOKENS   # advanced: explicit grouped path (sm_80+)
 
 DEV, DT = "cuda", torch.float16
 

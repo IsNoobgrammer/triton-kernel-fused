@@ -27,7 +27,7 @@ except ImportError:                          # Windows local: no triton — CUDA
         e.record(); torch.cuda.synchronize()
         return s.elapsed_time(e) / rep
 
-from kernels.muon import FusedMuon, newton_schulz, _PE_COEFFS
+from kernels.sm75.muon import FusedMuon, newton_schulz, _PE_COEFFS
 
 DEV = "cuda"
 

@@ -11,7 +11,7 @@ import sys, gc
 sys.path.insert(0, ".")
 import torch, torch.nn.functional as F
 from triton.testing import do_bench
-from kernels.cross_entropy import fused_linear_cross_entropy
+from kernels.sm75.cross_entropy import fused_linear_cross_entropy
 from ce_compiled import compiled_cross_entropy
 
 DEV, DT = "cuda", torch.float16
