@@ -30,11 +30,13 @@ __all__ = ["fused_router", "mlp_router", "router_bias_update",
 
 
 @triton.jit
-def _router_epilogue_fwd_kernel(Logit_ptr, Bias_ptr, Idx_ptr, W_ptr, N, sln, sle,
-                                HAS_BIAS: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
-                                BLOCK_N: tl.constexpr, BLOCK_E: tl.constexpr):
+def _router_epilogue_fwd_kernel(Logit_ptr, Bias_ptr, Idx_ptr, W_ptr, Count_ptr, N, sln, sle,
+                                HAS_BIAS: tl.constexpr, COUNT: tl.constexpr, E: tl.constexpr,
+                                TOPK: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_E: tl.constexpr):
     """sigmoid + (selection)bias + top-k argmax + unbiased gather in ONE pass. sel=scores+bias picks;
-    weights=scores (UNBIASED) at the picks. BLOCK_N rows/program (vectorized argmax over E)."""
+    weights=scores (UNBIASED) at the picks. BLOCK_N rows/program (vectorized argmax over E). When COUNT,
+    the per-expert load (bincount of the picks) is atomic-added IN THIS PASS from the in-register argmax,
+    so no separate _count_experts_kernel launch + no global idx re-read (Count_ptr must be zero-init)."""
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_e = tl.arange(0, BLOCK_E)
@@ -54,6 +56,10 @@ def _router_epilogue_fwd_kernel(Logit_ptr, Bias_ptr, Idx_ptr, W_ptr, N, sln, sle
         w_k = tl.sum(tl.where(onehot, scores, 0.0), axis=1)
         tl.store(Idx_ptr + offs_n * TOPK + k, am.to(tl.int64), mask=mask_n)
         tl.store(W_ptr + offs_n * TOPK + k, w_k, mask=mask_n)
+        if COUNT:                                          # fused bincount: atomic-add picks per expert
+            for ei in tl.static_range(E):
+                tl.atomic_add(Count_ptr + ei,
+                              tl.sum(tl.where(mask_n & (am == ei), 1, 0).to(tl.int32)))
         sel = tl.where(onehot, -1e30, sel)
 
 
@@ -82,18 +88,23 @@ def _router_epilogue_bwd_kernel(Logit_ptr, Idx_ptr, Gw_ptr, Gout_ptr, N,
              gout.to(Gout_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_e[None, :])
 
 
-def _epilogue_fwd(logits, bias, top_k):
+def _epilogue_fwd(logits, bias, top_k, num_experts=None):
+    """sigmoid+bias-select+top-k+unbiased-gather epilogue. If num_experts is given, the per-expert load
+    (counts) is fused into the same kernel (no separate _count_experts launch); returns (idx, w, counts)
+    with counts=None when num_experts is None."""
     N, E = logits.shape
     idx = torch.empty(N, top_k, device=logits.device, dtype=torch.long)
     w = torch.empty(N, top_k, device=logits.device, dtype=torch.float32)
+    counts = torch.zeros(num_experts, device=logits.device, dtype=torch.int32) if num_experts else None
     BLOCK_N = 128
     grid = (triton.cdiv(N, BLOCK_N),)
     _router_epilogue_fwd_kernel[grid](
-        logits, bias if bias is not None else logits, idx, w, N,
+        logits, bias if bias is not None else logits, idx, w,
+        counts if counts is not None else logits, N,
         logits.stride(0), logits.stride(1),
-        HAS_BIAS=bias is not None, E=E, TOPK=top_k,
+        HAS_BIAS=bias is not None, COUNT=counts is not None, E=E, TOPK=top_k,
         BLOCK_N=BLOCK_N, BLOCK_E=max(16, triton.next_power_of_2(E)))
-    return idx, w
+    return idx, w, counts
 
 
 @triton.jit
@@ -131,8 +142,7 @@ class FusedConvRouterCuDNN(torch.autograd.Function):
         xc = x.transpose(1, 2).contiguous()                     # (B,H,S) once, reused in bwd
         conv = F.conv1d(xc, weight, padding=K - 1)[..., :S]     # (B,E,S) causal, no F.pad copy
         logits = conv.transpose(1, 2).reshape(B * S, E)         # (B*S,E)
-        idx, weights = _epilogue_fwd(logits, bias, top_k)
-        counts = _count_experts(idx, num_experts)
+        idx, weights, counts = _epilogue_fwd(logits, bias, top_k, num_experts)  # count fused in-pass
         ctx.save_for_backward(xc, weight, logits, idx)
         ctx.K, ctx.S, ctx.E = K, S, E
         ctx.mark_non_differentiable(idx, counts)
@@ -175,9 +185,10 @@ class FusedMLPRouter(torch.autograd.Function):
         B, S, H = x.shape
         E = weight.shape[0]
         xflat = x.reshape(B * S, H)
-        logits = (xflat @ weight.t()).float()                   # (N,E) fp32 logits (matches eager .float())
-        idx, weights = _epilogue_fwd(logits, bias, top_k)
-        counts = _count_experts(idx, num_experts)
+        logits = xflat @ weight.t()                             # (N,E) GEMM-native dtype (fp32 in the
+        # fp32 gate, fp16 on the timed path) — the epilogue casts to fp32 in-register, so the separate
+        # .float() materialization (a full (N,E) copy kernel) is unnecessary.
+        idx, weights, counts = _epilogue_fwd(logits, bias, top_k, num_experts)  # count fused in-pass
         ctx.save_for_backward(xflat, weight, logits, idx)
         ctx.dims = (B, S, H, E, top_k)
         ctx.mark_non_differentiable(idx, counts)
@@ -188,7 +199,10 @@ class FusedMLPRouter(torch.autograd.Function):
         xflat, weight, logits, idx = ctx.saved_tensors
         B, S, H, E, top_k = ctx.dims
         N = B * S
-        grad_logits = torch.empty(N, E, device=xflat.device, dtype=torch.float32)
+        # grad_logits in weight.dtype: the bwd epilogue computes in fp32 and writes .to(Gout.dtype), so
+        # allocating it as the GEMM dtype removes the separate (N,E) .to(weight.dtype) cast kernel. fp32
+        # in the gate (weight is fp32), fp16 on the timed path — same dtype the two grad GEMMs consume.
+        grad_logits = torch.empty(N, E, device=xflat.device, dtype=weight.dtype)
         gw_in = grad_weights.contiguous()
         BLOCK_N = 128
         _router_epilogue_bwd_kernel[(triton.cdiv(N, BLOCK_N),)](
@@ -196,9 +210,8 @@ class FusedMLPRouter(torch.autograd.Function):
             logits.stride(0), logits.stride(1), idx.stride(0), idx.stride(1),
             gw_in.stride(0), gw_in.stride(1), grad_logits.stride(0), grad_logits.stride(1),
             E=E, TOPK=top_k, BLOCK_N=BLOCK_N, BLOCK_E=max(16, triton.next_power_of_2(E)))
-        gl = grad_logits.to(weight.dtype)
-        grad_x = (gl @ weight).view(B, S, H)                    # (N,E)@(E,H) -> grad wrt x
-        grad_w = gl.t() @ xflat                                 # (E,N)@(N,H) -> grad wrt W (E,H)
+        grad_x = (grad_logits @ weight).view(B, S, H)           # (N,E)@(E,H) -> grad wrt x
+        grad_w = grad_logits.t() @ xflat                        # (E,N)@(N,H) -> grad wrt W (E,H)
         return grad_x, grad_w, None, None, None
 
 
