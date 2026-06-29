@@ -69,12 +69,17 @@ class FusedMuon(optim.Optimizer):
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan"):
+                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan",
+                 ns_batch_elems=4 * 1024 * 1024):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype
         self.scale_mode = scale_mode
+        # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params (the launch win)
+        # while chunking the large expert stacks so their transients (gbuf/X/A) stay bounded. The
+        # persistent momentum buffer is unchanged (= baseline size); only the per-step transient shrinks.
+        self.ns_batch_elems = ns_batch_elems
 
     def _scale(self, p):
         r, c = p.shape[-2], p.shape[-1]
@@ -100,11 +105,21 @@ class FusedMuon(optim.Optimizer):
             for p in ps:
                 n = p.numel() // (r * c)                              # 1 for 2D, E for a 3D expert tensor
                 members.append((p, off, n)); off += n
+            M = off
             anchor = ps[0]
             if "muon_mom" not in self.state[anchor]:                 # don't clobber a loaded checkpoint
-                self.state[anchor]["muon_mom"] = torch.zeros((off, r, c), device=anchor.device, dtype=self.ns_dtype)
+                self.state[anchor]["muon_mom"] = torch.zeros((M, r, c), device=anchor.device, dtype=self.ns_dtype)
             scale = 0.2 * (max(r, c) ** 0.5) if self.scale_mode == "moonlight" else max(1, r / c) ** 0.5
-            plan.append({"r": r, "c": c, "M": off, "members": members, "anchor": anchor, "scale": scale})
+            # split members into row-chunks bounded by ns_batch_elems (params kept whole; ≥1 param/chunk)
+            row_cap = max(1, self.ns_batch_elems // (r * c))
+            chunks, cur, cur_rows, start = [], [], 0, 0
+            for p, _o, n in members:
+                if cur and cur_rows + n > row_cap:
+                    chunks.append((cur, start, cur_rows)); start += cur_rows; cur, cur_rows = [], 0
+                cur.append((p, cur_rows, n)); cur_rows += n          # offset relative to the chunk
+            if cur:
+                chunks.append((cur, start, cur_rows))
+            plan.append({"r": r, "c": c, "M": M, "chunks": chunks, "anchor": anchor, "scale": scale})
         cache[key] = plan
         return plan
 
@@ -131,20 +146,21 @@ class FusedMuon(optim.Optimizer):
             if wd != 0:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
             for g in plan:
-                r, c, M = g["r"], g["c"], g["M"]
+                r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
-                gbuf = torch.empty((M, r, c), device=mom.device, dtype=self.ns_dtype)
-                members = g["members"]
-                # gather all grads into the batched layout in ONE foreach (fp32->fp16), not N copies
-                torch._foreach_copy_([gbuf[off:off + n] for _, off, n in members],
-                                     [p.grad.reshape(n, r, c) for p, off, n in members])
-                mom.mul_(momentum).add_(gbuf)                         # buf = momentum*buf + grad (batched)
-                u = gbuf.add_(mom, alpha=momentum) if nesterov else mom   # reuse gbuf as the NS input
-                out = newton_schulz(u, self.coeffs, self.ns_dtype)
-                # scatter the scaled update back to the fp32 masters in ONE foreach (fp16->fp32 upcast)
-                torch._foreach_add_([p for p, _, _ in members],
-                                    [out[off:off + n].reshape(p.shape) for p, off, n in members],
-                                    alpha=-lr * g["scale"])
+                alpha = -lr * g["scale"]
+                for members, start, crows in g["chunks"]:            # bounded row-chunks (memory cap)
+                    mom_c = mom[start:start + crows]                  # view into the persistent buffer
+                    gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
+                    # gather this chunk's grads into the batched layout in ONE foreach (fp32->fp16)
+                    torch._foreach_copy_([gbuf[o:o + n] for _, o, n in members],
+                                         [p.grad.reshape(n, r, c) for p, o, n in members])
+                    mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
+                    u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
+                    out = newton_schulz(u, self.coeffs, self.ns_dtype)
+                    # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
+                    torch._foreach_add_([p for p, _, _ in members],
+                                        [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
 
         return loss
 
