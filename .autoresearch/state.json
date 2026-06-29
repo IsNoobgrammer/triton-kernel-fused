@@ -1,5 +1,16 @@
 {
   "round": 4,
+  "muon_round3_cudagraph": {
+    "objective": "minimize fused Muon step ms on T4 (baseline-mixed=1.00x); parity fused-fp32 vs full-fp32 < 1e-4, fp16-NS stability PASS, peak mem within reason",
+    "artifact": "kernels/muon.py FusedMuon (use_graph path)",
+    "eval_verdict": "python bench.py --compile muon (48 tensors/75M) AND muon_big (192/302M) on Tesla T4; user runs + pastes",
+    "incumbent_best": {"fused-mixed_48t_x": 1.07, "fused-mixed_192t_x": 1.03, "uncapped_48t_x": 1.11},
+    "diagnosis": "Step is LAUNCH-BOUND: profiler 'Command Buffer Full' = 60% (48t) / 81% (192t) of CUDA — GPU stalls waiting on CPU to submit ~1787/~7087 tiny kernels. GEMM (baddbmm+bmm)~62% = recipe floor (3 matmuls/iter x5, can't cut). copy_+Memcpy DtoD ~24% data movement. Fusion already halved launches; residual launch tax gates everything and GROWS with scale (why 192t is only 1.03x).",
+    "hypothesis": "CUDA-graph capture of momentum->NS->scatter collapses ~1787/7087 launches to (few eager grad-gathers)+1 replay, killing Command Buffer Full. Highest ceiling on muon_big (the real-training regime). Recipe math untouched -> parity preserved. Predicted: parity == fused-mixed (~2.3e-5), launch count collapses, ms approaches GEMM-bound floor (potentially 1.3-2x; theoretical since GPU spends ~50% in command-buffer stalls).",
+    "candidate": "fused-graph (FusedMuon use_graph=True): eager grad-gather into persistent fp16 staging buffers (robust to grad rebinding) + captured compute body; try/except falls back to permanent eager (=fused-mixed) on capture error. ASSUMES static lr/wd/momentum (baked into captured ops; set_graph(None) to recapture on LR-schedule change).",
+    "status": "DISPATCHED — awaiting T4 run of `bench.py --compile muon` and `muon_big`",
+    "keep_gate": "parity fused-graph vs fp32 ~= fused-mixed (capture-correctness), stability untouched, ms < fused-mixed beyond noise; else revert (drop fused-graph from variants, keep eager champion)."
+  },
   "round4_conv_router": {
     "objective": "max conv-router fwd+bwd x-vs-COMPILED-eager on T4, grad_rel<1.5e-2 idx-exact count-ok nan-free, mem<=compiled",
     "artifact": "kernels/router.py backends",

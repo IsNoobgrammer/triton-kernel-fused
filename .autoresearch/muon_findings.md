@@ -36,3 +36,20 @@ DISTRIBUTED option-B (DistributedMuon, exact whole-param round-robin, validated 
 
 NEXT (T4): run single-GPU A/B (--compile) to size fp16 win + the optimizer's % of step; then 2x T4
 torchrun to see if B's halved NS beats A's redundancy net of the broadcast. Ship winner to BiBo/bench/optim.py.
+
+## Round 3 — CUDA-graph capture (attack the launch bound)
+T4 profile verdict: fused-mixed is LAUNCH-BOUND, not compute-bound. `Command Buffer Full` = 60% of the
+step at 48 tensors and **81% at 192 tensors** — the GPU stalls waiting on the CPU to submit ~1787 / ~7087
+tiny kernels. GEMM (baddbmm+bmm) ~62% is the recipe floor (3 matmuls/iter x5 NS steps; tl.dot already
+refuted). copy_+Memcpy DtoD ~24% is data movement. Fusion (foreach+baddbmm+batched-state) already halved
+launches vs the compiled baseline, but the residual launch tax is exactly why fused-mixed is only 1.07x
+(48t) -> 1.03x (192t): the tax GROWS with param count.
+
+HYPOTHESIS: capture the whole momentum->NS->scatter as ONE CUDA graph, replay it each step. The grad
+gather stays eager (reads current p.grad -> robust to zero_grad(set_to_none=True) rebinding); everything
+downstream replays on persistent buffers. Collapses ~1787/7087 launches to (a few foreach gathers) + 1
+replay -> kills Command Buffer Full. Biggest upside on muon_big (the real-training regime). Recipe math
+untouched -> parity must stay == fused-mixed (~2.3e-5 vs fp32); a divergence flags a capture bug.
+CAVEAT: graph bakes in static lr/wd/momentum; call set_graph(None) to recapture after an LR-sched change.
+Candidate = `fused-graph` (use_graph=True), try/except falls back to eager champion on any capture error.
+STATUS: dispatched, awaiting T4. Predicted 1.3-2x (GPU spends ~50%/81% of the step in launch stalls).

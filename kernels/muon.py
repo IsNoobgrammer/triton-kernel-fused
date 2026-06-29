@@ -70,7 +70,7 @@ class FusedMuon(optim.Optimizer):
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan",
-                 ns_batch_elems=4 * 1024 * 1024):
+                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
@@ -80,6 +80,19 @@ class FusedMuon(optim.Optimizer):
         # while chunking the large expert stacks so their transients (gbuf/X/A) stay bounded. The
         # persistent momentum buffer is unchanged (= baseline size); only the per-step transient shrinks.
         self.ns_batch_elems = ns_batch_elems
+        # CUDA-graph capture: the step is LAUNCH-BOUND (the profiler's "Command Buffer Full" is 60-81%
+        # of the step — the GPU stalls waiting for the CPU to submit ~1.8k-7k tiny kernels). Capturing
+        # the whole momentum->NS->scatter as ONE graph and replaying it collapses that to (a few foreach
+        # grad-gathers) + 1 replay. The gather stays EAGER (reads the current p.grad each step, so it is
+        # robust to grads rebinding under zero_grad(set_to_none=True)); everything downstream is replayed
+        # on persistent buffers. ASSUMES STATIC HYPERPARAMS (lr/wd/momentum are baked into the captured
+        # ops) and stable param/grad shapes — recapture (set_graph(None)) on an LR-schedule change.
+        self.use_graph = use_graph
+        self.graph_warmup = graph_warmup
+        self._graph = None
+        self._gwork = None
+        self._gstep = 0
+        self._graph_failed = False
 
     def _scale(self, p):
         r, c = p.shape[-2], p.shape[-1]
@@ -123,12 +136,101 @@ class FusedMuon(optim.Optimizer):
         cache[key] = plan
         return plan
 
+    def _build_graph_work(self):
+        """Build (once, cached) the persistent per-chunk staging buffers + views the captured compute
+        reads/writes. `gbuf` is allocated ONCE here (not per-step), so its address is stable for capture;
+        `mom_c`/scatter views index into the persistent momentum/master buffers. `out_members` is kept so
+        the eager gather can re-fetch the CURRENT p.grad each step (grads may rebind between steps)."""
+        if self._gwork is not None:
+            return self._gwork
+        work, decay = [], []
+        for group in self.param_groups:
+            params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
+            if not params:
+                continue
+            lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
+                                          group["weight_decay"], group["nesterov"])
+            plan = self._plan(group, params)
+            if wd != 0:
+                decay.append((params, 1.0 - lr * wd))
+            for g in plan:
+                r, c = g["r"], g["c"]
+                mom = self.state[g["anchor"]]["muon_mom"]
+                alpha = -lr * g["scale"]
+                for members, start, crows in g["chunks"]:
+                    gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
+                    work.append({"gbuf": gbuf, "dst": [gbuf[o:o + n] for _, o, n in members],
+                                 "mom_c": mom[start:start + crows], "momentum": momentum,
+                                 "nesterov": nesterov, "alpha": alpha, "members": members,
+                                 "out_params": [p for p, _, _ in members], "r": r, "c": c})
+        self._gwork = (work, decay)
+        return self._gwork
+
+    def _gather(self, work):
+        """EAGER, every step: copy the current p.grad (fp32 master) into the persistent fp16 staging
+        buffers. This is the only op that touches p.grad, so capture/replay never sees a rebound grad."""
+        for w in work:
+            r, c = w["r"], w["c"]
+            torch._foreach_copy_(w["dst"], [p.grad.reshape(n, r, c) for p, o, n in w["members"]])
+
+    def _compute(self, work, decay):
+        """The capturable body: decoupled WD, batched momentum/Nesterov, Newton-Schulz, scatter — all on
+        persistent buffers (gbuf/mom/params). Identical math to the eager path; only the buffers persist."""
+        for params, f in decay:
+            torch._foreach_mul_(params, f)
+        for w in work:
+            mom_c, gbuf = w["mom_c"], w["gbuf"]
+            mom_c.mul_(w["momentum"]).add_(gbuf)
+            u = gbuf.add_(mom_c, alpha=w["momentum"]) if w["nesterov"] else mom_c
+            out = newton_schulz(u, self.coeffs, self.ns_dtype)
+            r, c = w["r"], w["c"]
+            torch._foreach_add_(w["out_params"],
+                                [out[o:o + n].reshape(p.shape) for p, o, n in w["members"]],
+                                alpha=w["alpha"])
+
+    @torch.no_grad()
+    def _graph_step(self):
+        """Launch-bound killer: warm a few eager steps, capture the compute body into a CUDA graph, then
+        replay it (one launch) every subsequent step. Falls back to permanent eager on any capture error
+        so a graph-unfriendly environment degrades to the fused-mixed champion instead of crashing."""
+        work, decay = self._build_graph_work()
+        self._gather(work)                                    # always eager — reads current grads
+        if self._graph is not None:
+            self._graph.replay()
+            return
+        self._gstep += 1
+        if self._gstep <= self.graph_warmup or self._graph_failed:
+            self._compute(work, decay)                        # eager warmup (materialize state, warm cuBLAS)
+            return
+        try:
+            g = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize()
+            with torch.cuda.graph(g):
+                self._compute(work, decay)                    # records ops; does NOT execute them
+            self._graph = g
+            self._graph.replay()                              # execute this step's work once
+        except Exception as ex:                               # noqa: BLE001 — degrade, don't crash the bench
+            self._graph, self._graph_failed = None, True
+            print(f"  (FusedMuon CUDA-graph capture failed: {type(ex).__name__}: "
+                  f"{str(ex).splitlines()[0]} — falling back to eager)")
+            self._compute(work, decay)
+
+    def set_graph(self, enabled):
+        """Toggle graph capture and drop any captured graph (call after an LR-schedule change so the
+        next step recaptures with the new hyperparams)."""
+        self.use_graph = enabled
+        self._graph, self._gwork, self._gstep, self._graph_failed = None, None, 0, False
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if self.use_graph:
+            self._graph_step()
+            return loss
 
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
