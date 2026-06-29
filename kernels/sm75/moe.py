@@ -450,11 +450,20 @@ def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
 
 
 def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
-    """Auto: grouped at >= GROUPED_MIN_TOKENS rows (N*top_k) on Ampere+ (sm_80+), else per-expert.
-    The grouped path's tl.dot GEMMs are catastrophic on Turing (T4, sm_75) — measured ~0.1x vs
-    compiled eager — so it is NEVER chosen on sm_<80. per-expert (cuBLAS) wins there."""
+    """Auto: grouped at >= GROUPED_MIN_TOKENS rows (N*top_k) on Ampere+ (sm_80+) AND only when every
+    expert is a GLU (act_codes in {0,1,2}); else per-expert.
+
+    The grouped path's tl.dot GEMMs are catastrophic on Turing (T4, sm_75) — measured ~0.1x vs compiled
+    eager — so it is NEVER chosen on sm_<80; per-expert (cuBLAS) wins there. The grouped path also does
+    NOT implement the Identity (code 3) / Zero (code 4) special experts — it runs GLU over every expert
+    uniformly — so it is correct ONLY for pure-GLU stacks. With a special expert present it produces
+    wrong output and gradients (measured: grad rel ~1.6e+03 on the 9-GLU+Identity+Zero stack), so we
+    fall back to the per-expert path (which handles codes 3/4 in fwd and bwd) whenever a special expert
+    is in the stack. per-expert is correct on every arch and is itself a large win (T4 ~2.9x; Blackwell
+    ~4x fwd+bwd). To use grouped on a mixed stack, fix _GroupedMoE to special-case codes 3/4 first."""
     cap_major = torch.cuda.get_device_capability(hidden.device)[0]
-    if top_k_indices.numel() >= GROUPED_MIN_TOKENS and cap_major >= 8:
+    glu_only = int(act_codes.max()) <= 2                          # codes 3 (Identity) / 4 (Zero) unsupported by grouped
+    if top_k_indices.numel() >= GROUPED_MIN_TOKENS and cap_major >= 8 and glu_only:
         return moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
     return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
 

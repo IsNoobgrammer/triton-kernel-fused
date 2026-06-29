@@ -65,14 +65,20 @@ The router stays in **your** model — this kernel only takes its top-k output a
 
 | Function | When | Notes |
 |---|---|---|
-| `moe` | auto | Picks `moe_grouped` at `≥ GROUPED_MIN_TOKENS` rows on Ampere+ (`sm_80+`), else `moe_per_expert`. |
-| `moe_per_expert` | small token counts; **all of Turing** | Sorted dispatch + cuBLAS GEMMs + fused PolyGLU + weighted scatter, with a manual backward. |
+| `moe` | auto | Picks `moe_grouped` at `≥ GROUPED_MIN_TOKENS` rows on Ampere+ (`sm_80+`) **and only for pure-GLU stacks**; otherwise `moe_per_expert`. |
+| `moe_per_expert` | small token counts, all of Turing, or any stack with Identity/Zero experts | Sorted dispatch + cuBLAS GEMMs + fused PolyGLU + weighted scatter, with a manual backward. Correct on every arch. |
 | `moe_eager` | reference only | The slow masked-loop baseline the fused paths beat — keep for parity checks. |
 
 <Aside type="caution">
-The grouped path's `tl.dot` GEMMs are **catastrophic on Turing** (~0.1× vs compiled eager on T4), so `moe`
-never selects it on `sm_<80`. On a T4 you always get the cuBLAS `moe_per_expert` path, which is the one
-that wins there.
+Two reasons `moe` may not pick the grouped path:
+
+1. **Turing.** The grouped `tl.dot` GEMMs are catastrophic on `sm_75` (~0.1× vs compiled eager), so grouped
+   is never selected on `sm_<80`. On a T4 you always get `moe_per_expert`.
+2. **Special experts.** The grouped path runs a GLU over every expert uniformly — it does **not** implement
+   the Identity (code `3`) or Zero (code `4`) experts. It is therefore correct only for pure-GLU stacks
+   (codes `0/1/2`). With a special expert present, `moe` falls back to `moe_per_expert`, which handles
+   codes `3`/`4` in both forward and backward. `moe_per_expert` is correct on every architecture and is
+   itself a large win (T4 ~2.9×, Blackwell ~4× forward+backward).
 </Aside>
 
 ## Usage
