@@ -727,55 +727,66 @@ def _import_bibo_muon():
         return None
 
 
-def _pe_reference():
-    """The verbatim single-GPU Polar-Express baseline (nprime06/parameter-golf) — bf16 NS, Jordan scale.
-    Returns (baseline_ns_fn, BaselineMuon_class). NS is plain so --compile can wrap it like the golf entry."""
+def _make_baseline_ns(ns_dtype):
+    """Unfused, separate-ops Polar-Express NS (the reference) at a chosen dtype. Norm is fp32 (an fp16
+    sum-of-squares overflows); the iteration GEMMs run in ns_dtype — so baseline-fp16 vs fused-fp16 is a
+    fair same-precision fusion comparison. Plain fn so --compile can wrap it (compile WORKS for fp16/fp32
+    on T4; it SKIPS bf16 — which is exactly why bf16 isn't a T4 baseline)."""
     from kernels.muon import _PE_COEFFS
 
     def baseline_ns(G, coeffs=_PE_COEFFS, eps=1e-7):
         was_2d = G.ndim == 2
         if was_2d:
             G = G.unsqueeze(0)
-        X = G.bfloat16()
+        X = G.float()
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
         transposed = X.size(-2) > X.size(-1)
         if transposed:
             X = X.mT
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+        X = X.to(ns_dtype)
         for a, b, c in coeffs:
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
+        X = X.float()
         if transposed:
             X = X.mT
         if was_2d:
             X = X.squeeze(0)
-        return X
+        return X.to(G.dtype)
 
-    class BaselineMuon(torch.optim.Optimizer):
-        def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0, ns_fn=baseline_ns):
-            super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay))
-            self.ns_fn = ns_fn
+    return baseline_ns
 
-        @torch.no_grad()
-        def step(self):
-            for grp in self.param_groups:
-                lr, mom, wd = grp["lr"], grp["momentum"], grp["weight_decay"]
-                for p in grp["params"]:
-                    if p.grad is None or p.ndim not in (2, 3):
-                        continue
-                    g = p.grad.bfloat16()
-                    st = self.state[p]
-                    if "momentum_buffer" not in st:
-                        st["momentum_buffer"] = torch.zeros_like(g)
-                    buf = st["momentum_buffer"]; buf.mul_(mom).add_(g)
-                    u = g.add(buf, alpha=mom) if grp["nesterov"] else buf
-                    u = self.ns_fn(u)
-                    scale = max(1, p.shape[-2] / p.shape[-1]) ** 0.5
-                    if wd > 0.0:
-                        p.data.mul_(1.0 - lr * wd)
-                    p.add_(u.to(p.dtype), alpha=-lr * scale)
 
-    return baseline_ns, BaselineMuon
+class _BaselineMuon(torch.optim.Optimizer):
+    """Reference Muon (PE coeffs, Jordan scale) — unfused per-param baseline. `compute_dtype` is the
+    grad+momentum dtype (matches FusedMuon's ns_dtype so baseline-mixed vs fused-mixed differs ONLY in
+    foreach+baddbmm); `ns_fn` runs the NS at the chosen precision. Master params keep their own dtype."""
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
+                 ns_fn=None, compute_dtype=torch.float32):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay))
+        self.ns_fn = ns_fn
+        self.compute_dtype = compute_dtype
+
+    @torch.no_grad()
+    def step(self):
+        for grp in self.param_groups:
+            lr, mom, wd = grp["lr"], grp["momentum"], grp["weight_decay"]
+            for p in grp["params"]:
+                if p.grad is None or p.ndim not in (2, 3):
+                    continue
+                g = p.grad.to(self.compute_dtype)
+                st = self.state[p]
+                if "momentum_buffer" not in st:
+                    st["momentum_buffer"] = torch.zeros_like(g)
+                buf = st["momentum_buffer"]; buf.mul_(mom).add_(g)
+                u = g.add(buf, alpha=mom) if grp["nesterov"] else buf
+                u = self.ns_fn(u)
+                scale = max(1, p.shape[-2] / p.shape[-1]) ** 0.5
+                if wd > 0.0:
+                    p.data.mul_(1.0 - lr * wd)
+                p.add_(u.to(p.dtype), alpha=-lr * scale)
 
 
 def _muon_shapes(layers=6, H=512, I=768, E=9):
@@ -787,9 +798,13 @@ def _muon_shapes(layers=6, H=512, I=768, E=9):
     return sh
 
 
-def _muon_params(shapes, seed=0):
+# Muon master weights are fp32 (the realistic mixed-precision setup): params/grads fp32, NS in fp16.
+_MASTER = torch.float32
+
+
+def _muon_params(shapes, seed=0, dtype=_MASTER):
     g = torch.Generator(device=DEV).manual_seed(seed)
-    return [torch.randn(*s, generator=g, device=DEV, dtype=DTYPE) for s in shapes]
+    return [torch.randn(*s, generator=g, device=DEV, dtype=dtype) for s in shapes]
 
 
 def _opt_ms(make_opt, shapes):
@@ -800,10 +815,27 @@ def _opt_ms(make_opt, shapes):
 
     def prime():
         for p in params:
-            p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=DTYPE)
+            p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)
     prime(); opt.step()                                        # materialize state, warm autotune/compile
     _warm(lambda: (prime(), opt.step()))
     return do_bench(lambda: (prime(), opt.step()))
+
+
+def _opt_peak(make_opt, shapes):
+    """Peak CUDA memory of one optimizer step (params + grads + momentum state + NS transients)."""
+    params = _muon_params(shapes, 0)
+    opt = make_opt(params)
+    gg = torch.Generator(device=DEV).manual_seed(1)
+
+    def prime():
+        for p in params:
+            p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)
+    prime(); opt.step()                                        # materialize momentum + warm
+    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+    prime(); opt.step(); torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() / 1e6
+    del params, opt; torch.cuda.empty_cache()
+    return peak
 
 
 def _muon_parity(make_opt, make_ref, shapes, steps=5):
@@ -813,7 +845,7 @@ def _muon_parity(make_opt, make_ref, shapes, steps=5):
     gg = torch.Generator(device=DEV).manual_seed(7)
     worst = 0.0
     for _ in range(steps):
-        grads = [torch.randn(*p.shape, generator=gg, device=DEV, dtype=DTYPE) for p in pr]
+        grads = [torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER) for p in pr]
         for p, gr in zip(pr, grads): p.grad = gr.clone()
         for p, gr in zip(pc, grads): p.grad = gr.clone()
         oref.step(); ocand.step()
@@ -826,50 +858,59 @@ def bench_muon():
     gate FIRST. Single-GPU always; distributed A (replicated) vs B (round-robin) when launched under
     `torchrun --nproc_per_node=2 bench.py --compile muon`.
     """
-    from kernels.muon import FusedMuon, DistributedMuon, newton_schulz, _PE_COEFFS
+    from kernels.muon import FusedMuon, DistributedMuon, newton_schulz
     shapes = _muon_shapes()
-    baseline_ns, BaselineMuon = _pe_reference()
     nparam = sum(int(torch.tensor(s).prod()) for s in shapes)
     print(f"\n=== Muon (Polar-Express) — {len(shapes)} tensors, {nparam/1e6:.1f}M params ===")
+    print("  master weights fp32, NS in fp16 (mixed) — the realistic T4 setup. bf16 omitted: no bf16")
+    print("  tensor cores on sm_75 AND torch.compile skips bf16 there (0.97x loser). Parity ref = FULL fp32 Muon.")
+    WD, LR = 0.1, 0.02
+    ns32, ns16 = _make_baseline_ns(torch.float32), _make_baseline_ns(torch.float16)
+    # PARITY REFERENCE = full fp32 Muon (everything fp32 — the mathematical truth).
+    ref = lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=ns32, compute_dtype=torch.float32)
 
-    # ── PHASE 1: PARITY GATE (correctness before speed) ──
+    # ── PHASE 1: PARITY GATE (correctness before speed; all vs the full-fp32 Muon) ──
     BiBoMuon = _import_bibo_muon()
     if BiBoMuon is not None:
-        # FUSION correctness vs the TRUSTED in-repo reference: match BiBo's recipe exactly
-        # (quintic Moonlight coeffs, 0.2*sqrt(max) scale, fp32 NS) and confirm foreach+baddbmm don't drift.
         d = _muon_parity(
-            lambda ps: FusedMuon(ps, lr=3e-4, weight_decay=0.1, coeffs=_QUINTIC,
+            lambda ps: FusedMuon(ps, lr=3e-4, weight_decay=WD, coeffs=_QUINTIC,
                                  ns_dtype=torch.float32, scale_mode="moonlight"),
-            lambda ps: BiBoMuon(ps, lr=3e-4, momentum=0.95, weight_decay=0.1),
-            shapes)
-        print(f"  parity  fused(quintic,fp32) vs BiBo Muon = {d:.2e}  "
-              f"{'PASS' if d < 1e-3 else 'FAIL'}  (fp32 fusion-correctness gate < 1e-3)")
+            lambda ps: BiBoMuon(ps, lr=3e-4, momentum=0.95, weight_decay=WD), shapes)
+        print(f"  parity  fused(quintic,fp32) vs BiBo Muon   = {d:.2e}  {'PASS' if d < 1e-4 else 'FAIL'}  (trusted anchor)")
     else:
-        print("  (BiBo Muon unavailable — fusion correctness falls back to the PE reference below)")
-
-    # PE faithfulness: our PE config vs the verbatim golf reference (bf16, Jordan scale)
-    dbf = _muon_parity(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.bfloat16),
-                       lambda ps: BaselineMuon(ps, lr=0.02, weight_decay=0.1), shapes)
-    print(f"  parity  fused-bf16 vs PE reference        = {dbf:.2e}  "
-          f"{'PASS' if dbf < 2e-2 else 'FAIL'}  (bf16 tolerance gate < 2e-2)")
-
-    # fp16-NS stability (T4 candidate): SV mean ~1, NaN-free
+        print("  (BiBo Muon unavailable — checkout ../BiBo next to repo for the trusted anchor)")
+    # FUSION correctness: fused-fp32 vs the full-fp32 reference (isolates foreach+baddbmm; fp32 params -> ~1e-6)
+    df32 = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float32), ref, shapes)
+    print(f"  parity  fused-fp32 vs full-fp32 Muon       = {df32:.2e}  {'PASS' if df32 < 1e-4 else 'FAIL'}  (isolates the fusion)")
+    # PRECISION fidelity: mixed (fp16 NS) vs the full-fp32 truth — informational (different op, not bit-parity)
+    dmix = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16), ref, shapes)
+    print(f"  parity  fused-mixed(fp16NS) vs full-fp32    = {dmix:.2e}  (fp16-NS precision diff, informational)")
+    # fp16-NS stability (T4 path): SV mean ~1, NaN-free
     ok = True
     for s in [(512, 512), (256, 512), (1536, 512), (9, 1536, 512), (9, 512, 768)]:
-        Y = newton_schulz(torch.randn(*s, device=DEV, dtype=DTYPE), ns_dtype=torch.float16).float()
+        Y = newton_schulz(torch.randn(*s, device=DEV, dtype=torch.float32), ns_dtype=torch.float16).float()
         sv = torch.linalg.svdvals(Y if Y.ndim == 3 else Y.unsqueeze(0))
         ok &= (not bool(Y.isnan().any())) and (0.80 <= sv.mean().item() <= 1.20)
-    print(f"  fp16-NS stability (SV~1, NaN-free)        = {'PASS' if ok else 'FAIL'}")
+    print(f"  fp16-NS stability (SV~1, NaN-free)         = {'PASS' if ok else 'FAIL'}")
 
-    # ── PHASE 2: SINGLE-GPU SPEED (vs the compiled baseline under --compile, like the golf entry) ──
-    ns_for_baseline = _c(baseline_ns)                          # --compile -> compiled NS (golf-faithful)
-    tb = _opt_ms(lambda ps: BaselineMuon(ps, lr=0.02, weight_decay=0.1, ns_fn=ns_for_baseline), shapes)
-    tbf = _opt_ms(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.bfloat16), shapes)
-    t16 = _opt_ms(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16), shapes)
-    print(f"\n  single-GPU step ({'compiled ' if COMPILE else ''}baseline = 1.00x):")
-    print(f"    baseline    {tb:7.3f} ms  (1.00x)")
-    print(f"    fused-bf16  {tbf:7.3f} ms  ({tb/tbf:.2f}x)")
-    print(f"    fused-fp16  {t16:7.3f} ms  ({tb/t16:.2f}x)   [T4 fp16 tensor cores; bf16 has none on sm_75]")
+    # ── PHASE 2: SINGLE-GPU — ms / speedup / peak mem / parity. Speedup baseline = MIXED (fp16 NS),
+    # our kernel = same MIXED, so the speedup is purely the fusion. |Δp| is vs the full-fp32 truth. ──
+    variants = [
+        ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32), compute_dtype=torch.float32)),
+        ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16), compute_dtype=torch.float16)),
+        ("fused-mixed",    lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)),
+    ]
+    res = {}
+    for name, mk in variants:
+        d = 0.0 if name == "full-fp32" else _muon_parity(mk, ref, shapes)
+        res[name] = (_opt_ms(mk, shapes), _opt_peak(mk, shapes), d)
+    den = res["baseline-mixed"][0]                              # speedup is vs the mixed baseline
+    print(f"\n  single-GPU step ({'compiled ' if COMPILE else ''}baseline-mixed = 1.00x):")
+    print(f"    {'variant':16s} {'ms':>9s} {'vs mixed':>9s} {'peak MB':>9s} {'|Δp| vs fp32':>14s}")
+    for name, (t, mem, d) in res.items():
+        tag = "  <- T4 path" if name == "fused-mixed" else ("  (parity ref)" if name == "full-fp32" else "")
+        print(f"    {name:16s} {t:9.2f} {den/t:8.2f}x {mem:9.0f} {d:14.2e}{tag}")
+    print(f"    => fusion-only win (mixed vs mixed) = {den/res['fused-mixed'][0]:.2f}x")
 
     # ── PHASE 3: DISTRIBUTED A (replicated) vs B (round-robin) — only under torchrun ──
     import torch.distributed as dist
@@ -882,7 +923,7 @@ def bench_muon():
         gg = torch.Generator(device=DEV).manual_seed(11)
         worst = 0.0
         for _ in range(3):
-            grads = [torch.randn(*p.shape, generator=gg, device=DEV, dtype=DTYPE) for p in pa]
+            grads = [torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER) for p in pa]
             for p, gr in zip(pa, grads): p.grad = gr.clone()    # DDP would all-reduce; same grads here
             for p, gr in zip(pb, grads): p.grad = gr.clone()
             oa.step(); ob.step()

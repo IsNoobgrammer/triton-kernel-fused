@@ -10,8 +10,9 @@ is the algorithmic floor — a Triton `tl.dot` NS loses to cuBLAS (proven 3x her
 T4 SRAM. The wins are launch-overhead, not a hand-written GEMM:
   1. `torch._foreach_*` collapses the per-param momentum/nesterov sweeps from N*(several launches) to a few.
   2. `baddbmm` folds each NS axpy (`b*A + c*(A@A)`, `a*X + B@X`) into the cuBLAS call — no pointwise kernels.
-  3. `ns_dtype`: bf16 matches the baseline (Ampere+ tensor cores); fp16 engages T4's fp16 tensor cores —
-     the only lever on the dominant GEMM cost where bf16 has none on sm_75. Opt-in; verify stability.
+  3. `ns_dtype`: **fp16 is the T4 default** — it engages T4's fp16 tensor cores, the dominant lever
+     where fp32 runs on slow CUDA cores and bf16 has NO tensor cores at all on sm_75 (and torch.compile
+     skips bf16 there). Use fp32 for a numerically-safe fallback, bf16 only on Ampere/Hopper.
 """
 import torch
 import torch.optim as optim
@@ -27,7 +28,7 @@ _PE_COEFFS = (
 )
 
 
-def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7):
+def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
     """Orthogonalize G (drive singular values -> 1) via Polar-Express Newton-Schulz (per-iteration coeffs).
 
     2D weights are unsqueezed to (1,A,B); 3D stacked experts (E,A,B) batch over E. Normalization is fp32
@@ -66,7 +67,7 @@ class FusedMuon(optim.Optimizer):
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 coeffs=_PE_COEFFS, ns_dtype=torch.bfloat16, scale_mode="jordan"):
+                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan"):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
@@ -93,25 +94,26 @@ class FusedMuon(optim.Optimizer):
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
                                           group["weight_decay"], group["nesterov"])
 
-            # momentum in ns_dtype (matches the bf16 baseline); buffer persists across steps.
-            grads = [p.grad.to(self.ns_dtype) for p in params]
+            # Mixed-precision layout (the AdamW-8bit norm): fp32 master weights `p`, fp32 grads, but the
+            # MOMENTUM STATE is kept in the low NS dtype (fp16) — that's the optimizer-memory saving.
+            # foreach fuses the per-param momentum sweep (the launch win); nesterov + NS are per-param so
+            # we never materialize all updates at once (keeps peak ~ the unfused baseline).
+            grads = [p.grad.to(self.ns_dtype) for p in params]        # fp32 grad -> low-precision for the state
             bufs = []
             for p, g in zip(params, grads):
                 st = self.state[p]
                 if "momentum_buffer" not in st:
-                    st["momentum_buffer"] = torch.zeros_like(g)
+                    st["momentum_buffer"] = torch.zeros_like(g)       # momentum state in ns_dtype (fp16)
                 bufs.append(st["momentum_buffer"])
 
             torch._foreach_mul_(bufs, momentum)                       # buf = momentum*buf + grad
             torch._foreach_add_(bufs, grads)
-            gs = list(torch._foreach_add(grads, bufs, alpha=momentum)) if nesterov else list(bufs)
-
-            # Newton-Schulz per param (3D experts batch over the expert dim inside NS), then scale + step.
             if wd != 0:
-                torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (all params)
+                torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
             for i, p in enumerate(params):
-                u = newton_schulz(gs[i], self.coeffs, self.ns_dtype)
-                p.add_(u.to(p.dtype), alpha=-lr * self._scale(p))     # scaled orthogonal step
+                u_in = grads[i].add(bufs[i], alpha=momentum) if nesterov else bufs[i]
+                u = newton_schulz(u_in, self.coeffs, self.ns_dtype)
+                p.add_(u.to(p.dtype), alpha=-lr * self._scale(p))     # update the fp32 master weight
 
         return loss
 
