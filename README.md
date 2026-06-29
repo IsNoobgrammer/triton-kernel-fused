@@ -71,10 +71,12 @@ and the one regression — the conv router — was diagnosed and recovered into 
 | `FusedMuon` | ~1.09× / ~1.05× | **~2.3× (75M) / ~2.48× (302M)**, peak ≤ baseline |
 | `fused_router` | ~1.11–1.17× fwd+bwd | **~1.86×** fwd+bwd (fwd 1.29× / bwd 2.30×) |
 | `moe` | ~2.87× | **~3.9×** fwd+bwd (per-expert) |
+| `moe` (grouped, many-experts) | — (Turing tl.dot cliff) | **~2–3× over per-expert** at ≤ memory (cuBLAS `torch._grouped_mm`) |
 
 Kernels live in **per-arch packages** (`kernels/sm75`, `kernels/sm120`) on a reuse-and-override model:
 `sm120` re-exports everything identical to the reference and overrides only what profiling proves is
-different (the Muon Newton-Schulz default; the conv router, forked to a transpose-free fused Triton conv).
+different (the Muon Newton-Schulz default; the conv router, forked to a transpose-free fused Triton conv;
+and a cuBLAS grouped MoE path the dispatch picks up when experts are many).
 `bench.py` auto-detects the arch. Full story:
 [Hardware and portability](https://isnoobgrammer.github.io/triton-kernel-fused/concepts/hardware/).
 

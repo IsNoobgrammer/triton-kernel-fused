@@ -31,7 +31,8 @@ The design rule is **reuse + override, never fork-and-drift**:
 - `kernels/sm120` **re-exports** every kernel that is byte-identical to its `sm75` version, so a fix in the
   reference lands on Blackwell automatically (single source of truth).
 - It **overrides** only what is *measurably* different on the new arch — a tuned default, or a kernel that
-  genuinely diverges. Today that is the Muon batched-Newton-Schulz default and the conv MoE router.
+  genuinely diverges. Today that is the Muon batched-Newton-Schulz default, the conv MoE router, and the
+  MoE combine (a Blackwell-only cuBLAS grouped path the per-expert dispatch picks up at scale).
 
 ```python
 import kernels
@@ -67,6 +68,7 @@ on T4. Both fp16 and bf16 validated; gradient parity checked in the same run.
 |---|---|---|---|
 | `FusedMuon` | **~2.3× (75M) / ~2.48× (302M)**, peak ≤ baseline | ~1.05–1.09× | parity ~2e-5, mem gate PASS |
 | `moe` (per-expert) | **~3.9× forward+backward** | ~2.87× | grad rel 7e-3, lighter peak |
+| `moe` (grouped, `sm_120`) | **~2–3× over per-expert** (many-experts; ~9–13× vs compile) | n/a (Turing tl.dot cliff) | grad rel 5e-3, ≤ per-expert mem |
 | `fused_router` (conv) | **~1.86× forward+backward** (fwd 1.29× / bwd 2.30×) | ~1.11–1.17× | grad rel 2.3e-4, 1.13× less mem |
 | `fused_xsa` | **~1.61× forward+backward** (warm) | ~1.15× | grad PASS, peak parity |
 | `fused_linear_cross_entropy` | up to **3.8× less peak**; **beats Liger** at equal memory | ~3.4× less peak | grad PASS |
@@ -75,10 +77,13 @@ The compute-bound wins (Muon, MoE) **widen** the most off Turing — Blackwell's
 ~1.6–1.8 TB/s GDDR7 reward the bigger batched GEMMs that the recipe builds. The memory and structural wins
 (CE, XSA, router) hold and improve.
 
-<Aside type="note" title="A note on the MoE grouped path">
-On Blackwell the grouped expert GEMM clocks ~4.95×, but its gradients are **wrong** (rel ~1.0) because it
-does not implement the Identity/Zero special experts — so `moe()` guards to the correct ~3.9× per-expert
-path whenever a special expert is present. Speed is never reported on incorrect math. See the
+<Aside type="note" title="The MoE grouped path (sm_120)">
+Blackwell adds a second MoE path: `moe_grouped_cublas_polyglu` — one cuBLAS grouped GEMM
+(`torch._grouped_mm`, autograd-native) over all routed tokens instead of one GEMM per expert. Unlike the
+older GLU-only grouped path (whose gradients were wrong on the special experts), it is **correct on the
+Identity/Zero stack** and supports PolyGLU, and it beats the per-expert path by **~2–3× at or below
+per-expert memory** when tokens-per-expert is low — the many-experts regime real MoEs live in. `moe()`
+dispatches to it automatically by tokens-per-expert; per-expert stays the correct, leaner fallback. See the
 [MoE page](/triton-kernel-fused/kernels/moe/).
 </Aside>
 

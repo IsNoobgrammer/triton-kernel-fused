@@ -39,6 +39,11 @@ Measured on a Tesla T4 (`sm_75`):
 correct and lighter on memory — the data-dependent-routing edge scales hard with the faster tensor cores.
 See [Hardware and portability](/triton-kernel-fused/concepts/hardware/).
 
+Blackwell also unlocks a second path. When a model has **many experts** (real-MoE sparsity), the
+per-expert loop becomes a tail of tiny GEMMs and `sm_120` instead routes to a single cuBLAS *grouped*
+GEMM — `moe_grouped_cublas_polyglu` — that beats per-expert by **~2–3× at or below its memory**. `moe()`
+picks it automatically; see [Grouped path on Blackwell](#grouped-path-on-blackwell-sm_120).
+
 ## API
 
 ```python
@@ -93,26 +98,79 @@ act_codes = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 3, 4], device="cuda", dtype
 # gate_up_proj / down_proj are sized (11, ...); slots 9 (Identity) and 10 (Zero) are placeholders.
 ```
 
+## Grouped path on Blackwell (`sm_120`)
+
+The per-expert path fires one cuBLAS GEMM **per expert**. That is ideal when each expert receives many
+tokens — its GEMMs are large and saturate the tensor cores. But real MoEs route a few tokens to many
+experts, so the per-expert loop degenerates into a long tail of tiny, tensor-core-starved GEMMs, each
+wrapped in a Python iteration with a device-to-device copy (profiled at ~1313 CUDA launches / ~510 DtoD
+copies per step with 32 experts).
+
+`kernels/sm120` adds **`moe_grouped_cublas_polyglu`**: one *grouped* GEMM over all routed tokens via
+[`torch._grouped_mm`](https://pytorch.org/docs/stable/generated/torch._grouped_mm.html) — a cuBLAS grouped
+GEMM that is **autograd-native** in bf16/fp16 — plus the PolyGLU activation and a weighted scatter. That
+collapses the loop to a few scheduled GEMMs (~851 launches / ~35 copies). It is **correct on the
+special-experts stack**: the GLU experts go through the grouped GEMM, while Identity and Zero are handled
+on the sorted tail (they have no weight GEMM). This is the gap the older GLU-only grouped path could not
+close — and it needs no hand-written backward, since `torch._grouped_mm` differentiates itself.
+
+### The win is governed by tokens-per-expert
+
+Grouped beats per-expert exactly when **tokens-per-expert (`routed_tokens / E_glu`) is low** — the
+many-experts regime. Measured on an RTX PRO 6000 Blackwell (bf16, forward+backward, vs the per-expert
+champion):
+
+| Tokens per expert | Example | Grouped vs per-expert | Memory |
+|---|---|---|---|
+| ~500 | 64 experts | **~3.0×** | lower than per-expert |
+| ~960 | 32 experts | **~2.1–2.6×** | ≤ per-expert |
+| ~1800 | 16 experts | **~1.6×** | ≈ per-expert |
+| ~3300 | 9 experts (BiBo) | ~1.2× | ≈ per-expert |
+| high | few experts, large batch | per-expert wins | per-expert leaner |
+
+Scaling the token count **up** at a fixed expert count actually favors per-expert (its GEMMs grow large
+and efficient), so the grouped edge is about expert count and routing sparsity, not batch size. This
+applies to **ordinary pure-GLU MoEs too** — a stack with no Identity/Zero is just the case where the
+special-expert tail is empty (measured pure-GLU: 32 experts → ~2.6× at lower memory; 16 → ~1.8×).
+
+### Automatic dispatch
+
+You do not choose the path — `moe()` on `sm_120` picks it:
+
+- **Grouped** when `torch._grouped_mm` is available (PyTorch ≥ ~2.5, `sm_80+`), the dtype is bf16/fp16,
+  shapes are 16-byte-aligned, **and** tokens-per-expert ≤ `GROUPED_TOKENS_PER_EXPERT_MAX` (2048).
+- **Per-expert** otherwise, and as the universal fallback — correct on every shape and arch, and more
+  memory-frugal at high `top_k`.
+
+<Aside type="note" title="Speed and memory are a frontier">
+Grouped processes all tokens' gradients together (faster, more live memory); per-expert loops
+expert-by-expert, freeing as it goes (slower, leaner). The shipped grouped path is the **balanced** point —
+at or below per-expert memory for `top_k=2` while 2–3× faster. A gradient-checkpointed (leaner, slower)
+and a manual-backward (faster, heavier) variant sit at the ends of that frontier; the dispatch ships the
+balanced one. Pick per-expert explicitly if you are memory-bound at high `top_k`.
+</Aside>
+
 ### Path selection
 
-`moe` auto-dispatches between two backends:
+`moe` auto-dispatches between these backends:
 
 | Function | When | Notes |
 |---|---|---|
-| `moe` | auto | Picks `moe_grouped` at `≥ GROUPED_MIN_TOKENS` rows on Ampere+ (`sm_80+`) **and only for pure-GLU stacks**; otherwise `moe_per_expert`. |
-| `moe_per_expert` | small token counts, all of Turing, or any stack with Identity/Zero experts | Sorted dispatch + cuBLAS GEMMs + fused PolyGLU + weighted scatter, with a manual backward. Correct on every arch. |
+| `moe` | auto | On `sm_120`: cuBLAS grouped (`moe_grouped_cublas_polyglu`) when supported and tokens-per-expert ≤ 2048; else per-expert. On `sm_75`/older: always per-expert. |
+| `moe_grouped_cublas_polyglu` | `sm_120`, many experts | One cuBLAS grouped GEMM (`torch._grouped_mm`) over all routed tokens; PolyGLU + Identity/Zero; autograd-native. The Blackwell scale win. |
+| `moe_per_expert` | small token counts, all of Turing, high tokens-per-expert, or memory-bound at high `top_k` | Sorted dispatch + per-expert cuBLAS GEMMs + fused PolyGLU + weighted scatter, manual backward. Correct on every arch; the universal fallback. |
+| `moe_grouped` | legacy / parity only | The original GLU-only `tl.dot` grouped GEMM. Catastrophic on Turing, superseded by the cuBLAS path on Blackwell. Not used by `moe()`. |
 | `moe_eager` | reference only | The slow masked-loop baseline the fused paths beat — keep for parity checks. |
 
-<Aside type="caution">
-Two reasons `moe` may not pick the grouped path:
+<Aside type="caution" title="Two grouped implementations — they differ on special experts">
+1. **`sm_120` cuBLAS grouped** (`moe_grouped_cublas_polyglu`) — **handles Identity/Zero correctly** and is
+   what `moe()` dispatches to on Blackwell when tokens-per-expert is low. No special-expert restriction.
+2. **Legacy `tl.dot` grouped** (`moe_grouped`, from `sm75`) — runs a GLU over every expert uniformly, so it
+   is correct **only** for pure-GLU stacks (codes `0/1/2`), and is catastrophic on Turing (~0.1× vs compiled
+   eager). `moe()` never uses it; it is kept for parity benches.
 
-1. **Turing.** The grouped `tl.dot` GEMMs are catastrophic on `sm_75` (~0.1× vs compiled eager), so grouped
-   is never selected on `sm_<80`. On a T4 you always get `moe_per_expert`.
-2. **Special experts.** The grouped path runs a GLU over every expert uniformly — it does **not** implement
-   the Identity (code `3`) or Zero (code `4`) experts. It is therefore correct only for pure-GLU stacks
-   (codes `0/1/2`). With a special expert present, `moe` falls back to `moe_per_expert`, which handles
-   codes `3`/`4` in both forward and backward. `moe_per_expert` is correct on every architecture and is
-   itself a large win (T4 ~2.9×, Blackwell ~4× forward+backward).
+So on Turing you always get `moe_per_expert`; on Blackwell you get the cuBLAS grouped path in its win regime
+and `moe_per_expert` (correct on every arch, a ~4× win itself) everywhere else.
 </Aside>
 
 ## Usage

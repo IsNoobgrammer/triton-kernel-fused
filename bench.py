@@ -61,6 +61,9 @@ fused_xsa = _arch.fused_xsa
 moe_per_expert = _arch_moe.moe_per_expert
 moe_grouped = _arch_moe.moe_grouped
 moe_grouped_cublas = _arch_moe.moe_grouped_cublas
+# sm_120 only: the cuBLAS grouped path (torch._grouped_mm) that moe() dispatches to at scale — correct on
+# special experts. None on arches/torch builds without it (bench falls back to the legacy tl.dot grouped).
+moe_grouped_cublas_polyglu = getattr(_arch_moe, "moe_grouped_cublas_polyglu", None)
 moe_eager = _arch_moe.moe_eager
 
 DTYPE = torch.float16
@@ -536,7 +539,9 @@ def bench_moe(N=16384, H=512, I=768, E_glu=9, n_special=2, top_k=2):   # BiBo ST
     logits = torch.randn(N, E, device=DEV, dtype=DTYPE)                   # routing over all 11
     wt_full, idx = torch.topk(torch.softmax(logits.float(), -1), top_k, dim=-1)
     wt_full = wt_full.to(DTYPE)
-    print(f"\n(MoE STACK: N={N} rows*top_k={N*top_k}; H={H} I={I} E={E} routed = {E_glu} GLU + Identity + Zero; k={top_k})")
+    _sp = ["Identity", "Zero"][:n_special]
+    _sp_label = (" + " + " + ".join(_sp)) if _sp else ""
+    print(f"\n(MoE STACK: N={N} rows*top_k={N*top_k}; H={H} I={I} E={E} routed = {E_glu} GLU{_sp_label}; k={top_k})")
     print("  BASELINE = compiled `moe_eager` (per-expert mask + loop + weighted scatter) = the "
           "Qwen3MoE / HF compute pattern, under torch.compile. 'x' columns are vs THAT (the real bar).")
 
@@ -569,7 +574,12 @@ def bench_moe(N=16384, H=512, I=768, E_glu=9, n_special=2, top_k=2):   # BiBo ST
     # wrong output) stays off; `grouped_cublas` is bf16/sm_80+ only — re-enable by hand if benching bf16.
     variants = [("per-expert", moe_per_expert)]
     if torch.cuda.get_device_capability()[0] >= 8:
-        variants.append(("grouped", moe_grouped))
+        # Prefer the cuBLAS grouped path moe() actually dispatches to on sm_120 (correct on special
+        # experts); fall back to the legacy GLU-only tl.dot grouped where it isn't available.
+        if moe_grouped_cublas_polyglu is not None:
+            variants.append(("grouped (cublas)", moe_grouped_cublas_polyglu))
+        else:
+            variants.append(("grouped", moe_grouped))
     for vname, vfn in variants:
         try:
             _report(f"MoE {vname} vs Qwen3MoE-eager (compiled)", *run(vfn))
