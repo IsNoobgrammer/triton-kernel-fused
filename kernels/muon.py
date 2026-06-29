@@ -37,25 +37,25 @@ def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
     in fp32). baddbmm folds each iteration's axpy into the GEMM (3 GEMMs/iter, 0 pointwise kernels).
     """
     orig_dtype = G.dtype
-    X = G.float()
-    squeeze = X.ndim == 2
-    if squeeze:
-        X = X.unsqueeze(0)                                            # (1,A,B) — unify 2D + (E,A,B)
-    X = X / (X.flatten(1).norm(dim=1).clamp_min(eps).view(-1, 1, 1))  # per-slice Frobenius (fp32)
-    transposed = X.size(1) > X.size(2)                               # iterate on the smaller Gram
+    squeeze = G.ndim == 2
+    X = G.unsqueeze(0) if squeeze else G                             # (1,A,B) — unify 2D + (E,A,B)
+    # Per-slice Frobenius norm with fp32 ACCUMULATION (no full fp32 copy of X — an fp16 sum-of-squares
+    # would overflow, but vector_norm(dtype=fp32) accumulates in fp32 while reading fp16). This is the
+    # whole copy-elimination: for the fp16-momentum->fp16-NS path there is now ZERO dtype round-trip.
+    nrm = torch.linalg.vector_norm(X.flatten(1), dim=1, dtype=torch.float32).clamp_min(eps).view(-1, 1, 1)
+    transposed = X.size(1) > X.size(2)                              # iterate on the smaller Gram
     if transposed:
         X = X.transpose(1, 2)
-    X = X.to(ns_dtype).contiguous()
+    X = X.to(ns_dtype) / nrm.to(ns_dtype)                           # normalize; one contiguous ns_dtype tensor
     for a, b, c in coeffs:
-        A = torch.bmm(X, X.transpose(1, 2))                          # XX^T
-        B = torch.baddbmm(A, A, A, beta=b, alpha=c)                  # b*A + c*(A@A)
+        A = torch.bmm(X, X.transpose(1, 2))                          # XX^T  (transpose is a free cuBLAS flag)
+        B = torch.baddbmm(A, A, A, beta=b, alpha=c)                  # b*A + c*(A@A)  — axpy folded into the GEMM
         X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)                # a*X + B@X
-    X = X.float()
     if transposed:
         X = X.transpose(1, 2)
     if squeeze:
         X = X.squeeze(0)
-    return X.to(orig_dtype)
+    return X.to(orig_dtype)                                          # no-op when orig_dtype == ns_dtype
 
 
 class FusedMuon(optim.Optimizer):
