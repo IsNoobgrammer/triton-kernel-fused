@@ -1,0 +1,57 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "triton-kernel-fused",
+  "description": "Drop-in fused Triton kernels (forward + backward) for transformer training on NVIDIA GPUs.",
+  "colors": {
+    "primary": "#7C3AED",
+    "light": "#A78BFA",
+    "dark": "#6D28D9"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": [
+          "index",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "concepts/the-structural-edge",
+          "concepts/benchmarking"
+        ]
+      },
+      {
+        "group": "Kernels",
+        "pages": [
+          "kernels/cross-entropy",
+          "kernels/xsa",
+          "kernels/muon",
+          "kernels/router",
+          "kernels/moe"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Benchmark",
+        "href": "https://github.com/IsNoobGrammer/triton-kernel-fused/blob/master/bench.py"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/IsNoobGrammer/triton-kernel-fused"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/IsNoobGrammer/triton-kernel-fused"
+    }
+  }
+}

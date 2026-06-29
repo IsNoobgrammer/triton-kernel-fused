@@ -1,0 +1,85 @@
+---
+title: "XSA correction"
+description: "Exclusive Self-Attention rejection fused into one forward and one backward kernel that reads V only once, with in-kernel GQA broadcast."
+keywords: ["xsa", "exclusive self attention", "attention", "gqa", "rejection", "read once", "triton"]
+---
+
+```python
+from kernels import fused_xsa
+```
+
+Exclusive Self-Attention (XSA, [arXiv:2603.09078](https://arxiv.org/abs/2603.09078)) removes, from each
+attention output, the component lying along that position's own value vector — a parameter-free rejection:
+
+$$
+z_i = y_i - \frac{y_i \cdot v_i}{\lVert v_i \rVert^2}\, v_i
+$$
+
+This kernel fuses the entire operation — normalize `V`, dot, scale, subtract, with grouped-query attention
+(GQA) repeat — into **one forward and one backward** Triton kernel.
+
+## Why it wins
+
+The natural eager expression of XSA makes the compiler read `V` twice and materialize intermediates that
+never need to exist. The fused kernel:
+
+- **Reads `V` once.** The normalization, dot product, scale, and subtraction all happen in a single pass
+  with reductions accumulated in float32 in-register — a [read-once reduction](/concepts/the-structural-edge)
+  the compiler emits as two passes.
+- **Broadcasts GQA in-kernel.** When there are fewer key/value heads than query heads, `V` is broadcast
+  across the query group inside the kernel (the SDPA `enable_gqa` style). The `(B, H, S, D)` `repeat_kv`
+  copy and the normalized-`V` tensor are **never materialized**.
+- **Has an analytic backward.** `grad_Y` is the rejection of `grad_z` against the unit value direction;
+  `grad_V` is computed analytically and accumulated over the query group.
+
+A re-tiling refinement (processing `XBLOCK` rows per program instead of one program per row) gave the read
+a 2D grid that saturates HBM — the original one-program-per-row launch was an occupancy trap on T4.
+
+## Performance
+
+Measured on a Tesla T4 (`sm_75`):
+
+- **~1.15×** forward+backward vs the compiled eager rejection.
+- **Grad-exact** vs the eager reference (fp16 absolute tolerance ~1e-3).
+
+## API
+
+```python
+fused_xsa(
+    attn_output,    # Y: (B, H,   S, D) — attention output (post value-aggregation)
+    value_states,   # V: (B, Hkv, S, D) — value states, Hkv <= H (GQA)
+)  # -> (B, H, S, D) XSA-corrected output
+```
+
+| Argument | Shape | Notes |
+|---|---|---|
+| `attn_output` | `(B, H, S, D)` | The attention output `Y`, after value aggregation and before the output projection. |
+| `value_states` | `(B, Hkv, S, D)` | The value states `V`. `Hkv` may be less than `H` — GQA is broadcast in-kernel. |
+
+Returns the corrected output, same shape as `attn_output`.
+
+## Usage
+
+Apply XSA after attention's value aggregation and before the output projection:
+
+```python
+import torch
+from kernels import fused_xsa
+
+B, H, Hkv, S, D = 16, 4, 2, 1024, 128
+attn_output  = torch.randn(B, H,   S, D, device="cuda", dtype=torch.float16, requires_grad=True)
+value_states = torch.randn(B, Hkv, S, D, device="cuda", dtype=torch.float16, requires_grad=True)
+
+corrected = fused_xsa(attn_output, value_states)   # (B, H, S, D)
+# ... feed `corrected` into o_proj ...
+corrected.sum().backward()                         # grads flow to both inputs
+```
+
+The class form `FusedXSA` (a `torch.autograd.Function`) is also exported if you need to call `.apply`
+directly.
+
+## Benchmark
+
+```bash
+python bench.py --compile xsa
+```

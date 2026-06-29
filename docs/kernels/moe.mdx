@@ -1,0 +1,104 @@
+---
+title: "PolyGLU MoE combine"
+description: "Data-dependent expert dispatch + cuBLAS GEMMs + fused activation + weighted scatter — the routing edge the compiler can't fuse."
+keywords: ["moe", "mixture of experts", "polyglu", "expert dispatch", "data dependent routing", "per expert", "grouped gemm", "bibo"]
+---
+
+```python
+from kernels import moe, moe_per_expert, moe_eager
+```
+
+The MoE **combine** step: given a router's top-k indices and weights and a set of stacked expert weights,
+dispatch each token to its experts, run the per-expert GEMMs and activation, and scatter the weighted
+results back. The data-dependent dispatch is something `torch.compile` cannot fuse at all, which is why
+this is the largest win in the library.
+
+<Note>
+This kernel is shaped for the **PolyGLU** expert layout used in BiBo — a fused gate+up projection with
+per-expert activation codes. The per-expert dispatch machinery is general, but the activation set and the
+weight layout are opinionated. Adapt the `act_codes` and weight shapes to your model.
+</Note>
+
+## Why it wins
+
+In a Mixture-of-Experts layer, the router decides which tokens go to which expert **at runtime**. The
+compiler plans a static graph, so it cannot fuse the dispatch, the per-expert cuBLAS GEMMs, the PolyGLU
+activation, and the weighted scatter into one data-dependent pass — it falls back to a masked loop with a
+GPU sync per expert and an unfused activation. This kernel does the whole thing in one fused path. It is the
+canonical [data-dependent routing](/concepts/the-structural-edge) edge.
+
+## Performance
+
+Measured on a Tesla T4 (`sm_75`):
+
+- **~2.87×** vs the compiled masked per-expert combine — and this is the win that survives the compiled
+  baseline by the widest margin, because the routing simply cannot be compiled.
+
+## API
+
+```python
+moe(
+    hidden,            # (N, H) — token hidden states
+    top_k_indices,     # (N, k) int — expert ids from YOUR router
+    top_k_weights,     # (N, k)     — routing weights from YOUR router
+    gate_up_proj,      # (E, 2*I, H) — fused gate+up projection per expert
+    down_proj,         # (E, H, I)   — down projection per expert
+    act_codes,         # (E,) int32  — per-expert activation: 0=SiLU, 1=ReLU², 2=Tanh
+)  # -> (N, H) combined output
+```
+
+| Argument | Shape / type | Notes |
+|---|---|---|
+| `hidden` | `(N, H)` | Flattened token hidden states. |
+| `top_k_indices` | `(N, k)` int | Chosen expert ids — comes from your router (e.g. [`fused_router`](/kernels/router)). |
+| `top_k_weights` | `(N, k)` | Routing weights for the chosen experts. |
+| `gate_up_proj` | `(E, 2·I, H)` | Stacked fused gate+up projection, one per expert. |
+| `down_proj` | `(E, H, I)` | Stacked down projection, one per expert. |
+| `act_codes` | `(E,)` int32 | Per-expert activation code: `0`=SiLU, `1`=ReLU², `2`=Tanh. |
+
+The router stays in **your** model — this kernel only takes its top-k output and the stacked expert weights.
+
+### Path selection
+
+`moe` auto-dispatches between two backends:
+
+| Function | When | Notes |
+|---|---|---|
+| `moe` | auto | Picks `moe_grouped` at `≥ GROUPED_MIN_TOKENS` rows on Ampere+ (`sm_80+`), else `moe_per_expert`. |
+| `moe_per_expert` | small token counts; **all of Turing** | Sorted dispatch + cuBLAS GEMMs + fused PolyGLU + weighted scatter, with a manual backward. |
+| `moe_eager` | reference only | The slow masked-loop baseline the fused paths beat — keep for parity checks. |
+
+<Warning>
+The grouped path's `tl.dot` GEMMs are **catastrophic on Turing** (~0.1× vs compiled eager on T4), so `moe`
+never selects it on `sm_<80`. On a T4 you always get the cuBLAS `moe_per_expert` path, which is the one
+that wins there.
+</Warning>
+
+## Usage
+
+```python
+import torch
+from kernels import moe
+
+N, H, I, E, k = 16384, 512, 768, 11, 2
+hidden    = torch.randn(N, H, device="cuda", dtype=torch.float16)
+gate_up   = (torch.randn(E, 2 * I, H, device="cuda", dtype=torch.float16) * 0.02).requires_grad_(True)
+down      = (torch.randn(E, H, I, device="cuda", dtype=torch.float16) * 0.02).requires_grad_(True)
+act_codes = torch.tensor([e % 3 for e in range(E)], device="cuda", dtype=torch.int32)  # PolyGLU triples
+
+# idx, weights come from your router:
+idx     = torch.randint(0, E, (N, k), device="cuda")
+weights = torch.rand(N, k, device="cuda", dtype=torch.float16)
+
+out = moe(hidden, idx, weights, gate_up, down, act_codes)   # (N, H)
+out.sum().backward()                                        # grads flow to the experts
+```
+
+See [`examples/moe_usage.py`](https://github.com/IsNoobGrammer/triton-kernel-fused/blob/master/examples/moe_usage.py)
+for a complete runnable example, including a full MoE layer wired up as an `nn.Module`.
+
+## Benchmark
+
+```bash
+python bench.py --compile moe
+```

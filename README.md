@@ -1,32 +1,50 @@
 # triton-kernel-fused
 
-Drop-in fused Triton kernels (forward **and** backward) for transformer training on NVIDIA GPUs,
-tuned and verified on the Turing/T4 class (`sm_75`). Each kernel is a tested replacement for an eager
-PyTorch block and ships with a custom autograd backward.
+**Drop-in fused Triton kernels (forward _and_ backward) for transformer training on NVIDIA GPUs.**
 
-These are not a general "compile everything" layer. `torch.compile` already saturates memory bandwidth
-on plain elementwise ops — you don't beat it there. These kernels target the places where the compiler
-*structurally* can't: data-dependent routing, terminal-loss fusion, read-once reductions, and
-native-op seams (e.g. `topk`) that the compiler must keep as separate library calls.
+Each kernel is a tested replacement for an eager PyTorch block, ships with a custom autograd backward,
+and is tuned and verified on the Turing / Tesla T4 class (`sm_75`). Correctness is the gate — numerical
+parity (forward output **and** gradients) against the eager reference is never traded for speed.
 
-| Kernel | Replaces | Why it wins over `torch.compile` |
-|---|---|---|
-| `fused_linear_cross_entropy` | `lm_head` + `F.cross_entropy` | gradient computed in the forward chunk loop — never materializes the `(N, V)` logits (trains where standard CE OOMs) |
-| `moe` / `moe_per_expert` | masked per-expert MoE combine | fuses data-dependent dispatch + cuBLAS GEMMs + activation + weighted scatter; the compiler can't fuse routing |
-| `fused_router` | conv router (conv → sigmoid → bias → topk → gather) | one fused epilogue replaces native `topk`+gather; merged backward removes the unfused glue |
-| `fused_xsa` | Exclusive Self-Attention correction | one fused kernel reads `V` once (the compiler emits two passes) |
+These are **not** a general "compile everything" layer. `torch.compile` already saturates memory
+bandwidth on plain elementwise ops — you don't beat it there, and we don't try. These kernels target the
+places where the compiler *structurally* can't fuse:
 
-All kernels are validated for numerical parity (forward output and gradients) against the eager
-reference; correctness is the gate, never traded for speed.
+- **data-dependent routing** (MoE dispatch) — the shape isn't known until runtime,
+- **terminal-loss fusion** (cross-entropy) — never materialize the giant `(N, V)` logits,
+- **read-once reductions** (XSA) — the compiler emits two passes over `V`; we read it once,
+- **native-op seams** (`topk` in the router) — ops the compiler must keep as separate library calls,
+- **launch-overhead collapse + bigger batched GEMMs** (Muon) — fuse N per-param launches into a few.
+
+---
+
+## Kernels
+
+| Kernel | Replaces | The edge `torch.compile` can't get | T4 result |
+|---|---|---|---|
+| [`fused_linear_cross_entropy`](docs/kernels/cross-entropy) | `lm_head` + `F.cross_entropy` | gradient computed in the forward chunk loop — **never materializes the `(N, V)` logits** | **~3.4× less peak memory** (trains where standard CE OOMs); matches Liger |
+| [`fused_xsa`](docs/kernels/xsa) | Exclusive Self-Attention correction | one fused kernel reads `V` **once** (the compiler emits two passes) | **~1.15×** fwd+bwd, grad-exact |
+| [`FusedMuon`](docs/kernels/muon) | Polar-Express Muon optimizer step | `foreach` + `baddbmm` collapse the per-param launch tax; experts batch into one GEMM | **~1.09×** (75M) / **~1.05×** (300M), peak mem ≤ baseline |
+| [`fused_router`](docs/kernels/router) | conv router (conv → sigmoid → bias → topk → gather) | fuses native `topk` into an in-register epilogue + a merged backward | **~1.11–1.17×** fwd+bwd, exact grads, mem parity |
+| [`moe`](docs/kernels/moe) | masked per-expert MoE combine | fuses data-dependent dispatch + cuBLAS GEMMs + activation + weighted scatter | **~2.87×** (the data-dependent edge survives compile) |
+
+> **Performance is architecture-specific.** All numbers above are measured on a Tesla T4 (`sm_75`)
+> against a `torch.compile`'d eager baseline. Numbers from one GPU class do not transfer to another —
+> always re-benchmark on your target hardware. See [Benchmarking](docs/concepts/benchmarking).
+
+`fused_router` documents a **conv** router (sigmoid-gate, no-activation) — see its page for which
+configurations are covered. `moe` is shaped for the **PolyGLU** expert layout (fused gate+up, per-expert
+activation codes) used in BiBo; the per-expert path is general, the activation set is opinionated.
 
 ## Requirements
 
-- NVIDIA GPU with CUDA (developed/tuned on Tesla T4, `sm_75`)
-- Python ≥ 3.10, PyTorch ≥ 2.4 with CUDA, Triton ≥ 3.0 (bundled in the CUDA PyTorch wheel)
+- NVIDIA GPU with CUDA (developed and tuned on Tesla T4, `sm_75`)
+- Python ≥ 3.10
+- PyTorch ≥ 2.4 with CUDA, Triton ≥ 3.0 (bundled in the CUDA PyTorch wheel)
 
 ## Install
 
-The kernels need no installation to be used — copy the `kernels/` folder into your project and import
+The kernels need no installation to be *used* — copy the `kernels/` folder into your project and import
 it. To run the benchmarks and examples from a clone:
 
 ```bash
@@ -36,9 +54,9 @@ uv run python bench.py
 
 Or, with an existing CUDA PyTorch environment, just run `python bench.py` from the repo root.
 
-## Usage
+## Quick usage
 
-### Fused-linear cross-entropy
+### Fused-linear cross-entropy — trains where standard CE OOMs
 
 ```python
 import torch
@@ -52,10 +70,41 @@ loss = fused_linear_cross_entropy(hidden, lm_head, labels)   # mean CE, no (N,V)
 loss.backward()
 ```
 
-`bwd_logits_budget` (bytes) caps the chunk size to trade peak memory against launch count;
-`ignore_index` matches `F.cross_entropy`.
+`bwd_logits_budget` (bytes) caps the `(chunk, V)` transient to trade peak memory against launch count;
+`ignore_index` matches `F.cross_entropy` (default `-100`).
 
-### Conv MoE router (MiMo-V2.5 / DeepSeek-V3 sigmoid gate)
+### XSA correction
+
+```python
+import torch
+from kernels import fused_xsa
+
+attn_output  = torch.randn(16, 4, 1024, 128, device="cuda", dtype=torch.float16)  # (B, H, S, D)
+value_states = torch.randn(16, 2, 1024, 128, device="cuda", dtype=torch.float16)  # (B, Hkv, S, D), GQA
+corrected = fused_xsa(attn_output, value_states)                                  # (B, H, S, D)
+```
+
+### Fused Muon optimizer
+
+```python
+import torch
+from kernels import FusedMuon
+
+# 2D/3D weights -> Muon; route 1D params (norms, biases) and embeddings to AdamW upstream.
+opt = FusedMuon(model.muon_params(), lr=0.02, momentum=0.95, weight_decay=0.01)
+
+loss = model(batch).loss
+loss.backward()
+opt.step()
+opt.zero_grad(set_to_none=True)
+```
+
+`ns_dtype=torch.float16` is the T4 default (engages fp16 tensor cores); use `torch.float32` for a
+numerically-safe fallback, `torch.bfloat16` only on Ampere/Hopper. `DistributedMuon` gives a bit-identical
+round-robin variant for DDP. See the [Muon page](docs/kernels/muon) for `ns_batch_elems`, `scale_mode`,
+and the opt-in fast mode.
+
+### Conv MoE router (sigmoid gate)
 
 ```python
 import torch
@@ -71,9 +120,6 @@ idx, weights = fused_router(x, weight, bias, top_k=2, num_experts=11)    # (B,S,
 idx, weights, counts = fused_router(x, weight, bias, top_k=2, num_experts=11, return_counts=True)
 router_bias_update(bias, counts, u=0.001)                                # b += u·sign(mean − load)
 ```
-
-The fused path covers the conv + sigmoid-gate + no-activation configuration. `norm_topk_prob` and
-`routed_scaling_factor` are applied in eager so autograd carries their Jacobian.
 
 ### PolyGLU MoE combine
 
@@ -93,31 +139,30 @@ out.sum().backward()
 
 See [`examples/moe_usage.py`](examples/moe_usage.py) for a complete runnable example.
 
-### XSA correction
-
-```python
-import torch
-from kernels import fused_xsa
-
-attn_output  = torch.randn(16, 4, 1024, 128, device="cuda", dtype=torch.float16)  # (B, H, S, D)
-value_states = torch.randn(16, 2, 1024, 128, device="cuda", dtype=torch.float16)  # (B, Hkv, S, D), GQA
-corrected = fused_xsa(attn_output, value_states)                                  # (B, H, S, D)
-```
-
 ## Benchmarking
 
 `bench.py` times each kernel against a `torch.compile`'d eager baseline (the industry steady state) and
 checks gradient parity in the same run:
 
 ```bash
-python bench.py --compile router     # conv MoE router
-python bench.py --compile moe        # PolyGLU MoE
 python bench.py --compile ce_fit     # fused-linear cross-entropy
 python bench.py --compile xsa        # XSA
+python bench.py --compile muon       # Fused Muon (add muon_big for the ~300M regime)
+python bench.py --compile router     # conv MoE router
+python bench.py --compile moe        # PolyGLU MoE
 ```
 
 Run on the target GPU — kernel performance is architecture-specific, so numbers from one GPU class do
 not transfer to another.
+
+## Documentation
+
+Full docs (per-kernel API, the design rationale behind each win, and benchmarking guidance) live in
+[`docs/`](docs/) and build with [Mintlify](https://mintlify.com):
+
+```bash
+cd docs && mint dev      # local preview at http://localhost:3000
+```
 
 ## License
 

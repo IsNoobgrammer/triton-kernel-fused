@@ -1,0 +1,58 @@
+---
+title: "Benchmarking"
+description: "How to benchmark the kernels honestly against a torch.compile baseline and read the output."
+keywords: ["benchmark", "torch.compile", "parity", "gradient check", "tesla t4", "memory"]
+---
+
+Every performance claim in these docs comes from `bench.py`, which times each kernel against a
+`torch.compile`'d eager baseline — the realistic steady state a modern training stack runs in — and checks
+gradient parity in the same run. The baseline is the compiled version on purpose: beating uncompiled eager
+is easy and uninteresting; beating the compiler is the bar that matters.
+
+## Running a benchmark
+
+```bash
+python bench.py --compile ce_fit     # fused-linear cross-entropy
+python bench.py --compile xsa        # XSA
+python bench.py --compile muon       # Fused Muon (~75M params)
+python bench.py --compile muon_big   # Fused Muon (~300M params)
+python bench.py --compile router     # conv MoE router
+python bench.py --compile moe        # PolyGLU MoE
+```
+
+Each run reports, for the forward and the backward separately and combined:
+
+- **Speedup** vs the compiled baseline (`>1` means the kernel is faster).
+- **Peak memory** vs the baseline.
+- **Gradient parity** — the maximum absolute difference of every input gradient against the eager
+  reference under the same upstream cotangent.
+
+<Tip>
+The `--compile` flag compiles the *baseline* with `torch.compile` (using `fullgraph=True` where possible,
+the strongest and fairest bar). Drop it to compare against uncompiled eager instead.
+</Tip>
+
+## Reading the result honestly
+
+Speed is not the only axis, and for some kernels it is not even the relevant one.
+
+| Kernel | What "winning" means |
+|---|---|
+| `fused_linear_cross_entropy` | **Memory.** It is roughly memory-neutral-to-slower on raw latency vs the compiled head, but uses ~3.4× less peak memory — which is what lets training run at all when the standard `(N, V)` logits would OOM. It matches Liger's fused CE on speed. |
+| `fused_xsa` | Speed and memory both — ~1.15× forward+backward, grad-exact, no extra peak. |
+| `FusedMuon` | Speed **subject to a hard memory gate**: the default config is the fastest setting whose peak memory stays at or below the baseline (~1.09× at 75M, ~1.05× at 300M). A faster opt-in mode exists if you have VRAM headroom. |
+| `fused_router` | Speed at memory parity — ~1.11–1.17× forward+backward with exact gradients. |
+| `moe` | Speed by a wide margin — ~2.87×, because the data-dependent routing is something the compiler cannot fuse at all. |
+
+<Warning>
+**Numbers do not transfer across GPU classes.** Every figure in these docs is from a Tesla T4 (`sm_75`).
+Tensor-core support, SRAM size, and occupancy differ enough between Turing, Ampere, and Hopper that a
+kernel which wins on one can lose on another. Always run `bench.py` on the GPU you will actually train on.
+</Warning>
+
+## A note on local vs target hardware
+
+A local development GPU is reliable for **correctness** (does the kernel produce the right output and
+gradients?) but not for **performance** (`tl.dot` scheduling, occupancy, and library-call costs all
+differ). The discipline this project follows: prove parity locally, but take every speed verdict from the
+target GPU. If you are evaluating these kernels for your own stack, do the same.

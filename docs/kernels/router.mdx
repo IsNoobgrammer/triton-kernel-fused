@@ -1,0 +1,129 @@
+---
+title: "Conv MoE router"
+description: "Conv -> sigmoid gate -> top-k -> gather fused into one epilogue (folding native topk) with a merged manual backward."
+keywords: ["moe router", "conv router", "topk", "sigmoid gate", "deepseek", "mimo", "cudnn", "load balancing", "bias update"]
+---
+
+```python
+from kernels import fused_router, router_bias_update
+```
+
+A fused **convolutional** MoE router: a 1D convolution over the sequence, a sigmoid gate, a selection-bias
+add, top-k selection, and the gather of the chosen weights — all collapsed into one cuDNN conv plus one
+fused Triton epilogue, with a merged manual backward. This is the sigmoid-gate routing used in
+MiMo-V2.5 / DeepSeek-V3-style models.
+
+<Note>
+This kernel is specific to a **conv router with a sigmoid gate**. If your model routes with a plain linear
+(MLP) gate, this kernel does not apply — use a standard `nn.Linear` + `topk` router (which `torch.compile`
+already handles well). Reach for this kernel only when your router is the conv variant.
+</Note>
+
+## Why it wins
+
+The router exposes two seams the compiler can't close:
+
+1. **The native `topk` seam.** `torch.topk` is a library call inductor must keep as a separate kernel — on
+   T4 it and its gather are ~36% of the compiled forward. The kernel replaces it with a bespoke top-2-of-11
+   argmax computed in-register in the epilogue, which is essentially free. This is the same
+   [native-op-seam](/concepts/the-structural-edge) edge as the MoE and XSA wins.
+2. **The backward glue.** cuDNN's `convolution_backward` is identical on every path; the gap was ~700µs of
+   *unfused* glue around it (contiguity copies, casts, transposes). A custom backward — save the input
+   contiguous once, call `convolution_backward` directly, and fuse the sigmoid derivative with the
+   scatter — removes it, taking the backward from 0.83× to 1.16×.
+
+A `padding=K-1` trick on the convolution also drops the `F.pad` copy in the forward.
+
+## Performance
+
+Measured on a Tesla T4 (`sm_75`), for the shape `B=16, S=1024, H=512, E=11, K=4, top_k=2`, fp16:
+
+- **~1.11–1.17×** forward+backward vs the compiled eager router.
+- **Exact gradients** (relative error ~3e-7).
+- **Memory parity** with the baseline.
+
+## API
+
+```python
+fused_router(
+    x,                          # (B, S, H) — input hidden states
+    conv_weight,                # (E, H, K) — nn.Conv1d(H, E, K) weight
+    bias,                       # (E,) fp32 selection bias, or None  (no grad)
+    top_k,                      # int
+    num_experts,                # int (E)
+    norm_topk_prob=True,        # normalize the top-k weights to sum to 1
+    routed_scaling_factor=1.0,  # multiply the routed weights (1.0 = no-op)
+    return_counts=False,        # also return per-expert token counts
+)
+# -> (idx, weights)              with idx (B, S, k) int64, weights (B, S, k) fp32
+# -> (idx, weights, counts)      if return_counts, counts (E,) int32
+```
+
+| Argument | Shape / type | Notes |
+|---|---|---|
+| `x` | `(B, S, H)` | Input hidden states. |
+| `conv_weight` | `(E, H, K)` | The weight of an `nn.Conv1d(H, E, K)` router. |
+| `bias` | `(E,)` fp32 or `None` | DeepSeek-V3-style **selection** bias — added before top-k, carries no gradient. |
+| `top_k` | int | Number of experts selected per token. |
+| `num_experts` | int | Total experts `E`. |
+| `norm_topk_prob` | bool | When `top_k > 1`, normalize the chosen weights to sum to 1 (MiMo / DeepSeek-V3). |
+| `routed_scaling_factor` | float | Scales the routed weights; `1.0` is a no-op. |
+| `return_counts` | bool | Also return per-expert token counts for load balancing. |
+
+<Note>
+`norm_topk_prob` and `routed_scaling_factor` are applied in **eager** so that autograd carries their
+Jacobian correctly. The fused path covers the conv + sigmoid-gate + no-activation configuration.
+</Note>
+
+## Auxiliary-loss-free load balancing
+
+`fused_router(..., return_counts=True)` returns per-expert token counts, and `router_bias_update` applies
+the DeepSeek-V3 heuristic bias update — a non-autograd, in-place nudge that pushes load toward the mean:
+
+```python
+from kernels import fused_router, router_bias_update
+
+idx, weights, counts = fused_router(x, weight, bias, top_k=2, num_experts=11, return_counts=True)
+router_bias_update(bias, counts, u=0.001)   # b += u * sign(mean_load - load)
+```
+
+```python
+router_bias_update(
+    bias,      # (E,) fp32 selection bias, updated in place
+    counts,    # (E,) per-expert load (the GLOBAL load — see below)
+    u,         # update rate; u <= 0 is a no-op
+)
+```
+
+<Warning>
+In a distributed run, `counts` must be the **global** load. All-reduce it first
+(`dist.all_reduce(counts, op=SUM)`) before calling `router_bias_update` — the reduction cannot run inside a
+Triton kernel. Because `sign()` is scale-invariant, a SUM across ranks is fine and the update is identical
+on every rank.
+</Warning>
+
+## Usage
+
+```python
+import torch
+from kernels import fused_router, router_bias_update
+
+B, S, H, E, K = 16, 1024, 512, 11, 4
+x      = torch.randn(B, S, H, device="cuda", dtype=torch.float16)
+weight = torch.randn(E, H, K, device="cuda", dtype=torch.float16)   # nn.Conv1d(H, E, K) weight
+bias   = torch.zeros(E, device="cuda")                              # selection bias
+
+idx, weights = fused_router(x, weight, bias, top_k=2, num_experts=E)
+# idx     : (B, S, 2) int64  — chosen expert ids
+# weights : (B, S, 2) fp32   — normalized routing weights
+
+# Feed idx/weights into the MoE combine (see the MoE page).
+```
+
+The class form `FusedConvRouterCuDNN` (a `torch.autograd.Function`) is also exported.
+
+## Benchmark
+
+```bash
+python bench.py --compile router
+```

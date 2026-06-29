@@ -1,0 +1,98 @@
+---
+title: "Quickstart"
+description: "Install the kernels, import them, and run your first fused kernel in a few minutes."
+keywords: ["install", "quickstart", "triton", "cuda", "uv", "pytorch"]
+---
+
+## Requirements
+
+- An NVIDIA GPU with CUDA. The kernels are developed and tuned on a **Tesla T4 (`sm_75`)**; they run on
+  other CUDA GPUs, but the performance characteristics are tuned for Turing.
+- **Python ≥ 3.10**
+- **PyTorch ≥ 2.4** built with CUDA, and **Triton ≥ 3.0** (Triton ships inside the CUDA PyTorch wheel).
+
+## Install
+
+<Tabs>
+  <Tab title="Copy the folder (no install)">
+    The kernels need no installation to be *used*. Copy the `kernels/` directory into your project and
+    import it directly — it is a self-contained package with no build step.
+
+    ```bash
+    cp -r triton-kernel-fused/kernels  your_project/
+    ```
+
+    ```python
+    from kernels import fused_linear_cross_entropy, fused_xsa, FusedMuon, fused_router, moe
+    ```
+  </Tab>
+  <Tab title="Run from a clone (uv)">
+    To run the benchmarks and examples from a fresh clone, [`uv`](https://docs.astral.sh/uv/) creates a
+    virtual environment with the correct CUDA PyTorch wheel:
+
+    ```bash
+    git clone https://github.com/IsNoobGrammer/triton-kernel-fused
+    cd triton-kernel-fused
+    uv sync                 # creates .venv with CUDA torch (cu124) + triton
+    uv run python bench.py
+    ```
+  </Tab>
+  <Tab title="Existing CUDA environment">
+    If you already have a CUDA PyTorch + Triton environment, there is nothing to install — run directly
+    from the repo root:
+
+    ```bash
+    python bench.py
+    ```
+  </Tab>
+</Tabs>
+
+## Your first kernel
+
+The fused-linear cross-entropy is the easiest win to feel: it computes the same mean cross-entropy as
+`F.cross_entropy(hidden @ lm_head.T, labels)` but never materializes the full `(N, V)` logits tensor, so
+it trains at vocabulary and sequence sizes where the standard path runs out of memory.
+
+```python
+import torch
+from kernels import fused_linear_cross_entropy
+
+hidden  = torch.randn(16384, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+lm_head = torch.randn(81000, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+labels  = torch.randint(0, 81000, (16384,), device="cuda")
+
+loss = fused_linear_cross_entropy(hidden, lm_head, labels)   # mean CE, no (N,V) logits materialized
+loss.backward()                                              # grad_hidden and grad_lm_head populated
+
+print(loss.item())
+```
+
+That is the whole API surface for a kernel: a single function call that returns a tensor with a working
+backward. Each kernel page documents its exact signature, tensor shapes, and tuning knobs.
+
+## Verify parity on your machine
+
+Correctness is the gate for every kernel. Before trusting a kernel in a training run, confirm it matches
+the eager reference (forward **and** gradients) on your own GPU:
+
+```bash
+python bench.py --compile ce_fit     # fused-linear cross-entropy
+python bench.py --compile xsa        # XSA
+python bench.py --compile muon       # Fused Muon
+python bench.py --compile router     # conv MoE router
+python bench.py --compile moe        # PolyGLU MoE
+```
+
+Each run prints both a speed/memory comparison against the `torch.compile`'d baseline and a gradient
+parity check. See [Benchmarking](/concepts/benchmarking) for how to read the output.
+
+## Where to go next
+
+<Columns cols={2}>
+  <Card title="The structural edge" icon="lightbulb" href="/concepts/the-structural-edge">
+    The design principle behind every kernel here.
+  </Card>
+  <Card title="Browse the kernels" icon="layer-group" href="/kernels/cross-entropy">
+    Per-kernel API, shapes, and tuning knobs.
+  </Card>
+</Columns>

@@ -1,0 +1,170 @@
+---
+title: "Fused Muon"
+description: "Polar-Express Newton-Schulz Muon optimizer step, launch-overhead-fused with foreach + baddbmm, plus a bit-identical distributed variant for DDP."
+keywords: ["muon", "optimizer", "newton schulz", "polar express", "orthogonalization", "foreach", "baddbmm", "distributed", "ddp", "tensor cores"]
+---
+
+```python
+from kernels import FusedMuon, DistributedMuon, newton_schulz
+```
+
+A fused implementation of the **Muon** optimizer step using a Polar-Express Newton-Schulz
+orthogonalization. Muon orthogonalizes each 2D (or per-slice 3D) weight's momentum before applying it —
+the Newton-Schulz iteration drives the matrix's singular values toward 1. This implementation keeps the
+algorithm identical to the established Polar-Express baseline and wins purely by removing launch overhead
+and batching same-shape work into larger GEMMs.
+
+## Why it wins
+
+This is **not** a Triton kernel — the step is GEMM-bound (Newton-Schulz is three matmuls per iteration,
+which is the algorithmic floor), and a hand-written `tl.dot` Newton-Schulz loses to cuBLAS on Turing. The
+wins are all [launch-overhead and batched-GEMM](/concepts/the-structural-edge) levers:
+
+1. **`torch._foreach_*`** collapses the per-parameter momentum / Nesterov sweeps from `N × (several
+   launches)` down to a handful.
+2. **`baddbmm`** folds each Newton-Schulz axpy (`b·A + c·(A@A)`, then `a·X + B@X`) directly into the cuBLAS
+   call — no separate pointwise kernels.
+3. **`ns_dtype` selects the compute precision.** On a T4, fp16 engages the tensor cores; fp32 runs on slow
+   CUDA cores and bf16 has **no tensor cores at all** on `sm_75`. fp16 is the dominant lever there.
+4. **Same-shape parameters batch into one GEMM.** Many small 2D weights and stacked 3D expert weights are
+   grouped so the Newton-Schulz runs as one larger, better-utilized matmul.
+
+<Note>
+Capturing the whole step as a CUDA graph was tried and **discarded**: it cut launches by more than half
+and erased "Command Buffer Full" from the profile, but wall-clock did not move — the step is
+GPU-compute-bound, not launch-bound. The capture path is kept as an opt-in (`use_graph=True`) for a
+genuinely launch-bound host, but it is off by default. See [the structural edge](/concepts/the-structural-edge).
+</Note>
+
+## Performance
+
+Measured on a Tesla T4 (`sm_75`), against a `torch.compile`'d Polar-Express Muon baseline, **under a hard
+memory gate** (fused peak memory must stay at or below the baseline's peak):
+
+| Parameter count | Speedup | Peak memory |
+|---|---|---|
+| ~75M (48 tensors) | **~1.09×** | ≤ baseline |
+| ~300M (192 tensors) | **~1.03–1.06×** | ≤ baseline |
+
+Parity vs the trusted reference is ~7e-7 (fp32 path). A faster setting exists if you can spend memory — see
+[Fast mode](#fast-mode-trading-memory-for-speed).
+
+## API
+
+```python
+FusedMuon(
+    params,
+    lr=0.02,
+    momentum=0.95,
+    nesterov=True,
+    weight_decay=0.0,
+    ns_dtype=torch.float16,            # T4 default; fp32 = safe fallback, bf16 = Ampere/Hopper only
+    scale_mode="jordan",               # "jordan" | "moonlight"
+    ns_batch_elems=4 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate)
+    use_graph=False,                   # opt-in CUDA-graph capture (off by default)
+)
+```
+
+<Warning>
+`FusedMuon` only steps **2D and 3D** parameters that have a gradient (3D stacked experts are orthogonalized
+per slice). Route 1D parameters (norms, biases), embeddings, and convolution kernels to a standard
+optimizer such as AdamW. The conventional Muon setup uses two parameter groups: Muon for the matrices,
+AdamW for everything else.
+</Warning>
+
+### Key arguments
+
+| Argument | Default | Notes |
+|---|---|---|
+| `lr` | `0.02` | Learning rate. |
+| `momentum` | `0.95` | Momentum coefficient. |
+| `nesterov` | `True` | Use Nesterov momentum. |
+| `weight_decay` | `0.0` | Decoupled (AdamW-style) weight decay. |
+| `ns_dtype` | `torch.float16` | Newton-Schulz compute dtype. **fp16** for T4 tensor cores; **fp32** for a numerically-safe fallback; **bf16** only on Ampere/Hopper. Normalization is always fp32 regardless. |
+| `scale_mode` | `"jordan"` | `"jordan"` = `max(1, rows/cols)**0.5` (the Polar-Express baseline). `"moonlight"` = `0.2·sqrt(max(rows, cols))` (a consistent-RMS scale that puts the LR in the AdamW band). |
+| `ns_batch_elems` | `4M` | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. The default keeps peak memory below the baseline. |
+| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. A wall-clock wash on a compute-bound host; only helps a launch-bound one (slow CPU / many tiny params). Bakes in static `lr`/`wd`/`momentum`. |
+
+### Fast mode — trading memory for speed
+
+`ns_batch_elems` is a frontier knob. Raising it batches more parameters into each Newton-Schulz call, which
+runs bigger and better-utilized GEMMs on the T4 — but it costs more transient memory:
+
+| `ns_batch_elems` | Speedup (75M / 300M) | Peak memory |
+|---|---|---|
+| `4M` (default) | ~1.09× / ~1.05× | ≤ baseline |
+| `64M` (fast mode) | **~1.16× / ~1.10×** | exceeds baseline |
+
+The default is gated to stay within the baseline's peak. If you have VRAM headroom over the baseline, set
+`ns_batch_elems=64 * 1024 * 1024` for the faster setting:
+
+```python
+opt = FusedMuon(matrix_params, lr=0.02, ns_batch_elems=64 * 1024 * 1024)   # fast mode
+```
+
+## Usage
+
+```python
+import torch
+from kernels import FusedMuon
+
+# Two groups: matrices -> Muon, everything else -> AdamW.
+matrix_params = [p for n, p in model.named_parameters() if p.ndim in (2, 3) and "embed" not in n]
+other_params  = [p for n, p in model.named_parameters() if p.ndim < 2 or "embed" in n]
+
+muon  = FusedMuon(matrix_params, lr=0.02, momentum=0.95, weight_decay=0.01)
+adamw = torch.optim.AdamW(other_params, lr=3e-4, weight_decay=0.01)
+
+loss = model(batch).loss
+loss.backward()
+muon.step();  adamw.step()
+muon.zero_grad(set_to_none=True);  adamw.zero_grad(set_to_none=True)
+```
+
+## Distributed (DDP)
+
+`DistributedMuon` is a drop-in subclass for `DistributedDataParallel`. Each rank computes Newton-Schulz for
+a FLOP-balanced subset of the parameters and broadcasts its packed updates; every rank applies the full
+update set.
+
+```python
+from kernels import DistributedMuon
+import torch.distributed as dist
+
+opt = DistributedMuon(matrix_params, lr=0.02, weight_decay=0.01, process_group=None)
+```
+
+- **Bit-identical** to a replicated `FusedMuon` — the same all-reduced gradients in produce the same
+  weights out; the Newton-Schulz work is relocated, not changed.
+- Each rank does ~`1/world_size` of the Newton-Schulz work and stores momentum **only for its owned
+  parameters** (less optimizer-state memory).
+- Communication is `world_size` broadcasts of packed update blobs — the same total volume as one
+  all-gather, on top of DDP's existing gradient all-reduce.
+
+It assumes gradients are already all-reduced across ranks (the DDP default) and that the parameters share
+one dtype.
+
+## `newton_schulz` (standalone)
+
+The orthogonalization is exported on its own for direct use:
+
+```python
+from kernels import newton_schulz
+
+G = torch.randn(512, 512, device="cuda", dtype=torch.float16)
+O = newton_schulz(G, ns_dtype=torch.float16)   # singular values driven toward 1
+```
+
+It accepts a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches over
+`E`. Normalization is always done in fp32 (an fp16 sum-of-squares of a unit `512²` matrix would overflow);
+the iteration GEMMs run in `ns_dtype`.
+
+## Benchmark
+
+```bash
+python bench.py --compile muon       # ~75M parameters
+python bench.py --compile muon_big   # ~300M parameters (batched GEMMs dominate)
+```
+
+The benchmark runs the parity gate first (correctness before speed), then the single-GPU A/B. Under
+`torchrun` it also compares the replicated and round-robin distributed paths.

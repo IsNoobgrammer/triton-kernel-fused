@@ -1,0 +1,104 @@
+---
+title: "Fused-linear cross-entropy"
+description: "Fuses the LM-head GEMM with softmax cross-entropy so the (N, V) logits are never materialized — trains where standard CE OOMs."
+keywords: ["cross entropy", "fused linear cross entropy", "cut cross entropy", "liger", "lm head", "logits", "memory", "oom"]
+---
+
+```python
+from kernels import fused_linear_cross_entropy
+```
+
+A drop-in replacement for `F.cross_entropy(hidden @ lm_head.weight.T, labels)` that **never materializes
+the full `(N, V)` logits tensor**. At a vocabulary of 80k+ and 16k tokens, those logits are the memory
+bottleneck of a language-model head and frequently cause an out-of-memory error. This kernel removes that
+intermediate entirely, so training runs where the standard path cannot.
+
+## Why it wins
+
+Standard cross-entropy on an LM head allocates the full `(N, V)` logits. But cross-entropy's gradient
+with respect to the logits is `(softmax − onehot) / n`, which needs **only the logits and the labels** —
+and the loss is a scalar, so the upstream gradient is just a scalar multiplier.
+
+The kernel exploits this. The forward pass streams logits in row-chunks via cuBLAS; for each live chunk, a
+single Triton kernel computes the log-sum-exp **and** writes the gradient in place, then forms
+`grad_hidden` / `grad_weight` via cuBLAS and **discards the chunk**. The backward pass is just a scalar
+scale. The result:
+
+- The `(N, V)` logits are **never stored** — peak memory is bounded by one `(chunk, V)` transient plus the
+  gradient accumulators.
+- **3 GEMMs** over the data (logits, `grad_hidden`, `grad_weight`), with **no backward recompute** — the
+  recompute variant lost to Liger by an extra GEMM, so this fused forward+backward path drops it.
+
+<Note>
+This is the same class of edge as [terminal-loss fusion](/concepts/the-structural-edge): the win is
+**memory**, and memory is what lets the training step happen at all.
+</Note>
+
+## Performance
+
+Measured on a Tesla T4 (`sm_75`):
+
+- **~3.4× less peak memory** than the compiled LM-head + cross-entropy.
+- **Matches Liger's** fused-linear cross-entropy on speed (it is roughly latency-neutral-to-slower vs the
+  compiled head on its own — its job is to fit, not to be the fastest path).
+- **Grad-exact** vs `F.cross_entropy`: loss Δ ~1e-6, gradient relative error < 1.2e-2 in fp16 (bit-identical
+  to the recompute variant).
+
+## API
+
+```python
+fused_linear_cross_entropy(
+    hidden,                    # (N, H) — token hidden states, requires_grad as needed
+    weight,                    # (V, H) — lm_head.weight (NOT transposed)
+    labels,                    # (N,)   — int64 target token ids
+    ignore_index=-100,         # matches F.cross_entropy
+    bwd_logits_budget=None,    # bytes; caps the (chunk, V) transient. None -> 192 MiB default
+)  # -> scalar mean cross-entropy loss
+```
+
+| Argument | Shape / type | Notes |
+|---|---|---|
+| `hidden` | `(N, H)` | Token hidden states. `H` up to a few thousand. |
+| `weight` | `(V, H)` | The LM-head weight, **not** transposed — pass `lm_head.weight` directly. Any vocab size. |
+| `labels` | `(N,)` int64 | Target token ids. |
+| `ignore_index` | int | Rows with this label contribute neither loss nor gradient. Default `-100`. |
+| `bwd_logits_budget` | int (bytes) or `None` | Caps the `(chunk, V)` transient — the **memory dial**. |
+
+### The memory dial
+
+`bwd_logits_budget` sets the byte budget for the live `(chunk, V)` logit transient, which determines the
+row-chunk size. The T4-tuned default is **192 MiB** (chunk ≈ 1242 at V = 81000), which a sweep placed at
+the latency knee.
+
+Chunk size barely moves latency (the step is GEMM-bound) — so lower the budget for less peak memory at the
+cost of a few more cuBLAS launches, and raise it only if you have headroom to spare.
+
+## Usage
+
+```python
+import torch
+from kernels import fused_linear_cross_entropy
+
+N, H, V = 16384, 512, 81000
+hidden  = torch.randn(N, H, device="cuda", dtype=torch.float16, requires_grad=True)
+lm_head = torch.nn.Linear(H, V, bias=False).cuda().half()
+labels  = torch.randint(0, V, (N,), device="cuda")
+
+loss = fused_linear_cross_entropy(hidden, lm_head.weight, labels, ignore_index=-100)
+loss.backward()   # populates hidden.grad and lm_head.weight.grad
+
+# Tighter memory budget (more chunks, lower peak):
+loss = fused_linear_cross_entropy(
+    hidden, lm_head.weight, labels,
+    bwd_logits_budget=128 * 1024 * 1024,
+)
+```
+
+## Benchmark
+
+```bash
+python bench.py --compile ce_fit
+```
+
+The `ce_fit` benchmark targets the regime where the standard `(N, V)` logits would OOM — the regime where
+this kernel is the **enabling** path, not merely the faster one.
