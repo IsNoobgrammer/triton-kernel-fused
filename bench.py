@@ -501,12 +501,15 @@ def bench_moe(N=16384, H=512, I=768, E_glu=9, n_special=2, top_k=2):   # BiBo ST
         kfb, efb = _stats(kstep, estep, leaves)
         return kf, ef, max(kfb - kf, 0.0), max(efb - ef, 0.0), kfb, efb, gabs, grel, _peak(kstep), _peak(estep)
 
-    # Only the per-expert path runs by default. Baseline (the "eager" column) = compiled `moe_eager`
-    # = the Qwen3MoE / HF MoE compute pattern (mask + per-expert loop + index_add) under torch.compile.
-    # DISABLED (T4, useless): `grouped` (tl.dot — 0.07x, the Turing tl.dot cliff) and `bassrehab`
-    # (fwd-only, 0.09x AND wrong output rel 0.76). `grouped_cublas` is bf16/sm_80+ only. Re-enable
-    # grouped/bassrehab by hand if benching on Ampere+.
+    # Baseline (the "eager" column) = compiled `moe_eager` = the Qwen3MoE / HF MoE compute pattern
+    # (mask + per-expert loop + index_add) under torch.compile. per-expert (cuBLAS) is the proven path
+    # and the only one that runs on Turing — `grouped` (tl.dot) is the 0.07x Turing tl.dot cliff there.
+    # On Ampere+/Blackwell (sm_80+) the tl.dot calculus flips, so we A/B `grouped` automatically to
+    # settle which path moe()'s auto-dispatch should pick per arch. `bassrehab` (fwd-only, 0.09x AND
+    # wrong output) stays off; `grouped_cublas` is bf16/sm_80+ only — re-enable by hand if benching bf16.
     variants = [("per-expert", moe_per_expert)]
+    if torch.cuda.get_device_capability()[0] >= 8:
+        variants.append(("grouped", moe_grouped))
     for vname, vfn in variants:
         try:
             _report(f"MoE {vname} vs Qwen3MoE-eager (compiled)", *run(vfn))
