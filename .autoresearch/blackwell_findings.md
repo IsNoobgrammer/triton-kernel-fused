@@ -115,10 +115,34 @@ materializes a ~16.8 MB intermediate = ~34 MB round-trip tax we avoid).
 
 ---
 
-## Router — PENDING
+## Router — REGRESSION on Blackwell (needs sm120-specific optimization)
 
-Conv MoE router (`fused_router`) has **not been benchmarked on Blackwell yet**. Last Blackwell gap to close.
-On T4 it was 1.11–1.17× fwd+bwd, exact grads, mem parity. Run: `python bench.py --compile router`.
+Conv MoE router (`fused_router` [cudnn]), B=16 S=1024 H=512 E=11 K=4 k=2, bf16. grad PASS, mem parity.
+**On Blackwell the T4 win FLIPS to a loss** (T4 was 1.11–1.17×):
+
+| baseline | forward | backward | fwd+bwd |
+|---|---|---|---|
+| uncompiled eager | 1.29× | 1.07× | **0.82×** |
+| compiled eager | 0.74× | 0.87× | **0.91×** |
+
+We win forward+backward *separately* but lose the *combined* step — and lose outright vs compiled.
+
+**Diagnosis (profile, compiled fwd+bwd):** our path = 5.58 ms CUDA vs eager 4.86 ms.
+- **`aten::copy_` = 48% of our CUDA (2.68 ms, 100 calls)** vs eager's 27.5% (1.34 ms, 60 calls) — we do
+  ~2 extra contiguity copies/iter. This is the killer.
+- cuDNN layout transposes (`nchwToNhwc` 410 µs + `nhwcToNchw` 226 µs + `tensorTransformGeneric` 234 µs ≈
+  870 µs) are paid by both paths.
+- We DO fuse away eager's native top-k (`topk` 630 µs + `gatherTopK` 405 µs + `bitonicSort` 224 µs ≈
+  1.26 ms) — the T4 edge — **but we spend ~1.3 ms MORE in copies than we save on top-k.** Net loss.
+
+**Why the T4 win doesn't transfer:** on T4 the prize was removing ~700 µs of *unfused glue* around
+`convolution_backward`. On Blackwell, inductor's compiled path is already lean on glue (60 copies), while
+our save-contiguous + manual `convolution_backward` adds copies (100). The copy tax now outweighs the
+top-k fusion. **The fix is the transpose-free fused Triton conv shelved on T4** (conv_router_findings.md
+"revisit on Ampere/Hopper — NOT T4": T4's 64 KB SRAM couldn't tile the read-once window; Blackwell's
+~228 KB SRAM + bf16 tensor cores is exactly that better-hardware case). Cheaper first test: feed cuDNN
+channels-last to skip the `nchwToNhwc` tax (T4-refuted, **Blackwell-untested**). This is the open
+"fork `kernels/sm120/router.py`" job.
 
 ---
 
@@ -131,4 +155,4 @@ On T4 it was 1.11–1.17× fwd+bwd, exact grads, mem parity. Run: `python bench.
 | MoE grouped | 4.95× but grad WRONG (specials) — not shippable | — |
 | CE | memory: up to 3.8× less peak; **beats Liger** at equal mem | memory-only |
 | XSA | **~1.61× fwd+bwd** (warm, 5-run stable) | 1.15× |
-| router | pending | 1.11–1.17× |
+| router | **0.82× uncompiled / 0.91× compiled — REGRESSED** (copy tax > topk fusion); needs sm120 opt | 1.11–1.17× |
