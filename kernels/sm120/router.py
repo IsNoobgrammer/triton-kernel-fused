@@ -11,7 +11,11 @@ intermediate copies:
   backward grad_x (`_conv_router_dx_kernel`): grad_x[:,s',:] = Σ_k grad_logit[:,s'+shift_k,:] @ W[:,:,k]
       (contraction over E), one fused kernel.
   backward grad_W (`_conv_router_dw_kernel`): grad_W[:,:,k] = Σ_n grad_logit[n,:]ᵀ · x[n-shift_k,:],
-      a fused reduction over n=B*S (no sliced-matmul copies).
+      a fused reduction over n=B*S (no sliced-matmul copies), split-K over N (atomic-add partials into a
+      zero-init fp32 accumulator) so the grid is K·(H/BLOCK_H)·SPLIT_N, not the under-occupied K·(H/BLOCK_H).
+
+All tl.dot use input_precision="ieee" — true fp32 (no TF32), so the fp32 correctness gate sees bit-faithful
+logits (no near-tie top-k flips); it is a no-op on the bf16/fp16 timed path.
 
 All tl.dot in bf16/fp16 with fp32 accumulate. ~4 launches vs cuDNN's ~75, zero layout transposes. The
 fused epilogue (top-k) is the same edge as sm75; only the conv is now Triton instead of cuDNN. T4-dead
@@ -48,7 +52,9 @@ def _conv_router_fwd_kernel(X, W, Bias, Idx, Wt, Logit, S, sxb, sxs, sxh, swe, s
                      mask=m_in[:, None] & mask_d[None, :], other=0.0)            # (BLOCK_S, BLOCK_D)
         wk = tl.load(W + offs_d[:, None] * swh + offs_e[None, :] * swe + k * swk,
                      mask=mask_d[:, None] & mask_e[None, :], other=0.0)          # (BLOCK_D, BLOCK_E)
-        acc = tl.dot(xk, wk, acc)                          # (BLOCK_S,BLOCK_D)@(BLOCK_D,BLOCK_E)
+        # input_precision="ieee": true fp32 (no TF32). No-op for bf16/fp16 (the timed path), but for the
+        # fp32 correctness gate it keeps logits bit-faithful so no near-tie top-k flips (count/idx/grad).
+        acc = tl.dot(xk, wk, acc, input_precision="ieee")  # (BLOCK_S,BLOCK_D)@(BLOCK_D,BLOCK_E)
     # save logits (for backward)
     n = b * S + offs_s
     tl.store(Logit + n[:, None] * sln + offs_e[None, :] * sle,
@@ -92,24 +98,30 @@ def _conv_router_dx_kernel(GL, W, GX, S, sgn, sge, swe, swh, swk, sxb, sxs, sxh,
                      mask=m_src[:, None] & mask_e[None, :], other=0.0)           # (BLOCK_S, BLOCK_E) fp32
         wk = tl.load(W + offs_e[:, None] * swe + offs_d[None, :] * swh + k * swk,
                      mask=mask_e[:, None] & mask_d[None, :], other=0.0)          # (BLOCK_E, BLOCK_D)
-        acc = tl.dot(gl.to(wk.dtype), wk, acc)             # (BLOCK_S,BLOCK_E)@(BLOCK_E,BLOCK_D)
+        acc = tl.dot(gl.to(wk.dtype), wk, acc, input_precision="ieee")  # (BLOCK_S,BLOCK_E)@(BLOCK_E,BLOCK_D)
     tl.store(GX + b * sxb + offs_s[:, None] * sxs + offs_d[None, :] * sxh,
              acc.to(GX.dtype.element_ty), mask=mask_s[:, None] & mask_d[None, :])
 
 
 @triton.jit
 def _conv_router_dw_kernel(GL, X, GW, N, S, sgn, sge, sxn, sxh, gwe, gwh, gwk,
-                           E: tl.constexpr, H: tl.constexpr, BLOCK_E: tl.constexpr,
+                           N_PER, E: tl.constexpr, H: tl.constexpr, BLOCK_E: tl.constexpr,
                            BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, K: tl.constexpr):
+    """grad_W[e,h,k] = Σ_n grad_logit[n,e]·x[n-shift_k,h]. Split-K over N (3rd grid axis `sn`): each
+    program reduces only its N-slice and atomic-adds the partial into a zero-init fp32 GW. Lifts the grid
+    from K·(H/BLOCK_H) (=32, badly under-occupied on 188 SMs with a 128-iter serial N-reduction) to
+    K·(H/BLOCK_H)·SPLIT_N. GW must be fp32 + zeroed (atomics); caller casts to weight.dtype after."""
     k = tl.program_id(0)
     hb = tl.program_id(1)
+    sn = tl.program_id(2)                                  # split-K index over N
     shift = (K - 1) - k
     offs_e = tl.arange(0, BLOCK_E)
     offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_e = offs_e < E
     mask_h = offs_h < H
     acc = tl.zeros((BLOCK_E, BLOCK_H), dtype=tl.float32)
-    for n0 in range(0, N, BLOCK_N):
+    n_start = sn * N_PER                                   # N_PER is a multiple of BLOCK_N (no overlap)
+    for n0 in range(n_start, n_start + N_PER, BLOCK_N):
         nn = n0 + tl.arange(0, BLOCK_N)                    # flat (b*S+s) for grad_logit
         s_in = nn % S
         m = (nn < N) & (s_in >= shift)                     # causal: x[n-shift] valid only when s>=shift
@@ -117,9 +129,9 @@ def _conv_router_dw_kernel(GL, X, GW, N, S, sgn, sge, sxn, sxh, gwe, gwh, gwk,
                        mask=mask_e[:, None] & m[None, :], other=0.0)             # (BLOCK_E, BLOCK_N)
         x_t = tl.load(X + (nn - shift)[:, None] * sxn + offs_h[None, :] * sxh,
                       mask=m[:, None] & mask_h[None, :], other=0.0)              # (BLOCK_N, BLOCK_H)
-        acc = tl.dot(gl_t.to(x_t.dtype), x_t, acc)         # (BLOCK_E,BLOCK_N)@(BLOCK_N,BLOCK_H)
-    tl.store(GW + offs_e[:, None] * gwe + offs_h[None, :] * gwh + k * gwk,
-             acc.to(GW.dtype.element_ty), mask=mask_e[:, None] & mask_h[None, :])
+        acc = tl.dot(gl_t.to(x_t.dtype), x_t, acc, input_precision="ieee")       # (BLOCK_E,BLOCK_N)@(BLOCK_N,BLOCK_H)
+    tl.atomic_add(GW + offs_e[:, None] * gwe + offs_h[None, :] * gwh + k * gwk,
+                  acc, mask=mask_e[:, None] & mask_h[None, :])
 
 
 class FusedConvRouterFused(torch.autograd.Function):
@@ -179,15 +191,20 @@ class FusedConvRouterFused(torch.autograd.Function):
             E=E, K=K, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D,
             num_stages=2, num_warps=4)
 
-        grad_w = torch.empty(E, H, K, device=x.device, dtype=weight.dtype)
+        # grad_W via split-K over N: fp32 zero-init accumulator (atomic_add), then cast to weight.dtype.
+        grad_w_acc = torch.zeros(E, H, K, device=x.device, dtype=torch.float32)
         xflat = x.view(N, H)
         BLOCK_H = 64
-        _conv_router_dw_kernel[(K, triton.cdiv(H, BLOCK_H))](
-            grad_logits, xflat, grad_w, N, S,
+        BLOCK_N = 128
+        SPLIT_N = 16                                       # 32 -> 512 programs; ~8 N-blocks each
+        N_PER = triton.cdiv(triton.cdiv(N, SPLIT_N), BLOCK_N) * BLOCK_N   # multiple of BLOCK_N, tiles [0,N)
+        _conv_router_dw_kernel[(K, triton.cdiv(H, BLOCK_H), SPLIT_N)](
+            grad_logits, xflat, grad_w_acc, N, S,
             grad_logits.stride(0), grad_logits.stride(1), xflat.stride(0), xflat.stride(1),
-            grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
-            E=E, H=H, BLOCK_E=BLOCK_E, BLOCK_H=BLOCK_H, BLOCK_N=128, K=K,
+            grad_w_acc.stride(0), grad_w_acc.stride(1), grad_w_acc.stride(2), N_PER,
+            E=E, H=H, BLOCK_E=BLOCK_E, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, K=K,
             num_stages=2, num_warps=4)
+        grad_w = grad_w_acc.to(weight.dtype)
         return grad_x, grad_w, None, None, None
 
 
