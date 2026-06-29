@@ -115,34 +115,41 @@ materializes a ~16.8 MB intermediate = ~34 MB round-trip tax we avoid).
 
 ---
 
-## Router — REGRESSION on Blackwell (needs sm120-specific optimization)
+## Router — WIN on Blackwell via a transpose-free fused Triton conv (the T4 regression, recovered)
 
-Conv MoE router (`fused_router` [cudnn]), B=16 S=1024 H=512 E=11 K=4 k=2, bf16. grad PASS, mem parity.
-**On Blackwell the T4 win FLIPS to a loss** (T4 was 1.11–1.17×):
+Conv MoE router, B=16 S=1024 H=512 E=11 K=4 k=2, bf16. `kernels.sm120` uses `FusedConvRouterFused` — a
+**single-launch fused Triton conv** (no cuDNN, no layout transpose): forward does the K-tap H-contraction
+in-SRAM + sigmoid + top-k + gather in-register; backward is two fused Triton kernels (grad_x H-tiled,
+grad_W split-K over N). grad PASS, mem parity-or-better.
 
 | baseline | forward | backward | fwd+bwd |
 |---|---|---|---|
-| uncompiled eager | 1.29× | 1.07× | **0.82×** |
-| compiled eager | 0.74× | 0.87× | **0.91×** |
+| compiled eager | **1.18×** | **1.62×** | **1.45×** |
 
-We win forward+backward *separately* but lose the *combined* step — and lose outright vs compiled.
+grad PASS (abs 4.23e-3, **rel 2.4e-4**), idx-agree 1.0000, count==bincount True, NaN-free. peak 273/308 MB
+(**1.13× less**). Our CUDA total 2.60 ms vs eager 4.86 ms (**1.87× less work**); ~51 launches vs cuDNN's
+~75 — zero layout-transpose copies, x read once.
 
-**Diagnosis (profile, compiled fwd+bwd):** our path = 5.58 ms CUDA vs eager 4.86 ms.
-- **`aten::copy_` = 48% of our CUDA (2.68 ms, 100 calls)** vs eager's 27.5% (1.34 ms, 60 calls) — we do
-  ~2 extra contiguity copies/iter. This is the killer.
-- cuDNN layout transposes (`nchwToNhwc` 410 µs + `nhwcToNchw` 226 µs + `tensorTransformGeneric` 234 µs ≈
-  870 µs) are paid by both paths.
-- We DO fuse away eager's native top-k (`topk` 630 µs + `gatherTopK` 405 µs + `bitonicSort` 224 µs ≈
-  1.26 ms) — the T4 edge — **but we spend ~1.3 ms MORE in copies than we save on top-k.** Net loss.
+**The history (why this took 3 candidates):** the sm75 **cuDNN** champion (T4 win 1.11–1.17×) *regressed to
+0.82× uncompiled / 0.91× compiled on Blackwell* — its `x.transpose(1,2).contiguous()` + manual
+`convolution_backward` cost `aten::copy_` = 48% of CUDA (2.68 ms), and inductor's compiled path was already
+lean on glue, so the top-k fusion no longer paid. The fix was the transpose-free fused Triton conv shelved
+on T4 (64 KB SRAM); Blackwell's ~99 KB Triton SMEM + bf16 TC is the "revisit on better hardware" case.
 
-**Why the T4 win doesn't transfer:** on T4 the prize was removing ~700 µs of *unfused glue* around
-`convolution_backward`. On Blackwell, inductor's compiled path is already lean on glue (60 copies), while
-our save-contiguous + manual `convolution_backward` adds copies (100). The copy tax now outweighs the
-top-k fusion. **The fix is the transpose-free fused Triton conv shelved on T4** (conv_router_findings.md
-"revisit on Ampere/Hopper — NOT T4": T4's 64 KB SRAM couldn't tile the read-once window; Blackwell's
-~228 KB SRAM + bf16 tensor cores is exactly that better-hardware case). Cheaper first test: feed cuDNN
-channels-last to skip the `nchwToNhwc` tax (T4-refuted, **Blackwell-untested**). This is the open
-"fork `kernels/sm120/router.py`" job.
+- **#1 K-GEMM (K torch matmuls):** correct but **0.54×** — launch/copy explosion (161 launches, 240 mm,
+  760 copy_). Lesson: any multi-torch-op conv is launch-bound here too. Only a single fused kernel wins.
+- **#2 fused Triton conv:** won wall-clock (1.47×) but **failed the fp32 gate** — `tl.dot` defaults to
+  **TF32** on fp32 inputs → ~1e-3 logit error flipped near-tie top-k picks → count≠bincount, grad rel 1e-1.
+  And backward was dw-bound (`_conv_router_dw` 58% of CUDA, 145 µs/call: grid only K·(H/64)=32 programs
+  serial-reducing all N on 188 SMs).
+- **#3 (shipped):** `input_precision="ieee"` on every `tl.dot` (true fp32, no-op on the bf16 timed path)
+  → grad PASS + count True. **split-K over N** in grad_W (3rd grid axis, SPLIT_N=16 → 512 programs,
+  atomic-add into a zero-init fp32 accumulator) → dw 145→**23 µs/call**, backward 0.87→**1.62×**.
+
+**Remaining soft spot (optional):** the forward kernel is now the largest single GPU cost (54 µs, fwd
+1.18×) — a skinny (M=32, N=16, K=512) matmul + in-register top-k, 512 programs, `BLOCK_S` pinned at 32 by
+the fp32-check SMEM budget. Halving it would push fwd+bwd toward ~1.6×. Not pursued — the scope target
+(tie-or-win, grad PASS, mem parity) is exceeded.
 
 ---
 
@@ -155,4 +162,4 @@ channels-last to skip the `nchwToNhwc` tax (T4-refuted, **Blackwell-untested**).
 | MoE grouped | 4.95× but grad WRONG (specials) — not shippable | — |
 | CE | memory: up to 3.8× less peak; **beats Liger** at equal mem | memory-only |
 | XSA | **~1.61× fwd+bwd** (warm, 5-run stable) | 1.15× |
-| router | **0.82× uncompiled / 0.91× compiled — REGRESSED** (copy tax > topk fusion); needs sm120 opt | 1.11–1.17× |
+| router | **~1.45× fwd+bwd** (fwd 1.18× / bwd 1.62×), grad PASS, 1.13× less mem — fused Triton conv, sm120 | 1.11–1.17× |
