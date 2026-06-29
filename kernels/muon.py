@@ -14,6 +14,8 @@ T4 SRAM. The wins are launch-overhead, not a hand-written GEMM:
      where fp32 runs on slow CUDA cores and bf16 has NO tensor cores at all on sm_75 (and torch.compile
      skips bf16 there). Use fp32 for a numerically-safe fallback, bf16 only on Ampere/Hopper.
 """
+from collections import defaultdict
+
 import torch
 import torch.optim as optim
 
@@ -96,8 +98,6 @@ class FusedMuon(optim.Optimizer):
 
             # Mixed-precision layout (the AdamW-8bit norm): fp32 master weights `p`, fp32 grads, but the
             # MOMENTUM STATE is kept in the low NS dtype (fp16) — that's the optimizer-memory saving.
-            # foreach fuses the per-param momentum sweep (the launch win); nesterov + NS are per-param so
-            # we never materialize all updates at once (keeps peak ~ the unfused baseline).
             grads = [p.grad.to(self.ns_dtype) for p in params]        # fp32 grad -> low-precision for the state
             bufs = []
             for p, g in zip(params, grads):
@@ -106,14 +106,32 @@ class FusedMuon(optim.Optimizer):
                     st["momentum_buffer"] = torch.zeros_like(g)       # momentum state in ns_dtype (fp16)
                 bufs.append(st["momentum_buffer"])
 
-            torch._foreach_mul_(bufs, momentum)                       # buf = momentum*buf + grad
+            torch._foreach_mul_(bufs, momentum)                       # buf = momentum*buf + grad  (foreach)
             torch._foreach_add_(bufs, grads)
             if wd != 0:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
+            u_ins = list(torch._foreach_add(grads, bufs, alpha=momentum)) if nesterov else bufs
+
+            # SAME-SHAPE BATCHING — the lever torch.compile structurally can't reach: it runs NS per
+            # parameter (small batch-1/9 GEMMs), so 48 params = 48*5*3 GEMM launches. We stack every
+            # same-(rows,cols) update into ONE (M,rows,cols) batched Newton-Schulz: ~6 groups => ~6*5*3
+            # GEMM launches + far better SM utilization. Each batch slice orthogonalizes independently,
+            # so this is BIT-IDENTICAL to the per-param step. (2D param -> (1,r,c); a 3D expert tensor
+            # (E,r,c) contributes E slices; scale depends only on (r,c) so it's shared within a group.)
+            groups = defaultdict(list)
             for i, p in enumerate(params):
-                u_in = grads[i].add(bufs[i], alpha=momentum) if nesterov else bufs[i]
-                u = newton_schulz(u_in, self.coeffs, self.ns_dtype)
-                p.add_(u.to(p.dtype), alpha=-lr * self._scale(p))     # update the fp32 master weight
+                r, c = p.shape[-2], p.shape[-1]
+                groups[(r, c)].append((i, u_ins[i].reshape(-1, r, c)))
+            for (r, c), items in groups.items():
+                sizes = [u.shape[0] for _, u in items]
+                batched = items[0][1] if len(items) == 1 else torch.cat([u for _, u in items], dim=0)
+                out = newton_schulz(batched, self.coeffs, self.ns_dtype)
+                alpha = -lr * (0.2 * (max(r, c) ** 0.5) if self.scale_mode == "moonlight" else max(1, r / c) ** 0.5)
+                off = 0
+                for (i, _), n in zip(items, sizes):
+                    p = params[i]
+                    p.add_(out[off:off + n].reshape(p.shape).to(p.dtype), alpha=alpha)
+                    off += n
 
         return loss
 
