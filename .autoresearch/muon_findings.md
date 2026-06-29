@@ -15,3 +15,24 @@ The old AGENTS.md conclusion ("compile is the only lever") missed: baddbmm folds
 GEMM (no pointwise kernels), foreach collapses the N-param launch tax, and fp16 NS engages tensor cores.
 NEXT: verify on T4 (sm_75) — fp32 has NO tensor cores there, so the fp16 gap should be even larger.
 Champion = fused-fp32 (bit-tight). fp16 = opt-in pending T4 stability + a real training-loss check.
+
+## Round 2 — Polar-Express baseline + full pipeline (single + distributed)
+Baseline switched to nprime06/parameter-golf Polar-Express Muon (5 per-iter NS coeffs, bf16, Jordan scale).
+Pipeline now in `bench.py` (`python bench.py --compile muon`, or `torchrun --nproc_per_node=2 ... muon`):
+
+PARITY GATE (correctness before speed), local RTX 3050:
+- fused(quintic,fp32) vs **BiBo's trusted Muon** = 4.88e-4  PASS  <- the fusion is correct vs the in-repo anchor
+- fused-bf16 vs PE reference (verbatim golf) = 5.86e-3  PASS
+- fp16-NS stability (SV mean ~1, NaN-free) = PASS
+
+SINGLE-GPU speed (uncompiled local): fused-bf16 1.11x, fused-fp16 1.15x. fp16 edge small on Ampere
+(bf16 already on tensor cores) — expected to OPEN UP on T4 (bf16 has NO tensor cores on sm_75; fp16 does).
+
+DISTRIBUTED option-B (DistributedMuon, exact whole-param round-robin, validated 2-rank gloo/CPU):
+- B vs A replicated = 2.4e-7 (BIT-EXACT — same grads in, same weights out; NS work relocated not changed)
+- B cross-rank weight agreement = 0.0 (all ranks stay in sync)
+- comm = world_size packed-blob broadcasts (~one all-gather) on top of DDP's grad all-reduce;
+  each rank does ~1/ws of the NS and stores momentum only for its owned params (less optim memory).
+
+NEXT (T4): run single-GPU A/B (--compile) to size fp16 win + the optimizer's % of step; then 2x T4
+torchrun to see if B's halved NS beats A's redundancy net of the broadcast. Ship winner to BiBo/bench/optim.py.

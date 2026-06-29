@@ -706,7 +706,200 @@ def bench_ce_sweep(N=16384, H=512, V=81000):
             torch.cuda.empty_cache()
 
 
+# ───────────────────────── Muon optimizer (Polar-Express) ─────────────────────────
+# Quintic Moonlight coeffs (BiBo's recipe) — used ONLY to parity-check the FUSION against BiBo's Muon.
+_QUINTIC = ((3.4445, -4.7750, 2.0315),) * 5
+
+
+def _import_bibo_muon():
+    """Best-effort import of BiBo's trusted Muon (../BiBo/bench/optim.py) via importlib — the parity
+    anchor for the fusion. Returns the class or None (T4 box may not have BiBo checked out alongside)."""
+    import importlib.util
+    p = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "BiBo", "bench", "optim.py"))
+    if not os.path.exists(p):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("bibo_optim", p)
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        return m.Muon
+    except Exception as ex:
+        print(f"  (BiBo Muon import failed: {type(ex).__name__}: {str(ex).splitlines()[0]}) — using PE reference only")
+        return None
+
+
+def _pe_reference():
+    """The verbatim single-GPU Polar-Express baseline (nprime06/parameter-golf) — bf16 NS, Jordan scale.
+    Returns (baseline_ns_fn, BaselineMuon_class). NS is plain so --compile can wrap it like the golf entry."""
+    from kernels.muon import _PE_COEFFS
+
+    def baseline_ns(G, coeffs=_PE_COEFFS, eps=1e-7):
+        was_2d = G.ndim == 2
+        if was_2d:
+            G = G.unsqueeze(0)
+        X = G.bfloat16()
+        transposed = X.size(-2) > X.size(-1)
+        if transposed:
+            X = X.mT
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+        for a, b, c in coeffs:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+        if transposed:
+            X = X.mT
+        if was_2d:
+            X = X.squeeze(0)
+        return X
+
+    class BaselineMuon(torch.optim.Optimizer):
+        def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0, ns_fn=baseline_ns):
+            super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay))
+            self.ns_fn = ns_fn
+
+        @torch.no_grad()
+        def step(self):
+            for grp in self.param_groups:
+                lr, mom, wd = grp["lr"], grp["momentum"], grp["weight_decay"]
+                for p in grp["params"]:
+                    if p.grad is None or p.ndim not in (2, 3):
+                        continue
+                    g = p.grad.bfloat16()
+                    st = self.state[p]
+                    if "momentum_buffer" not in st:
+                        st["momentum_buffer"] = torch.zeros_like(g)
+                    buf = st["momentum_buffer"]; buf.mul_(mom).add_(g)
+                    u = g.add(buf, alpha=mom) if grp["nesterov"] else buf
+                    u = self.ns_fn(u)
+                    scale = max(1, p.shape[-2] / p.shape[-1]) ** 0.5
+                    if wd > 0.0:
+                        p.data.mul_(1.0 - lr * wd)
+                    p.add_(u.to(p.dtype), alpha=-lr * scale)
+
+    return baseline_ns, BaselineMuon
+
+
+def _muon_shapes(layers=6, H=512, I=768, E=9):
+    sh = []
+    for _ in range(layers):
+        sh += [(H, H), (H // 2, H), (H // 2, H), (H, H)]      # q, k(GQA), v(GQA), o
+        sh += [(2 * I, H), (H, I)]                             # dense MLP gate_up, down
+        sh += [(E, 2 * I, H), (E, H, I)]                       # 3D stacked experts
+    return sh
+
+
+def _muon_params(shapes, seed=0):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    return [torch.randn(*s, generator=g, device=DEV, dtype=DTYPE) for s in shapes]
+
+
+def _opt_ms(make_opt, shapes):
+    """Time one optimizer step (fresh grads each iter) after warmup."""
+    params = _muon_params(shapes, 0)
+    opt = make_opt(params)
+    gg = torch.Generator(device=DEV).manual_seed(1)
+
+    def prime():
+        for p in params:
+            p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=DTYPE)
+    prime(); opt.step()                                        # materialize state, warm autotune/compile
+    _warm(lambda: (prime(), opt.step()))
+    return do_bench(lambda: (prime(), opt.step()))
+
+
+def _muon_parity(make_opt, make_ref, shapes, steps=5):
+    """max|Δp| between reference and candidate after `steps` identical steps from identical init+grads."""
+    pr, pc = _muon_params(shapes, 0), _muon_params(shapes, 0)
+    oref, ocand = make_ref(pr), make_opt(pc)
+    gg = torch.Generator(device=DEV).manual_seed(7)
+    worst = 0.0
+    for _ in range(steps):
+        grads = [torch.randn(*p.shape, generator=gg, device=DEV, dtype=DTYPE) for p in pr]
+        for p, gr in zip(pr, grads): p.grad = gr.clone()
+        for p, gr in zip(pc, grads): p.grad = gr.clone()
+        oref.step(); ocand.step()
+        worst = max(worst, max((a.float() - b.float()).abs().max().item() for a, b in zip(pr, pc)))
+    return worst
+
+
+def bench_muon():
+    """Polar-Express Muon: fused (foreach + baddbmm, bf16/fp16 NS) vs the baseline, with a hard parity
+    gate FIRST. Single-GPU always; distributed A (replicated) vs B (round-robin) when launched under
+    `torchrun --nproc_per_node=2 bench.py --compile muon`.
+    """
+    from kernels.muon import FusedMuon, DistributedMuon, newton_schulz, _PE_COEFFS
+    shapes = _muon_shapes()
+    baseline_ns, BaselineMuon = _pe_reference()
+    nparam = sum(int(torch.tensor(s).prod()) for s in shapes)
+    print(f"\n=== Muon (Polar-Express) — {len(shapes)} tensors, {nparam/1e6:.1f}M params ===")
+
+    # ── PHASE 1: PARITY GATE (correctness before speed) ──
+    BiBoMuon = _import_bibo_muon()
+    if BiBoMuon is not None:
+        # FUSION correctness vs the TRUSTED in-repo reference: match BiBo's recipe exactly
+        # (quintic Moonlight coeffs, 0.2*sqrt(max) scale, fp32 NS) and confirm foreach+baddbmm don't drift.
+        d = _muon_parity(
+            lambda ps: FusedMuon(ps, lr=3e-4, weight_decay=0.1, coeffs=_QUINTIC,
+                                 ns_dtype=torch.float32, scale_mode="moonlight"),
+            lambda ps: BiBoMuon(ps, lr=3e-4, momentum=0.95, weight_decay=0.1),
+            shapes)
+        print(f"  parity  fused(quintic,fp32) vs BiBo Muon = {d:.2e}  "
+              f"{'PASS' if d < 1e-3 else 'FAIL'}  (fp32 fusion-correctness gate < 1e-3)")
+    else:
+        print("  (BiBo Muon unavailable — fusion correctness falls back to the PE reference below)")
+
+    # PE faithfulness: our PE config vs the verbatim golf reference (bf16, Jordan scale)
+    dbf = _muon_parity(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.bfloat16),
+                       lambda ps: BaselineMuon(ps, lr=0.02, weight_decay=0.1), shapes)
+    print(f"  parity  fused-bf16 vs PE reference        = {dbf:.2e}  "
+          f"{'PASS' if dbf < 2e-2 else 'FAIL'}  (bf16 tolerance gate < 2e-2)")
+
+    # fp16-NS stability (T4 candidate): SV mean ~1, NaN-free
+    ok = True
+    for s in [(512, 512), (256, 512), (1536, 512), (9, 1536, 512), (9, 512, 768)]:
+        Y = newton_schulz(torch.randn(*s, device=DEV, dtype=DTYPE), ns_dtype=torch.float16).float()
+        sv = torch.linalg.svdvals(Y if Y.ndim == 3 else Y.unsqueeze(0))
+        ok &= (not bool(Y.isnan().any())) and (0.80 <= sv.mean().item() <= 1.20)
+    print(f"  fp16-NS stability (SV~1, NaN-free)        = {'PASS' if ok else 'FAIL'}")
+
+    # ── PHASE 2: SINGLE-GPU SPEED (vs the compiled baseline under --compile, like the golf entry) ──
+    ns_for_baseline = _c(baseline_ns)                          # --compile -> compiled NS (golf-faithful)
+    tb = _opt_ms(lambda ps: BaselineMuon(ps, lr=0.02, weight_decay=0.1, ns_fn=ns_for_baseline), shapes)
+    tbf = _opt_ms(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.bfloat16), shapes)
+    t16 = _opt_ms(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16), shapes)
+    print(f"\n  single-GPU step ({'compiled ' if COMPILE else ''}baseline = 1.00x):")
+    print(f"    baseline    {tb:7.3f} ms  (1.00x)")
+    print(f"    fused-bf16  {tbf:7.3f} ms  ({tb/tbf:.2f}x)")
+    print(f"    fused-fp16  {t16:7.3f} ms  ({tb/t16:.2f}x)   [T4 fp16 tensor cores; bf16 has none on sm_75]")
+
+    # ── PHASE 3: DISTRIBUTED A (replicated) vs B (round-robin) — only under torchrun ──
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        rank, ws = dist.get_rank(), dist.get_world_size()
+        # exactness: B must give bit-identical weights to A (same grads -> same weights, work just relocated)
+        pa, pb = _muon_params(shapes, 0), _muon_params(shapes, 0)
+        oa = FusedMuon(pa, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16)
+        ob = DistributedMuon(pb, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16)
+        gg = torch.Generator(device=DEV).manual_seed(11)
+        worst = 0.0
+        for _ in range(3):
+            grads = [torch.randn(*p.shape, generator=gg, device=DEV, dtype=DTYPE) for p in pa]
+            for p, gr in zip(pa, grads): p.grad = gr.clone()    # DDP would all-reduce; same grads here
+            for p, gr in zip(pb, grads): p.grad = gr.clone()
+            oa.step(); ob.step()
+            worst = max(worst, max((x.float() - y.float()).abs().max().item() for x, y in zip(pa, pb)))
+        ta = _opt_ms(lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16), shapes)
+        tbd = _opt_ms(lambda ps: DistributedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16), shapes)
+        if rank == 0:
+            print(f"\n  distributed (world_size={ws}):")
+            print(f"    exactness  B vs A weights = {worst:.2e}  {'PASS' if worst < 1e-3 else 'FAIL'}  (must be exact)")
+            print(f"    A replicated   {ta:7.3f} ms/rank  (1.00x)")
+            print(f"    B round-robin  {tbd:7.3f} ms/rank  ({ta/tbd:.2f}x)   [each rank does ~1/{ws} of the NS]")
+    else:
+        print("\n  (distributed A/B skipped — run `torchrun --nproc_per_node=2 bench.py --compile muon` on 2x T4)")
+
+
 BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
+           "muon": bench_muon,
            "ce_sweep": bench_ce_sweep,
            "xsa": bench_xsa, "router": bench_router_full,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
@@ -715,6 +908,13 @@ BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required"
+    # Under `torchrun --nproc_per_node=N`: init NCCL + pin this rank's GPU (for the muon distributed A/B).
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        import torch.distributed as dist
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        DEV = f"cuda:{os.environ['LOCAL_RANK']}"
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
     COMPILE = "--compile" in sys.argv
     JSON_OUT = "--json" in sys.argv
     PROFILE = "--profile" in sys.argv

@@ -114,3 +114,85 @@ class FusedMuon(optim.Optimizer):
                 p.add_(u.to(p.dtype), alpha=-lr * self._scale(p))     # scaled orthogonal step
 
         return loss
+
+
+class DistributedMuon(FusedMuon):
+    """Option B — exact whole-param round-robin Muon for DDP (2x T4). Each rank computes Newton-Schulz
+    for a FLOP-balanced subset of the params and broadcasts its packed updates; every rank applies the
+    full update set. **Bit-identical to the replicated FusedMuon** (same all-reduced grads in -> same
+    weights out), but each rank does ~1/world_size of the NS work and stores momentum only for its OWNED
+    params (less optimizer-state memory). Comm = `world_size` broadcasts of packed update blobs — same
+    total volume as one all-gather, on top of DDP's existing grad all-reduce.
+
+    Assumes grads are already all-reduced across ranks (DDP default) and params share one dtype.
+    """
+
+    def __init__(self, params, *, process_group=None, **kwargs):
+        super().__init__(params, **kwargs)
+        self.pg = process_group
+        self._owner = None                                            # owner[i] = rank that does param i
+
+    def _ordered(self):
+        out = []
+        for g in self.param_groups:
+            for p in g["params"]:
+                if p.ndim in (2, 3):
+                    out.append((p, g))
+        return out
+
+    def _plan(self, ordered, ws):
+        load = [0] * ws                                               # greedy least-loaded by numel (FLOP proxy)
+        owner = []
+        for p, _ in ordered:
+            r = min(range(ws), key=lambda i: load[i])
+            owner.append(r); load[r] += p.numel()
+        return owner
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        import torch.distributed as dist
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        ws, rank = dist.get_world_size(self.pg), dist.get_rank(self.pg)
+        ordered = self._ordered()
+        if self._owner is None or len(self._owner) != len(ordered):
+            self._owner = self._plan(ordered, ws)                     # deterministic — same on every rank
+
+        # 1) each rank computes the orthogonalized update for ITS owned params (momentum is owner-local).
+        upd = {}
+        for i, (p, g) in enumerate(ordered):
+            if self._owner[i] != rank or p.grad is None:
+                continue
+            gr = p.grad.to(self.ns_dtype)
+            st = self.state[p]
+            if "momentum_buffer" not in st:
+                st["momentum_buffer"] = torch.zeros_like(gr)
+            buf = st["momentum_buffer"]
+            buf.mul_(g["momentum"]).add_(gr)
+            u = gr.add(buf, alpha=g["momentum"]) if g["nesterov"] else buf
+            upd[i] = newton_schulz(u, self.coeffs, self.ns_dtype).to(p.dtype)
+
+        # 2) one broadcast per source rank of its packed owned-updates blob; every rank then applies.
+        for src in range(ws):
+            idxs = [i for i in range(len(ordered))
+                    if self._owner[i] == src and ordered[i][0].grad is not None]
+            if not idxs:
+                continue
+            sizes = [ordered[i][0].numel() for i in idxs]
+            ref = ordered[idxs[0]][0]
+            if src == rank:
+                blob = torch.cat([upd[i].reshape(-1) for i in idxs])
+            else:
+                blob = torch.empty(sum(sizes), device=ref.device, dtype=ref.dtype)
+            dist.broadcast(blob, src=src, group=self.pg)
+            off = 0
+            for i, n in zip(idxs, sizes):
+                p, g = ordered[i]
+                u = blob[off:off + n].view_as(p); off += n
+                lr, wd = g["lr"], g["weight_decay"]
+                if wd != 0:
+                    p.mul_(1.0 - lr * wd)
+                p.add_(u, alpha=-lr * self._scale(p))
+        return loss
