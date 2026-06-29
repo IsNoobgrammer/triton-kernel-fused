@@ -246,6 +246,17 @@ def bench_xsa(B=16, Hq=4, S=1024, D=128, Hkv=2):   # BiBo training: batch 16, 4 
     _report("XSA (B=%d Hq=%d S=%d D=%d Hkv=%d)" % (B, Hq, S, D, Hkv), kf, ef, kb, eb, kfb, efb, gabs, grel,
             _peak(kstep), _peak(estep))
 
+    if PROFILE:
+        # The forward is the branch to interrogate (0.81x on Blackwell — slower than eager). Contrast the
+        # fused kernel's launch count + per-op CUDA time against the eager rejection (which inductor fuses
+        # into a single bandwidth-bound pass): are we paying autotune/launch overhead on a ~0.03ms op, or
+        # is the picked XBLOCK/num_warps config bad for this arch? Then profile fwd+bwd (the 2.22x win).
+        with torch.no_grad():
+            _profile("XSA kernel FORWARD", lambda: K(Y, V))
+            _profile("XSA eager FORWARD (compiled)", lambda: E(Y, V))
+        y3 = Y.clone().requires_grad_(True); v3 = V.clone().requires_grad_(True)
+        _profile("XSA kernel FWD+BWD", lambda: (K(y3, v3) * G).sum().backward(), leaves=[y3, v3])
+
 
 def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv router: 11 experts, top-2
     """WHOLE conv router (conv+sigmoid+bias-select+topk+gather+norm) as ONE fused op vs the same
