@@ -808,17 +808,16 @@ def _muon_params(shapes, seed=0, dtype=_MASTER):
 
 
 def _opt_ms(make_opt, shapes):
-    """Time one optimizer step (fresh grads each iter) after warmup."""
+    """Time one optimizer step alone. Grads are set ONCE (the step only READS p.grad, never consumes
+    it) so randn generation stays OUT of the timed region — otherwise `normal_` pollutes the numbers."""
     params = _muon_params(shapes, 0)
     opt = make_opt(params)
     gg = torch.Generator(device=DEV).manual_seed(1)
-
-    def prime():
-        for p in params:
-            p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)
-    prime(); opt.step()                                        # materialize state, warm autotune/compile
-    _warm(lambda: (prime(), opt.step()))
-    return do_bench(lambda: (prime(), opt.step()))
+    for p in params:
+        p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)
+    opt.step()                                                 # materialize state, warm autotune/compile
+    _warm(opt.step)
+    return do_bench(opt.step)
 
 
 def _opt_peak(make_opt, shapes):

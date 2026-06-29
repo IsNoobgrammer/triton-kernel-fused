@@ -134,14 +134,17 @@ class FusedMuon(optim.Optimizer):
                 r, c, M = g["r"], g["c"], g["M"]
                 mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
                 gbuf = torch.empty((M, r, c), device=mom.device, dtype=self.ns_dtype)
-                for p, off, n in g["members"]:
-                    gbuf[off:off + n].copy_(p.grad.reshape(n, r, c))  # gather + fp32->fp16 in one copy
+                members = g["members"]
+                # gather all grads into the batched layout in ONE foreach (fp32->fp16), not N copies
+                torch._foreach_copy_([gbuf[off:off + n] for _, off, n in members],
+                                     [p.grad.reshape(n, r, c) for p, off, n in members])
                 mom.mul_(momentum).add_(gbuf)                         # buf = momentum*buf + grad (batched)
                 u = gbuf.add_(mom, alpha=momentum) if nesterov else mom   # reuse gbuf as the NS input
                 out = newton_schulz(u, self.coeffs, self.ns_dtype)
-                alpha = -lr * g["scale"]
-                for p, off, n in g["members"]:
-                    p.add_(out[off:off + n].reshape(p.shape), alpha=alpha)   # fp16->fp32 upcast in add_
+                # scatter the scaled update back to the fp32 masters in ONE foreach (fp16->fp32 upcast)
+                torch._foreach_add_([p for p, _, _ in members],
+                                    [out[off:off + n].reshape(p.shape) for p, off, n in members],
+                                    alpha=-lr * g["scale"])
 
         return loss
 
