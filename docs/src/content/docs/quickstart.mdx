@@ -7,10 +7,14 @@ import { Tabs, TabItem, Card, CardGrid, LinkCard, Aside } from '@astrojs/starlig
 
 ## Requirements
 
-- An NVIDIA GPU with CUDA. The kernels are developed and tuned on a **Tesla T4 (`sm_75`)**; they run on
-  other CUDA GPUs, but the performance characteristics are tuned for Turing.
+- An NVIDIA GPU with CUDA. Tuned on a **Tesla T4 (`sm_75`)** and verified on a production-grade
+  **RTX PRO 6000 Blackwell (`sm_120`)** — see [Hardware and portability](/triton-kernel-fused/concepts/hardware/).
 - **Python ≥ 3.10**
 - **PyTorch ≥ 2.4** built with CUDA, and **Triton ≥ 3.0** (Triton ships inside the CUDA PyTorch wheel).
+
+The kernels package declares **no hard torch/triton dependency** — you provide a CUDA PyTorch + Triton (most
+GPU containers already do), or the setup script below installs one only if it's missing. Nothing ever
+reinstalls over a working CUDA build.
 
 ## Install
 
@@ -27,23 +31,37 @@ import { Tabs, TabItem, Card, CardGrid, LinkCard, Aside } from '@astrojs/starlig
     from kernels.sm75 import fused_linear_cross_entropy, fused_xsa, FusedMuon, fused_router, moe
     ```
   </TabItem>
-  <TabItem label="Run from a clone (uv)">
-    To run the benchmarks and examples from a fresh clone, [uv](https://docs.astral.sh/uv/) creates a
-    virtual environment with the correct CUDA PyTorch wheel:
+  <TabItem label="Bench from a clone">
+    Reuse what you have, install only what's missing — so a GPU container that already ships torch is never
+    clobbered:
 
     ```bash
     git clone https://github.com/IsNoobgrammer/triton-kernel-fused
     cd triton-kernel-fused
-    uv sync                 # creates .venv with CUDA torch (cu124) + triton
-    uv run python bench.py
+
+    python scripts/env_check.py     # is this env ready? (probe only, installs nothing)
+    python scripts/setup_env.py     # reuse if ready; else install ONLY what's missing
+    python bench.py                 # auto-detects your arch (sm_75 / sm_120 / ...)
     ```
+
+    `setup_env.py` never reinstalls a working torch/triton; on a fresh machine it installs them with a
+    selectable CUDA channel (`--cuda cu128`, or `--torch-index <url>`). It uses `uv pip` if `uv` is on PATH,
+    else `pip`.
   </TabItem>
   <TabItem label="Existing CUDA environment">
-    If you already have a CUDA PyTorch + Triton environment, there is nothing to install — run directly
-    from the repo root:
+    Already have a CUDA PyTorch + Triton (most GPU containers do)? Nothing to install — run from the repo
+    root:
 
     ```bash
     python bench.py
+    ```
+
+    To get an isolated [uv](https://docs.astral.sh/uv/) venv that **reuses** the container's torch instead of
+    redownloading it:
+
+    ```bash
+    uv venv --system-site-packages   # the venv inherits the container's torch + triton
+    uv pip install -e .              # installs only this package; existing torch satisfies the rest
     ```
   </TabItem>
 </Tabs>

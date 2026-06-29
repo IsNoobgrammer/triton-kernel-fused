@@ -96,14 +96,37 @@ activation codes) used in BiBo; the per-expert path is general, the activation s
 ## Install
 
 The kernels need no installation to be *used* — copy the `kernels/` folder into your project and import
-it. To run the benchmarks and examples from a clone:
+it (it's pure Triton, no build step). To **benchmark/test from a clone**, the rule is *reuse what you have,
+install only what's missing* — so a GPU container that already ships torch (e.g. Blackwell `cu130`) is never
+clobbered:
 
 ```bash
-uv sync                 # creates .venv with CUDA torch + triton
-uv run python bench.py
+git clone https://github.com/IsNoobgrammer/triton-kernel-fused && cd triton-kernel-fused
+
+python scripts/env_check.py     # is this env already ready? (probe only, installs nothing)
+python scripts/setup_env.py     # reuse if ready; else install ONLY what's missing
+python bench.py                 # auto-detects your arch (sm_75 / sm_120 / ...)
 ```
 
-Or, with an existing CUDA PyTorch environment, just run `python bench.py` from the repo root.
+`scripts/setup_env.py` reuses an existing CUDA torch + triton and never reinstalls a working one; on a fresh
+machine it installs them, with a selectable CUDA channel — `--cuda cu128`, or `--torch-index <url>` for a
+non-standard build. It prefers `uv pip` (into the current interpreter) when `uv` is on PATH, else `pip`.
+
+<details><summary><b>Already have a CUDA torch + triton?</b> (most GPU containers do)</summary>
+
+Nothing to install — just run `python bench.py` from the repo root. If you want an isolated venv that
+**reuses** the container's torch instead of redownloading it:
+
+```bash
+uv venv --system-site-packages      # the venv inherits the container's torch + triton
+uv pip install -e .                 # installs only this package; existing torch satisfies the rest
+```
+</details>
+
+> **Why not `uv sync`?** A hard torch pin to a fixed CUDA channel makes `uv sync` fail on a GPU whose wheels
+> live on a different channel (this bit us on Blackwell `cu130`). The package now declares **no hard
+> torch/triton dependency** — you provide them, or `setup_env.py` does — so nothing forces an incompatible
+> CUDA build onto your hardware.
 
 ## Quick usage
 

@@ -5,27 +5,28 @@ description = "Drop-in fused Triton kernels (fwd+bwd): fused-linear cross-entrop
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = [
+# The kernels are pure Triton: the package itself has NO hard runtime deps, so installing it never
+# resolves, downloads, or clobbers torch/triton. You PROVIDE a CUDA torch + triton — most GPU containers
+# already ship one (e.g. an RTX PRO 6000 Blackwell image with torch cu130), and `scripts/setup_env.py`
+# installs one only if it's missing. This deliberately avoids the old failure where a hard torch pin to a
+# fixed CUDA channel (cu124) made `uv sync` fail on a Blackwell box whose wheels live on a different channel.
+dependencies = []
+
+[project.optional-dependencies]
+# Convenience for a FRESH machine that has NO CUDA torch yet. Prefer `scripts/setup_env.py` — it reuses an
+# existing install and lets you pick the CUDA channel (`--cuda cu128`, etc.). Do NOT install this on top of
+# a container that already provides torch; you'd risk replacing a GPU-correct build with a mismatched one.
+bench = [
     "torch>=2.4.0",
-    # triton ships in the torch wheel on Windows; on Linux it's a separate wheel.
-    "triton>=3.0.0; sys_platform == 'linux'",
+    "triton>=3.0.0; sys_platform == 'linux'",   # on Windows triton ships inside the torch wheel
 ]
 
-# Run the bench/examples from a fresh clone with uv:
-#   uv sync                       # creates .venv, installs torch (cu124) + triton + this package
-#   uv run python bench.py
-#   uv run python examples/moe_usage.py
-# Already have a CUDA torch + triton env? Skip all this — just `python bench.py` from the repo root,
-# or copy the `kernels/` folder into your project (the kernels need no install to be imported).
-
-# Pull CUDA torch (cu124) from the official PyTorch index instead of CPU-only PyPI wheels.
-[tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-
-[[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
+# Recommended environment setup (see README / docs Quickstart):
+#   python scripts/env_check.py                 # is this env already ready? (probe only)
+#   python scripts/setup_env.py                 # reuse if ready, else install only what's missing
+# uv users who want to REUSE a container's torch:
+#   uv venv --system-site-packages && uv pip install -e .   # existing torch satisfies nothing to reinstall
+# Already have a CUDA torch + triton env, or copied kernels/ into your project? Just `python bench.py`.
 
 [build-system]
 requires = ["hatchling"]
