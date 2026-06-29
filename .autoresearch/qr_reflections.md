@@ -33,3 +33,29 @@
 - RUN 2+: **blocked** Householder (compact-WY, batched bmm trailing updates -> tensor
   cores); tune panel width nb; consider fp16/bf16 internal with fp32 correction; Triton
   panel kernel; shape-based method dispatch (eager geqrf may still win small-batch-large-n).
+
+## RUN 1 -- batched unblocked Householder (DISCARD)
+- Python per-column loop = launch-bound: b00 (n=32) = 10ms = 0.03x baseline. Rank-1 bmm
+  trailing update = HBM-bound (re-reads trailing matrix every column, O(n^3) traffic):
+  b03 (640x512) = 320ms (2.93x, still far off), b04 (60x1024) = 0.62x. Dead family.
+
+## RUN 2 -- fused Triton Householder, 1 program/matrix (KEEP small-n)
+- One launch for the whole batch; whole matrix tile carried in registers; internal masked
+  column loop (no per-step launches). larfg convention -> householder_product reconstructs Q.
+- WIN n<=128: n64 16.6x, n96 6.3x, n128 4.7x, b00(n32) 38us=7.6x. HARD crossover at n>=176:
+  register spill (BN>=256 tile) -> 0.1x. So this is the small-n path only.
+- Triton can't do mutable-array dynamic single-column indexing; the functional whole-tile
+  +tl.where update sidesteps that but costs O(N*BN^2) regs -> only small N fits.
+
+## Toolchain constraint (important)
+- Box: triton 3.7 OK, but NO nvcc / NO ninja / CUDA_HOME unset -> torch.utils.cpp_extension
+  load_inline FAILS. CUDA custom kernels are NOT available. Triton + torch.bmm only.
+
+## Strategy / dispatch (shape-based by n, NOT conditioning -- legitimate)
+- n<=128  -> qr_hh_fused (RUN2).
+- n>=176  -> RUN3 blocked Householder: panel factor (nb cols, cheap) + compact-WY T +
+  trailing update via 3 batched bmm (cuBLAS tensor cores). Blocking cuts the unblocked's
+  HBM re-reads by ~nb and puts the heavy flops on tensor cores -> the big-case (b03/b04/
+  b07-b11) lever. Panel micro-step launch overhead (n total) is the next thing to fuse.
+- 4096/2048 small-batch cases (b05,b06): blocked may still lose to cuSOLVER's per-matrix
+  blocked geqrf -> consider eager geqrf fallback there (shape-dispatch).

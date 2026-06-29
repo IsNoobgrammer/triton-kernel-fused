@@ -9,9 +9,15 @@
   "baseline_geomean_us_sm120": 111900.551,
   "best_geomean_us_sm120": 111900.551,
   "best_submission": "RUN0 torch.geqrf (serial cuSOLVER)",
-  "run_number": 0,
-  "noise_note": "timing metric; eval early-stops at err/mean<0.001; treat <~2% geomean change as noise",
+  "run_number": 2,
+  "noise_note": "timing metric; eval early-stops at err/mean<0.001; treat <~2% geomean change as noise. Local screen aborts a candidate if any benchmark case 1-shot estimate > 8000us.",
   "plateau_counter": 0,
   "stop_target_us_sm120": null,
-  "tried_ideas": ["RUN0: torch.geqrf baseline (serial batch, 111900us)"]
+  "toolchain": "box has triton 3.7 (JIT ok) but NO nvcc/ninja -> no CUDA load_inline; use Triton + torch.bmm (cuBLAS tensor cores).",
+  "dispatch_plan": "n<=128: fused Triton (qr_hh_fused, RUN2, win). n>=176: blocked Householder + tensor-core bmm trailing (RUN3, TODO). Shape-based dispatch by n only (NOT conditioning).",
+  "tried_ideas": [
+    "RUN0: torch.geqrf baseline (serial batch) = 111865us geomean",
+    "RUN1: batched unblocked Householder (rank-1 bmm) -- DISCARD launch-bound+HBM-bound (b00 0.03x, b03 2.93x/320ms, b04 0.62x)",
+    "RUN2: fused Triton 1-program/matrix -- KEEP small-n path (n<=128 win, b00 7.6x); spills n>=176"
+  ]
 }
