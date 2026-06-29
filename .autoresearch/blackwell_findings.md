@@ -168,5 +168,4 @@ the fp32-check SMEM budget. Halving it would push fwd+bwd toward ~1.6×. Not pur
 | MoE grouped | 4.95× but grad WRONG (specials) — not shippable | — |
 | CE | memory: up to 3.8× less peak; **beats Liger** at equal mem | memory-only |
 | XSA | **~1.61× fwd+bwd** (warm, 5-run stable) | 1.15× |
-| router (conv) | **~1.86× fwd+bwd** (fwd 1.29× / bwd 2.30×), grad PASS, 1.13× less mem — fused Triton conv + fused norm, sm120 | 1.11–1.17× |
-| router (mlp/linear) | fwd **1.59×**, bwd ~0.57× (no structural seam — 2 clean GEMMs eager already fuses), fwd+bwd ~1.10×, grad PASS — shippable option, forward-win | n/a |
+| router | **~1.86× fwd+bwd** (fwd 1.29× / bwd 2.30×), grad PASS, 1.13× less mem — fused Triton conv + fused norm, sm120 | 1.11–1.17× |
