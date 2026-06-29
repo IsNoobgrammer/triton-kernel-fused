@@ -925,11 +925,10 @@ def bench_muon(layers=6):
         def _mk_step(mk):
             ps = _muon_params(shapes, 0); opt = mk(ps)
             gg = torch.Generator(device=DEV).manual_seed(1)
-            def prime():
-                for p in ps:
-                    p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)
-            prime(); opt.step()
-            return lambda: (prime(), opt.step())
+            for p in ps:                                       # grads set ONCE — keep randn out of the
+                p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)  # profiled step
+            opt.step()
+            return opt.step
         _profile("fused-mixed step",
                  _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)))
         _profile(f"{'compiled ' if COMPILE else ''}baseline-mixed step",
