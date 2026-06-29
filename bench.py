@@ -919,6 +919,15 @@ def bench_muon(layers=6):
         print(f"    {name:16s} {t:9.2f} {den/t:8.2f}x {mem:9.0f} {d:14.2e}{tag}")
     print(f"    => fusion-only win (mixed vs mixed) = {den/res['fused-mixed'][0]:.2f}x")
 
+    # ns_batch_elems frontier: the speed<->memory knob. Smaller cap = lower peak + more launches
+    # (CPU-launch-bound); bigger = faster GEMMs + more transient memory. Pick the knee vs baseline.
+    print(f"\n  ns_batch_elems frontier (fused-mixed; baseline-mixed = {den:.1f} ms / {res['baseline-mixed'][1]:.0f} MB):")
+    for cap in (2 << 20, 4 << 20, 8 << 20, 16 << 20, 64 << 20, 1 << 34):
+        mk = lambda ps, _c=cap: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, ns_batch_elems=_c)
+        t, mem = _opt_ms(mk, shapes), _opt_peak(mk, shapes)
+        label = "uncapped" if cap >= (1 << 33) else f"{cap >> 20}M"
+        print(f"    cap={label:>8s}: {t:8.2f} ms  {den/t:5.2f}x  {mem:7.0f} MB")
+
     # --profile: launch-count + per-op CUDA time for fused vs compiled-baseline step (the fusion signal —
     # foreach + baddbmm should issue FEWER launches than the unfused per-param baseline).
     if PROFILE:
