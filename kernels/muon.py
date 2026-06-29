@@ -82,6 +82,32 @@ class FusedMuon(optim.Optimizer):
             return 0.2 * (max(r, c) ** 0.5)
         return max(1, r / c) ** 0.5                                   # jordan (PE baseline)
 
+    def _plan(self, group, params):
+        """Build (once, cached) the same-shape grouping + one persistent (M,r,c) batched momentum buffer
+        per group. Momentum lives under self.state[anchor] so it round-trips through state_dict."""
+        cache = getattr(self, "_plan_cache", None)
+        if cache is None:
+            cache = self._plan_cache = {}
+        key = id(group)
+        if key in cache:
+            return cache[key]
+        buckets = defaultdict(list)
+        for p in params:
+            buckets[(p.shape[-2], p.shape[-1])].append(p)
+        plan = []
+        for (r, c), ps in buckets.items():
+            members, off = [], 0
+            for p in ps:
+                n = p.numel() // (r * c)                              # 1 for 2D, E for a 3D expert tensor
+                members.append((p, off, n)); off += n
+            anchor = ps[0]
+            if "muon_mom" not in self.state[anchor]:                 # don't clobber a loaded checkpoint
+                self.state[anchor]["muon_mom"] = torch.zeros((off, r, c), device=anchor.device, dtype=self.ns_dtype)
+            scale = 0.2 * (max(r, c) ** 0.5) if self.scale_mode == "moonlight" else max(1, r / c) ** 0.5
+            plan.append({"r": r, "c": c, "M": off, "members": members, "anchor": anchor, "scale": scale})
+        cache[key] = plan
+        return plan
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -96,42 +122,26 @@ class FusedMuon(optim.Optimizer):
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
                                           group["weight_decay"], group["nesterov"])
 
-            # Mixed-precision layout (the AdamW-8bit norm): fp32 master weights `p`, fp32 grads, but the
-            # MOMENTUM STATE is kept in the low NS dtype (fp16) — that's the optimizer-memory saving.
-            grads = [p.grad.to(self.ns_dtype) for p in params]        # fp32 grad -> low-precision for the state
-            bufs = []
-            for p, g in zip(params, grads):
-                st = self.state[p]
-                if "momentum_buffer" not in st:
-                    st["momentum_buffer"] = torch.zeros_like(g)       # momentum state in ns_dtype (fp16)
-                bufs.append(st["momentum_buffer"])
-
-            torch._foreach_mul_(bufs, momentum)                       # buf = momentum*buf + grad  (foreach)
-            torch._foreach_add_(bufs, grads)
+            # BATCHED-STATE, SAME-SHAPE: momentum is ONE (M,r,c) fp16 buffer per shape group (the lever
+            # compile can't reach — it runs NS per param). Grads are gathered directly into the batched
+            # layout in a single fp32->fp16 copy (no separate .to + no torch.cat), the whole group's
+            # momentum + Newton-Schulz run batched, and the update is scattered back. Mixed-precision
+            # (AdamW-8bit norm): fp32 master weights, fp32 grads, fp16 momentum state + NS.
+            plan = self._plan(group, params)
             if wd != 0:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
-            u_ins = list(torch._foreach_add(grads, bufs, alpha=momentum)) if nesterov else bufs
-
-            # SAME-SHAPE BATCHING — the lever torch.compile structurally can't reach: it runs NS per
-            # parameter (small batch-1/9 GEMMs), so 48 params = 48*5*3 GEMM launches. We stack every
-            # same-(rows,cols) update into ONE (M,rows,cols) batched Newton-Schulz: ~6 groups => ~6*5*3
-            # GEMM launches + far better SM utilization. Each batch slice orthogonalizes independently,
-            # so this is BIT-IDENTICAL to the per-param step. (2D param -> (1,r,c); a 3D expert tensor
-            # (E,r,c) contributes E slices; scale depends only on (r,c) so it's shared within a group.)
-            groups = defaultdict(list)
-            for i, p in enumerate(params):
-                r, c = p.shape[-2], p.shape[-1]
-                groups[(r, c)].append((i, u_ins[i].reshape(-1, r, c)))
-            for (r, c), items in groups.items():
-                sizes = [u.shape[0] for _, u in items]
-                batched = items[0][1] if len(items) == 1 else torch.cat([u for _, u in items], dim=0)
-                out = newton_schulz(batched, self.coeffs, self.ns_dtype)
-                alpha = -lr * (0.2 * (max(r, c) ** 0.5) if self.scale_mode == "moonlight" else max(1, r / c) ** 0.5)
-                off = 0
-                for (i, _), n in zip(items, sizes):
-                    p = params[i]
-                    p.add_(out[off:off + n].reshape(p.shape).to(p.dtype), alpha=alpha)
-                    off += n
+            for g in plan:
+                r, c, M = g["r"], g["c"], g["M"]
+                mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
+                gbuf = torch.empty((M, r, c), device=mom.device, dtype=self.ns_dtype)
+                for p, off, n in g["members"]:
+                    gbuf[off:off + n].copy_(p.grad.reshape(n, r, c))  # gather + fp32->fp16 in one copy
+                mom.mul_(momentum).add_(gbuf)                         # buf = momentum*buf + grad (batched)
+                u = gbuf.add_(mom, alpha=momentum) if nesterov else mom   # reuse gbuf as the NS input
+                out = newton_schulz(u, self.coeffs, self.ns_dtype)
+                alpha = -lr * g["scale"]
+                for p, off, n in g["members"]:
+                    p.add_(out[off:off + n].reshape(p.shape), alpha=alpha)   # fp16->fp32 upcast in add_
 
         return loss
 

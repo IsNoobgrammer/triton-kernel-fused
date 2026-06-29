@@ -853,13 +853,14 @@ def _muon_parity(make_opt, make_ref, shapes, steps=5):
     return worst
 
 
-def bench_muon():
-    """Polar-Express Muon: fused (foreach + baddbmm, bf16/fp16 NS) vs the baseline, with a hard parity
-    gate FIRST. Single-GPU always; distributed A (replicated) vs B (round-robin) when launched under
-    `torchrun --nproc_per_node=2 bench.py --compile muon`.
+def bench_muon(layers=6):
+    """Polar-Express Muon: fused (batched-state same-shape NS) vs the baseline, with a hard parity gate
+    FIRST. Single-GPU always; distributed A (replicated) vs B (round-robin) under torchrun. `muon` =
+    6 layers (~75M); `muon_big` = 24 layers (~300M) where the batched GEMMs dominate and the per-param
+    CPU launch overhead amortizes (the regime that matters for real training).
     """
     from kernels.muon import FusedMuon, DistributedMuon, newton_schulz
-    shapes = _muon_shapes()
+    shapes = _muon_shapes(layers=layers)
     nparam = sum(int(torch.tensor(s).prod()) for s in shapes)
     print(f"\n=== Muon (Polar-Express) — {len(shapes)} tensors, {nparam/1e6:.1f}M params ===")
     print("  master weights fp32, NS in fp16 (mixed) — the realistic T4 setup. bf16 omitted: no bf16")
@@ -963,7 +964,7 @@ def bench_muon():
 
 
 BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
-           "muon": bench_muon,
+           "muon": bench_muon, "muon_big": lambda: bench_muon(layers=24),
            "ce_sweep": bench_ce_sweep,
            "xsa": bench_xsa, "router": bench_router_full,
            "moe": bench_moe, "liger_swiglu": bench_liger_swiglu, "liger_ce": bench_liger_ce,
