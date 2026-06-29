@@ -25,12 +25,16 @@ import torch
 import triton
 import triton.language as tl
 
-# MLP (linear) router is arch-agnostic (cuBLAS GEMM + the proven fused epilogue) — re-export sm75's as-is.
+# FusedMLPRouter = the arch-agnostic all-cuBLAS version (kept for explicit use / the sm75 path). sm120's
+# `mlp_router` is OVERRIDDEN below to a HYBRID: cuBLAS GEMM forward (fwd 1.33x — cuBLAS-optimal for the
+# skinny (N,H)@(H,E)) + fused-Triton backward (the conv dx/dw kernels at K=1; a linear router IS a K=1 conv
+# with no shift). The all-cuBLAS backward is launch-bound (0.58x: same 2 mm's as eager + un-fused norm/cast
+# glue eager compiles away); the K=1 fused-Triton dx/split-K-dw won 1.62x as the conv router's backward.
 from kernels.sm75.router import (_count_experts, router_bias_update, FusedConvRouterCuDNN,  # noqa: F401
-                                 mlp_router, FusedMLPRouter)
+                                 FusedMLPRouter, _epilogue_fwd, _router_epilogue_bwd_kernel)
 
 __all__ = ["fused_router", "mlp_router", "router_bias_update", "FusedConvRouterCuDNN",
-           "FusedMLPRouter", "FusedConvRouterFused", "_count_experts"]
+           "FusedMLPRouter", "FusedMLPRouterHybrid", "FusedConvRouterFused", "_count_experts"]
 
 
 @triton.jit
@@ -215,6 +219,80 @@ def fused_router(x, conv_weight, bias, top_k, num_experts,
     """sm120 conv router (fused Triton conv). Same API/semantics as sm75.fused_router; conv is Triton."""
     B, S, _ = x.shape
     idx, w, counts = FusedConvRouterFused.apply(x, conv_weight, bias, top_k, num_experts)
+    if top_k > 1 and norm_topk_prob:
+        w = w / (w.sum(-1, keepdim=True) + 1e-20)
+    w = w * routed_scaling_factor
+    idx = idx.view(B, S, top_k)
+    w = w.view(B, S, top_k)
+    return (idx, w, counts) if return_counts else (idx, w)
+
+
+class FusedMLPRouterHybrid(torch.autograd.Function):
+    """sm120 linear (MLP) router: cuBLAS GEMM forward + fused-Triton backward. A linear router is a K=1
+    causal conv with no shift, so grad_x = grad_logits @ W reuses `_conv_router_dx_kernel` and grad_w =
+    grad_logitsᵀ @ x reuses the split-K `_conv_router_dw_kernel` (both at K=1, W as (E,H,1)). Keeps the
+    cuBLAS forward (fwd 1.33x — better than the fused conv's 1.18x for K=1) and replaces the launch-bound
+    cuBLAS backward (0.58x — 2 mm's + cast + un-fused norm glue) with the Triton kernels that won 1.62x as
+    the conv router's backward. Forward is identical to `FusedMLPRouter`; only the backward differs."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, top_k, num_experts):
+        B, S, H = x.shape
+        E = weight.shape[0]
+        xflat = x.reshape(B * S, H)
+        logits = xflat @ weight.t()                             # cuBLAS GEMM (native dtype; epilogue casts)
+        idx, weights, counts = _epilogue_fwd(logits, bias, top_k, num_experts)   # count fused in-pass
+        ctx.save_for_backward(xflat, weight, logits, idx)
+        ctx.dims = (B, S, H, E, top_k)
+        ctx.mark_non_differentiable(idx, counts)
+        return idx, weights, counts
+
+    @staticmethod
+    def backward(ctx, grad_idx, grad_weights, grad_counts):
+        xflat, weight, logits, idx = ctx.saved_tensors
+        B, S, H, E, top_k = ctx.dims
+        N = B * S
+        BLOCK_E = max(16, triton.next_power_of_2(E))
+        grad_logits = torch.empty(N, E, device=xflat.device, dtype=torch.float32)
+        gw_in = grad_weights.contiguous()
+        _router_epilogue_bwd_kernel[(triton.cdiv(N, 128),)](
+            logits, idx, gw_in, grad_logits, N,
+            logits.stride(0), logits.stride(1), idx.stride(0), idx.stride(1),
+            gw_in.stride(0), gw_in.stride(1), grad_logits.stride(0), grad_logits.stride(1),
+            E=E, TOPK=top_k, BLOCK_N=128, BLOCK_E=BLOCK_E)
+
+        # grad_x = grad_logits @ W  (K=1 conv dx kernel: W as (E,H,1), shift=0). Fused Triton, no cuBLAS.
+        wk = weight.unsqueeze(-1)                               # (E,H) -> (E,H,1)
+        grad_x = torch.empty(B, S, H, device=xflat.device, dtype=weight.dtype)
+        BLOCK_S, BLOCK_D = 32, 128
+        _conv_router_dx_kernel[(B, triton.cdiv(S, BLOCK_S), triton.cdiv(H, BLOCK_D))](
+            grad_logits, wk, grad_x, S,
+            grad_logits.stride(0), grad_logits.stride(1),
+            wk.stride(0), wk.stride(1), wk.stride(2),
+            grad_x.stride(0), grad_x.stride(1), grad_x.stride(2),
+            E=E, K=1, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D,
+            num_stages=2, num_warps=4)
+
+        # grad_w = grad_logitsᵀ @ x  (K=1 split-K dw kernel, shift=0 -> full N reduction). (E,H,1)->(E,H).
+        grad_w_acc = torch.zeros(E, H, 1, device=xflat.device, dtype=torch.float32)
+        BLOCK_H, BLOCK_N, SPLIT_N = 64, 128, 16
+        N_PER = triton.cdiv(triton.cdiv(N, SPLIT_N), BLOCK_N) * BLOCK_N
+        _conv_router_dw_kernel[(1, triton.cdiv(H, BLOCK_H), SPLIT_N)](
+            grad_logits, xflat, grad_w_acc, N, S,
+            grad_logits.stride(0), grad_logits.stride(1), xflat.stride(0), xflat.stride(1),
+            grad_w_acc.stride(0), grad_w_acc.stride(1), grad_w_acc.stride(2), N_PER,
+            E=E, H=H, BLOCK_E=BLOCK_E, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, K=1,
+            num_stages=2, num_warps=4)
+        grad_w = grad_w_acc.squeeze(-1).to(weight.dtype)
+        return grad_x, grad_w, None, None, None
+
+
+def mlp_router(x, weight, bias, top_k, num_experts,
+               norm_topk_prob=True, routed_scaling_factor=1.0, return_counts=False):
+    """sm120 linear (MLP) router — cuBLAS forward + fused-Triton (K=1 conv) backward. Same API/semantics as
+    sm75.mlp_router; only the backend differs (here the bwd is Triton, not cuBLAS). weight (E,H)."""
+    B, S, _ = x.shape
+    idx, w, counts = FusedMLPRouterHybrid.apply(x, weight, bias, top_k, num_experts)
     if top_k > 1 and norm_topk_prob:
         w = w / (w.sum(-1, keepdim=True) + 1e-20)
     w = w * routed_scaling_factor
