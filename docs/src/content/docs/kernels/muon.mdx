@@ -103,6 +103,14 @@ The default is gated to stay within the baseline's peak. If you have VRAM headro
 opt = FusedMuon(matrix_params, lr=0.02, ns_batch_elems=64 * 1024 * 1024)   # fast mode
 ```
 
+<Aside type="note">
+**Per-arch defaults.** The numbers above are `sm75` (T4). On Blackwell the mem-gated knee moves up:
+`kernels.sm120.FusedMuon` defaults `ns_batch_elems` to **8M** (measured ~2.42–2.47× at peak ≤ baseline on
+both 75M and 302M, vs 4M's ~2.0×). Same class, same API — just the Blackwell-tuned default. The
+Newton-Schulz dtype stays **fp16** on every arch: bf16's 7 mantissa bits orthogonalize less precisely than
+fp16's 10, and Blackwell runs fp16 on full-rate tensor cores, so fp16 is both tighter and fast.
+</Aside>
+
 ## Usage
 
 ```python

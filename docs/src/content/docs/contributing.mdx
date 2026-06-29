@@ -13,29 +13,57 @@ occupancy all differ), so each arch gets its own self-contained package and its 
 
 ```
 kernels/
-  __init__.py          # namespace + AVAILABLE_ARCHS (no auto-import)
-  sm75/                # Turing / Tesla T4 — the reference arch
+  __init__.py          # namespace: AVAILABLE_ARCHS + arch_for_capability() (no auto-import)
+  sm75/                # Turing / Tesla T4 — the REFERENCE arch (every kernel implemented & tuned here)
     __init__.py        # the public API for this arch
     cross_entropy.py  xsa.py  router.py  moe.py  muon.py
-  sm80/                # Ampere (A100, RTX 30xx) — add yours here
-  sm90/                # Hopper (H100) — ...
+  sm120/               # Blackwell (RTX PRO 6000 / GB202) — reuses sm75, overrides only what differs
+    __init__.py        # re-exports sm75's kernels
+    cross_entropy.py  xsa.py  router.py  moe.py   # one-line re-exports of sm75
+    muon.py            # the ONE divergence today: ns_batch_elems default 8M (Blackwell mem-gated knee)
 ```
 
-Each `kernels/sm<XX>/` package is **independent**: its kernel files do not import one another, and you
-import a kernel by naming its arch explicitly.
+You import a kernel by naming its arch explicitly:
 
 ```python
 from kernels.sm75 import fused_xsa, moe, FusedMuon       # the public API of an arch
+from kernels.sm120 import FusedMuon                       # same call, Blackwell-tuned default
 from kernels.sm75.moe import moe_grouped                  # advanced / private symbols
 ```
 
-The arch number is the compute capability without the dot: `sm_7.5` → `sm75`, `sm_8.0` → `sm80`,
-`sm_9.0` → `sm90`. Check yours with `torch.cuda.get_device_capability()`.
+The arch number is the compute capability without the dot: `sm_7.5` → `sm75`, `sm_9.0` → `sm90`,
+`sm_12.0` → `sm120`. Check yours with `torch.cuda.get_device_capability()`.
+
+### Reuse vs. fork
+
+A new arch does **not** have to copy every kernel. The pattern is **reuse + override**: an arch package
+re-exports the reference (`sm75`) implementations from its `__init__.py` and submodules, and forks a
+module into its own folder **only when that kernel genuinely diverges** on the arch. `kernels/sm120` is
+the worked example — it reuses sm75 wholesale and overrides exactly one default (Muon's `ns_batch_elems`,
+8M on Blackwell vs 4M on Turing). This keeps a single source of truth: a fix in `sm75` reaches every arch
+that reuses it, with no duplication to drift.
+
+### Benchmarking auto-detects the arch
+
+`bench.py` resolves the right package for the GPU it runs on via `arch_for_capability(major, minor)` (the
+highest shipped arch whose capability is ≤ the device's), and imports every kernel from it. On a T4 it
+exercises `kernels.sm75`; on Blackwell, `kernels.sm120`. The banner prints `arch=…` so you can see which
+ran. Register a new arch in `AVAILABLE_ARCHS` and the resolver picks it up automatically.
 
 <Aside type="note">
-Today only `sm75` (Turing / Tesla T4) is populated — every number in these docs is measured there. Adding
-support for another GPU class is exactly the kind of contribution this layout is designed for.
+`sm75` (Turing / Tesla T4) is the reference arch — every kernel is implemented and tuned there, and most
+docs numbers are measured there. `sm120` (Blackwell) reuses those implementations. Adding a genuinely
+different kernel for another GPU class is exactly the kind of contribution this layout is designed for.
 </Aside>
+
+### Precision (fp16 / bf16)
+
+The fused kernels are **dtype-generic**: they accumulate reductions in fp32 and store in the input's
+dtype, so passing bf16 tensors gives you bf16 + fp32-accumulate "for free" — no separate code path. (Run
+`python bench.py --bf16 …` to validate parity/speed in bf16 on your GPU.) The one deliberate exception is
+**Muon's Newton-Schulz dtype**, which stays **fp16** even on bf16-capable hardware: bf16's 7 mantissa bits
+orthogonalize less precisely than fp16's 10, and Blackwell runs fp16 on full-rate tensor cores — so fp16
+is both tighter and fast. Use bf16 for Muon only via `ns_dtype=torch.bfloat16` if your stack requires it.
 
 ## The bar: only fuse where the compiler structurally can't
 

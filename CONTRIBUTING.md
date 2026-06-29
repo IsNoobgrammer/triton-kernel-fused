@@ -11,22 +11,33 @@ self-contained package and its own measured numbers:
 
 ```
 kernels/
-  __init__.py          # namespace + AVAILABLE_ARCHS (no auto-import)
-  sm75/                # Turing / Tesla T4 — the reference arch (everything is tuned here today)
+  __init__.py          # namespace: AVAILABLE_ARCHS + arch_for_capability() (no auto-import)
+  sm75/                # Turing / Tesla T4 — the REFERENCE arch (every kernel implemented & tuned here)
     __init__.py        # the public API for this arch
     cross_entropy.py  xsa.py  router.py  moe.py  muon.py
-  sm80/                # Ampere — add yours here
-  sm90/                # Hopper — ...
+  sm120/               # Blackwell (RTX PRO 6000 / GB202) — reuses sm75, overrides only Muon's 8M default
+    __init__.py  cross_entropy.py  xsa.py  router.py  moe.py  muon.py
 ```
 
-Import by naming the arch explicitly (`sm_7.5` → `sm75`, `sm_8.0` → `sm80`, ...):
+Import by naming the arch explicitly (`sm_7.5` → `sm75`, `sm_9.0` → `sm90`, `sm_12.0` → `sm120`):
 
 ```python
 from kernels.sm75 import fused_xsa, moe, FusedMuon       # an arch's public API
+from kernels.sm120 import FusedMuon                       # same call, Blackwell-tuned default
 from kernels.sm75.moe import moe_grouped                  # advanced / private symbols
 ```
 
 Find your arch with `torch.cuda.get_device_capability()`.
+
+**Reuse + override:** a new arch re-exports the reference (`sm75`) implementations and forks a module into
+its own folder *only* when that kernel genuinely diverges (e.g. `kernels/sm120/muon.py` overrides one
+default). Single source of truth — no duplicated code to drift. **`bench.py` auto-detects** the right
+package for the GPU via `arch_for_capability()` and prints `arch=…`; register a new arch in
+`AVAILABLE_ARCHS` and it's picked up automatically.
+
+**Precision:** the kernels are dtype-generic (fp32 accumulate, store in input dtype), so bf16 + fp32
+works with no separate path — validate with `python bench.py --bf16 …`. Muon's Newton-Schulz stays fp16
+on every arch (more mantissa than bf16 → tighter orthogonalization; full-rate on Blackwell tensor cores).
 
 ## The bar
 

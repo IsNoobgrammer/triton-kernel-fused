@@ -43,8 +43,25 @@ import torch.nn.functional as F
 import triton
 from triton.testing import do_bench
 
-from kernels.sm75 import fused_linear_cross_entropy, fused_xsa
-from kernels.sm75.moe import moe_per_expert, moe_grouped, moe_grouped_cublas, moe_eager
+# Auto-detect the kernels.<arch> package for THIS GPU (highest shipped arch <= the device capability)
+# and import every kernel from it. On a T4 this resolves to kernels.sm75; on Blackwell, kernels.sm120
+# (which reuses sm75 with the Blackwell-tuned Muon default). One source of truth; the bench always
+# exercises the kernels that ship for the GPU it runs on.
+import importlib
+from kernels import arch_for_capability
+
+ARCH = arch_for_capability(*torch.cuda.get_device_capability()) if torch.cuda.is_available() else "sm75"
+_arch = importlib.import_module(f"kernels.{ARCH}")
+_arch_moe = importlib.import_module(f"kernels.{ARCH}.moe")
+_arch_router = importlib.import_module(f"kernels.{ARCH}.router")
+_arch_muon = importlib.import_module(f"kernels.{ARCH}.muon")
+
+fused_linear_cross_entropy = _arch.fused_linear_cross_entropy
+fused_xsa = _arch.fused_xsa
+moe_per_expert = _arch_moe.moe_per_expert
+moe_grouped = _arch_moe.moe_grouped
+moe_grouped_cublas = _arch_moe.moe_grouped_cublas
+moe_eager = _arch_moe.moe_eager
 
 DTYPE = torch.float16
 DEV = "cuda"
@@ -263,7 +280,7 @@ def bench_router_full(B=16, S=1024, H=512, E=11, K=4, top_k=2):   # BiBo conv ro
     pipeline in torch.compile'd eager. The fused win is the transpose-free conv + folded-away glue
     (sigmoid/bias/gather) that compile can't pull out of cuDNN. Verifies grad_x/grad_w equivalence,
     idx agreement, and that the in-kernel count == bincount. topk/norm stay eager on both sides."""
-    from kernels.sm75.router import fused_router, _count_experts
+    fused_router, _count_experts = _arch_router.fused_router, _arch_router._count_experts
     x = torch.randn(B, S, H, device=DEV, dtype=DTYPE)
     w = torch.randn(E, H, K, device=DEV, dtype=DTYPE) * 0.02
     bias = torch.zeros(E, device=DEV, dtype=torch.float32)
@@ -747,7 +764,7 @@ def _make_baseline_ns(ns_dtype):
     sum-of-squares overflows); the iteration GEMMs run in ns_dtype — so baseline-fp16 vs fused-fp16 is a
     fair same-precision fusion comparison. Plain fn so --compile can wrap it (compile WORKS for fp16/fp32
     on T4; it SKIPS bf16 — which is exactly why bf16 isn't a T4 baseline)."""
-    from kernels.sm75.muon import _PE_COEFFS
+    _PE_COEFFS = _arch_muon._PE_COEFFS
 
     def baseline_ns(G, coeffs=_PE_COEFFS, eps=1e-7):
         was_2d = G.ndim == 2
@@ -873,7 +890,8 @@ def bench_muon(layers=6):
     6 layers (~75M); `muon_big` = 24 layers (~300M) where the batched GEMMs dominate and the per-param
     CPU launch overhead amortizes (the regime that matters for real training).
     """
-    from kernels.sm75.muon import FusedMuon, DistributedMuon, newton_schulz
+    FusedMuon, DistributedMuon, newton_schulz = (
+        _arch_muon.FusedMuon, _arch_muon.DistributedMuon, _arch_muon.newton_schulz)
     shapes = _muon_shapes(layers=layers)
     nparam = sum(int(torch.tensor(s).prod()) for s in shapes)
     print(f"\n=== Muon (Polar-Express) — {len(shapes)} tensors, {nparam/1e6:.1f}M params ===")
@@ -1013,10 +1031,13 @@ if __name__ == "__main__":
     JSON_OUT = "--json" in sys.argv
     PROFILE = "--profile" in sys.argv
     NO_SPECIAL = "--no-special" in sys.argv
+    if "--bf16" in sys.argv:        # validate the kernels in bf16+fp32-accumulate (they are dtype-generic)
+        DTYPE = torch.bfloat16
     if "--dump-triton" in sys.argv:
         COMPILE = True  # dumping is meaningless without compiled fns
-    args = [a for a in sys.argv[1:] if a not in ("--compile", "--json", "--dump-triton", "--profile", "--no-special")]
-    print(f"GPU: {torch.cuda.get_device_name(0)} | dtype={DTYPE} | torch {torch.__version__} | "
+    args = [a for a in sys.argv[1:]
+            if a not in ("--compile", "--json", "--dump-triton", "--profile", "--no-special", "--bf16")]
+    print(f"GPU: {torch.cuda.get_device_name(0)} | arch={ARCH} | dtype={DTYPE} | torch {torch.__version__} | "
           f"triton {triton.__version__} | compile={'ON' if COMPILE else 'off'}")
     # Default run = head-to-head vs compiled eager: OUR MoE/CE/SwiGLU + the OUTSOURCED reference
     # kernels (Liger SwiGLU + Liger fused-linear CE). Answers "do ANY hand-written kernels — ours OR

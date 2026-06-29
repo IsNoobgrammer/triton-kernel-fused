@@ -28,8 +28,12 @@ __all__ = ["fused_xsa", "FusedXSA"]
 def _cfgs():
     # Tile XBLOCK rows per program (the win over the old one-program-per-row launch). XBLOCK + warps
     # are shape-stable (depend only on D/GROUP, not the per-step token count) -> safe to autotune.
+    # Widened past the original T4 ceiling (XBLOCK<=32): this is a memory-streaming kernel, and the
+    # profile shows it's L2-resident-fast (7us, 3x eager) but only ~70% HBM-efficient in the cold-cache
+    # regime on Blackwell. Bigger tiles give the autotuner room to close that HBM gap. The autotune key
+    # includes the shape, so Turing keeps picking its own best config — this cannot regress sm_75.
     return [triton.Config({"XBLOCK": xb}, num_warps=w)
-            for xb in (1, 2, 4, 8, 16, 32) for w in (2, 4, 8)]
+            for xb in (1, 2, 4, 8, 16, 32, 64, 128, 256) for w in (2, 4, 8)]
 
 
 @triton.autotune(configs=_cfgs(), key=["S", "D", "H", "Hkv"])
