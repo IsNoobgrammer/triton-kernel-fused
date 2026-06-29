@@ -12,31 +12,31 @@ measured on this host with grad-parity checked in the same run. Contrast: on T4 
 
 ## Muon (Polar-Express step) — the win scales hard off Turing
 
-fp32 master + fp16 NS (mixed). Parity: fused-fp32 vs full-fp32 = **7.15e-7** (isolates the fusion);
-fused-mixed(fp16-NS) vs full-fp32 = 2.44e-5; fp16-NS SV~1, NaN-free. **`ns_batch_elems` knee = 8M on
-Blackwell** (vs 4M on T4) — `kernels.sm120.FusedMuon` defaults to it. Hard gate still holds: peak ≤ baseline.
+fp32 master + fp16 NS (mixed). Parity: fused-fp32 vs full-fp32 = **7–9.5e-7** (isolates the fusion, run
+variance); fused-mixed(fp16-NS) vs full-fp32 = 2.44e-5; fp16-NS SV~1, NaN-free. **`ns_batch_elems` knee =
+8M on Blackwell** (vs 4M on T4) — `kernels.sm120.FusedMuon` defaults to it. Hard gate: peak ≤ baseline.
 
-**48 tensors / 75.5M params** — baseline-mixed 17.69 ms / 916 MB:
-
-| ns_batch_elems | speed | peak MB | gate |
-|---|---|---|---|
-| 4M | 2.05× | 879 | PASS |
-| **8M (sm120 default)** | **2.42×** | 914 | **PASS (knee)** |
-| 16M | 2.66× | 993 | OVER |
-| 64M | 2.42× | 1172 | OVER |
-
-**192 tensors / 302M params** — baseline-mixed 66.70 ms / 3249 MB:
+**48 tensors / 75.5M params** — baseline-mixed 16.43 ms / 916 MB (default fused-mixed = 2.34× / 913 MB):
 
 | ns_batch_elems | speed | peak MB | gate |
 |---|---|---|---|
-| 4M | 2.02× | 3196 | PASS |
-| **8M (sm120 default)** | **2.47×** | 3231 | **PASS (knee)** |
-| 16M | 2.72× | 3310 | OVER |
-| 64M | 2.19× | 3845 | OVER |
+| 4M | 1.94× | 879 | PASS |
+| **8M (sm120 default)** | **2.29×** | 914 | **PASS (knee)** |
+| 16M | 2.57× | 993 | OVER |
+| 64M | 2.30× | 1172 | OVER |
 
-**WIN: ~2.42–2.47× fwd-equiv step at peak ≤ baseline, both sizes** (T4 was 1.05–1.09×). 16M would give
-2.66–2.72× but breaks the mem gate. fp16 NS stays the right choice (bf16 has fewer mantissa bits; Blackwell
-runs fp16 on full-rate tensor cores).
+**192 tensors / 302M params** — baseline-mixed 67.14 ms / 3249 MB (default fused-mixed = 2.46× / 3235 MB):
+
+| ns_batch_elems | speed | peak MB | gate |
+|---|---|---|---|
+| 4M | 2.05× | 3196 | PASS |
+| **8M (sm120 default)** | **2.48×** | 3231 | **PASS (knee)** |
+| 16M | 2.74× | 3310 | OVER |
+| 64M | 2.23× | 3845 | OVER |
+
+**WIN: ~2.3× (75M) / ~2.48× (302M) at peak ≤ baseline** (T4 was 1.05–1.09×). 16M would give 2.57–2.74×
+but breaks the mem gate. fp16 NS stays the right choice (bf16 has fewer mantissa bits; Blackwell runs fp16
+on full-rate tensor cores).
 
 ---
 
@@ -92,19 +92,26 @@ in-place grad; no recompute GEMM) is the edge. Verified (grad PASS on every poin
 
 ---
 
-## XSA (B=16, Hq=4, S=1024, D=128, Hkv=2) — forward 3× warm; backward at the roofline
+## XSA (B=16, Hq=4, S=1024, D=128, Hkv=2) — warm, 5-run stable
 
 Measured **warm** (no L2 flush): XSA's `Y` is the attention output produced the instant before, so it is
-L2-resident in real use. (do_bench's cold-L2 default read fwd 0.79× — an unrepresentative worst case on a
-7 µs op; the bench now times XSA warm.)
+L2-resident in real use. (do_bench's cold-L2 default read fwd 0.79× — an unrepresentative worst case.)
+Stable across 5 runs:
 
-- **Forward: ~3×** — profiler self-CUDA `_xsa_fwd_kernel` **7.1 µs** vs eager (norm + rejection) **22.5 µs**.
-- Backward ~1.10×; **fwd+bwd ~2.18×**. grad PASS (bf16 rel 8.42e-3; fp16 rel 1.22e-3).
-- **Backward is at the structural roofline:** one fused read-once kernel moving only the essential ~67 MB
-  (read GZ/Y/V, write GY/GV). Inductor's backward is 2 kernels that materialize a ~16.8 MB intermediate
-  (~34 MB round-trip tax we don't pay) — that tax is why we win. No intermediate left to fuse.
+| phase | kernel | eager | speedup |
+|---|---|---|---|
+| forward | 0.028 ms | 0.036 ms | **1.29×** |
+| backward | 0.131 ms | 0.163 ms | **1.25×** |
+| **fwd+bwd** | 0.194 ms | 0.313 ms | **1.61×** |
 
-**WIN: ~2.18× fwd+bwd (3× forward warm), grad-exact, no extra peak.** (T4 was 1.15×.)
+peak 235/235 MB (1.00×). grad PASS (bf16 rel 9.03e-3; fp16 rel 1.22e-3).
+
+**WIN: ~1.61× fwd+bwd, grad-exact, no extra peak** (T4 was 1.15×). Note: the *pure-kernel* forward is ~3×
+on the GPU (profiler: `_xsa_fwd_kernel` 7.1 µs vs eager 22.5 µs), but the op is tiny enough that Python /
+launch dispatch dominates wall-clock, so the end-to-end warm forward is 1.29×. The honest, representative
+number is the **1.61× fwd+bwd** — don't quote the 3× (it's GPU-only, not what a step sees). The backward is
+still at the structural roofline (one fused read-once kernel, ~67 MB essential traffic; inductor's backward
+materializes a ~16.8 MB intermediate = ~34 MB round-trip tax we avoid).
 
 ---
 
@@ -119,9 +126,9 @@ On T4 it was 1.11–1.17× fwd+bwd, exact grads, mem parity. Run: `python bench.
 
 | kernel | Blackwell result | vs T4 |
 |---|---|---|
-| Muon | **2.42–2.47×** (8M knee, peak ≤ baseline) | 1.05–1.09× |
+| Muon | **~2.3× (75M) / ~2.48× (302M)** (8M knee, peak ≤ baseline) | 1.05–1.09× |
 | MoE per-expert | **~3.9× fwd+bwd**, correct | 2.87× |
 | MoE grouped | 4.95× but grad WRONG (specials) — not shippable | — |
 | CE | memory: up to 3.8× less peak; **beats Liger** at equal mem | memory-only |
-| XSA | **~2.18× fwd+bwd** (3× fwd warm) | 1.15× |
+| XSA | **~1.61× fwd+bwd** (warm, 5-run stable) | 1.15× |
 | router | pending | 1.11–1.17× |
