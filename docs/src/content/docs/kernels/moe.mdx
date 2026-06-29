@@ -48,7 +48,7 @@ moe(
     top_k_weights,     # (N, k)     — routing weights from YOUR router
     gate_up_proj,      # (E, 2*I, H) — fused gate+up projection per expert
     down_proj,         # (E, H, I)   — down projection per expert
-    act_codes,         # (E,) int32  — per-expert activation: 0=SiLU, 1=ReLU², 2=Tanh
+    act_codes,         # (E,) int32  — per-expert kind: 0=SiLU 1=ReLU² 2=Tanh (GLU); 3=Identity 4=Zero
 )  # -> (N, H) combined output
 ```
 
@@ -57,11 +57,41 @@ moe(
 | `hidden` | `(N, H)` | Flattened token hidden states. |
 | `top_k_indices` | `(N, k)` int | Chosen expert ids — comes from your router (e.g. [`fused_router`](/triton-kernel-fused/kernels/router/)). |
 | `top_k_weights` | `(N, k)` | Routing weights for the chosen experts. |
-| `gate_up_proj` | `(E, 2·I, H)` | Stacked fused gate+up projection, one per expert. |
-| `down_proj` | `(E, H, I)` | Stacked down projection, one per expert. |
-| `act_codes` | `(E,)` int32 | Per-expert activation code: `0`=SiLU, `1`=ReLU², `2`=Tanh. |
+| `gate_up_proj` | `(E, 2·I, H)` | Stacked fused gate+up projection, one slot per expert (`E` counts special experts too — see below). |
+| `down_proj` | `(E, H, I)` | Stacked down projection, one slot per expert. |
+| `act_codes` | `(E,)` int32 | Per-expert **kind**: `0`=SiLU, `1`=ReLU², `2`=Tanh (GLU experts); `3`=Identity, `4`=Zero (special experts). |
 
 The router stays in **your** model — this kernel only takes its top-k output and the stacked expert weights.
+
+### Special experts (Identity and Zero)
+
+`act_codes` selects each expert's **kind**, not just its activation. Beyond the three GLU activations, two
+codes pick non-GLU experts — the MiMo / BiBo "9 GLU + Identity + Zero" stack uses both:
+
+| `act_codes[e]` | Expert kind | Computes | Uses its weight slots? |
+|---|---|---|---|
+| `0` | SiLU GLU | `down(SiLU(gate) · up)` | yes |
+| `1` | ReLU² GLU | `down(ReLU²(gate) · up)` | yes |
+| `2` | Tanh GLU | `down(Tanh(gate) · up)` | yes |
+| `3` | **Identity** | weighted passthrough: `out += w · hidden` | **no** (slot ignored) |
+| `4` | **Zero** | nothing — the token is dropped for that expert | **no** (slot ignored) |
+
+There is no separate API for special experts: you just set their code in `act_codes`. Two rules:
+
+- **`E` (and the first dim of `gate_up_proj` / `down_proj`) counts the special experts.** Their weight slots
+  are **never read**, but they must exist so expert id `e` keeps indexing the stacked weights directly —
+  fill them with zeros (or any placeholder). For the 11-expert BiBo stack, `gate_up_proj` is `(11, 2I, H)`
+  with two unused rows.
+- **`moe` routes correctly automatically.** A code `> 2` means a special expert is present, so `moe` uses
+  the per-expert path (the grouped path is GLU-only and would compute wrong math on codes `3`/`4`). Identity
+  and Zero are handled in both forward and backward — Identity passes the routing-weight gradient through
+  (`dx = w · go`, `dw = Σ go · hidden`); Zero produces no gradient.
+
+```python
+# 9 GLU experts (SiLU/ReLU²/Tanh triples) + Identity + Zero -> 11 experts total
+act_codes = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 3, 4], device="cuda", dtype=torch.int32)
+# gate_up_proj / down_proj are sized (11, ...); slots 9 (Identity) and 10 (Zero) are placeholders.
+```
 
 ### Path selection
 
