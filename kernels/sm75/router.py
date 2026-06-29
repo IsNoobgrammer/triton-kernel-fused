@@ -50,17 +50,18 @@ def _router_epilogue_fwd_kernel(Logit_ptr, Bias_ptr, Idx_ptr, W_ptr, Count_ptr, 
         b = tl.load(Bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
         sel = sel + b[None, :]
     sel = tl.where(mask_e[None, :], sel, -1e30)
+    cnt = tl.zeros((BLOCK_E,), dtype=tl.int32)             # per-expert pick tally, this block
     for k in tl.static_range(TOPK):
         am = tl.argmax(sel, axis=1)
         onehot = offs_e[None, :] == am[:, None]
         w_k = tl.sum(tl.where(onehot, scores, 0.0), axis=1)
         tl.store(Idx_ptr + offs_n * TOPK + k, am.to(tl.int64), mask=mask_n)
         tl.store(W_ptr + offs_n * TOPK + k, w_k, mask=mask_n)
-        if COUNT:                                          # fused bincount: atomic-add picks per expert
-            for ei in tl.static_range(E):
-                tl.atomic_add(Count_ptr + ei,
-                              tl.sum(tl.where(mask_n & (am == ei), 1, 0).to(tl.int32)))
+        if COUNT:                                          # accumulate in-register; one atomic at the end
+            cnt += tl.sum(tl.where(mask_n[:, None] & onehot, 1, 0).to(tl.int32), axis=0)
         sel = tl.where(onehot, -1e30, sel)
+    if COUNT:                                              # ONE vectorized atomic_add over E (not E*TOPK)
+        tl.atomic_add(Count_ptr + offs_e, cnt, mask=mask_e)
 
 
 @triton.jit
