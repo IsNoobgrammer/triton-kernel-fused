@@ -124,11 +124,17 @@ grad_W split-K over N). grad PASS, mem parity-or-better.
 
 | baseline | forward | backward | fwd+bwd |
 |---|---|---|---|
-| compiled eager | **1.18×** | **1.62×** | **1.45×** |
+| compiled eager | **1.29×** | **2.30×** | **1.86×** |
 
-grad PASS (abs 4.23e-3, **rel 2.4e-4**), idx-agree 1.0000, count==bincount True, NaN-free. peak 273/308 MB
-(**1.13× less**). Our CUDA total 2.60 ms vs eager 4.86 ms (**1.87× less work**); ~51 launches vs cuDNN's
-~75 — zero layout-transpose copies, x read once.
+grad PASS (abs 4.26e-3, **rel 2.3e-4**), idx-agree 1.0000, count==bincount True, NaN-free. peak 273/308 MB
+(**1.13× less**). Our CUDA total 2.32 ms vs eager 4.83 ms (**2.08× less work**); ~31 launches vs cuDNN's
+~54 — zero layout-transpose copies, x read once.
+
+**The last lever was fusing the weight tail.** `norm_topk_prob` (÷Σ) + `routed_scaling` (×c) were running in
+eager (~17 un-fused div/sum/mul/fill launches the compiled baseline fuses away) — the dominant launch tax
+once the kernels were fast. `_TopkNormalize` folds both into one Triton Function (fwd `O=c·w/(Σw+eps)`; bwd
+the sum-to-1 Jacobian `grad_w=c/s·(go−⟨go,p⟩)`). That cut launches 47→31 and lifted fwd+bwd 1.45→**1.86×**
+(backward 1.62→**2.30×**). grad still exact.
 
 **The history (why this took 3 candidates):** the sm75 **cuDNN** champion (T4 win 1.11–1.17×) *regressed to
 0.82× uncompiled / 0.91× compiled on Blackwell* — its `x.transpose(1,2).contiguous()` + manual
@@ -162,4 +168,5 @@ the fp32-check SMEM budget. Halving it would push fwd+bwd toward ~1.6×. Not pur
 | MoE grouped | 4.95× but grad WRONG (specials) — not shippable | — |
 | CE | memory: up to 3.8× less peak; **beats Liger** at equal mem | memory-only |
 | XSA | **~1.61× fwd+bwd** (warm, 5-run stable) | 1.15× |
-| router | **~1.45× fwd+bwd** (fwd 1.18× / bwd 1.62×), grad PASS, 1.13× less mem — fused Triton conv, sm120 | 1.11–1.17× |
+| router (conv) | **~1.86× fwd+bwd** (fwd 1.29× / bwd 2.30×), grad PASS, 1.13× less mem — fused Triton conv + fused norm, sm120 | 1.11–1.17× |
+| router (mlp/linear) | fwd **1.59×**, bwd ~0.57× (no structural seam — 2 clean GEMMs eager already fuses), fwd+bwd ~1.10×, grad PASS — shippable option, forward-win | n/a |
