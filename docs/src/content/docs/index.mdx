@@ -61,19 +61,25 @@ insists on doing in two passes, or a native op it must keep as an opaque library
 
 ## Performance at a glance
 
-All numbers are measured on a **Tesla T4 (`sm_75`)** against a `torch.compile`'d eager baseline.
+Measured against a `torch.compile`'d eager baseline on two GPU classes: the **Tesla T4 (`sm_75`)** the
+kernels are tuned on, and a production-grade **RTX PRO 6000 Blackwell (`sm_120`)** they were ported to. Every
+win held or widened on the new hardware — see [Hardware and portability](/triton-kernel-fused/concepts/hardware/).
 
-| Kernel | T4 result vs `torch.compile` |
-|---|---|
-| `fused_linear_cross_entropy` | ~3.4× less peak memory (trains where standard CE OOMs); matches Liger |
-| `fused_xsa` | ~1.15× forward+backward, grad-exact |
-| `FusedMuon` | ~1.09× (75M params) / ~1.05× (300M), peak memory ≤ baseline |
-| `fused_router` | ~1.11–1.17× forward+backward, exact grads, memory parity |
-| `moe` | ~2.87× (the data-dependent routing edge survives compile) |
+| Kernel | Tesla T4 (`sm_75`) | RTX PRO 6000 Blackwell (`sm_120`) |
+|---|---|---|
+| `fused_linear_cross_entropy` | ~3.4× less peak; matches Liger | up to 3.8× less peak; **beats Liger** at equal memory |
+| `fused_xsa` | ~1.15× forward+backward | **~1.61×** forward+backward (warm) |
+| `FusedMuon` | ~1.09× (75M) / ~1.05× (300M) | **~2.3× (75M) / ~2.48× (302M)**, peak ≤ baseline |
+| `fused_router` | ~1.11–1.17× forward+backward | **~1.86×** forward+backward (fwd 1.29× / bwd 2.30×) |
+| `moe` | ~2.87× | **~3.9×** forward+backward (per-expert) |
 
-<Aside type="caution" title="Numbers are architecture-specific">
-These figures were obtained on Turing (`sm_75`) and do not transfer to other GPU classes. Always
-re-benchmark on your own target hardware — see [Benchmarking](/triton-kernel-fused/concepts/benchmarking/).
+All figures are grad-gated: every speedup is reported next to a passing gradient-parity check on that arch.
+
+<Aside type="caution" title="Speedups are still architecture-specific">
+A win transferring from Turing to Blackwell does not mean it transfers to *every* GPU — a T4 number is not a
+Blackwell number is not an A100 number. The [per-arch layout](/triton-kernel-fused/concepts/hardware/) exists
+precisely so you re-benchmark on your target; what generalizes is the *method*, not the multiplier. See
+[Benchmarking](/triton-kernel-fused/concepts/benchmarking/).
 </Aside>
 
 ## Next steps

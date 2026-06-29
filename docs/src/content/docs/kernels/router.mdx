@@ -43,6 +43,24 @@ Measured on a Tesla T4 (`sm_75`), for the shape `B=16, S=1024, H=512, E=11, K=4,
 - **Exact gradients** (relative error ~3e-7).
 - **Memory parity** with the baseline.
 
+### On Blackwell (`sm_120`)
+
+The cuDNN backend that wins on T4 **regressed to 0.82–0.91×** on Blackwell: cuDNN's `nchwToNhwc` layout
+transposes plus the contiguity copies around `convolution_backward` became ~48% of the CUDA time, and
+inductor's compiled path was already lean on glue, so the Turing edge did not transfer.
+
+`kernels/sm120` **overrides** the router with a **transpose-free single-launch fused Triton conv** (no
+cuDNN, no layout copies, x read once) plus a fused `norm_topk_prob` tail — the approach that was shelved on
+T4 for lack of SRAM, which Blackwell's larger SRAM makes viable. The result, same shape, bf16:
+
+- **~1.86×** forward+backward (forward **1.29×**, backward **2.30×**).
+- **Exact gradients** (relative error ~2.3e-4), index/count agreement, NaN-free.
+- **1.13× less** peak memory; our total CUDA work is ~2.1× less than the baseline.
+
+This is documented end-to-end — including the TF32-on-fp32 correctness fix and the split-K `grad_W` lift —
+in [Hardware and portability](/triton-kernel-fused/concepts/hardware/#the-proof-a-regression-diagnosed-and-recovered).
+The API is identical on both arches; `kernels.sm120.fused_router` simply uses the Triton conv internally.
+
 ## API
 
 ```python

@@ -44,6 +44,7 @@ export default defineConfig({
           label: 'Concepts',
           items: [
             { label: 'The structural edge', link: '/concepts/the-structural-edge/' },
+            { label: 'Hardware and portability', link: '/concepts/hardware/' },
             { label: 'Benchmarking', link: '/concepts/benchmarking/' },
           ],
         },

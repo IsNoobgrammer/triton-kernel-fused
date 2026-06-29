@@ -46,6 +46,10 @@ Measured on a Tesla T4 (`sm_75`):
 - **Grad-exact** vs `F.cross_entropy`: loss Δ ~1e-6, gradient relative error < 1.2e-2 in fp16 (bit-identical
   to the recompute variant).
 
+**On Blackwell (`sm_120`)** the same memory dial holds — up to **3.8× less peak** — and it **beats Liger**
+on the memory↔speed frontier: at equal-or-lower peak memory it is faster, and it degrades far more gently as
+you cut the chunk budget. See [Hardware and portability](/triton-kernel-fused/concepts/hardware/).
+
 ## API
 
 ```python

@@ -43,6 +43,11 @@ Measured on a Tesla T4 (`sm_75`):
 - **~1.15×** forward+backward vs the compiled eager rejection.
 - **Grad-exact** vs the eager reference (fp16 absolute tolerance ~1e-3).
 
+**On Blackwell (`sm_120`)** it reaches **~1.61×** forward+backward (warm: forward 1.29×, backward 1.25×),
+grad-exact, peak parity. The backward sits at the HBM roofline — one fused read-once kernel that avoids the
+~34 MB intermediate round-trip inductor's backward materializes. See
+[Hardware and portability](/triton-kernel-fused/concepts/hardware/).
+
 ## API
 
 ```python

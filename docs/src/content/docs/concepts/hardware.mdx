@@ -1,0 +1,161 @@
+---
+title: Hardware and portability
+description: How the per-architecture package layout (sm75 reference, sm120 reuse+override) lets the same kernels move from a Tesla T4 to a production-grade RTX PRO 6000 Blackwell — with every win measured and the gradients re-gated on the new arch.
+---
+
+import { Aside, CardGrid, LinkCard, Steps } from '@astrojs/starlight/components';
+
+These kernels were developed and tuned on the **Tesla T4 (`sm_75`, Turing)** — deliberately the *hardest*
+bar to win on (no bf16 tensor cores, 64 KB SRAM, no `cp.async`). The open question for any kernel library
+is whether that work survives a move to new hardware, or whether it was overfit to one GPU's quirks.
+
+This page is the answer: the same kernels were taken to a **production-grade NVIDIA RTX PRO 6000 Blackwell
+Server Edition (`sm_120`)** and re-benchmarked end to end, with the gradient-parity gate re-run on the new
+architecture. **Every win held or widened, and the one regression was diagnosed and recovered into a win.**
+The methodology — beat `torch.compile` only at [structural seams](/triton-kernel-fused/concepts/the-structural-edge/),
+prove it with the frozen benchmark — generalizes off Turing.
+
+## The per-architecture layout
+
+Kernels live in **per-architecture packages**, each a self-contained source of truth for one GPU class:
+
+```text
+kernels/
+  __init__.py      # arch registry + arch_for_capability(major, minor)
+  sm75/            # Turing / Tesla T4 — the reference implementations
+  sm120/           # Blackwell / RTX PRO 6000 — reuse + override
+```
+
+The design rule is **reuse + override, never fork-and-drift**:
+
+- `kernels/sm120` **re-exports** every kernel that is byte-identical to its `sm75` version, so a fix in the
+  reference lands on Blackwell automatically (single source of truth).
+- It **overrides** only what is *measurably* different on the new arch — a tuned default, or a kernel that
+  genuinely diverges. Today that is the Muon batched-Newton-Schulz default and the conv MoE router.
+
+```python
+import kernels
+
+kernels.AVAILABLE_ARCHS                 # ('sm75', 'sm120')
+kernels.arch_for_capability(12, 0)      # 'sm120'  (RTX PRO 6000 Blackwell, cc 12.0)
+kernels.arch_for_capability(9, 0)       # 'sm75'   (Hopper falls back to the reference)
+kernels.arch_for_capability(7, 5)       # 'sm75'   (the T4 itself)
+```
+
+`arch_for_capability` returns the **highest shipped architecture at or below the device's compute
+capability**, so a GPU with no dedicated package transparently runs the reference kernels. There is no flat
+top-level API — you import explicitly from the package for your hardware, so the arch you are running is
+always visible in your code.
+
+```python
+from kernels.sm120 import fused_linear_cross_entropy, fused_xsa, FusedMuon, fused_router, moe
+```
+
+<Aside type="tip">
+`bench.py` auto-detects the arch (`arch_for_capability(*torch.cuda.get_device_capability())`) and prints it
+in the banner, so the benchmark always reports the package it actually exercised. See
+[Benchmarking](/triton-kernel-fused/concepts/benchmarking/).
+</Aside>
+
+## Measured on Blackwell (`sm_120`)
+
+**Host:** NVIDIA RTX PRO 6000 Blackwell Server Edition · `sm_120` (cc 12.0, 188 SMs, ~128 MB L2, GDDR7) ·
+`torch 2.12.0+cu130` · `triton 3.7.0` · `compile=ON`. Baseline is the same `torch.compile`'d eager block as
+on T4. Both fp16 and bf16 validated; gradient parity checked in the same run.
+
+| Kernel | Blackwell (`sm_120`) vs `torch.compile` | T4 (`sm_75`) | Gate |
+|---|---|---|---|
+| `FusedMuon` | **~2.3× (75M) / ~2.48× (302M)**, peak ≤ baseline | ~1.05–1.09× | parity ~2e-5, mem gate PASS |
+| `moe` (per-expert) | **~3.9× forward+backward** | ~2.87× | grad rel 7e-3, lighter peak |
+| `fused_router` (conv) | **~1.86× forward+backward** (fwd 1.29× / bwd 2.30×) | ~1.11–1.17× | grad rel 2.3e-4, 1.13× less mem |
+| `fused_xsa` | **~1.61× forward+backward** (warm) | ~1.15× | grad PASS, peak parity |
+| `fused_linear_cross_entropy` | up to **3.8× less peak**; **beats Liger** at equal memory | ~3.4× less peak | grad PASS |
+
+The compute-bound wins (Muon, MoE) **widen** the most off Turing — Blackwell's full-rate tensor cores and
+~1.6–1.8 TB/s GDDR7 reward the bigger batched GEMMs that the recipe builds. The memory and structural wins
+(CE, XSA, router) hold and improve.
+
+<Aside type="note" title="A note on the MoE grouped path">
+On Blackwell the grouped expert GEMM clocks ~4.95×, but its gradients are **wrong** (rel ~1.0) because it
+does not implement the Identity/Zero special experts — so `moe()` guards to the correct ~3.9× per-expert
+path whenever a special expert is present. Speed is never reported on incorrect math. See the
+[MoE page](/triton-kernel-fused/kernels/moe/).
+</Aside>
+
+## The proof: a regression, diagnosed and recovered
+
+The honest signal that a port is *real* is what happens when something breaks. On Blackwell the conv MoE
+router — a **1.11–1.17× win on T4** — **regressed to 0.82–0.91×**. The cuDNN backward that won on Turing was
+now dominated by an `aten::copy_` layout tax (cuDNN's `nchwToNhwc`/`nhwcToNchw` transposes were ~48% of the
+CUDA time). The T4 edge did not transfer because inductor's compiled path was already lean on glue here.
+
+It was recovered to a **~1.86× win** by forking `kernels/sm120/router.py` to a transpose-free fused Triton
+conv — the approach that was *shelved on T4 for lack of SRAM* and that Blackwell's larger SRAM finally makes
+viable. Three measured iterations got it there:
+
+1. **A single fused conv kernel** (one launch, x read once, no layout copies) won wall-clock but failed the
+   fp32 gate — `tl.dot` silently uses **TF32** on fp32 inputs, perturbing logits enough to flip a few
+   near-tie top-k picks. Fixed with `input_precision="ieee"` (a no-op on the bf16 timed path).
+2. **Split-K over the token axis** in the `grad_W` reduction lifted it from an under-occupied 32-program grid
+   to 512 programs — backward `0.87× → 2.30×`.
+3. **Fusing the `norm_topk_prob` + scaling tail** into one Triton Function (the sum-to-1 Jacobian, grad-exact)
+   removed ~17 un-fused launches that the compiled baseline fuses away — forward+backward `1.45× → 1.86×`.
+
+The result is the second-largest Blackwell win after Muon/MoE, with exact gradients and lighter memory. That
+is the portability story in one kernel: the structural reasoning is arch-independent, and the frozen
+benchmark plus the gradient gate keep every claim honest on hardware the kernels were never tuned on.
+
+## Running on your hardware
+
+<Steps>
+
+1. **Pick the package for your GPU** — or let `arch_for_capability` pick it:
+
+   ```python
+   import torch, importlib
+   from kernels import arch_for_capability
+
+   arch = arch_for_capability(*torch.cuda.get_device_capability())   # 'sm120' on RTX PRO 6000
+   k = importlib.import_module(f"kernels.{arch}")
+   loss = k.fused_linear_cross_entropy(hidden, lm_head_weight, labels)
+   ```
+
+2. **Re-benchmark on your own card.** Speedups are architecture-specific by nature — the point of the
+   per-arch layout is that you re-measure, not assume:
+
+   ```bash
+   python bench.py --compile muon
+   python bench.py --compile router
+   ```
+
+3. **Trust the gate, not the table.** Every `bench.py` run prints gradient parity (`grad … PASS`), index/count
+   agreement, and NaN-freedom alongside the speedup. A speed number is only meaningful next to a passing gate.
+
+</Steps>
+
+<Aside type="caution" title="Speedups are still architecture-specific">
+That a win transfers from Turing to Blackwell does **not** mean it transfers to *every* GPU — a T4 number is
+not a Blackwell number is not an A100 number. The per-arch layout exists precisely so you re-benchmark on
+your target. What generalizes is the *method* (attack structural seams; gate on correctness), not the
+specific multiplier.
+</Aside>
+
+## Contributing a new architecture
+
+Adding a GPU class is the same reuse + override pattern — see
+[Contributing a kernel](/triton-kernel-fused/contributing/). In short: create `kernels/sm<NN>/`, re-export
+everything from the nearest reference package, override only what your profiling proves is different, register
+the arch in `kernels/__init__.py`, and let the frozen benchmark + gradient gate decide what ships.
+
+<CardGrid>
+  <LinkCard
+    title="The structural edge"
+    description="Why these kernels beat torch.compile at all — the arch-independent reasoning behind every win."
+    href="/triton-kernel-fused/concepts/the-structural-edge/"
+  />
+  <LinkCard
+    title="Benchmarking"
+    description="How bench.py auto-detects the arch and gates every speedup on gradient parity."
+    href="/triton-kernel-fused/concepts/benchmarking/"
+  />
+</CardGrid>

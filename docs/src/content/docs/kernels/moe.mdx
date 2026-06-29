@@ -35,6 +35,10 @@ Measured on a Tesla T4 (`sm_75`):
 - **~2.87×** vs the compiled masked per-expert combine — and this is the win that survives the compiled
   baseline by the widest margin, because the routing simply cannot be compiled.
 
+**On Blackwell (`sm_120`)** the per-expert path widens to **~3.9× forward+backward** (backward ~4.6×),
+correct and lighter on memory — the data-dependent-routing edge scales hard with the faster tensor cores.
+See [Hardware and portability](/triton-kernel-fused/concepts/hardware/).
+
 ## API
 
 ```python

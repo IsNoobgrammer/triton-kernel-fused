@@ -8,7 +8,8 @@
 
 <p>
 Drop-in replacements for eager PyTorch blocks in transformer training on NVIDIA GPUs.<br/>
-Tuned and verified on the Turing&nbsp;/&nbsp;Tesla&nbsp;T4 class (<code>sm_75</code>) — correctness is always the gate.
+Tuned on the Turing&nbsp;/&nbsp;Tesla&nbsp;T4 class (<code>sm_75</code>) and proven on production-grade
+RTX&nbsp;PRO&nbsp;6000 Blackwell (<code>sm_120</code>) — every win held or widened, correctness is always the gate.
 </p>
 
 <p>
@@ -23,6 +24,7 @@ Tuned and verified on the Turing&nbsp;/&nbsp;Tesla&nbsp;T4 class (<code>sm_75</c
 <img src="https://img.shields.io/badge/Triton-%E2%89%A53.0-2C2C2C?style=flat-square" alt="Triton >= 3.0" />
 <img src="https://img.shields.io/badge/PyTorch-%E2%89%A52.4-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch >= 2.4" />
 <img src="https://img.shields.io/badge/CUDA-Turing_sm__75-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA Turing sm_75" />
+<img src="https://img.shields.io/badge/Blackwell-sm__120_verified-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="Blackwell sm_120 verified" />
 <img src="https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python >= 3.10" />
 <img src="https://img.shields.io/badge/License-MIT-A78BFA?style=flat-square" alt="License: MIT" />
 </p>
@@ -56,9 +58,30 @@ Numerical parity (forward output **and** gradients) against the eager reference 
 | [`fused_router`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/router/) | conv router (conv → sigmoid → bias → topk → gather) | fuses native `topk` into an in-register epilogue + a merged backward | **~1.11–1.17×** fwd+bwd, exact grads, mem parity |
 | [`moe`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/moe/) | masked per-expert MoE combine | fuses data-dependent dispatch + cuBLAS GEMMs + activation + weighted scatter | **~2.87×** (the data-dependent edge survives compile) |
 
-> **Performance is architecture-specific.** All numbers above are measured on a Tesla T4 (`sm_75`)
-> against a `torch.compile`'d eager baseline. Numbers from one GPU class do not transfer to another —
-> always re-benchmark on your target hardware. See [Benchmarking](https://isnoobgrammer.github.io/triton-kernel-fused/concepts/benchmarking/).
+### Proven on production-grade Blackwell (`sm_120`)
+
+The same kernels were ported to an **NVIDIA RTX PRO 6000 Blackwell Server Edition** (`sm_120`, torch
+2.12+cu130) and re-benchmarked with the gradient gate re-run on the new arch. **Every win held or widened,
+and the one regression — the conv router — was diagnosed and recovered into a larger win:**
+
+| Kernel | Tesla T4 (`sm_75`) | RTX PRO 6000 Blackwell (`sm_120`) |
+|---|---|---|
+| `fused_linear_cross_entropy` | ~3.4× less peak; matches Liger | up to **3.8× less peak**; **beats Liger** at equal memory |
+| `fused_xsa` | ~1.15× fwd+bwd | **~1.61×** fwd+bwd (warm) |
+| `FusedMuon` | ~1.09× / ~1.05× | **~2.3× (75M) / ~2.48× (302M)**, peak ≤ baseline |
+| `fused_router` | ~1.11–1.17× fwd+bwd | **~1.86×** fwd+bwd (fwd 1.29× / bwd 2.30×) |
+| `moe` | ~2.87× | **~3.9×** fwd+bwd (per-expert) |
+
+Kernels live in **per-arch packages** (`kernels/sm75`, `kernels/sm120`) on a reuse-and-override model:
+`sm120` re-exports everything identical to the reference and overrides only what profiling proves is
+different (the Muon Newton-Schulz default; the conv router, forked to a transpose-free fused Triton conv).
+`bench.py` auto-detects the arch. Full story:
+[Hardware and portability](https://isnoobgrammer.github.io/triton-kernel-fused/concepts/hardware/).
+
+> **Speedups are still architecture-specific.** A win transferring from Turing to Blackwell does not mean it
+> transfers to *every* GPU. The per-arch layout exists so you re-benchmark on your target — what generalizes
+> is the method (attack structural seams, gate on correctness), not the multiplier. See
+> [Benchmarking](https://isnoobgrammer.github.io/triton-kernel-fused/concepts/benchmarking/).
 
 `fused_router` documents a **conv** router (sigmoid-gate, no-activation) — see its page for which
 configurations are covered. `moe` is shaped for the **PolyGLU** expert layout (fused gate+up, per-expert
@@ -66,7 +89,7 @@ activation codes) used in BiBo; the per-expert path is general, the activation s
 
 ## Requirements
 
-- NVIDIA GPU with CUDA (developed and tuned on Tesla T4, `sm_75`)
+- NVIDIA GPU with CUDA (tuned on Tesla T4 `sm_75`; verified on RTX PRO 6000 Blackwell `sm_120`)
 - Python ≥ 3.10
 - PyTorch ≥ 2.4 with CUDA, Triton ≥ 3.0 (bundled in the CUDA PyTorch wheel)
 
