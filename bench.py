@@ -895,6 +895,13 @@ def bench_muon():
 
     # ── PHASE 2: SINGLE-GPU — ms / speedup / peak mem / parity. Speedup baseline = MIXED (fp16 NS),
     # our kernel = same MIXED, so the speedup is purely the fusion. |Δp| is vs the full-fp32 truth. ──
+    # NS is called with ~6 distinct shapes (+ internal transposes); the default recompile_limit (8) is
+    # hit -> the compiled baseline falls back to EAGER for the overflow shapes (an unfairly slow bar).
+    # Bump it so EVERY shape gets its own compiled kernel — the strongest, fairest baseline.
+    import torch._dynamo as _dyn                                # aliased: don't rebind the local `torch`
+    for _attr in ("recompile_limit", "cache_size_limit"):
+        if hasattr(_dyn.config, _attr):
+            setattr(_dyn.config, _attr, 64)
     variants = [
         ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32), compute_dtype=torch.float32)),
         ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16), compute_dtype=torch.float16)),
@@ -911,6 +918,22 @@ def bench_muon():
         tag = "  <- T4 path" if name == "fused-mixed" else ("  (parity ref)" if name == "full-fp32" else "")
         print(f"    {name:16s} {t:9.2f} {den/t:8.2f}x {mem:9.0f} {d:14.2e}{tag}")
     print(f"    => fusion-only win (mixed vs mixed) = {den/res['fused-mixed'][0]:.2f}x")
+
+    # --profile: launch-count + per-op CUDA time for fused vs compiled-baseline step (the fusion signal —
+    # foreach + baddbmm should issue FEWER launches than the unfused per-param baseline).
+    if PROFILE:
+        def _mk_step(mk):
+            ps = _muon_params(shapes, 0); opt = mk(ps)
+            gg = torch.Generator(device=DEV).manual_seed(1)
+            def prime():
+                for p in ps:
+                    p.grad = torch.randn(*p.shape, generator=gg, device=DEV, dtype=_MASTER)
+            prime(); opt.step()
+            return lambda: (prime(), opt.step())
+        _profile("fused-mixed step",
+                 _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)))
+        _profile(f"{'compiled ' if COMPILE else ''}baseline-mixed step",
+                 _mk_step(lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16), compute_dtype=torch.float16)))
 
     # ── PHASE 3: DISTRIBUTED A (replicated) vs B (round-robin) — only under torchrun ──
     import torch.distributed as dist
