@@ -7,9 +7,17 @@
     "incumbent_best": {"fused-mixed_48t_x": 1.07, "fused-mixed_192t_x": 1.03, "uncapped_48t_x": 1.11},
     "diagnosis": "Step is LAUNCH-BOUND: profiler 'Command Buffer Full' = 60% (48t) / 81% (192t) of CUDA — GPU stalls waiting on CPU to submit ~1787/~7087 tiny kernels. GEMM (baddbmm+bmm)~62% = recipe floor (3 matmuls/iter x5, can't cut). copy_+Memcpy DtoD ~24% data movement. Fusion already halved launches; residual launch tax gates everything and GROWS with scale (why 192t is only 1.03x).",
     "hypothesis": "CUDA-graph capture of momentum->NS->scatter collapses ~1787/7087 launches to (few eager grad-gathers)+1 replay, killing Command Buffer Full. Highest ceiling on muon_big (the real-training regime). Recipe math untouched -> parity preserved. Predicted: parity == fused-mixed (~2.3e-5), launch count collapses, ms approaches GEMM-bound floor (potentially 1.3-2x; theoretical since GPU spends ~50% in command-buffer stalls).",
-    "candidate": "fused-graph (FusedMuon use_graph=True): eager grad-gather into persistent fp16 staging buffers (robust to grad rebinding) + captured compute body; try/except falls back to permanent eager (=fused-mixed) on capture error. ASSUMES static lr/wd/momentum (baked into captured ops; set_graph(None) to recapture on LR-schedule change).",
-    "status": "DISPATCHED — awaiting T4 run of `bench.py --compile muon` and `muon_big`",
-    "keep_gate": "parity fused-graph vs fp32 ~= fused-mixed (capture-correctness), stability untouched, ms < fused-mixed beyond noise; else revert (drop fused-graph from variants, keep eager champion)."
+    "candidate": "fused-graph (FusedMuon use_graph=True): eager grad-gather into persistent fp16 staging buffers (robust to grad rebinding) + captured compute body; try/except falls back to permanent eager (=fused-mixed) on capture error.",
+    "status": "RESOLVED — graph DISCARDED, 64M default KEPT",
+    "t4_result": {
+      "fused_graph_48t_x": 1.11, "fused_graph_vs_fused_mixed": 1.01, "fused_graph_192t_x": 1.05,
+      "graph_launches_48t": 830, "fused_mixed_launches_48t": 1768,
+      "graph_parity": "2.31e-5 == fused-mixed (capture is BIT-correct)", "graph_mem_cost_MB": "+148 (48t) / +607 (192t)"
+    },
+    "diagnosis_CORRECTED": "LAUNCH-BOUND was WRONG. CUDA-graph collapsed launches 1768->830 and 'Command Buffer Full' vanished from the profile, yet wall-clock was unchanged (tie 48t, -1% 192t) and total CUDA time held (1.486->1.508s). The step is GPU-COMPUTE-bound on the small fp16 GEMMs (turing_fp16 gemm ~839ms + Memcpy DtoD 166ms, IDENTICAL in both profiles). 'Command Buffer Full' was CPU submission OVERLAPPED behind a saturated GPU, not idle stall. Removing launch overhead the GPU never waited on buys nothing. Consistent with the standing lesson: compile/HBM already saturated -> only a STRUCTURAL edge wins.",
+    "win_KEPT": "ns_batch_elems default 4M->64M. T4 frontier knee: 48t 1.09->1.16x (862->1155 MB), 192t 1.06->1.10x (3180->3830 MB); matches uncapped speed at LESS memory (192t 3830 vs 4521). Mechanism: at 4M the (9,1536,512) expert stacks row-chunk (row_cap=5 -> 5+4); at 64M all 9 experts batch into ONE bmm = bigger GEMM = better SM utilization. Past noise, consistent across both sizes and both runs.",
+    "decision": "KEEP 4M->64M default. DISCARD fused-graph from the bench variants/profile; KEEP use_graph as documented opt-in (bit-correct, would pay off on a launch-bound host). fullgraph=True on the NS baseline kept (fairer 1.00x bar).",
+    "next_lever": "Memcpy DtoD = 11% of CUDA (166ms, 3760 calls, present in BOTH profiles) is the only remaining non-GEMM cost. Likely a contiguity copy of a transposed operand inside newton_schulz (bmm/baddbmm with X.transpose). NEXT round: find + eliminate it (bounded ~11% ceiling). GEMM 62% is the recipe floor (tl.dot refuted)."
   },
   "round4_conv_router": {
     "objective": "max conv-router fwd+bwd x-vs-COMPILED-eager on T4, grad_rel<1.5e-2 idx-exact count-ok nan-free, mem<=compiled",

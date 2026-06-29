@@ -907,10 +907,6 @@ def bench_muon(layers=6):
         ("full-fp32",      lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns32, fullgraph=True), compute_dtype=torch.float32)),
         ("baseline-mixed", lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)),
         ("fused-mixed",    lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)),
-        # CUDA-graph capture of the step: attacks the launch-bound "Command Buffer Full" (60-81% of the
-        # step) by replaying momentum->NS->scatter as ONE launch + a few eager grad-gathers. Parity should
-        # match fused-mixed (same kernels, just captured); a divergence here flags a capture bug.
-        ("fused-graph",    lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, use_graph=True)),
     ]
     res = {}
     for name, mk in variants:
@@ -923,9 +919,6 @@ def bench_muon(layers=6):
         tag = "  <- T4 path" if name == "fused-mixed" else ("  (parity ref)" if name == "full-fp32" else "")
         print(f"    {name:16s} {t:9.2f} {den/t:8.2f}x {mem:9.0f} {d:14.2e}{tag}")
     print(f"    => fusion-only win (mixed vs mixed) = {den/res['fused-mixed'][0]:.2f}x")
-    if "fused-graph" in res:
-        print(f"    => CUDA-graph win (vs mixed)        = {den/res['fused-graph'][0]:.2f}x"
-              f"  (vs fused-mixed = {res['fused-mixed'][0]/res['fused-graph'][0]:.2f}x)")
 
     # ns_batch_elems frontier: the speed<->memory knob. Smaller cap = lower peak + more launches
     # (CPU-launch-bound); bigger = faster GEMMs + more transient memory. Pick the knee vs baseline.
@@ -948,8 +941,6 @@ def bench_muon(layers=6):
             return opt.step
         _profile("fused-mixed step",
                  _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16)))
-        _profile("fused-graph step  (CUDA-graph; launches should collapse to ~gather + 1 replay)",
-                 _mk_step(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16, use_graph=True)))
         _profile(f"{'compiled ' if COMPILE else ''}baseline-mixed step",
                  _mk_step(lambda ps: _BaselineMuon(ps, lr=LR, weight_decay=WD, ns_fn=_c(ns16, fullgraph=True), compute_dtype=torch.float16)))
 

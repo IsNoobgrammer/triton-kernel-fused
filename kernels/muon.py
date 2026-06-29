@@ -70,23 +70,27 @@ class FusedMuon(optim.Optimizer):
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan",
-                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3):
+                 ns_batch_elems=64 * 1024 * 1024, use_graph=False, graph_warmup=3):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype
         self.scale_mode = scale_mode
-        # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params (the launch win)
-        # while chunking the large expert stacks so their transients (gbuf/X/A) stay bounded. The
-        # persistent momentum buffer is unchanged (= baseline size); only the per-step transient shrinks.
+        # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params AND lets a whole
+        # 9-expert stack fall into ONE bmm instead of being row-chunked — bigger GEMMs = better T4 SM
+        # utilization (the step is GPU-COMPUTE-bound on the small fp16 GEMMs, not launch-bound). T4
+        # frontier: 64M is the knee — 1.16x/1.10x (48t/192t) vs 1.09x/1.06x at the old 4M cap, and matches
+        # uncapped speed at LESS transient memory (192t: 3830 vs 4521 MB). Lower it only on a tight-VRAM
+        # GPU where the larger per-step transient (peak 1155/3830 MB here) doesn't fit.
         self.ns_batch_elems = ns_batch_elems
-        # CUDA-graph capture: the step is LAUNCH-BOUND (the profiler's "Command Buffer Full" is 60-81%
-        # of the step — the GPU stalls waiting for the CPU to submit ~1.8k-7k tiny kernels). Capturing
-        # the whole momentum->NS->scatter as ONE graph and replaying it collapses that to (a few foreach
-        # grad-gathers) + 1 replay. The gather stays EAGER (reads the current p.grad each step, so it is
-        # robust to grads rebinding under zero_grad(set_to_none=True)); everything downstream is replayed
-        # on persistent buffers. ASSUMES STATIC HYPERPARAMS (lr/wd/momentum are baked into the captured
-        # ops) and stable param/grad shapes — recapture (set_graph(None)) on an LR-schedule change.
+        # CUDA-graph capture (opt-in, OFF by default): captures momentum->NS->scatter as ONE graph and
+        # replays it, with the grad-gather kept EAGER (reads current p.grad -> robust to grads rebinding
+        # under zero_grad(set_to_none=True)). It collapses launches (T4: 1768->830) but is a WALL-CLOCK
+        # WASH ON T4 (Round 3): the step is GPU-COMPUTE-bound on the small fp16 GEMMs, not CPU-launch-
+        # bound — the profiler's "Command Buffer Full" was CPU submission OVERLAPPED behind a saturated
+        # GPU, not idle stall. Kept as opt-in for a genuinely launch-bound host (slow CPU / many tiny
+        # params) where it would pay off. ASSUMES STATIC HYPERPARAMS (lr/wd/momentum baked into the
+        # captured ops) and stable shapes — call set_graph(None) to recapture after an LR-schedule change.
         self.use_graph = use_graph
         self.graph_warmup = graph_warmup
         self._graph = None

@@ -53,3 +53,29 @@ untouched -> parity must stay == fused-mixed (~2.3e-5 vs fp32); a divergence fla
 CAVEAT: graph bakes in static lr/wd/momentum; call set_graph(None) to recapture after an LR-sched change.
 Candidate = `fused-graph` (use_graph=True), try/except falls back to eager champion on any capture error.
 STATUS: dispatched, awaiting T4. Predicted 1.3-2x (GPU spends ~50%/81% of the step in launch stalls).
+
+### Round 3 RESULT — graph REFUTED, but the frontier sweep handed us a real win
+**CUDA-graph = DISCARD.** Launches collapsed 1768->830 and "Command Buffer Full" VANISHED from the
+profile — but wall-clock was unchanged (48t: 72.2 vs 73.0ms tie; 192t: 329.7 vs 328.3 loss), total CUDA
+time held (1.486->1.508s), and it cost +148/+607 MB. Parity was bit-correct (2.31e-5 == fused-mixed), so
+the capture works perfectly — it just buys nothing. **The launch-bound diagnosis was WRONG: the step is
+GPU-COMPUTE-bound** on the small fp16 GEMMs (turing_fp16 gemm ~839ms + Memcpy DtoD 166ms, IDENTICAL in
+both profiles). "Command Buffer Full" was CPU submission OVERLAPPED behind a saturated GPU, not idle
+stall — a profiler-accounting trap. Reinforces the standing lesson: GPU already saturated -> only a
+STRUCTURAL edge wins, never launch reduction. use_graph kept as documented opt-in (would pay off on a
+launch-bound host: slow CPU, many tiny params); off by default.
+
+**ns_batch_elems 4M -> 64M = KEEP (the round's real win).** T4 frontier knee:
+| cap | 48t x / MB | 192t x / MB |
+|-----|------------|-------------|
+| 4M (old default) | 1.09 / 862 | 1.05 / 3180 |
+| **64M (new default)** | **1.16 / 1155** | **1.10 / 3830** |
+| uncapped | 1.15 / 1155 | 1.09 / 4521 |
+64M >= uncapped on speed at LESS memory (192t 3830 vs 4521). Mechanism: at 4M the (9,1536,512) expert
+stacks row-chunk (row_cap = 4M/(1536*512) = 5 -> a 5+4 split); at 64M all 9 experts batch into ONE bmm
+= bigger GEMM = better T4 SM utilization. The structural edge the compute-bound step actually responds to.
+Consistent across both sizes and both runs, past noise. Champion is now fused-mixed @ 64M = 1.16x/1.10x.
+
+NEXT lever: Memcpy DtoD = 11% of CUDA (166ms, 3760 calls) is the only non-GEMM cost left and is present
+in BOTH profiles -> inherent to the NS math, likely a contiguity copy of a transposed bmm/baddbmm operand
+inside newton_schulz. Bounded ~11% ceiling. GEMM 62% is the recipe floor (tl.dot refuted).
