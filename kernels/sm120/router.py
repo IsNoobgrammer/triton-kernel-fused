@@ -220,11 +220,81 @@ def fused_router(x, conv_weight, bias, top_k, num_experts,
     B, S, _ = x.shape
     idx, w, counts = FusedConvRouterFused.apply(x, conv_weight, bias, top_k, num_experts)
     if top_k > 1 and norm_topk_prob:
-        w = w / (w.sum(-1, keepdim=True) + 1e-20)
-    w = w * routed_scaling_factor
+        w = _topk_normalize(w, routed_scaling_factor)       # fused norm+scale (one kernel each way)
+    else:
+        w = w * routed_scaling_factor
     idx = idx.view(B, S, top_k)
     w = w.view(B, S, top_k)
     return (idx, w, counts) if return_counts else (idx, w)
+
+
+@triton.jit
+def _topk_norm_fwd_kernel(W, O, N, sn, sk, SCALE, EPS, K: tl.constexpr,
+                          BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr):
+    """O[n,k] = SCALE·W[n,k] / (Σ_k W[n,k] + EPS) — the top-k sum-to-1 norm + routed-scaling, FUSED into
+    one kernel. Replaces the eager div+sum+mul tail (~17 un-fused launches/iter the compiled baseline
+    fuses away — the dominant launch tax on this lean MLP-router step)."""
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    m = (offs_n < N)[:, None] & (offs_k < K)[None, :]
+    w = tl.load(W + offs_n[:, None] * sn + offs_k[None, :] * sk, mask=m, other=0.0).to(tl.float32)
+    s = tl.sum(w, axis=1) + EPS
+    o = w * (SCALE / s)[:, None]
+    tl.store(O + offs_n[:, None] * sn + offs_k[None, :] * sk, o.to(O.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _topk_norm_bwd_kernel(W, GO, GW, N, sn, sk, SCALE, EPS, K: tl.constexpr,
+                          BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Jacobian of the sum-to-1 norm: grad_w_l = SCALE/s · (go_l − Σ_j go_j·p_j), p_j = w_j/s. One pass."""
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    m = (offs_n < N)[:, None] & (offs_k < K)[None, :]
+    w = tl.load(W + offs_n[:, None] * sn + offs_k[None, :] * sk, mask=m, other=0.0).to(tl.float32)
+    go = tl.load(GO + offs_n[:, None] * sn + offs_k[None, :] * sk, mask=m, other=0.0).to(tl.float32)
+    s = tl.sum(w, axis=1) + EPS
+    p = w / s[:, None]
+    gdot = tl.sum(go * p, axis=1)                                   # ⟨go, p⟩ per row
+    gw = (SCALE / s)[:, None] * (go - gdot[:, None])
+    tl.store(GW + offs_n[:, None] * sn + offs_k[None, :] * sk, gw.to(GW.dtype.element_ty), mask=m)
+
+
+class _TopkNormalize(torch.autograd.Function):
+    """Fused top-k sum-to-1 normalization × routed_scaling (the router weight tail), one kernel each way.
+    w (N,k) raw gathered scores -> (N,k) normalized·scaled. Mathematically identical to the eager
+    `w/(w.sum(-1,keepdim)+eps)*scale` but ~17 launches -> 2. grad-exact (sum-to-1 Jacobian). sm120-only."""
+
+    @staticmethod
+    def forward(ctx, w, scale, eps):
+        w = w.contiguous()
+        N, K = w.shape
+        o = torch.empty_like(w)
+        BLOCK_N, BLOCK_K = 128, max(1, triton.next_power_of_2(K))
+        _topk_norm_fwd_kernel[(triton.cdiv(N, BLOCK_N),)](
+            w, o, N, w.stride(0), w.stride(1), float(scale), float(eps),
+            K=K, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N)
+        ctx.save_for_backward(w)
+        ctx.scale, ctx.eps = float(scale), float(eps)
+        return o
+
+    @staticmethod
+    def backward(ctx, go):
+        (w,) = ctx.saved_tensors
+        N, K = w.shape
+        go = go.contiguous()
+        gw = torch.empty_like(w)
+        BLOCK_N, BLOCK_K = 128, max(1, triton.next_power_of_2(K))
+        _topk_norm_bwd_kernel[(triton.cdiv(N, BLOCK_N),)](
+            w, go, gw, N, w.stride(0), w.stride(1), ctx.scale, ctx.eps,
+            K=K, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N)
+        return gw, None, None
+
+
+def _topk_normalize(w, scale, eps=1e-20):
+    """w (N,k) -> SCALE·w / (Σ_k w + eps), fused (replaces the eager norm+scale launch tail)."""
+    return _TopkNormalize.apply(w, scale, eps)
 
 
 class FusedMLPRouterHybrid(torch.autograd.Function):
@@ -294,8 +364,9 @@ def mlp_router(x, weight, bias, top_k, num_experts,
     B, S, _ = x.shape
     idx, w, counts = FusedMLPRouterHybrid.apply(x, weight, bias, top_k, num_experts)
     if top_k > 1 and norm_topk_prob:
-        w = w / (w.sum(-1, keepdim=True) + 1e-20)
-    w = w * routed_scaling_factor
+        w = _topk_normalize(w, routed_scaling_factor)       # fused norm+scale (one kernel each way)
+    else:
+        w = w * routed_scaling_factor
     idx = idx.view(B, S, top_k)
     w = w.view(B, S, top_k)
     return (idx, w, counts) if return_counts else (idx, w)
