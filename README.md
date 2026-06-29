@@ -157,7 +157,7 @@ not transfer to another.
 
 ## Documentation
 
-📖 **[isnoobgrammer.github.io/triton-kernel-fused](https://isnoobgrammer.github.io/triton-kernel-fused/)**
+**[isnoobgrammer.github.io/triton-kernel-fused](https://isnoobgrammer.github.io/triton-kernel-fused/)**
 
 Full docs — per-kernel API, the design rationale behind each win, and benchmarking guidance — are an
 [Astro Starlight](https://starlight.astro.build) site under [`docs/`](docs/), published to GitHub Pages
