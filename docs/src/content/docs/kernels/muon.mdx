@@ -174,6 +174,9 @@ batches the symmetric kernel across same-shape parameters in one launch. The sym
 from [nil0x9/flash-muon](https://github.com/nil0x9/flash-muon) (Triton triangle + transpose-copy; idea
 originally by Laker Newhouse et al.), with a batch dimension and a fused polynomial epilogue added.
 
+In short, **`amalg` (amalgamated) = `fused` + `symmul`** — our batched, launch-collapsed optimizer
+(`fused`) plus the symmetric-matmul FLOP cut (`symmul`). The two levers are orthogonal, so they stack.
+
 Measured on an **RTX PRO 6000 Blackwell (`sm_120`)**, single square matrix, Newton-Schulz(5), fp16 —
 five implementations (`eager` = naive PyTorch, `compiled` = `torch.compile`, `ours-fused` = our
 cuBLAS+`baddbmm` NS, `flash` = flash-muon's exact `fast_newtonschulz`, `ours-amalg` = symmetric-matmul):
@@ -185,6 +188,14 @@ cuBLAS+`baddbmm` NS, `flash` = flash-muon's exact `fast_newtonschulz`, `ours-ama
 | 4096 | 5.800 ms | 5.502 | 4.381 | **3.847** | **1.51×** |
 | 8192 | 44.23 ms | 43.31 | 33.83 | **31.05** | **1.42×** |
 
+![Newton-Schulz step time vs matrix dim, five implementations, log-log](../../../assets/muon/chart_time.png)
+
+![Speedup over torch.compile by matrix dim — ours-amalg wins at every scale](../../../assets/muon/chart_speedup.png)
+
+`ours-amalg` (green) leads at every size ≥2048. `flash` loses at 1024 (kernel launch outweighs the tiny
+GEMM) but its symmetric trick pulls ahead of dense cuBLAS by 4096 — and `ours-amalg` stays ahead of
+`flash` by batching same-shape work and folding the polynomial into the kernel epilogue.
+
 At the full optimizer step (dense ~0.4B params), the batched state composes with the symmetric cut:
 
 | optimizer | step | peak | speedup |
@@ -193,6 +204,8 @@ At the full optimizer step (dense ~0.4B params), the batched state composes with
 | ours-fused (cuBLAS) | 119.0 ms | 3519 MB | 1.05× |
 | flash (nil0x9) | 109.7 ms | 4779 MB | 1.14× |
 | **ours-amalg** | **91.2 ms** | 4725 MB | **1.37×** |
+
+![Full Muon optimizer step time, five implementations, dense 0.4B params](../../../assets/muon/chart_opt.png)
 
 The advantage is scale-invariant from 1B to 2.6B params (width *and* depth): ~1.32× over `torch.compile`,
 ~1.28× over our own champion, at ≤ compiled memory.
@@ -206,6 +219,8 @@ the Newton-Schulz tolerance (`2e-2`), with identical singular values (SV mean ~0
 ~0.85 after 5 steps — so it is compared on speed and orthogonality, not bit-parity; our Polar-Express
 coefficients reach ~0.98 *and* the faster kernel.)
 </Aside>
+
+![Parity: max absolute delta vs fp32 reference per method at 4096, all well under the 2e-2 tolerance](../../../assets/muon/chart_parity.png)
 
 <Aside type="caution">
 **The ceiling.** Only 2 of the 3 NS GEMMs are symmetric; `B·X` is a full cuBLAS tensor-core GEMM at
