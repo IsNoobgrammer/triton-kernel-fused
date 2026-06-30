@@ -1,0 +1,20 @@
+{
+  "objective": "Minimize NS(5)-step ms vs the champion FusedMuon NS (cuBLAS), per shape, at PARITY PASS and peak<=compiled. Beat fused ~1.8x and beat all three baselines (compiled/triu/fused) as the matrix scales.",
+  "eval": ".autoresearch/bench_symmul.py (4-way; algorithm frozen, only symmetric GEMMs vary)",
+  "baselines_3": ["compiled", "triu", "fused"],
+  "candidate": "amalg = kernels/sm120/newton_schulz_symmul.py (batched symmul)",
+  "bars": {"speed_vs_fused": 1.8, "mem": "amalg peak <= compiled peak", "parity": "hard gate (max|Δ| < tol, SV mean in [0.80,1.20], NaN-free)"},
+  "regime": "B (large-matrix square sweep is headline; batched-small 512^2 is the BiBo regression guard)",
+  "headline_shapes": [[1024,1024],[2048,2048],[4096,4096],[8192,8192]],
+  "guard_shapes": [[32,512,512],[128,512,512]],
+  "dtypes": ["fp16", "bf16"],
+  "run_number": 0,
+  "best_candidate": "v1 (batched symmul, explicit-axpy epilogue, dispatch<1024)",
+  "best_measured": null,
+  "baseline_measured": null,
+  "plateau_counter": 0,
+  "engine_rewards": {"improvement": 0, "novel": 0, "tangential": 0},
+  "tried_ideas": ["v1: batched triangle+transpose-copy symmul replacing both symmetric NS GEMMs; polynomial as explicit axpy; cuBLAS dispatch below dim 1024"],
+  "stop_target": "amalg >= 1.8x fused on dim>=2048, parity PASS, peak<=compiled, no batched-small regression",
+  "loop_mode": "human-gated: user runs bench on RTX PRO 6000, pastes results; agent diagnoses + generates next atomic candidate"
+}

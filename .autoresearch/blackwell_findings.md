@@ -169,3 +169,23 @@ the fp32-check SMEM budget. Halving it would push fwd+bwd toward ~1.6×. Not pur
 | CE | memory: up to 3.8× less peak; **beats Liger** at equal mem | memory-only |
 | XSA | **~1.61× fwd+bwd** (warm, 5-run stable) | 1.15× |
 | router | **~1.86× fwd+bwd** (fwd 1.29× / bwd 2.30×), grad PASS, 1.13× less mem — fused Triton conv + fused norm, sm120 | 1.11–1.17× |
+
+## MoE grouped (sm_120) — cuBLAS grouped GEMM beats per-expert at scale (2026-06-30)
+
+New path `kernels/sm120/moe_grouped.py::moe_grouped_cublas_polyglu` (commit b8a6660). One
+`torch._grouped_mm` (cuBLAS, autograd-native) grouped GEMM over all routed GLU tokens + PolyGLU
+activation + special experts (Identity/Zero) on the sorted tail. Correct on the BiBo special-experts
+stack (grad PASS), unlike the old GLU-only tl.dot `moe_grouped` (grad rel ~5.7 WRONG there).
+
+The win is governed by TOKENS-PER-EXPERT (= routed/E_glu), not N or E alone (vs per-expert, bf16, fwd+bwd):
+  tok/exp ~496 -> 3.0x + LESS mem | ~963 -> 2.1-2.5x + <= mem | ~1820 -> 1.6x | ~3277 (BiBo E=9) -> ~1.17x
+  high tok/exp -> per-expert GEMMs already saturate the tensor cores; per-expert wins (and is leaner).
+Why: per-expert fires one tiny cuBLAS GEMM + a DtoD copy PER expert (~1313 launches/~510 copies at E=32);
+grouped collapses that to a few scheduled grouped GEMMs (~851 launches/~35 copies).
+
+Speed/memory is a Pareto frontier: v4 manual-backward = fastest (2.55x) but +18-35% mem; v3 checkpoint =
+leanest (<= mem) but slower; shipped v2 (autograd-native, bf16 scatter) = balanced (2-3x at <=/~equal mem
+for top_k=2). `moe()` dispatches to grouped only when supported (sm_80+, bf16/fp16, 16B-aligned,
+torch._grouped_mm) AND tokens-per-expert <= 2048; else per-expert (the memory-frugal fallback). BiBo's own
+E=9 stack stays on per-expert; grouped is the win for higher-expert-count MoEs on Blackwell.
+Full ladder + per-run numbers: .autoresearch/moe_grouped_results.jsonl, _reflections.md, _scope.md.
