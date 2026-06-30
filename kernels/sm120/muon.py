@@ -1,20 +1,21 @@
-"""sm120 Muon for Blackwell — two interchangeable optimizers:
+"""sm120 Muon for Blackwell — FusedMuon defaults to the symmetric-matmul ("symmul") Newton-Schulz.
 
-  FusedMuon       : the champion. foreach launch-collapse + batched same-shape state + baddbmm fold,
-                    pure cuBLAS Newton-Schulz. No Triton dependency. The git-versioned reference.
-  AmalgamatedMuon : FusedMuon's exact step + levers, with the two SYMMETRIC NS GEMMs (X X^T, A A)
-                    done by the Triton symmul kernel (compute one triangle, mirror it -> ~half the
-                    GEMM FLOPs). Measured on RTX PRO 6000: 1.28-1.43x faster than FusedMuon on large
-                    matrices (gram >= 2048), 1.31-3.49x vs torch.compile, beats flash-muon's exact
-                    impl 1.10-1.17x, and uses <= compiled memory. Scale-invariant 1B -> 2.6B params.
+On Blackwell the symmul NS strictly dominates the old pure-cuBLAS path with NO precision tradeoff, so
+it is now the FusedMuon default (the symmetric trick + our foreach/batched-state levers, composed):
+the two SYMMETRIC NS GEMMs (X Xᵀ, A·A) compute one triangle and mirror it -> ~half the GEMM FLOPs.
 
-PRECISION IS NOT A TRADEOFF. AmalgamatedMuon runs the IDENTICAL fp16 NS math with fp32 accumulate as
-FusedMuon; the symmetric kernel only changes float rounding ORDER (triangle+mirror vs full bmm),
-~1e-4..1e-3 -> parity vs FusedMuon is 5.9e-3, well inside the NS tolerance (2e-2), and orthogonalization
-quality is the same (SV ~0.98). It also self-gates: below the gram knee (min(rows,cols) < SYMMUL_MIN_DIM)
-it calls the EXACT FusedMuon NS, so small matrices are bit-for-bit the champion. => AmalgamatedMuon can
-REPLACE FusedMuon outright on Blackwell. Keep FusedMuon for: Triton-free environments, or as the
-pure-cuBLAS reference. Only the default `ns_batch_elems` (8M) differs from sm75 (the Blackwell mem knee).
+  FusedMuon            : symmul NS by default. 1.28-1.43x faster than the cuBLAS NS on large matrices
+                         (gram >= 2048), 1.31-3.49x vs torch.compile, beats flash-muon's exact impl
+                         1.10-1.17x, mem <= compiled, scale-invariant 1B->2.6B params.
+  FusedMuon(use_symmul=False) : the pure-cuBLAS champion step (no Triton launched) — for a Triton-free
+                         environment or an exact-reference run.
+  AmalgamatedMuon      : back-compat alias of FusedMuon.
+
+PRECISION IS NOT A TRADEOFF: identical fp16 NS with fp32 accumulate; the symmetric kernel only changes
+float rounding ORDER (triangle+mirror vs full bmm), ~1e-4..1e-3 -> parity 5.9e-3 (< 2e-2 NS tolerance),
+SV ~0.98 (same orthogonalization). It self-gates below the gram knee (min(rows,cols) < SYMMUL_MIN_DIM)
+to the EXACT cuBLAS NS, so small matrices are bit-for-bit the champion. Only the default `ns_batch_elems`
+(8M) differs from sm75 (the Blackwell mem knee). The opt-in CUDA-graph path still uses the cuBLAS NS.
 """
 import torch
 
@@ -27,31 +28,30 @@ NS_BATCH_ELEMS = 8 * 1024 * 1024
 
 
 class FusedMuon(_FusedMuon75):
-    """sm75 FusedMuon with `ns_batch_elems` defaulting to the Blackwell knee (8M)."""
+    """sm120 FusedMuon — DEFAULTS to the symmetric-matmul ("symmul") Newton-Schulz on Blackwell.
 
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
-        super().__init__(*args, **kwargs)
+    Same foreach + batched same-shape state + Blackwell mem knee (8M) as before, but the two SYMMETRIC
+    NS GEMMs (X Xᵀ, A·A) run on the Triton symmul kernel (compute one triangle, mirror it -> ~half the
+    GEMM FLOPs). Measured: 1.28-1.43x faster than the pure-cuBLAS NS on large matrices (gram >= 2048),
+    1.31-3.49x vs torch.compile, beats flash-muon's exact impl 1.10-1.17x, mem <= compiled, scale-
+    invariant 1B->2.6B params. NO precision tradeoff: identical fp16 / fp32-accumulate NS, parity 5.9e-3
+    (< 2e-2 tol), SV ~0.98; it self-gates to the EXACT cuBLAS champion NS below the gram knee, so small
+    matrices are bit-for-bit unchanged.
 
-
-class DistributedMuon(_DistributedMuon75):
-    """sm75 DistributedMuon with `ns_batch_elems` defaulting to the Blackwell knee (8M)."""
-
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
-        super().__init__(*args, **kwargs)
-
-
-class AmalgamatedMuon(FusedMuon):
-    """FusedMuon with the symmetric-matmul ("symmul") Newton-Schulz — faster on large matrices, same
-    precision (see module docstring). Drop-in: same constructor/state_dict as FusedMuon; the only
-    change is the NS function (`newton_schulz_symmul`, which gates to the champion NS below the knee).
-
-    The eager `step` is FusedMuon's step verbatim except `newton_schulz(...)` -> `newton_schulz_symmul`.
+    `use_symmul=False` -> the pure-cuBLAS champion step (no Triton kernels launched) for a Triton-free
+    environment or an exact-reference run. The opt-in CUDA-graph path (`use_graph=True`) still uses the
+    cuBLAS NS. State dict / constructor are identical either way.
     """
+
+    def __init__(self, *args, use_symmul=True, **kwargs):
+        kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
+        super().__init__(*args, **kwargs)
+        self.use_symmul = use_symmul
 
     @torch.no_grad()
     def step(self, closure=None):
+        if not self.use_symmul or self.use_graph:
+            return super().step(closure)                  # pure-cuBLAS champion (or the graph path)
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -76,7 +76,19 @@ class AmalgamatedMuon(FusedMuon):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
-                    out = newton_schulz_symmul(u, self.coeffs, self.ns_dtype)   # <-- the only change
+                    out = newton_schulz_symmul(u, self.coeffs, self.ns_dtype)   # symmetric-matmul NS
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
         return loss
+
+
+class DistributedMuon(_DistributedMuon75):
+    """sm75 DistributedMuon with `ns_batch_elems` defaulting to the Blackwell knee (8M)."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
+        super().__init__(*args, **kwargs)
+
+
+# Back-compat alias: FusedMuon now IS the amalgamated (symmul) optimizer on sm120.
+AmalgamatedMuon = FusedMuon
