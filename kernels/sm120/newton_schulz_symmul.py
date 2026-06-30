@@ -153,17 +153,22 @@ def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)
     if transposed:
         X = X.transpose(1, 2)
     X = X.to(ns_dtype) / nrm.to(ns_dtype)
+    X = X.contiguous()
     Bsz, M, _ = X.shape
-    # Preallocate the two Gram buffers ONCE and reuse them every iteration (no per-iter alloc), and
-    # fold the polynomial b*A + c*AA IN-PLACE into the AA buffer so B aliases it -> the live working
-    # set is X + A + AA (same as the champion's X/A/B), recovering the memory the explicit axpy lost.
+    # Preallocate every buffer ONCE and reuse across all iterations (zero per-iter allocation), to
+    # out-plan inductor's buffer reuse and hold peak at/under `compiled`. A/AA are the two Gram
+    # buffers; the polynomial b*A + c*AA folds IN-PLACE into AA (B aliases it). The B@X result
+    # PING-PONGS between X and Xb (baddbmm out=) so the iteration never allocates a fresh X. Live
+    # set = {X, Xb, A, AA} for the whole loop, fixed.
     A = torch.empty((Bsz, M, M), device=X.device, dtype=ns_dtype)
     AA = torch.empty_like(A)
+    Xb = torch.empty_like(X)
     for a, b, c in coeffs:
         symmul(X, out=A)                                # A = X X^T   (symmetric -> half FLOPs)
         symmul(A, out=AA)                               # AA = A A^T = A A  (A is exactly symmetric)
         AA.mul_(c).add_(A, alpha=b)                     # B = b*A + c*AA, in-place into AA (no new alloc)
-        X = torch.baddbmm(X, AA, X, beta=a, alpha=1.0)  # a*X + B X  (non-symmetric -> cuBLAS)
+        torch.baddbmm(X, AA, X, beta=a, alpha=1.0, out=Xb)  # Xb = a*X + B X  (out= -> reuse, no alloc)
+        X, Xb = Xb, X                                   # ping-pong: next iter overwrites the old X
     if transposed:
         X = X.transpose(1, 2)
     if squeeze:
