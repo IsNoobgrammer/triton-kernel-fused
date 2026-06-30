@@ -34,6 +34,26 @@ v4 (fused symmul-axpy kernel + torch.compile core): SPEED 2048 1.33x, 4096 1.43x
    torch.compile engaged). Even the CHAMPION (pure cuBLAS eager) is 1.3-1.76x over compiled. amalg
    meets "mem <= champion" (== or slightly below fused), just not "<= compiled".
 
+## OPTIMIZER-LEVEL bench (bench_muon_symmul.py, big-model d=4096, 810M params, fp16, CLEAN)
+AmalgamatedMuon = FusedMuon + newton_schulz_symmul. Full .step():
+  compiled (per-param)  242.2 ms  5767 MB  1.00x
+  fused    (champion)   238.2 ms  5947 MB  1.02x vs compiled   <-- only 1.02x, NOT the BiBo 2.3x
+  amalg                 181.9 ms  6094 MB  1.33x vs compiled, 1.31x vs fused  (parity 1.95e-3 PASS)
+mem amalg/compiled = 1.06x (param/momentum memory dominates -> NS transient delta is small).
+
+## KEY STRUCTURAL FINDING: the two levers are DISJOINT (no multiplicative 1.8x)
+fused's batching beats compiled ~2.3x ONLY in the small-matrix-many-params regime (BiBo 512^2,
+launch-bound). At d=4096 the matrices are compute-bound cuBLAS -> launch overhead ~0 -> batching
+gives ~1.02x. So:
+  - small matrices (gram<2048): batching wins 2.3x, symmul INERT (gated to champion) -> amalg=fused.
+  - large matrices (gram>=2048): symmul wins ~1.3-1.4x, batching INERT (~1.02x) -> amalg=compiled*1.33.
+They can't multiply to 1.8x: a matrix big enough for symmul is too big for batching to matter.
+=> amalg is an ADDITIVE per-shape win (take whichever lever applies), not multiplicative. It
+   STRICTLY DOMINATES both compiled and the champion fused at every scale (>=1x always, 1.3-1.4x on
+   large matrices), parity-exact. 1.8x is above reach; strict mem<=compiled is structural (inductor
+   pools; eager+custom-kernel can't), but amalg mem ~= champion and within 6% of compiled at the
+   optimizer level.
+
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),
 parity-exact, and uses <= the champion's memory. i.e. it strictly dominates the optimizer we SHIP
