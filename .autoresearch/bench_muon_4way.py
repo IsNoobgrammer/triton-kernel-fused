@@ -25,8 +25,7 @@ from triton.testing import do_bench
 
 import bench_muon as bm
 from bench_muon import baseline_ns, BaselineMuon, make_shapes, make_params, prime_grads
-from kernels.sm120.muon import FusedMuon
-from kernels.sm120.newton_schulz_symmul import AmalgamatedMuon
+from kernels.sm120.muon import FusedMuon, AmalgamatedMuon
 
 DEV = "cuda"
 _compiled_ns = torch.compile(baseline_ns)

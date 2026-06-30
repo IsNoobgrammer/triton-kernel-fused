@@ -25,8 +25,7 @@ import torch.optim as optim
 from triton.testing import do_bench
 
 from kernels.sm75.muon import _PE_COEFFS, newton_schulz
-from kernels.sm120.muon import FusedMuon
-from kernels.sm120.newton_schulz_symmul import AmalgamatedMuon
+from kernels.sm120.muon import FusedMuon, AmalgamatedMuon
 
 DEV = "cuda"
 _DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
