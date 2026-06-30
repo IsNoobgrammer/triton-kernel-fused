@@ -61,6 +61,42 @@ This is documented end-to-end — including the TF32-on-fp32 correctness fix and
 in [Hardware and portability](/triton-kernel-fused/concepts/hardware/#the-proof-a-regression-diagnosed-and-recovered).
 The API is identical on both arches; `kernels.sm120.fused_router` simply uses the Triton conv internally.
 
+### Scaling the kernel size
+
+The conv kernel size `K` sets how much temporal context the router sees. Unlike the Newton-Schulz
+iteration count in [Muon](/triton-kernel-fused/kernels/muon/#scaling-the-newton-schulz-iteration-count)
+— where each added step is three matmuls, so runtime grows linearly — each extra conv tap is a
+near-free `static_range` accumulation inside a kernel whose cost is dominated by the H-contraction
+and the top-k epilogue. So **widening `K` is essentially free on the fused path, and the advantage
+over the compiled baseline grows as `K` scales.** Measured on an RTX PRO 6000 Blackwell (`sm_120`),
+fwd+bwd, bf16, steady-state (mean ± std over 5×100 samples, with a K=10 warmup pass first):
+
+| K | fused mean ± std (ms) | fused p99 | compiled mean ± std (ms) | compiled p99 | fused vs compiled | k@3 / k@K (fused) |
+|---|---|---|---|---|---|---|
+| 3 | 0.448 ± 0.062 | 0.751 | 0.669 ± 0.054 | 0.929 | **1.49×** | 1.00 |
+| 4 | 0.417 ± 0.023 | 0.493 | 0.675 ± 0.055 | 0.979 | **1.62×** | 1.07 |
+| 5 | 0.436 ± 0.046 | 0.688 | 0.689 ± 0.039 | 0.796 | **1.58×** | 1.03 |
+| 6 | 0.439 ± 0.049 | 0.668 | 0.693 ± 0.040 | 0.857 | **1.58×** | 1.02 |
+| 7 | 0.442 ± 0.053 | 0.609 | 0.685 ± 0.035 | 0.885 | **1.55×** | 1.01 |
+| 8 | 0.436 ± 0.058 | 0.743 | 0.722 ± 0.057 | 0.987 | **1.66×** | 1.03 |
+| 9 | 0.440 ± 0.058 | 0.723 | 0.733 ± 0.058 | 1.016 | **1.67×** | 1.02 |
+| 10 | 0.494 ± 0.111 | 0.871 | 0.764 ± 0.109 | 1.174 | **1.55×** | 0.91 |
+
+- **The fused router does not degrade as you widen the kernel.** Mean step time is flat at ~0.43 ms
+  from K=3 through K=9 (`k@3/k@K ≈ 1.0`); only at K=10 does it tick up ~12% with a wider tail. Adding
+  routing context costs essentially nothing up to a fairly wide kernel.
+- **The compiled baseline degrades faster.** cuDNN's conv gets more expensive per tap (its
+  `k@3/k@K` falls to ~0.88 by K=10), so the fused advantage **widens** with `K` — from 1.49× at K=3
+  to **1.66–1.67×** at K=8–9. Fused p95/p99 sit below the compiled tail at every `K`.
+- **Gradients stay exact at every `K`** (relative error 2–3e-4, index/count agreement exact) — the
+  fused conv is correct across the whole range, not only at the K=4 default.
+
+<Aside type="note">
+These are steady-state per-iteration samples (each individually synced), so the absolute ms run higher
+than the warm `bench.py` figure behind the ~1.86× headline above. The scaling conclusions are the
+**flatness in `K`** and the **~1.5–1.67× advantage that holds and slightly widens** as the kernel grows.
+</Aside>
+
 ## API
 
 ```python
