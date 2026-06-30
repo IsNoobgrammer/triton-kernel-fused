@@ -97,6 +97,24 @@ cuBLAS doesn't), but amalg beats flash by batching the same-shape group into one
 + compile vs their per-param launches. We beat their exact impl at BOTH levels AND orthogonalize
 tighter (SV .97-.98 vs .84-.90, PE coeffs). [VRAM cleared between runs: empty_cache freed ~40GB.]
 
+## B@X INVESTIGATION (the non-symmetric NS GEMM) — pushed with profiler+roofline+fp8, it's at floor
+torch.profiler, 10x NS(5) @ d=4096, CUDA self-time:
+  cutlass f16 gemm (B@X)   18.04ms  46.2%   <- biggest kernel, irreducible
+  _bmmt_kernel (X X^T)     10.03ms  25.7%
+  _bmmt_axpy (bA+cA^2)      9.82ms  25.1%
+  memcpy/norm/elementwise   ~1.2ms   ~3%
+Roofline: B@X = 371 TFLOP/s (cutlass tensorop, near SoL for square fp16 on RTX PRO 6000).
+Levers tried on B@X, ALL fail:
+  - symmetry: B@X output not symmetric -> no FLOP cut.
+  - reassociation B@X=b(A@X)+cA(A@X): MORE FLOPs (replaces cheap 0.5*M^3 A^2 with two full M^2K). Ruled out.
+  - fp8 (_scaled_mm): 0.69-0.81x of fp16 (quantize overhead, not at peak) AND breaks orthogonalization
+    (fp8 NS SV spread 0.001..2.2; 3 mantissa bits kill small singular values). Dead on both counts.
+  - hand Triton GEMM: loses to cutlass (known: tl.dot < cuBLAS).
+CONCLUSION: B@X is at its floor; the ~1.5x NS-step ceiling is FUNDAMENTAL. amalg ~1.43x is ~93-95%
+of it. Remaining slivers: symmul kernels are ~0.55x of B@X each vs ideal 0.5x -> ~10% headroom on OUR
+triton kernels (worth ~5% on the step) via autotune. Only structural way past 1.5x = fewer NS steps
+(4 vs 5 = algorithm/convergence change, user-owned, orthogonal to the kernel work).
+
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),
 parity-exact, and uses <= the champion's memory. i.e. it strictly dominates the optimizer we SHIP
