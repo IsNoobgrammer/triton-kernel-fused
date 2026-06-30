@@ -1,7 +1,10 @@
 # Scope contract — Symmetric-matmul ("symmul") Newton-Schulz fused into our Muon
 
-Status: CONFIRMED + Phase-0 artifacts written. Loop is HUMAN-GATED (agent cannot run GPU; user
-runs the bench on the box and pastes results, then agent diagnoses + generates the next candidate).
+Status: SHIPPED (2026-06-30). sm120 FusedMuon now DEFAULTS to the symmetric-matmul ("symmul") NS;
+`use_symmul=False` gives the pure-cuBLAS champion; `AmalgamatedMuon` is a back-compat alias.
+Verified on RTX PRO 6000: parity vs cuBLAS champion 1.95e-3 (<2e-2), 1.31x faster at 0.61B, mem ==.
+Full results (NS micro, 4-way, 1B-2.6B scaling, flash-muon head-to-head, B@X profiler/roofline/fp8)
+in symmul_reflections.md. NO precision tradeoff -> symmul is the Blackwell default.
 Date: 2026-06-30. GPU dev box: RTX PRO 6000 Blackwell sm_120 (no nvcc -> Triton-only).
 
 ## RESOLVED (user call, 2026-06-30)
