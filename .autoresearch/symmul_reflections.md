@@ -84,6 +84,19 @@ win replicates). At these large matrices batching is inert (fused 1.03-1.06x cmp
 the symmul FLOP cut, stable from 1B to 2.6B+. SHIP-WORTHY: dominates compiled and champion on speed
 AND memory across the full large-model range.
 
+## HEAD-TO-HEAD vs flash-muon's EXACT code (nil0x9/flash-muon main, verified verbatim)
+NS micro (single matrix), amalg (PE/fp16, batched symmul + fused-axpy + compile) vs their EXACT
+fast_newtonschulz (Jordan/bf16, matmul_transpose_assign x2 + elementwise B):
+  d=2048: amalg 0.787ms (SV .982) | flash 0.887ms (SV .897) | 1.13x
+  d=4096: amalg 3.853ms (SV .978) | flash 4.382ms (SV .852) | 1.14x
+  d=8192: amalg 30.85ms (SV .974) | flash 33.86ms (SV .837) | 1.10x
+Optimizer step, dense 0.81B (H=4096 L=4): compiled 299.8 | flash 273.1 | fused 291.5 | amalg 233.6 ms
+  -> amalg/flash 1.17x, amalg/compiled 1.28x, amalg/fused 1.25x.
+NOTE: flash (per-param symmul) BEATS fused/compiled at large dense matrices (gets the FLOP cut full
+cuBLAS doesn't), but amalg beats flash by batching the same-shape group into one symmul + fused-axpy
++ compile vs their per-param launches. We beat their exact impl at BOTH levels AND orthogonalize
+tighter (SV .97-.98 vs .84-.90, PE coeffs). [VRAM cleared between runs: empty_cache freed ~40GB.]
+
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),
 parity-exact, and uses <= the champion's memory. i.e. it strictly dominates the optimizer we SHIP
