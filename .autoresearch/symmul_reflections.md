@@ -74,6 +74,16 @@ KEY CORRECTIONS to earlier (over-pessimistic) notes:
    1.20-1.28x once gram>=2048 so symmul fires). Best-of-both envelope: batching where matrices are
    small, symmul where large. Parity PASS throughout.
 
+## SCALE TEST 1B-2.6B params (both width H AND depth layers up) -- win is scale-invariant
+  H3072 L4 (0.96B): compiled 253ms  fused 240 (1.06x)  amalg 186 (1.36x cmp / 1.29x fused)  mem a/c 0.98x
+  H3584 L5 (1.64B): compiled 479ms  fused 463 (1.03x)  amalg 364 (1.32x cmp / 1.27x fused)  mem a/c 0.99x
+  H4096 L6 (2.57B): compiled 809ms  fused 786 (1.03x)  amalg 613 (1.32x cmp / 1.28x fused)  mem a/c 0.99x
+parity 5.9e-3 PASS throughout. amalg ~1.32x compiled / ~1.28x champion, mem < compiled, at every
+scale. Depth doesn't change it (more layers = more matrices of the same sizes -> per-matrix symmul
+win replicates). At these large matrices batching is inert (fused 1.03-1.06x cmp) so amalg's gain is
+the symmul FLOP cut, stable from 1B to 2.6B+. SHIP-WORTHY: dominates compiled and champion on speed
+AND memory across the full large-model range.
+
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),
 parity-exact, and uses <= the champion's memory. i.e. it strictly dominates the optimizer we SHIP
