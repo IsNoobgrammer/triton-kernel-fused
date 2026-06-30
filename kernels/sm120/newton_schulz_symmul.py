@@ -28,9 +28,11 @@ import triton.language as tl
 from kernels.sm75.muon import _PE_COEFFS, newton_schulz as _newton_schulz_cublas  # noqa: F401
 
 
-# Shape-dispatch threshold: below this matrix dim the symmetric FLOP cut does not beat cuBLAS
-# (flash-muon: wash at dim<=1024). Tunable by the loop. `symmul` dispatches to cuBLAS bmm below.
-SYMMUL_MIN_DIM = 1024
+# Shape-dispatch threshold on the GRAM dim (min(rows,cols)): at/above this the symmetric FLOP cut
+# beats cuBLAS, below it loses. MEASURED on RTX PRO 6000 (fp16): gram=1024 symmul=0.71x (loss),
+# gram=2048 symmul=1.22x (win) -> knee at 2048. Below the knee newton_schulz_symmul returns the
+# CHAMPION verbatim (cuBLAS+baddbmm) so the batched-small / small-matrix regime never regresses.
+SYMMUL_MIN_DIM = 2048
 
 
 def _bmmt_configs():
@@ -136,6 +138,13 @@ def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)
     the baddbmm fold on those two terms — the tradeoff the loop measures), but the GEMM FLOPs are
     ~halved. `symmul` self-dispatches to cuBLAS below SYMMUL_MIN_DIM so small matrices never regress.
     """
+    # Gate on the Gram dim min(rows,cols): below the knee the symmetric cut loses, so return the
+    # champion verbatim (cuBLAS + baddbmm fold) -> the batched-small / small-matrix regime never
+    # regresses, by construction (identical op to the champion, not a re-implementation).
+    gram = min(G.shape[-2], G.shape[-1])
+    if gram < SYMMUL_MIN_DIM:
+        return _newton_schulz_cublas(G, coeffs, ns_dtype, eps)
+
     orig_dtype = G.dtype
     squeeze = G.ndim == 2
     X = G.unsqueeze(0) if squeeze else G
@@ -144,11 +153,17 @@ def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)
     if transposed:
         X = X.transpose(1, 2)
     X = X.to(ns_dtype) / nrm.to(ns_dtype)
+    Bsz, M, _ = X.shape
+    # Preallocate the two Gram buffers ONCE and reuse them every iteration (no per-iter alloc), and
+    # fold the polynomial b*A + c*AA IN-PLACE into the AA buffer so B aliases it -> the live working
+    # set is X + A + AA (same as the champion's X/A/B), recovering the memory the explicit axpy lost.
+    A = torch.empty((Bsz, M, M), device=X.device, dtype=ns_dtype)
+    AA = torch.empty_like(A)
     for a, b, c in coeffs:
-        A = symmul(X)                                   # X X^T  (symmetric -> half FLOPs)
-        AA = symmul(A)                                  # A A^T = A A  (A is exactly symmetric)
-        B = b * A + c * AA                              # explicit axpy (no baddbmm fold here)
-        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)   # a*X + B X  (non-symmetric -> cuBLAS)
+        symmul(X, out=A)                                # A = X X^T   (symmetric -> half FLOPs)
+        symmul(A, out=AA)                               # AA = A A^T = A A  (A is exactly symmetric)
+        AA.mul_(c).add_(A, alpha=b)                     # B = b*A + c*AA, in-place into AA (no new alloc)
+        X = torch.baddbmm(X, AA, X, beta=a, alpha=1.0)  # a*X + B X  (non-symmetric -> cuBLAS)
     if transposed:
         X = X.transpose(1, 2)
     if squeeze:
