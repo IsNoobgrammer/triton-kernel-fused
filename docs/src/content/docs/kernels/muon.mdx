@@ -65,7 +65,7 @@ FusedMuon(
     scale_mode="polarexpress",         # "polarexpress" (alias "jordan") | "moonlight"
     ns_batch_elems=8 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate); sm120 knee = 8M
     use_symmul=True,                   # symmetric-matmul NS (the amalgamated default); False = pure cuBLAS
-    use_graph=False,                   # opt-in CUDA-graph capture (off by default; stays on cuBLAS)
+    use_graph=False,                   # opt-in CUDA-graph capture (off by default; captures symmul too)
 )
 ```
 
@@ -92,7 +92,7 @@ AdamW for everything else.
 | `scale_mode` | `"polarexpress"` | The **post-Newton-Schulz update multiplier** (`p += -lr·scale·update`) — it does **not** touch the NS iteration or its coefficients. `"polarexpress"` (alias `"jordan"`) = `max(1, rows/cols)**0.5`, the aspect-ratio scale of the Polar-Express baseline. `"moonlight"` = `0.2·sqrt(max(rows, cols))`, a consistent-RMS scale that puts the LR in the AdamW band. |
 | `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
 | `use_symmul` | `True` (sm120) | Use the symmetric-matmul Newton-Schulz (`fused` + `symmul`). `False` = the pure-cuBLAS NS (no Triton). Same precision either way; see [Symmetric-matmul Newton-Schulz](#symmetric-matmul-newton-schulz-blackwell). |
-| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. A wall-clock wash on a compute-bound host; only helps a launch-bound one (slow CPU / many tiny params). Bakes in static `lr`/`wd`/`momentum`; stays on the cuBLAS NS. |
+| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs symmul too (forced to its eager Triton path, which is graph-capturable). **Speed is a wash** on a compute-bound step (T4 / Blackwell / even a 4GB laptop all measured ~1.0×), but the graph's static buffer pool **lowers peak memory ~30%** (e.g. 644 → 445 MB) — useful on a memory-constrained GPU. Bakes in static `lr`/`wd`/`momentum`. |
 
 ### Fast mode — trading memory for speed
 
@@ -236,7 +236,8 @@ coefficients reach ~0.98 *and* the faster kernel.)
 fp8 was tested and rejected — `_scaled_mm` ran *slower* than fp16 here and fp8 shattered orthogonalization
 (SV spread `0.001`→`2.2`). So ~1.5× is the algorithmic ceiling for this lever and the kernel sits at
 ~93–95% of it. Set `use_symmul=False` for the pure-cuBLAS path (no Triton — for a Triton-free environment
-or an exact-reference run); the opt-in CUDA-graph path also stays on cuBLAS.
+or an exact-reference run). The opt-in CUDA-graph path (`use_graph=True`) captures the symmul step too
+(via its eager Triton path) — same speed, ~30% lower peak memory.
 </Aside>
 
 ## Usage

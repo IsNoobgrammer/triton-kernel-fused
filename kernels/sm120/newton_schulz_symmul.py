@@ -266,7 +266,7 @@ def _amalg_eager(X, coeffs):
 AMALG_COMPILE = _amalg_compiled is not None
 
 
-def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
+def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7, force_eager=False):
     """Polar-Express Newton-Schulz with the two SYMMETRIC GEMMs done by the symmul kernel.
 
     Bit-for-bit the same algorithm as `kernels.sm75.muon.newton_schulz` (same PE coeffs, same
@@ -290,7 +290,10 @@ def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)
     if transposed:
         X = X.transpose(1, 2)
     X = (X.to(ns_dtype) / nrm.to(ns_dtype)).contiguous()
-    if AMALG_COMPILE:
+    # force_eager=True bypasses torch.compile so the body is pure Triton + baddbmm — which IS
+    # CUDA-graph-capturable (the compiled/inductor path manages its own cudagraphs and can't be
+    # re-captured in an outer torch.cuda.graph). The optimizer's graph path uses force_eager=True.
+    if AMALG_COMPILE and not force_eager:
         try:
             X = _amalg_compiled(X, coeffs)
         except Exception:                               # graph-unfriendly env -> eager (keeps the speed win)

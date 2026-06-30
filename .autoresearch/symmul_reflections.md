@@ -122,10 +122,15 @@ auto-set). Box (torch2.12) still compiles. Symmul transfers to Ampere AND graph 
   NS micro symmul vs cuBLAS: d2048 1.49x, d4096 1.51x (better than Blackwell's 1.43x — consumer cuBLAS
     leaves more room), parity exact (0.0-1.2e-4).
   Optimizer (mixed 18M, 3x2048^2): symmul-eager 71.2ms / cuBLAS-eager 98.4ms / cuBLAS-graph 97.9ms.
-  -> symmul 1.38x cuBLAS-eager. CUDA-graph CAPTURED (graph_captured=True) but 1.00x vs cuBLAS-eager:
-     compute-bound even on a slow-CPU laptop -> use_graph is a SPEED WASH everywhere (T4/Blackwell/3050),
-     only saves memory (644->445MB). use_graph=True costs 1.37x (loses symmul, gains ~0 from graph).
-     KEEP use_graph=False (the default). Repro: .autoresearch/bench_graph_local.py.
+  -> symmul 1.38x cuBLAS-eager. CUDA-graph is a SPEED WASH (compute-bound everywhere: T4/Blackwell/3050,
+     ~1.0x) but saves ~30% peak memory via its static pool.
+SYMMUL-IN-GRAPH NOW WIRED + VERIFIED LOCALLY: newton_schulz_symmul gained force_eager=True (bypasses
+torch.compile -> pure Triton + baddbmm = CUDA-graph-capturable; the compiled/inductor path can't be
+re-captured in an outer manual graph). sm120 FusedMuon._compute overridden to use it, so use_graph=True
++ use_symmul=True captures the SYMMUL step. Measured (3050, mixed 18M): symmul-graph 70.8ms/445MB vs
+symmul-eager 71.2ms/644MB = 1.01x speed, 1.45x LESS memory, captured=True, bit-identical (isolated
+capture test: max|d|=0.0, SV 0.982). => use_graph=True is now symmul-speed + graph-memory (best of both
+on memory-constrained GPUs); default stays use_graph=False. Repro: .autoresearch/bench_graph_local.py.
 
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),

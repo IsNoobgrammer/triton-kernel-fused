@@ -39,8 +39,10 @@ class FusedMuon(_FusedMuon75):
     matrices are bit-for-bit unchanged.
 
     `use_symmul=False` -> the pure-cuBLAS champion step (no Triton kernels launched) for a Triton-free
-    environment or an exact-reference run. The opt-in CUDA-graph path (`use_graph=True`) still uses the
-    cuBLAS NS. State dict / constructor are identical either way.
+    environment or an exact-reference run. With `use_graph=True` the captured body ALSO runs symmul (forced
+    to its eager Triton path, which is CUDA-graph-capturable); the graph is a speed wash on a compute-bound
+    step but lowers peak memory, so symmul-in-graph = symmul speed + the graph's smaller footprint (useful
+    on a memory-constrained GPU). State dict / constructor are identical across all modes.
     """
 
     def __init__(self, *args, use_symmul=True, **kwargs):
@@ -80,6 +82,21 @@ class FusedMuon(_FusedMuon75):
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
         return loss
+
+    def _compute(self, work, decay):
+        """The CUDA-graph-captured body (used when use_graph=True). Runs symmul forced to its eager
+        Triton path (capturable) when use_symmul; else defers to the cuBLAS compute."""
+        if not self.use_symmul:
+            return super()._compute(work, decay)
+        for params, f in decay:
+            torch._foreach_mul_(params, f)
+        for w in work:
+            mom_c, gbuf = w["mom_c"], w["gbuf"]
+            mom_c.mul_(w["momentum"]).add_(gbuf)
+            u = gbuf.add_(mom_c, alpha=w["momentum"]) if w["nesterov"] else mom_c
+            out = newton_schulz_symmul(u, self.coeffs, self.ns_dtype, force_eager=True)
+            torch._foreach_add_(w["out_params"],
+                                [out[o:o + n].reshape(p.shape) for p, o, n in w["members"]], alpha=w["alpha"])
 
 
 class DistributedMuon(_DistributedMuon75):
