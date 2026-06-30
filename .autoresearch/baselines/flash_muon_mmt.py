@@ -89,3 +89,63 @@ def matmul_transpose(d_in):
     d_out = torch.empty((M, M), device=d_in.device, dtype=d_in.dtype)
     matmul_transpose_assign(d_in, d_out)
     return d_out
+
+
+# ── flash-muon's EXACT Newton-Schulz + optimizer (nil0x9/flash-muon muon.py, verbatim) ──
+import torch.optim as _optim
+
+
+def fast_newtonschulz(G, steps=5):
+    """nil0x9/flash-muon muon.py fast_newtonschulz, VERBATIM (Jordan quintic coeffs, bf16,
+    buf1/buf2 reuse, matmul_transpose_assign for the two symmetric GEMMs). 2D only."""
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    buf1 = torch.empty(X.size(0), X.size(0), dtype=X.dtype, device=X.device)
+    buf2 = torch.empty(X.size(0), X.size(0), dtype=X.dtype, device=X.device)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        matmul_transpose_assign(X, buf1)
+        matmul_transpose_assign(buf1, buf2)
+        B = b * buf1 + c * buf2
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+class FlashMuon(_optim.Optimizer):
+    """flash-muon's optimizer NS used single-GPU: per-param momentum + their exact fast_newtonschulz
+    (the distributed all_gather is stripped; for world_size=1 it changes nothing). 3D expert stacks
+    are looped per slice since their NS is 2D-only. This is the apples-to-apples 'their triu' baseline
+    at the optimizer level (no cross-param batching, their Jordan/bf16 NS)."""
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0, ns_steps=5):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                      weight_decay=weight_decay, ns_steps=ns_steps))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr, momentum, wd, nesterov, steps = (group["lr"], group["momentum"], group["weight_decay"],
+                                                 group["nesterov"], group["ns_steps"])
+            for p in group["params"]:
+                if p.grad is None or p.ndim not in (2, 3):
+                    continue
+                g = p.grad
+                st = self.state[p]
+                if "momentum_buffer" not in st:
+                    st["momentum_buffer"] = torch.zeros_like(g)
+                buf = st["momentum_buffer"]
+                buf.lerp_(g, 1 - momentum)
+                u = g.lerp_(buf, momentum) if nesterov else buf
+                if u.ndim == 3:
+                    out = torch.stack([fast_newtonschulz(u[i], steps) for i in range(u.shape[0])])
+                else:
+                    out = fast_newtonschulz(u, steps)
+                scale = max(1, p.shape[-2] / p.shape[-1]) ** 0.5
+                if wd > 0.0:
+                    p.mul_(1.0 - lr * wd)
+                p.add_(out.to(p.dtype).reshape(p.shape), alpha=-lr * scale)
