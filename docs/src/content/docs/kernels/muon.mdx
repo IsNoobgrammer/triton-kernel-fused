@@ -111,6 +111,51 @@ Newton-Schulz dtype stays **fp16** on every arch: bf16's 7 mantissa bits orthogo
 fp16's 10, and Blackwell runs fp16 on full-rate tensor cores, so fp16 is both tighter and fast.
 </Aside>
 
+## Scaling the Newton-Schulz iteration count
+
+The default recipe runs **5** Newton-Schulz iterations. Some recent work argues for more
+(around **10**) for tighter orthogonalization. Since each iteration is a fixed three matmuls,
+scaling the count is a clean test of whether the fusion advantage is a quirk of 5 iterations
+or a property of the step itself. It is the latter — the advantage holds across the range.
+
+Measured on an **RTX PRO 6000 Blackwell (`sm_120`)**, fused fp16 vs a `torch.compile`'d
+(`fullgraph`) Polar-Express baseline, both at the **same** iteration count, median step time:
+
+| NS iters | 75M fused / compiled | speedup | 302M fused / compiled | speedup |
+|---|---|---|---|---|
+| 5 | 7.44 / 16.31 ms | **2.19×** | 28.8 / 64.9 ms | **2.26×** |
+| 6 | 8.41 / 18.25 ms | **2.17×** | 31.6 / 72.7 ms | **2.30×** |
+| 7 | 9.40 / 19.91 ms | **2.12×** | 35.2 / 90.1 ms | **2.56×** |
+| 8 | 10.39 / 21.82 ms | **2.10×** | 37.6 / 86.7 ms | **2.30×** |
+| 9 | 11.38 / 23.65 ms | **2.08×** | 41.1 / 94.1 ms | **2.29×** |
+| 10 | 12.25 / 26.61 ms | **2.17×** | 44.7 / 103.1 ms | **2.31×** |
+
+The fused-vs-compiled advantage is essentially **flat across the range** — ~2.1× at 75M and
+~2.3× at 302M — so the win is a property of the fusion, not of one iteration count. Two
+consequences are worth calling out, because they make the higher iteration count cheap to adopt:
+
+- **The marginal cost of each added iteration is ~half.** Going from 5 to 10 iterations costs
+  the fused path **~0.96 ms/iter** (75M) and **~3.19 ms/iter** (302M), versus **~2.06 ms/iter**
+  and **~7.64 ms/iter** for the compiled baseline — roughly **2.1–2.4× cheaper to add** an
+  iteration. (Expressed as throughput retained, both paths keep ~61–64% of their 5-iter speed
+  at 10 iterations — the *relative* slope is the same; the fused path's advantage is the
+  constant ~2× factor on top, so the absolute time lost per iteration is half.)
+- **Doubling the iteration count is still cheaper than the baseline at 5.** Fused at 10
+  iterations (12.25 ms / 44.7 ms) beats the compiled baseline at 5 (16.31 ms / 64.9 ms). You can
+  move to 10-iteration Newton-Schulz on `FusedMuon` and still come out ahead of `torch.compile`
+  at today's default.
+
+Peak memory is **flat across the iteration count** (Newton-Schulz reuses its working buffers),
+so more iterations stay within the same memory gate.
+
+<Aside type="note">
+This is a runtime-scaling study: step time is set by the iteration **count** (three matmuls
+each), and the per-iteration coefficient values only affect orthogonalization quality. The 5
+Polar-Express tuples are tuned per iteration; for counts above 5 the settled (last) tuple is
+repeated to reach `N`. Pass your own `coeffs` tuple of length `N` to `FusedMuon` /
+`newton_schulz` to run `N` iterations.
+</Aside>
+
 ## Usage
 
 ```python
