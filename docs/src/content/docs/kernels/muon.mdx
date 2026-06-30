@@ -156,6 +156,66 @@ repeated to reach `N`. Pass your own `coeffs` tuple of length `N` to `FusedMuon`
 `newton_schulz` to run `N` iterations.
 </Aside>
 
+## Symmetric-matmul Newton-Schulz (Blackwell)
+
+Two of the three Newton-Schulz GEMMs are **symmetric**: `A = X·Xᵀ` and `A·A`. A symmetric product
+`M·Mᵀ` only needs its upper triangle — compute those output tiles, transpose-copy each to its mirror,
+skip the lower triangle, and you spend about **half** the GEMM FLOPs. On `sm_120` this is the default
+Newton-Schulz:
+
+```python
+A = symmul(X)              # X·Xᵀ   — Triton triangle + mirror   (~½ FLOPs)
+B = symmul_axpy(A, b, c)   # b·A + c·A²   — fused into the kernel epilogue (~½ FLOPs)
+X = baddbmm(X, B, X, β=a)  # a·X + B·X — non-symmetric, stays cuBLAS
+```
+
+This is **orthogonal** to the launch/batching wins above, so it composes with them: `kernels.sm120`
+batches the symmetric kernel across same-shape parameters in one launch. The symmetric matmul is adapted
+from [nil0x9/flash-muon](https://github.com/nil0x9/flash-muon) (Triton triangle + transpose-copy; idea
+originally by Laker Newhouse et al.), with a batch dimension and a fused polynomial epilogue added.
+
+Measured on an **RTX PRO 6000 Blackwell (`sm_120`)**, single square matrix, Newton-Schulz(5), fp16 —
+five implementations (`eager` = naive PyTorch, `compiled` = `torch.compile`, `ours-fused` = our
+cuBLAS+`baddbmm` NS, `flash` = flash-muon's exact `fast_newtonschulz`, `ours-amalg` = symmetric-matmul):
+
+| dim | compiled | ours-fused | flash | **ours-amalg** | amalg vs compile |
+|---|---|---|---|---|---|
+| 1024 | 0.249 ms | 0.237 | 0.325 | **0.237** | 1.05× |
+| 2048 | 1.076 ms | 1.050 | 0.889 | **0.755** | **1.43×** |
+| 4096 | 5.800 ms | 5.502 | 4.381 | **3.847** | **1.51×** |
+| 8192 | 44.23 ms | 43.31 | 33.83 | **31.05** | **1.42×** |
+
+At the full optimizer step (dense ~0.4B params), the batched state composes with the symmetric cut:
+
+| optimizer | step | peak | speedup |
+|---|---|---|---|
+| `torch.compile` | 124.6 ms | 3846 MB | 1.00× |
+| ours-fused (cuBLAS) | 119.0 ms | 3519 MB | 1.05× |
+| flash (nil0x9) | 109.7 ms | 4779 MB | 1.14× |
+| **ours-amalg** | **91.2 ms** | 4725 MB | **1.37×** |
+
+The advantage is scale-invariant from 1B to 2.6B params (width *and* depth): ~1.32× over `torch.compile`,
+~1.28× over our own champion, at ≤ compiled memory.
+
+<Aside type="note">
+**Parity — no precision tradeoff.** The symmetric kernel changes only the *order* of floating-point adds
+(triangle+mirror vs full `bmm`), not the math: it runs the identical fp16 NS with fp32 accumulate. Against
+an fp32 reference, `ours-amalg` matches `ours-fused` **exactly** — max|Δ| `8.5e-5`–`2.5e-4`, 30–200× under
+the Newton-Schulz tolerance (`2e-2`), with identical singular values (SV mean ~0.98). It replaces
+`FusedMuon` on Blackwell with no accuracy cost. (flash-muon uses the original Jordan coefficients — SV mean
+~0.85 after 5 steps — so it is compared on speed and orthogonality, not bit-parity; our Polar-Express
+coefficients reach ~0.98 *and* the faster kernel.)
+</Aside>
+
+<Aside type="caution">
+**The ceiling.** Only 2 of the 3 NS GEMMs are symmetric; `B·X` is a full cuBLAS tensor-core GEMM at
+~371 TFLOP/s (near speed-of-light, 46% of the step by `torch.profiler`) and is irreducible by symmetry.
+fp8 was tested and rejected — `_scaled_mm` ran *slower* than fp16 here and fp8 shattered orthogonalization
+(SV spread `0.001`→`2.2`). So ~1.5× is the algorithmic ceiling for this lever and the kernel sits at
+~93–95% of it. Set `use_symmul=False` for the pure-cuBLAS path (no Triton — for a Triton-free environment
+or an exact-reference run); the opt-in CUDA-graph path also stays on cuBLAS.
+</Aside>
+
 ## Usage
 
 ```python
