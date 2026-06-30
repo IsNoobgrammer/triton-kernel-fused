@@ -69,12 +69,14 @@ class FusedMuon(optim.Optimizer):
     """Polar-Express Muon with foreach + baddbmm + configurable NS dtype (bf16 baseline / fp16 for T4).
 
     Only 2D and 3D params with a grad are stepped (3D experts orthogonalized per slice); route 1D params
-    and conv kernels to AdamW upstream. `scale_mode`: 'jordan' = max(1, rows/cols)**0.5 (the PE baseline);
-    'moonlight' = 0.2*sqrt(max(rows,cols)) (BiBo's current consistent-RMS scale, AdamW-band LR).
+    and conv kernels to AdamW upstream. `scale_mode` sets the POST-Newton-Schulz update multiplier (the
+    `alpha` in `p += -lr*scale*update`); it does NOT touch the NS iteration or its coefficients.
+    'polarexpress' (default, alias 'jordan') = max(1, rows/cols)**0.5 — the aspect-ratio scale of the
+    Polar-Express baseline. 'moonlight' = 0.2*sqrt(max(rows,cols)) — a consistent-RMS scale (AdamW-band LR).
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="jordan",
+                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="polarexpress",
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -106,7 +108,7 @@ class FusedMuon(optim.Optimizer):
         r, c = p.shape[-2], p.shape[-1]
         if self.scale_mode == "moonlight":
             return 0.2 * (max(r, c) ** 0.5)
-        return max(1, r / c) ** 0.5                                   # jordan (PE baseline)
+        return max(1, r / c) ** 0.5                                   # polarexpress / jordan (aspect-ratio scale)
 
     def _plan(self, group, params):
         """Build (once, cached) the same-shape grouping + one persistent (M,r,c) batched momentum buffer

@@ -1,0 +1,3 @@
+# The benchmark writeup is a generated artifact — keep it out of GitHub's language stats.
+*.html linguist-generated=true
+.autoresearch/** linguist-documentation=true

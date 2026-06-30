@@ -6,7 +6,7 @@ description: Polar-Express Newton-Schulz Muon optimizer step, launch-overhead-fu
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels.sm75 import FusedMuon, DistributedMuon, newton_schulz
+from kernels.sm120 import FusedMuon, DistributedMuon, newton_schulz, newton_schulz_symmul
 ```
 
 A fused implementation of the **Muon** optimizer step using a Polar-Express Newton-Schulz
@@ -53,18 +53,25 @@ Parity vs the trusted reference is ~7e-7 (fp32 path). A faster setting exists if
 ## API
 
 ```python
+from kernels.sm120 import FusedMuon
+
 FusedMuon(
     params,
     lr=0.02,
     momentum=0.95,
     nesterov=True,
     weight_decay=0.0,
-    ns_dtype=torch.float16,            # T4 default; fp32 = safe fallback, bf16 = Ampere/Hopper only
-    scale_mode="jordan",               # "jordan" | "moonlight"
-    ns_batch_elems=4 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate)
-    use_graph=False,                   # opt-in CUDA-graph capture (off by default)
+    ns_dtype=torch.float16,            # fp16 (tensor cores); fp32 = safe fallback, bf16 = Ampere/Hopper
+    scale_mode="polarexpress",         # "polarexpress" (alias "jordan") | "moonlight"
+    ns_batch_elems=8 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate); sm120 knee = 8M
+    use_symmul=True,                   # symmetric-matmul NS (the amalgamated default); False = pure cuBLAS
+    use_graph=False,                   # opt-in CUDA-graph capture (off by default; stays on cuBLAS)
 )
 ```
+
+On `sm_120` `FusedMuon` is the **amalgamated** optimizer: `fused` + `symmul`, with `use_symmul=True` by
+default. It is a single class — flip `use_symmul=False` to fall back to the pure-cuBLAS Newton-Schulz
+(e.g. a Triton-free environment or an exact-reference run); there is no separate optimizer to import.
 
 <Aside type="caution">
 `FusedMuon` only steps **2D and 3D** parameters that have a gradient (3D stacked experts are orthogonalized
@@ -82,9 +89,10 @@ AdamW for everything else.
 | `nesterov` | `True` | Use Nesterov momentum. |
 | `weight_decay` | `0.0` | Decoupled (AdamW-style) weight decay. |
 | `ns_dtype` | `torch.float16` | Newton-Schulz compute dtype. **fp16** for T4 tensor cores; **fp32** for a numerically-safe fallback; **bf16** only on Ampere/Hopper. Normalization is always fp32 regardless. |
-| `scale_mode` | `"jordan"` | `"jordan"` = `max(1, rows/cols)**0.5` (the Polar-Express baseline). `"moonlight"` = `0.2·sqrt(max(rows, cols))` (a consistent-RMS scale that puts the LR in the AdamW band). |
-| `ns_batch_elems` | `4M` | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. The default keeps peak memory below the baseline. |
-| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. A wall-clock wash on a compute-bound host; only helps a launch-bound one (slow CPU / many tiny params). Bakes in static `lr`/`wd`/`momentum`. |
+| `scale_mode` | `"polarexpress"` | The **post-Newton-Schulz update multiplier** (`p += -lr·scale·update`) — it does **not** touch the NS iteration or its coefficients. `"polarexpress"` (alias `"jordan"`) = `max(1, rows/cols)**0.5`, the aspect-ratio scale of the Polar-Express baseline. `"moonlight"` = `0.2·sqrt(max(rows, cols))`, a consistent-RMS scale that puts the LR in the AdamW band. |
+| `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
+| `use_symmul` | `True` (sm120) | Use the symmetric-matmul Newton-Schulz (`fused` + `symmul`). `False` = the pure-cuBLAS NS (no Triton). Same precision either way; see [Symmetric-matmul Newton-Schulz](#symmetric-matmul-newton-schulz-blackwell). |
+| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. A wall-clock wash on a compute-bound host; only helps a launch-bound one (slow CPU / many tiny params). Bakes in static `lr`/`wd`/`momentum`; stays on the cuBLAS NS. |
 
 ### Fast mode — trading memory for speed
 
@@ -235,7 +243,7 @@ or an exact-reference run); the opt-in CUDA-graph path also stays on cuBLAS.
 
 ```python
 import torch
-from kernels.sm75 import FusedMuon
+from kernels.sm120 import FusedMuon
 
 # Two groups: matrices -> Muon, everything else -> AdamW.
 matrix_params = [p for n, p in model.named_parameters() if p.ndim in (2, 3) and "embed" not in n]
@@ -257,7 +265,7 @@ a FLOP-balanced subset of the parameters and broadcasts its packed updates; ever
 update set.
 
 ```python
-from kernels.sm75 import DistributedMuon
+from kernels.sm120 import DistributedMuon
 
 opt = DistributedMuon(matrix_params, lr=0.02, weight_decay=0.01, process_group=None)
 ```
@@ -274,18 +282,70 @@ one dtype.
 
 ## `newton_schulz` (standalone)
 
-The orthogonalization is exported on its own for direct use:
+The orthogonalization is exported on its own for direct use. On `sm_120` there are two interchangeable
+implementations — `newton_schulz` (pure cuBLAS) and `newton_schulz_symmul` (the symmetric-matmul version,
+what `FusedMuon` calls by default):
 
 ```python
-from kernels.sm75 import newton_schulz
+from kernels.sm120 import newton_schulz, newton_schulz_symmul
 
-G = torch.randn(512, 512, device="cuda", dtype=torch.float16)
-O = newton_schulz(G, ns_dtype=torch.float16)   # singular values driven toward 1
+G = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
+O  = newton_schulz(G, ns_dtype=torch.float16)          # cuBLAS Newton-Schulz
+Os = newton_schulz_symmul(G, ns_dtype=torch.float16)   # ~1.4-1.5x faster, same output (parity 8.5e-5)
 ```
 
-It accepts a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches over
-`E`. Normalization is always done in fp32 (an fp16 sum-of-squares of a unit `512²` matrix would overflow);
-the iteration GEMMs run in `ns_dtype`.
+Both accept a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches over
+`E`, and share the same signature `(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)`. Normalization
+is always done in fp32 (an fp16 sum-of-squares of a unit `512²` matrix would overflow); the iteration GEMMs
+run in `ns_dtype`. `newton_schulz_symmul` self-gates: below the gram knee (`min(rows, cols) < 2048`) it
+calls the cuBLAS `newton_schulz` verbatim, so small matrices never regress.
+
+The lower-level symmetric primitives are exported too, if you want to build your own iteration:
+`symmul(X)` computes `X·Xᵀ` (batched triangle + mirror), and `symmul_axpy(A, b, c)` computes
+`b·A + c·(A·A)` for a symmetric `A` in one fused kernel.
+
+### Custom coefficients
+
+The iteration is `X ← a·X + b·(X·Xᵀ)·X + c·(X·Xᵀ)²·X`, with one `(a, b, c)` tuple **per step**. Pass your
+own `coeffs` — a tuple of `(a, b, c)` tuples — to use a different recipe. The number of tuples **is** the
+number of Newton-Schulz iterations:
+
+```python
+# 5 Polar-Express steps (the default _PE_COEFFS)
+from kernels.sm120 import newton_schulz_symmul
+O = newton_schulz_symmul(G)
+
+# your own 3-step quintic
+my_coeffs = (
+    (3.4445, -4.7750, 2.0315),   # step 1
+    (3.4445, -4.7750, 2.0315),   # step 2
+    (3.4445, -4.7750, 2.0315),   # step 3
+)
+O = newton_schulz_symmul(G, coeffs=my_coeffs)          # runs 3 iterations
+opt = FusedMuon(matrix_params, lr=0.02, coeffs=my_coeffs)   # same recipe inside the optimizer
+```
+
+### Scaling the iteration count
+
+Because each tuple is one iteration, you scale the count just by passing a longer `coeffs`. The Polar-Express
+defaults are tuned per-step for 5 steps; for **more** steps, repeat the settled (last) tuple to reach `N`:
+
+```python
+from kernels.sm75.muon import _PE_COEFFS    # the 5 tuned tuples
+
+def pe_coeffs(n_iters: int):
+    """Polar-Express coeffs scaled to n_iters: keep the 5 tuned tuples, repeat the last to extend."""
+    if n_iters <= len(_PE_COEFFS):
+        return _PE_COEFFS[:n_iters]
+    return _PE_COEFFS + (_PE_COEFFS[-1],) * (n_iters - len(_PE_COEFFS))
+
+opt = FusedMuon(matrix_params, lr=0.02, coeffs=pe_coeffs(10))   # 10-step Newton-Schulz
+```
+
+More steps give tighter orthogonalization (SV closer to 1) at a linear cost in matmuls. On Blackwell the
+marginal cost per added step is **about half** with the symmetric kernel, and peak memory is flat across the
+count (the iteration reuses its buffers) — see [Scaling the Newton-Schulz iteration count](#scaling-the-newton-schulz-iteration-count)
+for the measured curve.
 
 ## Benchmark
 
