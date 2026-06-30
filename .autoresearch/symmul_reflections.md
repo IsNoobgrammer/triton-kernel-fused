@@ -115,6 +115,18 @@ of it. Remaining slivers: symmul kernels are ~0.55x of B@X each vs ideal 0.5x ->
 triton kernels (worth ~5% on the step) via autotune. Only structural way past 1.5x = fewer NS steps
 (4 vs 5 = algorithm/convergence change, user-owned, orthogonal to the kernel work).
 
+## LOCAL GPU — RTX 3050 Laptop (sm_86 Ampere, 4GB), torch 2.6+cu124, triton 3.7 (free, no VM)
+Compile guard added: module-level torch.compile(_amalg_core) wrapped in try/except (the local env has a
+torch2.6/triton3.7 mismatch -> inductor import errors). Falls back to EAGER symmul kernels (AMALG_COMPILE
+auto-set). Box (torch2.12) still compiles. Symmul transfers to Ampere AND graph question answered:
+  NS micro symmul vs cuBLAS: d2048 1.49x, d4096 1.51x (better than Blackwell's 1.43x — consumer cuBLAS
+    leaves more room), parity exact (0.0-1.2e-4).
+  Optimizer (mixed 18M, 3x2048^2): symmul-eager 71.2ms / cuBLAS-eager 98.4ms / cuBLAS-graph 97.9ms.
+  -> symmul 1.38x cuBLAS-eager. CUDA-graph CAPTURED (graph_captured=True) but 1.00x vs cuBLAS-eager:
+     compute-bound even on a slow-CPU laptop -> use_graph is a SPEED WASH everywhere (T4/Blackwell/3050),
+     only saves memory (644->445MB). use_graph=True costs 1.37x (loses symmul, gains ~0 from graph).
+     KEEP use_graph=False (the default). Repro: .autoresearch/bench_graph_local.py.
+
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),
 parity-exact, and uses <= the champion's memory. i.e. it strictly dominates the optimizer we SHIP

@@ -242,7 +242,10 @@ def _amalg_core(X, coeffs):
     return X
 
 
-_amalg_compiled = torch.compile(_amalg_core)
+try:
+    _amalg_compiled = torch.compile(_amalg_core)
+except Exception:                                       # inductor unavailable (e.g. torch/triton mismatch)
+    _amalg_compiled = None
 
 
 def _amalg_eager(X, coeffs):
@@ -259,8 +262,8 @@ def _amalg_eager(X, coeffs):
     return X
 
 
-# Use the torch.compile path by default (inductor buffer planning); fall back to eager on any error.
-AMALG_COMPILE = True
+# Use the torch.compile path when inductor is available (buffer planning); else eager symmul kernels.
+AMALG_COMPILE = _amalg_compiled is not None
 
 
 def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
