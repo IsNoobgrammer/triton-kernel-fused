@@ -54,6 +54,26 @@ They can't multiply to 1.8x: a matrix big enough for symmul is too big for batch
    pools; eager+custom-kernel can't), but amalg mem ~= champion and within 6% of compiled at the
    optimizer level.
 
+## CORRECTED VERDICT — 4-way on bench_muon's REAL methodology, H-swept (bench_muon_4way.py)
+The NS-micro and my first d=4096-only optimizer bench were both MISLEADING. The faithful sweep
+(BiBo inventory: attn+dense MLP+3D experts, do_bench step, clean per-contender peak):
+  H     compiled   fused(x cmp)   amalg(x cmp / x fused)   mem amalg/compiled   parity
+  512   5.48ms     1.57 (3.49x)   1.57 (3.49x / 1.00x)     1.04x                5.9e-3
+  1024  9.17ms     7.16 (1.28x)   7.02 (1.31x / 1.02x)     0.92x                5.9e-3
+  2048  43.5ms    39.5 (1.10x)   33.0 (1.32x / 1.20x)     0.97x                5.9e-3
+  4096  267ms     262  (1.02x)   204  (1.31x / 1.28x)     0.97x                3.9e-3
+
+KEY CORRECTIONS to earlier (over-pessimistic) notes:
+1. fused-vs-compiled is ~3.49x at H=512 (matches the user's recollection), FADING to 1.02x at
+   H=4096. My earlier "fused==compiled" was H=4096-ONLY (compute-bound, batching inert) -- not the
+   whole curve. Not an optimizer bug.
+2. "mem <= compiled unreachable" was a NS-MICRO artifact (no optimizer state to amortize). At the
+   OPTIMIZER level amalg uses LESS mem than compiled for H>=1024 (0.92-0.97x); 1.04x at H=512
+   (==champion, negligible). The mem bar is MET in the real regime.
+3. amalg BEATS compiled at EVERY H (1.31-3.49x) and is >= fused everywhere (1.00x small H gated,
+   1.20-1.28x once gram>=2048 so symmul fires). Best-of-both envelope: batching where matrices are
+   small, symmul where large. Parity PASS throughout.
+
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),
 parity-exact, and uses <= the champion's memory. i.e. it strictly dominates the optimizer we SHIP
