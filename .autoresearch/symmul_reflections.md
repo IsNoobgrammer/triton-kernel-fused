@@ -129,8 +129,13 @@ torch.compile -> pure Triton + baddbmm = CUDA-graph-capturable; the compiled/ind
 re-captured in an outer manual graph). sm120 FusedMuon._compute overridden to use it, so use_graph=True
 + use_symmul=True captures the SYMMUL step. Measured (3050, mixed 18M): symmul-graph 70.8ms/445MB vs
 symmul-eager 71.2ms/644MB = 1.01x speed, 1.45x LESS memory, captured=True, bit-identical (isolated
-capture test: max|d|=0.0, SV 0.982). => use_graph=True is now symmul-speed + graph-memory (best of both
-on memory-constrained GPUs); default stays use_graph=False. Repro: .autoresearch/bench_graph_local.py.
+capture test: max|d|=0.0, SV 0.982).
+SWEEP (bench_graph_sweep.py, N x 2048^2): the memory win DOES NOT GENERALIZE — it inverts with scale.
+eager frees each chunk's symmul transients per-chunk; the captured graph holds ALL chunks' transients
+in its static pool. mem ratio eager/graph: 4mat 1.39x (graph saves) -> 8 1.04x -> 16 0.95x -> 24 0.90x
+-> 32 0.87x (graph WORSE). Speed flat 1.00x throughout. So symmul-in-graph is a NICHE knob: helps memory
+only for a few same-shape matrices, hurts past ~8-16; speed always a wash. Default use_graph=False stays
+correct. (My earlier "~30% mem saving" was the small-model regime; corrected.)
 
 ## What amalg DOES win (clean, measured)
 Beats ALL THREE baselines on SPEED at every dim >=2048 (1.33-1.43x fused/compiled, 1.08-1.11x triu),

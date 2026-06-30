@@ -92,7 +92,7 @@ AdamW for everything else.
 | `scale_mode` | `"polarexpress"` | The **post-Newton-Schulz update multiplier** (`p += -lr·scale·update`) — it does **not** touch the NS iteration or its coefficients. `"polarexpress"` (alias `"jordan"`) = `max(1, rows/cols)**0.5`, the aspect-ratio scale of the Polar-Express baseline. `"moonlight"` = `0.2·sqrt(max(rows, cols))`, a consistent-RMS scale that puts the LR in the AdamW band. |
 | `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
 | `use_symmul` | `True` (sm120) | Use the symmetric-matmul Newton-Schulz (`fused` + `symmul`). `False` = the pure-cuBLAS NS (no Triton). Same precision either way; see [Symmetric-matmul Newton-Schulz](#symmetric-matmul-newton-schulz-blackwell). |
-| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs symmul too (forced to its eager Triton path, which is graph-capturable). **Speed is a wash** on a compute-bound step (T4 / Blackwell / even a 4GB laptop all measured ~1.0×), but the graph's static buffer pool **lowers peak memory ~30%** (e.g. 644 → 445 MB) — useful on a memory-constrained GPU. Bakes in static `lr`/`wd`/`momentum`. |
+| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs symmul too (forced to its eager Triton path, which is graph-capturable). **Speed is a wash** on a compute-bound step (T4 / Blackwell / 4GB laptop all measured ~1.0×). Memory is **shape-dependent**: the graph's static pool wins for a *few* same-shape matrices (≈1.4× lower at 4× 2048²) but must hold *all* chunks' transients at once, so it **inverts past ~8–16 matrices** (≈0.87× at 32×, i.e. higher). A niche knob — leave it off unless you've measured a memory win on your exact model. Bakes in static `lr`/`wd`/`momentum`. |
 
 ### Fast mode — trading memory for speed
 
@@ -237,7 +237,8 @@ fp8 was tested and rejected — `_scaled_mm` ran *slower* than fp16 here and fp8
 (SV spread `0.001`→`2.2`). So ~1.5× is the algorithmic ceiling for this lever and the kernel sits at
 ~93–95% of it. Set `use_symmul=False` for the pure-cuBLAS path (no Triton — for a Triton-free environment
 or an exact-reference run). The opt-in CUDA-graph path (`use_graph=True`) captures the symmul step too
-(via its eager Triton path) — same speed, ~30% lower peak memory.
+(via its eager Triton path) — same speed, and a memory effect that depends on shape count (lower for a
+few same-shape matrices, higher past ~8–16; see the `use_graph` row above).
 </Aside>
 
 ## Usage
