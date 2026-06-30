@@ -342,5 +342,5 @@ class AmalgamatedMuon(_FusedMuon120):
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
                     out = newton_schulz_symmul(u, self.coeffs, self.ns_dtype)   # <-- the only change
                     torch._foreach_add_([p for p, _, _ in members],
-                                        [out[o:o + n].reshape(p.shape) for p, _, n in members], alpha=alpha)
+                                        [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
         return loss
