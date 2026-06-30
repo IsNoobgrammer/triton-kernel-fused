@@ -99,6 +99,35 @@ def run_sweep(h_list=(512, 1024, 2048, 4096), layers=2, E=4):
     return rows
 
 
+def run_configs(configs):
+    """configs = [(H, layers, E), ...] -- scale BOTH width and depth. Same contenders/metrics."""
+    rows = []
+    for H, layers, E in configs:
+        I = 768 if H == 512 else int(1.5 * H)
+        shapes = make_shapes(layers=layers, H=H, I=I, E=E)
+        nparam = sum(int(torch.tensor(s).prod().item()) for s in shapes)
+        mkf = lambda ps: FusedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16)
+        mk = {
+            "compiled": lambda ps: CompiledMuon(ps, lr=0.02, weight_decay=0.1),
+            "fused": mkf,
+            "amalg": lambda ps: AmalgamatedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16),
+        }
+        dpar = bm.parity(lambda ps: AmalgamatedMuon(ps, lr=0.02, weight_decay=0.1, ns_dtype=torch.float16), shapes)
+        res = {name: measure(fn, shapes) for name, fn in mk.items()}
+        tc = res["compiled"][0]; tf = res["fused"][0]
+        for name, (ms, mb) in res.items():
+            rows.append(dict(H=H, layers=layers, params_B=round(nparam / 1e9, 2), kernel=name,
+                             ms=round(ms, 2), MB=round(mb, 0),
+                             x_vs_compiled=round(tc / ms, 2), x_vs_fused=round(tf / ms, 2),
+                             mem_vs_compiled=round(mb / res["compiled"][1], 2),
+                             amalg_parity=("%.1e" % dpar) if name == "amalg" else ""))
+        print(f"H={H} L={layers} ({nparam/1e9:.2f}B): compiled {tc:8.1f}ms  "
+              f"fused {tf:8.1f}ms ({tc/tf:.2f}x)  amalg {res['amalg'][0]:8.1f}ms "
+              f"({tc/res['amalg'][0]:.2f}x cmp, {tf/res['amalg'][0]:.2f}x fused)  "
+              f"mem a/c {res['amalg'][1]/res['compiled'][1]:.2f}x  parity {dpar:.1e}")
+    return rows
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--H", default="512,1024,2048,4096")
