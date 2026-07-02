@@ -211,7 +211,7 @@ class GramNewtonSchulz:
 
 
 def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1e4, 1e6),
-                      ns_dtype=torch.float16, seed=0, verbose=True):
+                      ns_dtype=torch.float16, seed=0, verbose=True, bench=True):
     """Grid-search restart placement(s) for a coefficient set (GPU required).
 
     Scores every combination of `num_restarts` positions in [1, len(coeffs)-1] on
@@ -220,6 +220,8 @@ def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1
     means the restarts fully restore champion-grade stability (all placements cost
     the same ~1.5r, so accuracy is the only criterion). Returns the best placement
     as a list, e.g. [3], ready for GramNewtonSchulz(..., reset_iterations=best).
+    With bench=True also times the winner vs symmul NS and the cuBLAS champion
+    (same coeffs, same shape) and prints the speedups.
     """
     from itertools import combinations
     n, m = shape
@@ -254,6 +256,17 @@ def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1
             best, best_score = list(resets), score
     if verbose:
         print(f"best: {best}  (worst ratio {best_score:.4f}; 1.0 = champion-grade)")
+    if bench:
+        from triton.testing import do_bench
+        Xb = cases[0][1]
+        t_gram = do_bench(lambda: newton_schulz_gram(Xb, coeffs, ns_dtype, restart_at=tuple(best)),
+                          warmup=10, rep=50)
+        t_sym = do_bench(lambda: newton_schulz_symmul(Xb, coeffs, ns_dtype), warmup=10, rep=50)
+        t_cub = do_bench(lambda: _newton_schulz_cublas(Xb, coeffs, ns_dtype), warmup=10, rep=50)
+        if verbose:
+            print(f"speed @ {shape}: gram{best} {t_gram:.3f} ms | "
+                  f"symmul {t_sym:.3f} ms ({t_sym / t_gram:.2f}x) | "
+                  f"cuBLAS {t_cub:.3f} ms ({t_cub / t_gram:.2f}x)", flush=True)
     return best
 
 
