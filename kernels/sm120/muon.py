@@ -58,16 +58,21 @@ class FusedMuon(_FusedMuon75):
     on a memory-constrained GPU). State dict / constructor are identical across all modes.
     """
 
-    def __init__(self, *args, use_symmul=True, use_gram=True, **kwargs):
+    def __init__(self, *args, use_symmul=True, use_gram=True, gram_restarts=None, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
         self.use_symmul = use_symmul
         self.use_gram = use_gram
+        # restart iteration(s) for the gram NS; None = the tuned default (GRAM_RESTART_AT).
+        # Custom `coeffs` may want their own placement: kernels.sm120.newton_schulz_gram
+        # `autotune_restarts(coeffs)` finds it.
+        self.gram_restarts = gram_restarts
 
     def _ns(self, u, force_eager=False):
         """The NS this optimizer runs: gram (default) -> symmul -> cuBLAS, by shape gates."""
         if self.use_gram:
-            return newton_schulz_gram(u, self.coeffs, self.ns_dtype, force_eager=force_eager)
+            kw = {} if self.gram_restarts is None else {"restart_at": self.gram_restarts}
+            return newton_schulz_gram(u, self.coeffs, self.ns_dtype, force_eager=force_eager, **kw)
         return newton_schulz_symmul(u, self.coeffs, self.ns_dtype, force_eager=force_eager)
 
     @torch.no_grad()
