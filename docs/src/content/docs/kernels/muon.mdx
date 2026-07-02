@@ -102,7 +102,7 @@ AdamW for everything else.
 | `use_symmul` | `True` (sm120) | **Master Triton switch.** `True` runs a Triton Newton-Schulz backend (gram or symmul, per `use_gram`); `False` runs the pure-cuBLAS champion with **no Triton launched at all** (a Triton-free environment or an exact-reference run). When `False`, `use_gram` and `gram_restarts` are ignored. See [Three Newton-Schulz backends](#three-newton-schulz-backends). |
 | `use_gram` | `True` (sm120) | When Triton is on (`use_symmul=True`), selects the **Gram-space** NS (default, fastest) over the symmetric-matmul NS. Both self-gate by shape and fall back to cuBLAS for small matrices, so parity is preserved either way. See the [gram sub-page](/kernels/muon/gram/). |
 | `gram_restarts` | `None` | Override the gram NS restart placement (an int, a list like `[2, 4]`, or `()` for none). `None` uses the tuned default `[3]`. Only relevant when the gram backend is active; needed mainly for **custom `coeffs`** — find the right value with [`autotune_restarts`](/kernels/muon/gram/#autotune_restarts). |
-| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs the active Triton NS too (forced to its eager path, which is graph-capturable). **Speed is a wash** on a compute-bound step (T4 / Blackwell / 4GB laptop all measured ~1.0×). Memory is **shape-dependent**: the graph's static pool wins for a *few* same-shape matrices (≈1.4× lower at 4× 2048²) but must hold *all* chunks' transients at once, so it **inverts past ~8–16 matrices** (≈0.87× at 32×, i.e. higher). A niche knob — leave it off unless you've measured a memory win on your exact model. Bakes in static `lr`/`wd`/`momentum`. |
+| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs the active Triton NS too (forced to its eager path, which is graph-capturable). **Speed is a wash** and **memory is a penalty on a realistic (mixed-shape) model** — leave it off unless you've measured a win on your exact model. Bit-identical to eager (verified `0.0` over 6 steps, all three backends). See [The CUDA-graph path](#the-cuda-graph-path-use_graph) for the measured tradeoff. Bakes in static `lr`/`wd`/`momentum`. |
 
 ### Three Newton-Schulz backends
 
@@ -134,6 +134,41 @@ been measured to win. The two levers you actually set:
 <Aside type="caution">
 `use_gram=True` with `use_symmul=False` does **not** run the gram backend — `use_symmul=False` is the master
 off-switch and wins. To use gram you need Triton on (`use_symmul=True`, the default).
+</Aside>
+
+### The CUDA-graph path (`use_graph`)
+
+`use_graph=True` captures the whole step as a CUDA graph and replays it, cutting kernel-launch overhead.
+It is **off by default** because the Muon step is GPU-compute-bound, not launch-bound — so on a realistic
+model the launch saving buys nothing and the graph's static memory pool costs you.
+
+Measured on an **RTX PRO 6000 Blackwell (`sm_120`)**, a transformer stack at `d=4096` (7 matrices/layer:
+4 attention `4096²`, 2 MLP `11008×4096`, 1 MLP `4096×11008`), fp16, absolute step-overhead memory (peak
+minus resident params + momentum), across all three backends:
+
+| Matrices | Step time (graph vs eager) | Eager overhead | Graph overhead | Graph memory penalty |
+|---|---|---|---|---|
+| 7 (1 layer) | wash (~1.0×) | 1082 MB | 1126 MB | +44 MB (1.04×) |
+| 21 (3 layers) | wash | 1854 MB | 2702 MB | +848 MB (**1.46×**) |
+| 56 (8 layers) | wash | 3784 MB | 6562 MB | +2778 MB (**1.73×**) |
+| 112 (16 layers) | wash | 6872 MB | 12738 MB | +5866 MB (**1.85×**) |
+
+Two things to take away:
+
+- **Speed is a wash at every size** — graph replay lands within ~1% of eager. There is no throughput win to
+  chase on this step.
+- **The memory penalty grows with the matrix count.** The graph must hold *all* chunks' transient buffers
+  live in its static pool at once (eager frees them between chunks), and because a real model has *mixed*
+  shapes the pool cannot amortize across many same-shape tensors. By a 16-layer model the graph nearly
+  **doubles** the step's memory overhead.
+
+<Aside type="note">
+**When it can still help.** The one regime where the static pool amortizes is a handful of *identical*-shape
+matrices and nothing else — there the graph's single pool can undercut eager's repeated allocations. That is
+narrow; for any normal transformer (mixed attention + MLP shapes) leave `use_graph=False`. The capture is
+**correctness-safe** either way — graph replay is bit-identical to eager (max\|Δ\| `0.0` over 6 steps for
+gram, symmul, and cuBLAS alike), including the gram backend's mid-loop restart — so the only reason it is
+off by default is the memory tradeoff, not any accuracy risk.
 </Aside>
 
 ### Fast mode — trading memory for speed
