@@ -1,4 +1,14 @@
-"""sm120 Muon for Blackwell — FusedMuon defaults to the symmetric-matmul ("symmul") Newton-Schulz.
+"""sm120 Muon for Blackwell — FusedMuon defaults to the GRAM-SPACE Newton-Schulz (restart@3).
+
+Gram NS (kernels/sm120/newton_schulz_gram.py): every NS iterate is a polynomial in G = X X^T,
+so the loop runs on the n x n Gram (R <- C^2 R, Q <- C Q, ALL products symmetric-halved by the
+symmul kernels) with ONE rectangular apply X = Q X at the end — the five B@X GEMMs are gone.
+Dao-style restart@3 re-anchors to X mid-run: parity matches the cuBLAS champion to the 4th
+digit at kappa 1e2..1e6 (fp32 alone does NOT stabilize — measured). Gates: gram needs
+r = m/n >= 1.5 and dim >= 2048, else symmul NS, else cuBLAS — no regime regresses.
+MEASURED (RTX PRO 6000): NS-level 1.81x vs symmul at (2048,8192), 2.24x batched; end-to-end
+step (3 layers d=4096) 118ms vs symmul 145ms vs cuBLAS 190ms, param parity 1.8e-4, peak mem
+696 vs 718MB. `use_gram=False` restores the symmul default described below.
 
 On Blackwell the symmul NS strictly dominates the old pure-cuBLAS path with NO precision tradeoff, so
 it is now the FusedMuon default (the symmetric trick + our foreach/batched-state levers, composed):
@@ -29,7 +39,9 @@ NS_BATCH_ELEMS = 8 * 1024 * 1024
 
 
 class FusedMuon(_FusedMuon75):
-    """sm120 FusedMuon — DEFAULTS to the symmetric-matmul ("symmul") Newton-Schulz on Blackwell.
+    """sm120 FusedMuon — DEFAULTS to gram NS (restart@3) -> symmul -> cuBLAS by shape gates.
+
+    use_gram=False falls back to the symmul-default behavior documented below.
 
     Same foreach + batched same-shape state + Blackwell mem knee (8M) as before, but the two SYMMETRIC
     NS GEMMs (X Xᵀ, A·A) run on the Triton symmul kernel (compute one triangle, mirror it -> ~half the
