@@ -6,7 +6,12 @@ description: Polar-Express Newton-Schulz Muon optimizer step, launch-overhead-fu
 import { Aside } from '@astrojs/starlight/components';
 
 ```python
-from kernels.sm120 import FusedMuon, DistributedMuon, newton_schulz, newton_schulz_symmul
+from kernels.sm120 import (
+    FusedMuon, DistributedMuon,
+    newton_schulz,          # pure cuBLAS Newton-Schulz (the reference champion)
+    newton_schulz_symmul,   # symmetric-matmul NS  -> see the symmul sub-page
+    newton_schulz_gram,     # Gram-space NS        -> see the gram sub-page
+)
 ```
 
 A fused implementation of the **Muon** optimizer step using a Polar-Express Newton-Schulz
@@ -64,14 +69,17 @@ FusedMuon(
     ns_dtype=torch.float16,            # fp16 (tensor cores); fp32 = safe fallback, bf16 = Ampere/Hopper
     scale_mode="polarexpress",         # "polarexpress" (alias "jordan") | "moonlight"
     ns_batch_elems=8 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate); sm120 knee = 8M
-    use_symmul=True,                   # symmetric-matmul NS (the amalgamated default); False = pure cuBLAS
-    use_graph=False,                   # opt-in CUDA-graph capture (off by default; captures symmul too)
+    use_symmul=True,                   # MASTER Triton switch. False = pure-cuBLAS champion (no Triton)
+    use_gram=True,                     # when Triton is on: Gram-space NS (default) vs symmul NS
+    gram_restarts=None,                # override gram restart placement; None = the tuned default ([3])
+    use_graph=False,                   # opt-in CUDA-graph capture (off by default; captures the NS too)
 )
 ```
 
-On `sm_120` `FusedMuon` is the **amalgamated** optimizer: `fused` + `symmul`, with `use_symmul=True` by
-default. It is a single class — flip `use_symmul=False` to fall back to the pure-cuBLAS Newton-Schulz
-(e.g. a Triton-free environment or an exact-reference run); there is no separate optimizer to import.
+On `sm_120` `FusedMuon` is a single class that dispatches across **three** interchangeable Newton-Schulz
+backends — Gram-space (default), symmetric-matmul, and pure cuBLAS — selected by two flags plus per-call
+shape gates. There is no separate optimizer to import; the state dict and constructor are identical across
+all modes. See [Three Newton-Schulz backends](#three-newton-schulz-backends) for the exact precedence.
 
 <Aside type="caution">
 `FusedMuon` only steps **2D and 3D** parameters that have a gradient (3D stacked experts are orthogonalized
@@ -91,8 +99,42 @@ AdamW for everything else.
 | `ns_dtype` | `torch.float16` | Newton-Schulz compute dtype. **fp16** for T4 tensor cores; **fp32** for a numerically-safe fallback; **bf16** only on Ampere/Hopper. Normalization is always fp32 regardless. |
 | `scale_mode` | `"polarexpress"` | The **post-Newton-Schulz update multiplier** (`p += -lr·scale·update`) — it does **not** touch the NS iteration or its coefficients. `"polarexpress"` (alias `"jordan"`) = `max(1, rows/cols)**0.5`, the aspect-ratio scale of the Polar-Express baseline. `"moonlight"` = `0.2·sqrt(max(rows, cols))`, a consistent-RMS scale that puts the LR in the AdamW band. |
 | `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
-| `use_symmul` | `True` (sm120) | Use the symmetric-matmul Newton-Schulz (`fused` + `symmul`). `False` = the pure-cuBLAS NS (no Triton). Same precision either way; see [Symmetric-matmul Newton-Schulz](#symmetric-matmul-newton-schulz-blackwell). |
-| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs symmul too (forced to its eager Triton path, which is graph-capturable). **Speed is a wash** on a compute-bound step (T4 / Blackwell / 4GB laptop all measured ~1.0×). Memory is **shape-dependent**: the graph's static pool wins for a *few* same-shape matrices (≈1.4× lower at 4× 2048²) but must hold *all* chunks' transients at once, so it **inverts past ~8–16 matrices** (≈0.87× at 32×, i.e. higher). A niche knob — leave it off unless you've measured a memory win on your exact model. Bakes in static `lr`/`wd`/`momentum`. |
+| `use_symmul` | `True` (sm120) | **Master Triton switch.** `True` runs a Triton Newton-Schulz backend (gram or symmul, per `use_gram`); `False` runs the pure-cuBLAS champion with **no Triton launched at all** (a Triton-free environment or an exact-reference run). When `False`, `use_gram` and `gram_restarts` are ignored. See [Three Newton-Schulz backends](#three-newton-schulz-backends). |
+| `use_gram` | `True` (sm120) | When Triton is on (`use_symmul=True`), selects the **Gram-space** NS (default, fastest) over the symmetric-matmul NS. Both self-gate by shape and fall back to cuBLAS for small matrices, so parity is preserved either way. See the [gram sub-page](/kernels/muon/gram/). |
+| `gram_restarts` | `None` | Override the gram NS restart placement (an int, a list like `[2, 4]`, or `()` for none). `None` uses the tuned default `[3]`. Only relevant when the gram backend is active; needed mainly for **custom `coeffs`** — find the right value with [`autotune_restarts`](/kernels/muon/gram/#autotune_restarts). |
+| `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs the active Triton NS too (forced to its eager path, which is graph-capturable). **Speed is a wash** on a compute-bound step (T4 / Blackwell / 4GB laptop all measured ~1.0×). Memory is **shape-dependent**: the graph's static pool wins for a *few* same-shape matrices (≈1.4× lower at 4× 2048²) but must hold *all* chunks' transients at once, so it **inverts past ~8–16 matrices** (≈0.87× at 32×, i.e. higher). A niche knob — leave it off unless you've measured a memory win on your exact model. Bakes in static `lr`/`wd`/`momentum`. |
+
+### Three Newton-Schulz backends
+
+`FusedMuon` runs the same Polar-Express Newton-Schulz math through one of three backends. Two flags plus
+two per-call shape gates decide which, in this strict order of precedence:
+
+```text
+use_symmul=False ────────────────────────────────► pure cuBLAS (no Triton)   [master off-switch]
+use_symmul=True
+   └─ use_gram=True  (default)
+        └─ gram NS, which self-gates per matrix:
+              r = max(rows,cols)/min(rows,cols) >= 1.5  AND  min(rows,cols) >= 2048 ─► Gram-space NS
+              otherwise ──────────────────────────────────────────────────────────► symmul NS
+                 which itself gates: min(rows,cols) >= 2048 ─► symmul, else ────────► cuBLAS
+   └─ use_gram=False
+        └─ symmul NS  (same dim>=2048 gate to cuBLAS)
+```
+
+The upshot: **you never regress by turning a backend on.** Each one falls back to the exact cuBLAS champion
+in the regime where it would lose (small or square matrices), so the fast path only engages where it has
+been measured to win. The two levers you actually set:
+
+| Goal | Setting |
+|---|---|
+| Fastest (default) — Gram-space NS where it wins, symmul/cuBLAS elsewhere | `use_symmul=True, use_gram=True` |
+| Symmetric-matmul NS only (skip gram) | `use_symmul=True, use_gram=False` |
+| Pure cuBLAS champion, no Triton (Triton-free box / exact reference) | `use_symmul=False` |
+
+<Aside type="caution">
+`use_gram=True` with `use_symmul=False` does **not** run the gram backend — `use_symmul=False` is the master
+off-switch and wins. To use gram you need Triton on (`use_symmul=True`, the default).
+</Aside>
 
 ### Fast mode — trading memory for speed
 
@@ -164,82 +206,22 @@ repeated to reach `N`. Pass your own `coeffs` tuple of length `N` to `FusedMuon`
 `newton_schulz` to run `N` iterations.
 </Aside>
 
-## Symmetric-matmul Newton-Schulz (Blackwell)
+## The two fast Newton-Schulz backends
 
-Two of the three Newton-Schulz GEMMs are **symmetric**: `A = X·Xᵀ` and `A·A`. A symmetric product
-`M·Mᵀ` only needs its upper triangle — compute those output tiles, transpose-copy each to its mirror,
-skip the lower triangle, and you spend about **half** the GEMM FLOPs. On `sm_120` this is the default
-Newton-Schulz:
+Beyond the launch/batching wins above, `FusedMuon` ships two Triton backends that cut the Newton-Schulz
+**FLOPs**, each on its own sub-page with full API, gates, and measured numbers:
 
-```python
-A = symmul(X)              # X·Xᵀ   — Triton triangle + mirror   (~½ FLOPs)
-B = symmul_axpy(A, b, c)   # b·A + c·A²   — fused into the kernel epilogue (~½ FLOPs)
-X = baddbmm(X, B, X, β=a)  # a·X + B·X — non-symmetric, stays cuBLAS
-```
+- **[Symmetric-matmul NS (symmul)](/kernels/muon/symmul/)** — two of the three NS GEMMs (`X·Xᵀ` and `A·A`)
+  are symmetric, so compute one triangle and mirror it: about **half** the GEMM FLOPs. Measured ~1.4–1.5×
+  over `torch.compile` at the NS level, ~1.37× at the full optimizer step. No precision tradeoff.
+- **[Gram-space NS (gram)](/kernels/muon/gram/)** — every NS iterate is a polynomial in `G = X·Xᵀ`, so the
+  whole iteration runs on the small `n × n` Gram matrix and the rectangular `B·X` GEMMs collapse into one
+  final apply. Measured up to **1.81×** over symmul at the NS level (2.24× batched), **1.22×** at the full
+  step, with a Dao-style restart for stability. This is the default (`use_gram=True`).
 
-This is **orthogonal** to the launch/batching wins above, so it composes with them: `kernels.sm120`
-batches the symmetric kernel across same-shape parameters in one launch. The symmetric matmul is adapted
-from [nil0x9/flash-muon](https://github.com/nil0x9/flash-muon) (Triton triangle + transpose-copy; idea
-originally by Laker Newhouse et al.), with a batch dimension and a fused polynomial epilogue added.
-
-In short, **`amalg` (amalgamated) = `fused` + `symmul`** — our batched, launch-collapsed optimizer
-(`fused`) plus the symmetric-matmul FLOP cut (`symmul`). The two levers are orthogonal, so they stack.
-
-Measured on an **RTX PRO 6000 Blackwell (`sm_120`)**, single square matrix, Newton-Schulz(5), fp16 —
-five implementations (`eager` = naive PyTorch, `compiled` = `torch.compile`, `ours-fused` = our
-cuBLAS+`baddbmm` NS, `flash` = flash-muon's exact `fast_newtonschulz`, `ours-amalg` = symmetric-matmul):
-
-| dim | compiled | ours-fused | flash | **ours-amalg** | amalg vs compile |
-|---|---|---|---|---|---|
-| 1024 | 0.249 ms | 0.237 | 0.325 | **0.237** | 1.05× |
-| 2048 | 1.076 ms | 1.050 | 0.889 | **0.755** | **1.43×** |
-| 4096 | 5.800 ms | 5.502 | 4.381 | **3.847** | **1.51×** |
-| 8192 | 44.23 ms | 43.31 | 33.83 | **31.05** | **1.42×** |
-
-![Newton-Schulz step time vs matrix dim, five implementations, log-log](../../../assets/muon/chart_time.png)
-
-![Speedup over torch.compile by matrix dim — ours-amalg wins at every scale](../../../assets/muon/chart_speedup.png)
-
-`ours-amalg` (green) leads at every size ≥2048. `flash` loses at 1024 (kernel launch outweighs the tiny
-GEMM) but its symmetric trick pulls ahead of dense cuBLAS by 4096 — and `ours-amalg` stays ahead of
-`flash` by batching same-shape work and folding the polynomial into the kernel epilogue.
-
-At the full optimizer step (dense ~0.4B params), the batched state composes with the symmetric cut:
-
-| optimizer | step | peak | speedup |
-|---|---|---|---|
-| `torch.compile` | 124.6 ms | 3846 MB | 1.00× |
-| ours-fused (cuBLAS) | 119.0 ms | 3519 MB | 1.05× |
-| flash (nil0x9) | 109.7 ms | 4779 MB | 1.14× |
-| **ours-amalg** | **91.2 ms** | 4725 MB | **1.37×** |
-
-![Full Muon optimizer step time, five implementations, dense 0.4B params](../../../assets/muon/chart_opt.png)
-
-The advantage is scale-invariant from 1B to 2.6B params (width *and* depth): ~1.32× over `torch.compile`,
-~1.28× over our own champion, at ≤ compiled memory.
-
-<Aside type="note">
-**Parity — no precision tradeoff.** The symmetric kernel changes only the *order* of floating-point adds
-(triangle+mirror vs full `bmm`), not the math: it runs the identical fp16 NS with fp32 accumulate. Against
-an fp32 reference, `ours-amalg` matches `ours-fused` **exactly** — max|Δ| `8.5e-5`–`2.5e-4`, 30–200× under
-the Newton-Schulz tolerance (`2e-2`), with identical singular values (SV mean ~0.98). It replaces
-`FusedMuon` on Blackwell with no accuracy cost. (flash-muon uses the original Jordan coefficients — SV mean
-~0.85 after 5 steps — so it is compared on speed and orthogonality, not bit-parity; our Polar-Express
-coefficients reach ~0.98 *and* the faster kernel.)
-</Aside>
-
-![Parity: max absolute delta vs fp32 reference per method at 4096, all well under the 2e-2 tolerance](../../../assets/muon/chart_parity.png)
-
-<Aside type="caution">
-**The ceiling.** Only 2 of the 3 NS GEMMs are symmetric; `B·X` is a full cuBLAS tensor-core GEMM at
-~371 TFLOP/s (near speed-of-light, 46% of the step by `torch.profiler`) and is irreducible by symmetry.
-fp8 was tested and rejected — `_scaled_mm` ran *slower* than fp16 here and fp8 shattered orthogonalization
-(SV spread `0.001`→`2.2`). So ~1.5× is the algorithmic ceiling for this lever and the kernel sits at
-~93–95% of it. Set `use_symmul=False` for the pure-cuBLAS path (no Triton — for a Triton-free environment
-or an exact-reference run). The opt-in CUDA-graph path (`use_graph=True`) captures the symmul step too
-(via its eager Triton path) — same speed, and a memory effect that depends on shape count (lower for a
-few same-shape matrices, higher past ~8–16; see the `use_graph` row above).
-</Aside>
+Both are orthogonal to the launch/batch levers, so they stack, and both self-gate to the exact cuBLAS
+champion where they would lose — see [Three Newton-Schulz backends](#three-newton-schulz-backends) for the
+dispatch and precedence.
 
 ## Usage
 
@@ -284,27 +266,30 @@ one dtype.
 
 ## `newton_schulz` (standalone)
 
-The orthogonalization is exported on its own for direct use. On `sm_120` there are two interchangeable
-implementations — `newton_schulz` (pure cuBLAS) and `newton_schulz_symmul` (the symmetric-matmul version,
-what `FusedMuon` calls by default):
+The orthogonalization is exported on its own for direct use. On `sm_120` there are three interchangeable
+implementations, all with the same output (to within Newton-Schulz tolerance) and the same core signature:
 
 ```python
-from kernels.sm120 import newton_schulz, newton_schulz_symmul
+from kernels.sm120 import newton_schulz, newton_schulz_symmul, newton_schulz_gram
 
-G = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
-O  = newton_schulz(G, ns_dtype=torch.float16)          # cuBLAS Newton-Schulz
-Os = newton_schulz_symmul(G, ns_dtype=torch.float16)   # ~1.4-1.5x faster, same output (parity 8.5e-5)
+G = torch.randn(2048, 8192, device="cuda", dtype=torch.float16)
+O  = newton_schulz(G, ns_dtype=torch.float16)          # pure cuBLAS — the reference champion
+Os = newton_schulz_symmul(G, ns_dtype=torch.float16)   # symmetric-matmul — ~1.4-1.5x, parity 8.5e-5
+Og = newton_schulz_gram(G, ns_dtype=torch.float16)     # Gram-space — up to ~1.8x over symmul, restart@3
 ```
 
-Both accept a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches over
-`E`, and share the same signature `(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)`. Normalization
-is always done in fp32 (an fp16 sum-of-squares of a unit `512²` matrix would overflow); the iteration GEMMs
-run in `ns_dtype`. `newton_schulz_symmul` self-gates: below the gram knee (`min(rows, cols) < 2048`) it
-calls the cuBLAS `newton_schulz` verbatim, so small matrices never regress.
+All three accept a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches
+over `E`, and share the signature `(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)` (gram adds
+`gram_dtype`, `restart_at`). Normalization is always done in fp32 (an fp16 sum-of-squares of a unit `512²`
+matrix would overflow); the iteration GEMMs run in `ns_dtype`. Each fast variant **self-gates** to the
+implementation below it where it would lose, so small matrices never regress:
 
-The lower-level symmetric primitives are exported too, if you want to build your own iteration:
-`symmul(X)` computes `X·Xᵀ` (batched triangle + mirror), and `symmul_axpy(A, b, c)` computes
-`b·A + c·(A·A)` for a symmetric `A` in one fused kernel.
+- `newton_schulz_gram` → `newton_schulz_symmul` when `r < 1.5` or `min(rows, cols) < 2048`
+- `newton_schulz_symmul` → `newton_schulz` when `min(rows, cols) < 2048`
+
+For the full API of each fast variant — the lower-level `symmul` / `symmul_axpy` / `symmul2` primitives, the
+`GramNewtonSchulz` callable, restart lists, and the `autotune_restarts` tool — see the
+[symmul](/kernels/muon/symmul/) and [gram](/kernels/muon/gram/) sub-pages.
 
 ### Custom coefficients
 

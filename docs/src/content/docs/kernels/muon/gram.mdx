@@ -1,0 +1,196 @@
+---
+title: Gram-space Newton-Schulz (gram)
+description: The gram backend — iterate on the small n x n Gram matrix so the rectangular GEMMs collapse into one final apply, for up to ~1.8x over symmul. Enable/disable, the GramNewtonSchulz callable, restart lists, and the autotune_restarts tool.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+```python
+from kernels.sm120 import newton_schulz_gram, GramNewtonSchulz, autotune_restarts
+```
+
+The `symmul` backend halves the two symmetric GEMMs but leaves the rectangular `B·X` product on cuBLAS —
+and for a tall matrix (`r = max/min` large), that product **dominates**. The gram backend removes it.
+
+Every Newton-Schulz iterate is a polynomial in the Gram matrix `G = X·Xᵀ`. Because polynomials in `G` all
+commute and stay symmetric, the entire iteration can run on the small `n × n` Gram (`R ← C²·R`, accumulate
+`Q ← C·Q`, every product symmetric-halved by the `symmul` kernels), with the five rectangular `B·X` GEMMs
+collapsing into a **single** final apply `X = Q·X₀`. This is the same identity as
+[Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz) (theirs is CuTeDSL,
+Hopper/datacenter-Blackwell only; ours is Triton, portable to any arch it runs on).
+
+FLOPs per iteration, in units of `n³` (symmul-halved), where `r = max(rows,cols) / min(rows,cols)`:
+
+| Path | Cost | r=1 | r=2 | r=4 |
+|---|---|---|---|---|
+| symmul NS | `7.5r + 2.5` | 10.0 | 17.5 | 32.5 |
+| **gram NS** | `1.5r + 8.5` | 10.0 | **11.5** | **14.5** |
+
+A tie at `r=1` (square), a strict win for every `r > 1` — and transformer stacks are dominated by the
+`r ∈ [2, 4]` MLP and projection matrices. That is why the gate is a **ratio**, not just a dimension.
+
+## Enable / disable
+
+Gram is the default backend (`use_gram=True`). It is reached with the master Triton switch on:
+
+```python
+from kernels.sm120 import FusedMuon
+
+opt = FusedMuon(matrix_params, lr=0.02)                          # default: gram NS + restart@3
+opt = FusedMuon(matrix_params, lr=0.02, use_gram=False)          # symmul NS instead
+opt = FusedMuon(matrix_params, lr=0.02, use_symmul=False)        # pure cuBLAS, no Triton
+opt = FusedMuon(matrix_params, lr=0.02, gram_restarts=[2, 4])    # custom restart placement
+```
+
+<Aside type="caution">
+`use_gram=True` with `use_symmul=False` does **not** run gram — `use_symmul=False` is the master off-switch
+and routes to pure cuBLAS. Gram needs Triton on (`use_symmul=True`, the default). See
+[Three Newton-Schulz backends](/kernels/muon/#three-newton-schulz-backends).
+</Aside>
+
+### Gates
+
+`newton_schulz_gram` self-gates twice, so it only engages where it has been measured to win:
+
+- **`GRAM_MIN_RATIO = 1.5`** — if `r < 1.5` it falls back to `symmul` NS. Measured knee on RTX PRO 6000
+  (fp16, `gram=2048`): `r=1.0` 0.93× (loss), `r=1.25` 0.99×, `r=1.5` 1.20×, `r=1.75` 1.24×, `r=2` 1.27×.
+- **`SYMMUL_MIN_DIM = 2048`** — below this Gram dimension, `symmul` itself falls back to cuBLAS.
+
+So square attention weights (`r≈1`) keep the symmul/cuBLAS path bit-for-bit, and only tall matrices take
+the gram path.
+
+## Restarts (stability)
+
+`kappa(Gram) = kappa(X)²`, and a pure Gram loop never re-reads `X`, so on **ill-conditioned** inputs
+(real momentum matrices, `kappa ≥ 1e2`) it loses the Newton-Schulz self-correction and drifts. The fix is
+a **restart** (Dao's term): part-way through, materialize `X = Q·X`, recompute a fresh Gram from it, and
+reset `Q`. Re-anchoring to the real `X` restores self-correction.
+
+Measured on RTX PRO 6000 with log-spaced singular values, error vs the fp32-SVD polar factor:
+
+| kappa | champion (cuBLAS) | plain gram | gram fp32-loop | **gram restart@3** |
+|---|---|---|---|---|
+| 1e2 | 0.1215 | 0.1929 | 0.2075 | **0.1216** |
+| 1e4 | 0.5949 | 0.6330 | 0.6331 | **0.5948** |
+| 1e6 | 0.7439 | 0.7852 | 0.7768 | **0.7439** |
+
+The lesson: running the Gram loop in **fp32 does not help** (the Gram's small eigenvalues are `σ²`, already
+crushed at fp16 formation — the failure is algorithmic, not roundoff), but a single **restart@3** matches
+the champion to the 4th digit at every conditioning level. `restart_at=3` is therefore the default; the
+`gram_dtype` knob is kept but measured unnecessary as a stabilizer.
+
+<Aside type="note">
+For **5** Newton-Schulz steps, one restart (`[3]`) is the sweet spot for speed and stability. If you run
+more steps or hit instability with custom coefficients, add restarts — and let
+[`autotune_restarts`](#autotune_restarts) pick the placement.
+</Aside>
+
+## API
+
+### `newton_schulz_gram`
+
+```python
+newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
+                   gram_dtype=None, restart_at=3, force_eager=False)
+```
+
+Gram-space Newton-Schulz. Same coefficients/normalization/orientation as the champion; falls back to
+`newton_schulz_symmul` (then cuBLAS) below the gates above.
+
+| Argument | Default | Notes |
+|---|---|---|
+| `G` | — | Input `(A, B)` or batched `(E, A, B)`. |
+| `coeffs` | `_PE_COEFFS` | Per-iteration `(a, b, c)` tuples; count = iteration count. |
+| `ns_dtype` | `torch.float16` | Iteration compute dtype (normalization always fp32). |
+| `eps` | `1e-7` | Normalization floor. |
+| `gram_dtype` | `None` | dtype of the `n³` Gram loop; `None` = `ns_dtype`. Measured **not** a stabilizer — prefer a restart. |
+| `restart_at` | `3` | 1-based iteration(s) after which to restart. An int, a list (`[2, 4]` = after the 2nd **and** 4th), or `None`/`()` for none (only safe for well-conditioned input). |
+| `force_eager` | `False` | Pure-Triton (CUDA-graph-capturable) body; used by the optimizer's `use_graph` path. |
+
+### `GramNewtonSchulz` (callable)
+
+A Dao-style callable that mirrors the upstream API, for use outside the optimizer:
+
+```python
+from kernels.sm120 import GramNewtonSchulz
+from kernels.sm75.muon import _PE_COEFFS
+
+gram_NS = GramNewtonSchulz(
+    ns_coefficients=_PE_COEFFS,
+    gram_newton_schulz_reset_iterations=[3],   # or [2, 4] for two restarts
+)
+Y = gram_NS(X)
+```
+
+| Argument | Default | Notes |
+|---|---|---|
+| `ns_coefficients` | `_PE_COEFFS` | List of `(a, b, c)` per iteration. |
+| `gram_newton_schulz_reset_iterations` | `(3,)` | 1-based iterations to restart after. Validated to `[1, len(coeffs)-1]` (a restart after the last iteration is a no-op and is rejected). |
+| `ns_dtype` | `torch.float16` | Iteration compute dtype. |
+| `gram_dtype` | `None` | Gram-loop dtype override. |
+
+### `autotune_restarts`
+
+Grid-search the best restart placement(s) for a **custom** coefficient set — essential when you bring your
+own coefficients, since their ideal restart may differ from the shipped `[3]`:
+
+```python
+from kernels.sm120 import autotune_restarts
+
+best = autotune_restarts(my_coeffs, num_restarts=1)   # -> e.g. [3]
+opt  = FusedMuon(matrix_params, lr=0.02, coeffs=my_coeffs, gram_restarts=best)
+```
+
+It scores every combination of `num_restarts` positions on ill-conditioned inputs (`kappa = 1e2/1e4/1e6`)
+by the **worst error ratio vs the cuBLAS champion running the same coefficients** — a ratio of `1.0` means
+the restarts fully restore champion-grade stability. All placements cost the same `~1.5r`, so accuracy is
+the only criterion. With `bench=True` (default) it also times the winner against `symmul` and cuBLAS.
+
+| Argument | Default | Notes |
+|---|---|---|
+| `coeffs` | — | The coefficient set to tune (list of `(a, b, c)`). |
+| `num_restarts` | `1` | How many restart positions to place. |
+| `shape` | `(2048, 8192)` | Tuning shape; must clear the gram gates (`dim ≥ 2048`, `r ≥ 1.5`). |
+| `kappas` | `(1e2, 1e4, 1e6)` | Condition numbers to stress. |
+| `bench` | `True` | Also print gram-winner ms vs symmul and cuBLAS. |
+
+There is a CLI too, matching the upstream invocation:
+
+```bash
+python -m kernels.sm120.newton_schulz_gram --autotune-restarts --num-restarts 1 \
+    --coefs "4.0848,-6.8946,2.9270;3.9505,-6.3029,2.6377;3.7418,-5.5913,2.3037;2.8769,-3.1427,1.2046;2.8366,-3.0525,1.2012"
+```
+
+### `symmul2` (primitive)
+
+The building block gram adds on top of `symmul`/`symmul_axpy`: a batched product of two **symmetric,
+commuting** matrices whose result is itself symmetric, so it too is triangle+mirror halved.
+
+```python
+symmul2(S1, S2, out=None)   # S1 @ S2 for symmetric commuting inputs -> symmetric (B,M,M)
+```
+
+## Performance
+
+Newton-Schulz level, RTX PRO 6000 (`sm_120`), fp16, speedup vs the `symmul` baseline:
+
+| shape | r | gram ms | symmul ms | vs symmul | vs cuBLAS |
+|---|---|---|---|---|---|
+| (2048, 8192) | 4.0 | 1.07 | 1.93 | **1.81×** | 2.23× |
+| (3072, 8192) | 2.7 | 2.52 | 4.17 | **1.65×** | 2.14× |
+| (2048, 4096) | 2.0 | 0.89 | 1.15 | **1.30×** | 1.66× |
+| (8, 2048, 8192) | 4.0 | 6.82 | 15.28 | **2.24×** | 2.80× |
+| (2048, 2048) | 1.0 | 0.74 | 0.74 | 1.00× (gated) | — |
+
+End-to-end `FusedMuon.step()`, 3 transformer layers at `d=4096` (q/k/v/o at `r=1`, MLP at `r≈2.7`),
+identical grads, fp16:
+
+| backend | step | peak | param parity |
+|---|---|---|---|
+| cuBLAS champion | 189.9 ms | 664 MB | reference |
+| symmul (old default) | 144.3 ms | 718 MB | — |
+| **gram + restart@3 (default)** | **118.2 ms** | **696 MB** | max\|Δ\| 1.8e-4 |
+
+The step-level win is smaller than the NS-level 1.81× because the square attention matrices are gated to
+symmul either way — it is the MLP fraction that speeds up. Parity is 1.8e-4, 100× under the `2e-2`
+Newton-Schulz tolerance.

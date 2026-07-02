@@ -20,6 +20,9 @@ from .router import fused_router, router_bias_update, FusedConvRouterCuDNN
 from .moe import moe, moe_per_expert, moe_eager
 from .muon import FusedMuon, DistributedMuon, AmalgamatedMuon, newton_schulz
 from .newton_schulz_symmul import newton_schulz_symmul, symmul, symmul_axpy
+from .newton_schulz_gram import (
+    newton_schulz_gram, symmul2, GramNewtonSchulz, autotune_restarts,
+)
 
 __all__ = [
     "fused_linear_cross_entropy",
@@ -28,4 +31,5 @@ __all__ = [
     "moe", "moe_per_expert", "moe_eager",
     "FusedMuon", "DistributedMuon", "AmalgamatedMuon", "newton_schulz",
     "newton_schulz_symmul", "symmul", "symmul_axpy",
+    "newton_schulz_gram", "symmul2", "GramNewtonSchulz", "autotune_restarts",
 ]

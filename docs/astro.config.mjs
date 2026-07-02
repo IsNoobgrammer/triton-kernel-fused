@@ -53,7 +53,14 @@ export default defineConfig({
           items: [
             { label: 'Fused-linear cross-entropy', link: '/kernels/cross-entropy/' },
             { label: 'XSA correction', link: '/kernels/xsa/' },
-            { label: 'Fused Muon', link: '/kernels/muon/' },
+            {
+              label: 'Fused Muon',
+              items: [
+                { label: 'Overview and API', link: '/kernels/muon/' },
+                { label: 'Symmetric-matmul NS (symmul)', link: '/kernels/muon/symmul/' },
+                { label: 'Gram-space NS (gram)', link: '/kernels/muon/gram/' },
+              ],
+            },
             { label: 'Conv MoE router', link: '/kernels/router/' },
             { label: 'PolyGLU MoE combine', link: '/kernels/moe/' },
           ],
