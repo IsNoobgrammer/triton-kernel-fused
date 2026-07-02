@@ -14,13 +14,15 @@ G = X0 X0^T, so they are ALL symmetric and ALL commute. Consequences:
 FLOPs (units of n^3, symmul-halved): gram NS = 1.5r + 8.5 vs symmul NS = 7.5r + 2.5
 -> tie at r=1, 1.52x at r=2, 2.24x at r=4. Gate on r: square matrices keep symmul NS.
 
-Numerics: kappa(Gram) = kappa(X)^2 and Q is a chain of 5 low-precision products.
-Two stabilizers, both flagged so the bench picks:
-  restart_at=k : Dao's fix — materialize X = Q X, refresh R from it, reset Q (costs
-                 ~1.5r extra rectangular work once).
-  gram_dtype=torch.float32 : run the n^3 Gram loop in fp32 (tf32 tensor cores on
-                 Ampere+); the loop is n^3 not n^2*m, so at r>=2 this still wins
-                 while being MORE precise than the fp16 X-space loop.
+Numerics: kappa(Gram) = kappa(X)^2, and a pure Gram loop never re-reads X, so the
+NS self-correction is lost — on ILL-CONDITIONED inputs (kappa>=1e2; real momentum
+matrices) plain gram drifts (vs-truth 0.193 vs champion 0.122 at kappa=1e2) and
+fp32 does NOT fix it (0.207 — the Gram's small eigenvalues are sigma^2, already
+crushed at fp16 formation; the failure is algorithmic, not roundoff). Dao's
+RESTART is the fix: materialize X = Q X mid-run, refresh R, reset Q — re-anchoring
+restores self-correction. MEASURED (RTX PRO 6000): restart@3 matches the champion
+to the 4th digit at kappa = 1e2/1e4/1e6, costs ~1.5r once. restart_at=3 is the
+DEFAULT; gram_dtype=torch.float32 is kept as a flag but measured unnecessary.
 
 Self-check + local bench: python -m kernels.sm120.newton_schulz_gram
 """
@@ -38,6 +40,11 @@ from kernels.sm120.newton_schulz_symmul import (
 # r=1.0 0.93x + parity 2.1e-2 (loss), r=1.25 0.99x, r=1.5 1.20x, r=1.75 1.24x,
 # r=2 1.27-1.30x, r=2.7 1.65x, r=4 1.81x (2.24x batched) -> knee at 1.5.
 GRAM_MIN_RATIO = 1.5
+
+# Restart after this iteration (1-based; Dao recommends 1 restart for 5 NS steps).
+# Ill-conditioned eval: restart@3 == champion parity at kappa 1e2..1e6; without it
+# (and with fp32) gram drifts. None disables (only safe for well-conditioned input).
+GRAM_RESTART_AT = 3
 
 
 @triton.autotune(configs=_bmmt_configs(), key=["M", "K"])
@@ -122,7 +129,7 @@ def symmul2(S1, S2, out=None):
 
 
 def newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
-                       gram_dtype=None, restart_at=None, force_eager=False):
+                       gram_dtype=None, restart_at=GRAM_RESTART_AT, force_eager=False):
     """Polar-Express NS via the Gram recurrence: R <- C^2 R, Q <- C Q, X_out = Q X0.
 
     Same normalization/orientation/coeffs as the champion. Gates: falls back to
