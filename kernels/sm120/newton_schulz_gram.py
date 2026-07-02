@@ -34,8 +34,10 @@ from kernels.sm120.newton_schulz_symmul import (
 )
 
 # The Gram algorithm wins iff r = m/n > 1 (FLOP tie at r=1, and the extra kernel
-# launches lose the tie in practice). Knee is a ratio, not a dim; measured locally.
-GRAM_MIN_RATIO = 2.0
+# launches lose the tie in practice). MEASURED on RTX PRO 6000 (fp16, gram=2048):
+# r=1.0 0.93x + parity 2.1e-2 (loss), r=1.25 0.99x, r=1.5 1.20x, r=1.75 1.24x,
+# r=2 1.27-1.30x, r=2.7 1.65x, r=4 1.81x (2.24x batched) -> knee at 1.5.
+GRAM_MIN_RATIO = 1.5
 
 
 @triton.autotune(configs=_bmmt_configs(), key=["M", "K"])
@@ -120,7 +122,7 @@ def symmul2(S1, S2, out=None):
 
 
 def newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
-                       gram_dtype=None, restart_at=None):
+                       gram_dtype=None, restart_at=None, force_eager=False):
     """Polar-Express NS via the Gram recurrence: R <- C^2 R, Q <- C Q, X_out = Q X0.
 
     Same normalization/orientation/coeffs as the champion. Gates: falls back to
@@ -133,7 +135,7 @@ def newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
     n, m = G.shape[-2], G.shape[-1]
     r = max(n, m) / min(n, m)
     if min(n, m) < SYMMUL_MIN_DIM or r < GRAM_MIN_RATIO:
-        return newton_schulz_symmul(G, coeffs, ns_dtype, eps)
+        return newton_schulz_symmul(G, coeffs, ns_dtype, eps, force_eager=force_eager)
 
     orig_dtype = G.dtype
     squeeze = G.ndim == 2

@@ -22,6 +22,7 @@ import torch
 from kernels.sm75.muon import newton_schulz, _PE_COEFFS  # noqa: F401
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
+from kernels.sm120.newton_schulz_gram import newton_schulz_gram
 
 # Blackwell mem-gated knee (peak<=baseline at both sizes); sm75 uses 4M. Callers can still override.
 NS_BATCH_ELEMS = 8 * 1024 * 1024
@@ -45,10 +46,17 @@ class FusedMuon(_FusedMuon75):
     on a memory-constrained GPU). State dict / constructor are identical across all modes.
     """
 
-    def __init__(self, *args, use_symmul=True, **kwargs):
+    def __init__(self, *args, use_symmul=True, use_gram=True, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
         self.use_symmul = use_symmul
+        self.use_gram = use_gram
+
+    def _ns(self, u, force_eager=False):
+        """The NS this optimizer runs: gram (default) -> symmul -> cuBLAS, by shape gates."""
+        if self.use_gram:
+            return newton_schulz_gram(u, self.coeffs, self.ns_dtype, force_eager=force_eager)
+        return newton_schulz_symmul(u, self.coeffs, self.ns_dtype, force_eager=force_eager)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -78,7 +86,7 @@ class FusedMuon(_FusedMuon75):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
-                    out = newton_schulz_symmul(u, self.coeffs, self.ns_dtype)   # symmetric-matmul NS
+                    out = self._ns(u)                     # gram NS (default) or symmul NS
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
         return loss
@@ -94,7 +102,7 @@ class FusedMuon(_FusedMuon75):
             mom_c, gbuf = w["mom_c"], w["gbuf"]
             mom_c.mul_(w["momentum"]).add_(gbuf)
             u = gbuf.add_(mom_c, alpha=w["momentum"]) if w["nesterov"] else mom_c
-            out = newton_schulz_symmul(u, self.coeffs, self.ns_dtype, force_eager=True)
+            out = self._ns(u, force_eager=True)
             torch._foreach_add_(w["out_params"],
                                 [out[o:o + n].reshape(p.shape) for p, o, n in w["members"]], alpha=w["alpha"])
 
