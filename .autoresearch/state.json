@@ -90,14 +90,15 @@
     "compiled_std_ce_t4_mb": 3075
   },
   "best": {
-    "name": "_CEFusedFwdBwd (grad-in-forward, no recompute; per-row _fwd_reduce + 2D-grid _grad_logits_inplace)",
-    "t4_192MB_ms": 260,
-    "t4_192MB_mb": 904,
-    "t4_192MB_x_compiled": 0.76,
-    "grad_hidden_rel_vs_fp32": 0.0019,
-    "grad_weight_rel_vs_fp32": 0.00071,
+    "name": "_CEFusedFwdBwd + memory-pareto iter1 (in-kernel 1/n_valid, gw addmm_ in weight.dtype, out= GEMM2, needs_input_grad gating)",
+    "t4_192MB_ms": 188,
+    "t4_192MB_mb": 820,
+    "t4_192MB_x_compiled": 0.96,
+    "t4_128MB_ms": 199,
+    "t4_128MB_mb": 686,
+    "grad_rel_vs_eager": 0.000407,
     "loss_vs_liger": 0.0,
-    "status": "CONVERGED \u2014 beats Liger@1024 by 19% at +68MB AND Liger@2048 (faster, 180MB less); grads tighter to fp32 than Liger. Ported to BiBo src/kernels/fused_ce.py."
+    "status": "RE-CONVERGED 2026-07-04 \u2014 0.94-0.96x compiled at 3.75x less mem (4.48x @128MB); beats Liger@1024 (321ms/836MB) on speed AND memory; grad rel TIGHTENED to 4.07e-4. Sweep 128..512MB flat -> budget is a nearly-free memory dial. Remaining floor = inputs+grad outputs+chunk dial; nothing structural left. Needs re-port to BiBo src/kernels/fused_ce.py."
   },
   "diagnosis": "Round-2 'recompute GEMM is the irreducible floor' was REFUTED by the Liger baseline. CE grad needs only logits+labels (loss scalar -> scalar upstream grad), so the full gradient is computable in the FORWARD chunk loop -> no stored (N,V), no recompute (4 GEMM -> 3). The recompute was a self-inflicted design choice from splitting fwd(lse)/bwd. Occupancy sub-trap: a one-program-per-row fused reduce+grad kernel won locally but lost on T4 (launch-bound, V streamed serially); the 2D-grid grad kernel saturates the T4 SMs and is the real fix.",
   "tried": [

@@ -17,9 +17,9 @@ in-place addmm_ (cuBLAS beta=1, fp32 internal compute) — no fp32 (V,H) accumul
 per-chunk (V,H) temp, no backward cast. Grads for frozen inputs (needs_input_grad) skip
 their GEMM + buffer entirely, so a frozen lm_head / no-grad eval pays only GEMM 1 + lse.
 
-Speed: matches Liger's fused-linear CE (the recompute variant lost to it by an extra GEMM);
-the only path that fits when standard CE OOMs. Grad-exact vs F.cross_entropy (loss Δ~1e-6,
-grad rel <1.2e-2 fp16).
+T4 (N=16384 V=81000 H=512): ~0.96x compiled fwd+bwd at 3.75x less peak (820 vs 3072 MB @192MB
+budget; 4.48x less @128MB) — beats Liger's fused-linear CE on speed AND memory. Grad-exact vs
+F.cross_entropy (loss Δ~1e-6, grad rel 4.1e-4 fp16).
 
 Drop-in (replaces `F.cross_entropy(hidden @ lm_head.weight.T, labels)`):
     from kernels.sm75.cross_entropy import fused_linear_cross_entropy

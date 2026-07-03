@@ -29,6 +29,12 @@ scale. The result:
   gradient accumulators.
 - **3 GEMMs** over the data (logits, `grad_hidden`, `grad_weight`), with **no backward recompute** — the
   recompute variant lost to Liger by an extra GEMM, so this fused forward+backward path drops it.
+- `grad_weight` accumulates **in `weight.dtype`** via one in-place `addmm_` per chunk (cuBLAS `beta=1`,
+  fp32 internal compute) — no fp32 `(V, H)` accumulator, no per-chunk temp, no backward cast. This is safe
+  because the `1/n_valid` scale is folded into the gradient kernel (as a device scalar — no host sync), so
+  gradient magnitudes stay ~`1/N`.
+- Frozen inputs skip their GEMM and buffer entirely (`needs_input_grad` gating): a frozen LM head (LoRA) or
+  a no-grad eval pays only the logits GEMM plus the log-sum-exp reduction.
 
 <Aside type="note">
 This is the same class of edge as terminal-loss fusion described in
@@ -38,13 +44,13 @@ memory is what lets the training step happen at all.
 
 ## Performance
 
-Measured on a Tesla T4 (`sm_75`):
+Measured on a Tesla T4 (`sm_75`), N=16384 H=512 V=81000:
 
-- **~3.4× less peak memory** than the compiled LM-head + cross-entropy.
-- **Matches Liger's** fused-linear cross-entropy on speed (it is roughly latency-neutral-to-slower vs the
-  compiled head on its own — its job is to fit, not to be the fastest path).
-- **Grad-exact** vs `F.cross_entropy`: loss Δ ~1e-6, gradient relative error < 1.2e-2 in fp16 (bit-identical
-  to the recompute variant).
+- **3.75× less peak memory** than the compiled LM-head + cross-entropy (820 MB vs 3072 MB at the default
+  192 MiB budget; **4.5× less** at 128 MiB).
+- **~0.96× the compiled path's speed** (188 ms vs 180 ms fwd+bwd) — essentially a tie, at a quarter of the
+  memory. It **beats Liger's** fused-linear cross-entropy outright (Liger: 321 ms / 836 MB at chunk 1024).
+- **Grad-exact** vs `F.cross_entropy`: loss Δ ~1e-6, gradient relative error 4.1e-4 in fp16.
 
 **On Blackwell (`sm_120`)** the same memory dial holds — up to **3.8× less peak** — and it **beats Liger**
 on the memory↔speed frontier: at equal-or-lower peak memory it is faster, and it degrades far more gently as

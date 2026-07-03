@@ -52,7 +52,7 @@ Numerical parity (forward output **and** gradients) against the eager reference 
 
 | Kernel | Replaces | The edge `torch.compile` can't get | T4 result |
 |---|---|---|---|
-| [`fused_linear_cross_entropy`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/cross-entropy/) | `lm_head` + `F.cross_entropy` | gradient computed in the forward chunk loop — **never materializes the `(N, V)` logits** | **~3.4× less peak memory** (trains where standard CE OOMs); matches Liger |
+| [`fused_linear_cross_entropy`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/cross-entropy/) | `lm_head` + `F.cross_entropy` | gradient computed in the forward chunk loop — **never materializes the `(N, V)` logits** | **3.75× less peak memory at ~0.96× compiled speed** (trains where standard CE OOMs); beats Liger on speed and memory |
 | [`fused_xsa`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/xsa/) | Exclusive Self-Attention correction | one fused kernel reads `V` **once** (the compiler emits two passes) | **~1.15×** fwd+bwd, grad-exact |
 | [`FusedMuon`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/muon/) | Polar-Express Muon optimizer step | `foreach` + `baddbmm` collapse the per-param launch tax; experts batch into one GEMM | **~1.09×** (75M) / **~1.05×** (300M), peak mem ≤ baseline |
 | [`fused_router`](https://isnoobgrammer.github.io/triton-kernel-fused/kernels/router/) | conv router (conv → sigmoid → bias → topk → gather) | fuses native `topk` into an in-register epilogue + a merged backward | **~1.11–1.17×** fwd+bwd, exact grads, mem parity |
@@ -66,7 +66,7 @@ and the one regression — the conv router — was diagnosed and recovered into 
 
 | Kernel | Tesla T4 (`sm_75`) | RTX PRO 6000 Blackwell (`sm_120`) |
 |---|---|---|
-| `fused_linear_cross_entropy` | ~3.4× less peak; matches Liger | up to **3.8× less peak**; **beats Liger** at equal memory |
+| `fused_linear_cross_entropy` | **3.75× less peak** at ~0.96× compiled speed; beats Liger | up to **3.8× less peak**; **beats Liger** at equal memory |
 | `fused_xsa` | ~1.15× fwd+bwd | **~1.61×** fwd+bwd (warm) |
 | `FusedMuon` | ~1.09× / ~1.05× | **~2.3× (75M) / ~2.48× (302M)**, peak ≤ baseline |
 | `fused_router` | ~1.11–1.17× fwd+bwd | **~1.86×** fwd+bwd (fwd 1.29× / bwd 2.30×) |

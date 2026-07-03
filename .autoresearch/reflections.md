@@ -164,7 +164,22 @@ gw*sc 166MB + cast 83MB — all avoidable, none of it the budget.**
   ~13x(83+166+166)MB = ~5.4GB HBM traffic/step ~ 17ms on T4). grad_weight rel expected
   7e-4 -> ~2e-3 (13 fp16 chunk-to-chunk adds); gate 1.5e-2. If T4 fails the gate, fallback =
   fp32 accumulator behind a flag (do NOT pre-add the flag).
-- AWAIT: `python bench.py --compile ce ce_sweep` on T4.
+- **T4 VERDICT (2026-07-04): KEEP — pareto win on BOTH axes, CONVERGED again.**
+  @192MB: fwd+bwd **187.7-194ms / 820MB = 0.94-0.96x compiled at 3.75x less mem** (was 260ms/904MB
+  = 0.76x/3.4x). @128MB: 199ms/686MB = 0.91x at 4.48x less. grad rel **4.07e-4** (TIGHTENED vs the
+  old ~1e-3-class number — the fp16-accumulation fear was unfounded; the removed fp16 mm-temp ->
+  fp32 add_ round-trip was itself a rounding step, and in-kernel 1/n keeps magnitudes well-scaled).
+  Sweep 128..512MB flat (193-200ms): budget = nearly-free memory dial, 192MB stays default.
+- **Why the speed jumped 0.76->0.96x**: the killed add_ pass (13x(83+166+166)MB ~ 5.4GB HBM/step
+  ~ 17ms) + backward product/cast (~250MB of alloc+traffic) + out= GEMM2. Memory objective paid
+  in latency too — on a memory-bound op, bytes ARE time.
+- **Observed peak saving 84MB (904->820), not the predicted ~250**: only the persistent fp32->fp16
+  accumulator halving moved peak; the per-chunk temp + bwd transients were hidden under the
+  allocator's reuse of freed chunk blocks. Lesson: transient allocs inside a chunk loop often
+  DON'T set peak (allocator reuse) — but they still cost HBM traffic = latency. Predict peak from
+  the max LIVE set, not the sum of allocs.
+- Remaining memory floor: inputs (hidden 16 + weight 83) + outputs (gh 16 + gw 83) + chunk
+  transient (the dial). Nothing structural left; vs Liger we are faster at less memory. CLOSED.
 
 ## Round 3b (XSA beats inductor) — 2026-06-28
 - XSA was 0.86x fwd+bwd vs compiled (README "fallback only"). Diagnosed: the kernel launched
