@@ -20,18 +20,19 @@ then a global Frobenius factor sets the overall scale. Faithful to the Tilde alg
                       correct rows, SCALE-INVARIANT gain: per-row norm = k*sqrt(cols/rows), update
                       spectral norm ~= k = SPECTRAL_GAIN. Post-hoc row-rescale of ONE polar, so it
                       BREAKS orthogonality/spectrum (SV diff ~1e-2 vs Aurora).
-  unormuon_aurora   : DEFAULT. `leverage_prescale` the momentum (divide each row by its L2 norm)
-                      BEFORE Newton-Schulz, then the SAME spectral post-scale. The single polar then
-                      orthogonalizes an already leverage-balanced matrix -> a genuinely near-orthogonal,
-                      row-uniform factor = Aurora's K=2 output, at ONE polar (Aurora's iterative = K
-                      polars). Measured: closer to Aurora(K=2) than Aurora's own K=3 iterate on tall
-                      skewed inputs; SV spectrum preserved (diff ~1e-4). Same magnitude as
-                      unormuon_spectral (k), so no LR change vs it. Prescale is a no-op for rows<=cols.
       where  v_t = beta2*v_{t-1} + (1-beta2)*mean_cols(O*O)   (per-row EMA second moment)
 
-`unormuon_aurora` is the DEFAULT: Aurora-quality leverage correction at one polar solve + one row
-reduction + one divide. Switching the default from the old `polarexpress` changes the effective LR band,
-so retune LR (k=SPECTRAL_GAIN is the one knob — it IS the target spectral norm of the update).
+AURORA family (an orthogonalization METHOD, not a post-scale: it re-runs the polar) — see aurora_update:
+  aurora            : DEFAULT. Iterate {divide rows by (damped) row-norm, re-orthogonalize} K times,
+                      then scale to spectral gain k. Because it PRESCALES the input (not the output),
+                      the polar rebuilds orthogonality -> a leverage-balanced near-orthogonal factor
+                      (this is exactly the prescale mechanism NorMuon/U-NorMuon skip). K = AURORA_K:
+                      K=1 (one polar) matches the paper's K=2 for our task at HALF the cost; K=2 = the
+                      paper's full method. Magnitude = k*sqrt(cols/rows) (same band as unormuon_spectral).
+
+`aurora` (K=1) is the DEFAULT: Aurora-quality leverage correction at ONE polar solve. Switching the
+default from the old `polarexpress` changes the effective LR band, so retune LR (k=SPECTRAL_GAIN is the
+one magnitude knob = target spectral norm; K=AURORA_K trades polar solves for fidelity to paper Aurora).
 
 Aurora's *iterative* variant (interleave rescale + re-orthogonalize, K polar solves) is NOT here — it
 replaces the Newton-Schulz itself rather than post-scaling its output, so it belongs with newton_schulz.
@@ -41,15 +42,22 @@ Self-check: python -m kernels.muon.muon_scaling
 import torch
 
 SCALAR_MODES = ("polarexpress", "jordan", "moonlight")
-PERROW_MODES = ("normuon", "unormuon", "unormuon_spectral", "unormuon_aurora")
-ALL_MODES = SCALAR_MODES + PERROW_MODES
-DEFAULT_MODE = "unormuon_aurora"
+PERROW_MODES = ("normuon", "unormuon", "unormuon_spectral")
+AURORA_MODES = ("aurora",)
+ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES
+DEFAULT_MODE = "aurora"
 
 PERROW_BETA2 = 0.95
 PERROW_EPS = 1e-8
-# Target spectral norm of the update for `unormuon_spectral` (scale-invariant gain). ~k*sqrt(cols/rows)
-# per-row -> ~2-3 at projection aspect ratios (rows/cols ~ 2.5-4). The one LR-band knob; tune per run.
+# Target spectral norm of the update (scale-invariant gain) for `unormuon_spectral` and `aurora`.
+# ~k*sqrt(cols/rows) per-row -> ~2-3 at projection aspect ratios (rows/cols ~ 2.5-4). LR-band knob.
 SPECTRAL_GAIN = 4.5
+# aurora polar-solve iterations. K=1 (prescale + one polar) matches the paper's K=2 for our task at
+# HALF the cost (measured: closer to K=2 than K=2's own K=3 iterate). K=2 = the paper's full method.
+AURORA_K = 1
+# aurora row-norm damping: D_k = D_{k-1}^beta * rownorm^(1-beta). 0 = full prescale (best at K=1,
+# measured); the paper uses 0.5 at K=2.
+AURORA_BETA = 0.0
 
 
 def is_perrow(mode):
@@ -77,18 +85,31 @@ def perrow_state(M, rows, device):
     return torch.zeros((M, rows), device=device, dtype=torch.float32)
 
 
-def prescale_needed(mode, rows, cols):
-    """Whether to leverage-prescale the momentum before Newton-Schulz (aurora mode, tall only)."""
-    return mode == "unormuon_aurora" and rows > cols
+def is_aurora(mode):
+    return mode in AURORA_MODES
 
 
-def leverage_prescale(u, eps=PERROW_EPS):
-    """Aurora(K=1, beta=0): divide each row of the momentum by its L2 norm BEFORE Newton-Schulz, so the
-    single polar solve produces a leverage-balanced near-orthogonal factor (matches Aurora's K=2 output
-    within its own fp16 convergence noise) at ZERO extra polar cost. u: (M, rows, cols). fp32 reduction
-    (fp16 sum-of-squares overflows). Caller gates on prescale_needed (tall matrices only)."""
-    r = u.float().norm(dim=-1, keepdim=True).clamp_min(eps)
-    return (u.float() / r).to(u.dtype)
+def aurora_update(M, polar_fn, gain=SPECTRAL_GAIN, K=AURORA_K, beta=AURORA_BETA, eps=PERROW_EPS):
+    """Aurora: iterate {leverage-prescale rows, re-orthogonalize} K times, then scale to spectral gain.
+
+    M: (B, rows, cols) batch of momenta. polar_fn: the arch's orthogonalizer (returns U V^T, same shape).
+    Each iteration divides rows by a (damped) row-norm and re-runs the polar, so the output is a
+    leverage-BALANCED near-orthogonal factor (rows ~ sqrt(cols/rows)), unlike a post-hoc row rescale
+    which breaks orthogonality. K=1 (one polar) matches the paper's K=2 for our task; K=2 = the paper.
+    Returns gain * X_K (per-row norm ~ gain*sqrt(cols/rows) = spectral norm ~ gain). Cost: K polar solves.
+    """
+    rows, cols = M.shape[-2], M.shape[-1]
+    tgt = (min(rows, cols) / rows) ** 0.5                        # sqrt(cols/rows) tall, 1 wide
+    dt = M.dtype
+    X = M.float()
+    fro = X.flatten(-2, -1).norm(dim=-1).clamp_min(eps)          # per-matrix Frobenius -> (B,)
+    X = X / fro.view(*fro.shape, 1, 1)
+    D = torch.ones(X.shape[:-1], device=X.device)                # (B, rows)
+    for _ in range(K):
+        r = X.norm(dim=-1).clamp_min(eps)                        # per-row L2 -> (B, rows)
+        D = D.pow(beta) * r.pow(1.0 - beta)
+        X = polar_fn((tgt * (X / D.unsqueeze(-1))).to(dt)).float()
+    return (gain * X).to(dt)
 
 
 def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):

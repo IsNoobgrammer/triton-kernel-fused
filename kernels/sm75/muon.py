@@ -77,23 +77,27 @@ class FusedMuon(optim.Optimizer):
         'moonlight' = 0.2*sqrt(max(rows,cols)) (consistent-RMS, AdamW-band LR).
       PER-ROW (leverage-aware, fixes rectangular-matrix neuron death; per-row EMA second moment in
         optimizer state, round-trips in state_dict): 'normuon' (rows->unit RMS), 'unormuon' (leverage-
-        correct but moonlight-band magnitude that grows with sqrt(rows)), 'unormuon_spectral' (DEFAULT:
-        leverage-correct AND scale-invariant — rows -> k*sqrt(cols/rows), spectral norm ~= k =
-        muon_scaling.SPECTRAL_GAIN; ~2-3 for projection matrices at any model width).
-    DEFAULT is 'unormuon_spectral'. NOTE: behavioral change from the old 'polarexpress' default — it
-    fixes neuron death and sets a scale-invariant update magnitude (SPECTRAL_GAIN is the LR-band knob),
-    so RETUNE LR; pass scale_mode='polarexpress' for the old behavior. Per-row modes use the eager apply
-    (not the CUDA-graph capture path).
+        correct but moonlight-band magnitude that grows with sqrt(rows)), 'unormuon_spectral' (leverage-
+        correct AND scale-invariant — rows -> k*sqrt(cols/rows), spectral norm ~= k = SPECTRAL_GAIN).
+      AURORA (orthogonalization method, K polar solves): 'aurora' (DEFAULT) — iterate {prescale rows,
+        re-orthogonalize} `aurora_k` times then scale to spectral gain k; K=1 matches paper Aurora (K=2)
+        at half cost. Prescaling the input (vs post-scaling the output) lets the polar rebuild
+        orthogonality, which the post-hoc unormuon* modes cannot.
+    DEFAULT is 'aurora' (K=1). NOTE: behavioral change from the old 'polarexpress' default — it fixes
+    neuron death and sets a scale-invariant update magnitude (SPECTRAL_GAIN is the LR-band knob), so
+    RETUNE LR; pass scale_mode='polarexpress' for the old behavior. Per-row/aurora modes use the eager
+    apply (not the CUDA-graph capture path). `aurora_k` sets aurora's polar-solve count.
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode=_scaling.DEFAULT_MODE,
-                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3):
+                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype
         self.scale_mode = _scaling.validate(scale_mode)
+        self.aurora_k = _scaling.AURORA_K if aurora_k is None else aurora_k
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
         # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
         # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
@@ -117,6 +121,10 @@ class FusedMuon(optim.Optimizer):
 
     def _scale(self, p):
         return _scaling.scalar_scale(self.scale_mode, p.shape[-2], p.shape[-1])
+
+    def _polar(self, u):
+        """The raw orthogonalizer aurora iterates on (overridden on sm120 to gram/symmul)."""
+        return newton_schulz(u, self.coeffs, self.ns_dtype)
 
     def _plan(self, group, params):
         """Build (once, cached) the same-shape grouping + one persistent (M,r,c) batched momentum buffer
@@ -143,7 +151,9 @@ class FusedMuon(optim.Optimizer):
             perrow = _scaling.is_perrow(self.scale_mode)
             if perrow and "scale_v" not in self.state[anchor]:       # per-row EMA state (round-trips in state_dict)
                 self.state[anchor]["scale_v"] = _scaling.perrow_state(M, r, anchor.device)
-            scale = 1.0 if perrow else _scaling.scalar_scale(self.scale_mode, r, c)
+            # aurora/per-row fold their scale into the update tensor, so the scalar is unused (1.0)
+            scale = (_scaling.scalar_scale(self.scale_mode, r, c)
+                     if self.scale_mode in _scaling.SCALAR_MODES else 1.0)
             # split members into row-chunks bounded by ns_batch_elems (params kept whole; ≥1 param/chunk)
             row_cap = max(1, self.ns_batch_elems // (r * c))
             chunks, cur, cur_rows, start = [], [], 0, 0
@@ -249,7 +259,7 @@ class FusedMuon(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self.use_graph and not _scaling.is_perrow(self.scale_mode):
+        if self.use_graph and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)):
             self._graph_step()                                    # captured graph supports scalar scales only
             return loss
 
@@ -269,6 +279,7 @@ class FusedMuon(optim.Optimizer):
             if wd != 0:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
             perrow = _scaling.is_perrow(self.scale_mode)
+            aurora = _scaling.is_aurora(self.scale_mode)
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
@@ -282,15 +293,16 @@ class FusedMuon(optim.Optimizer):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
-                    if _scaling.prescale_needed(self.scale_mode, r, c):   # aurora: leverage-prescale before NS
-                        u = _scaling.leverage_prescale(u)
-                    out = newton_schulz(u, self.coeffs, self.ns_dtype)
-                    if perrow:                                        # leverage-aware per-row rescale (scale folded into out)
-                        out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
+                    if aurora:                                        # iterative prescale+re-orthogonalize (K polars)
+                        out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
+                    else:
+                        out = newton_schulz(u, self.coeffs, self.ns_dtype)
+                        if perrow:                                    # leverage-aware per-row rescale (scale folded into out)
+                            out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members],
-                                        alpha=(-lr if perrow else alpha))
+                                        alpha=(-lr if (perrow or aurora) else alpha))
 
         return loss
 
@@ -351,9 +363,11 @@ class DistributedMuon(FusedMuon):
             buf = st["momentum_buffer"]
             buf.mul_(g["momentum"]).add_(gr)
             u = gr.add(buf, alpha=g["momentum"]) if g["nesterov"] else buf
-            if _scaling.prescale_needed(self.scale_mode, p.shape[-2], p.shape[-1]):   # aurora prescale (tall)
-                u = _scaling.leverage_prescale(u)
-            upd[i] = newton_schulz(u, self.coeffs, self.ns_dtype).to(p.dtype)
+            if _scaling.is_aurora(self.scale_mode):                  # aurora bakes the full scaled update (gain incl.)
+                upd[i] = _scaling.aurora_update(u.unsqueeze(0) if u.ndim == 2 else u,
+                                                self._polar, K=self.aurora_k).reshape(p.shape).to(p.dtype)
+            else:
+                upd[i] = newton_schulz(u, self.coeffs, self.ns_dtype).to(p.dtype)
 
         # 2) one broadcast per source rank of its packed owned-updates blob; every rank then applies.
         for src in range(ws):
@@ -370,13 +384,16 @@ class DistributedMuon(FusedMuon):
             dist.broadcast(blob, src=src, group=self.pg)
             off = 0
             perrow = _scaling.is_perrow(self.scale_mode)
+            aurora = _scaling.is_aurora(self.scale_mode)
             for i, n in zip(idxs, sizes):
                 p, g = ordered[i]
                 u = blob[off:off + n].view_as(p); off += n
                 lr, wd = g["lr"], g["weight_decay"]
                 if wd != 0:
                     p.mul_(1.0 - lr * wd)
-                if perrow:                                            # per-row rescale (identical on every rank -> still bit-consistent)
+                if aurora:                                            # blob is already the fully scaled update
+                    p.add_(u, alpha=-lr)
+                elif perrow:                                          # per-row rescale (identical on every rank -> still bit-consistent)
                     uu = u.unsqueeze(0) if u.ndim == 2 else u
                     st = self.state[p]
                     if "scale_v" not in st:
