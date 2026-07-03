@@ -181,6 +181,23 @@ gw*sc 166MB + cast 83MB — all avoidable, none of it the budget.**
 - Remaining memory floor: inputs (hidden 16 + weight 83) + outputs (gh 16 + gw 83) + chunk
   transient (the dial). Nothing structural left; vs Liger we are faster at less memory. CLOSED.
 
+## CE speed probe (grad sparsity GO/NO-GO) — 2026-07-04
+- Profile (now wired into bench_ce; was missing) settled the cost structure @192MB, 185.9ms:
+  3 GEMMs 145.9ms (56.8 GEMM1 + 42.8 GEMM2 + 46.3 GEMM3) vs compiled's 147.9 — **we TIE cuBLAS
+  on GEMM time; chunking is free** (chunked GEMM1 beats the monolithic one). Non-GEMM:
+  _grad_logits 26.8ms @ ~198GB/s (headroom to ~250-280), _fwd_reduce 12.5ms (~212GB/s, near floor).
+- Grad sparsity (user ask) = CCE gradient filtering (skip tiles, max softmax p < 2^-12) on
+  GEMM2+GEMM3 = 89.1ms of skippable work. Requires replacing cuBLAS with a maskable tl.dot GEMM.
+  Break-even: (1-skip)*h < 1 where h = sm75 tl.dot/cuBLAS handicap. Receipts against: CCE = 0.08x
+  on T4 (bench.py:604), ledger "tl.dot 2.5-3x on Turing". But CCE's 0.08x may be its config, not
+  tl.dot-intrinsic — MEASURE, don't assume either way.
+- Pushed `ce_probe` (3d5e330): (a) _grad_logits tile sweep on scratch (in-place kernel can't
+  autotune in prod — Liger NaN trap), 7 configs; (b) dense tl.dot best-of-5-configs vs cuBLAS at
+  GEMM2/GEMM3 shapes -> prints h + required skip. h<=2 GO / ~3 marginal / >=6 dead on Turing.
+- AWAIT: `python bench.py ce_probe` on T4 (no --compile needed). If (a) finds >10% -> hard-code
+  tiles (~3% total win). If (b) says GO -> open the sparse-GEMM round; else grad sparsity =
+  sm120/Ampere+ lever only (CCE targets those arches natively).
+
 ## Round 3b (XSA beats inductor) — 2026-06-28
 - XSA was 0.86x fwd+bwd vs compiled (README "fallback only"). Diagnosed: the kernel launched
   **one program per (b,kv,s) row, BLOCK_D=128**, doing cross-lane D-reductions — the SAME
