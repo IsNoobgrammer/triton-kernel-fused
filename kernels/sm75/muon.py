@@ -75,13 +75,15 @@ class FusedMuon(optim.Optimizer):
     NOT touch the NS iteration or its coefficients. All modes live in kernels/muon/muon_scaling.py:
       SCALAR (per-matrix constant): 'polarexpress' (alias 'jordan') = max(1, rows/cols)**0.5;
         'moonlight' = 0.2*sqrt(max(rows,cols)) (consistent-RMS, AdamW-band LR).
-      PER-ROW (leverage-aware, fixes rectangular-matrix neuron death): 'normuon' (rows->unit RMS),
-        'unormuon' (rows->sqrt(cols/rows), the leverage-CORRECT target). Both keep a per-row EMA
-        second moment in optimizer state (round-trips in state_dict).
-    DEFAULT is 'unormuon'. NOTE: this is a behavioral change from the old 'polarexpress' default — it
-    fixes neuron death on tall matrices but lands in moonlight's LR band, so RETUNE LR accordingly; pass
-    scale_mode='polarexpress' for the old behavior. Per-row modes use the eager apply (not the CUDA-graph
-    capture path).
+      PER-ROW (leverage-aware, fixes rectangular-matrix neuron death; per-row EMA second moment in
+        optimizer state, round-trips in state_dict): 'normuon' (rows->unit RMS), 'unormuon' (leverage-
+        correct but moonlight-band magnitude that grows with sqrt(rows)), 'unormuon_spectral' (DEFAULT:
+        leverage-correct AND scale-invariant — rows -> k*sqrt(cols/rows), spectral norm ~= k =
+        muon_scaling.SPECTRAL_GAIN; ~2-3 for projection matrices at any model width).
+    DEFAULT is 'unormuon_spectral'. NOTE: behavioral change from the old 'polarexpress' default — it
+    fixes neuron death and sets a scale-invariant update magnitude (SPECTRAL_GAIN is the LR-band knob),
+    so RETUNE LR; pass scale_mode='polarexpress' for the old behavior. Per-row modes use the eager apply
+    (not the CUDA-graph capture path).
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,

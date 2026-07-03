@@ -11,15 +11,21 @@ PER-ROW (stateful, leverage-aware) — fixes the non-uniform row norms Muon prod
 matrices (the Tilde/Aurora "neuron death" finding: on a tall matrix the update's row norms follow the
 leverage scores and can starve rows). Each output row (neuron) is normalized by an EMA second moment,
 then a global Frobenius factor sets the overall scale. Faithful to the Tilde algorithm boxes:
-  normuon  : Ohat = O / (sqrt(v)+eps),  eta_hat = 0.2*sqrt(rows*cols)/||Ohat||_F   (rows -> unit RMS;
-             MIS-SCALES tall matrices: magnitude is flat in the aspect ratio)
-  unormuon : same Ohat,                 eta_hat = 0.2*cols       /||Ohat||_F        (leverage-CORRECT
-             target sqrt(cols/rows); magnitude shrinks as sqrt(cols/rows) with the aspect ratio)
+  normuon           : Ohat=O/(sqrt(v)+eps), scale rows -> 0.2*sqrt(rows*cols)/||Ohat||_F  (unit RMS;
+                      MIS-SCALES tall: magnitude flat in the aspect ratio)
+  unormuon          : same Ohat, scale -> 0.2*min(rows,cols)/||Ohat||_F   (leverage-CORRECT target;
+                      faithful to the Tilde box, BUT its magnitude ~ 0.2*sqrt(rows)*sqrt(cols/rows)
+                      GROWS with model width sqrt(rows) -> not scale-invariant, and large)
+  unormuon_spectral : same Ohat, scale -> k*sqrt(min(rows,cols))/||Ohat||_F   (DEFAULT). Same uniform
+                      leverage-correct rows, but the overall gain is SCALE-INVARIANT: per-row norm =
+                      k*sqrt(cols/rows), i.e. the update's spectral norm ~= k regardless of model width
+                      (modular / spectral-norm view). k = SPECTRAL_GAIN. At the SwiGLU proj ratio
+                      (rows/cols ~ 2.7) this is ~k*0.6; k=4.5 -> ~2.7, identical for d=2048 or 4096.
       where  v_t = beta2*v_{t-1} + (1-beta2)*mean_cols(O*O)   (per-row EMA second moment)
 
-`unormuon` is the DEFAULT: it removes rectangular-matrix neuron death at ~zero extra cost (one row
-reduction + a per-slice Frobenius norm on top of the NS) and lands in moonlight's LR band. Switching
-the default here from the old `polarexpress` changes the effective LR band, so retune LR accordingly.
+`unormuon_spectral` is the DEFAULT: leverage-correct uniform rows at a scale-invariant, small gain
+(~2-3 for projection matrices). Switching the default from the old `polarexpress` changes the effective
+LR band, so retune LR (k=SPECTRAL_GAIN is the one knob — it IS the target spectral norm of the update).
 
 Aurora's *iterative* variant (interleave rescale + re-orthogonalize, K polar solves) is NOT here — it
 replaces the Newton-Schulz itself rather than post-scaling its output, so it belongs with newton_schulz.
@@ -29,12 +35,15 @@ Self-check: python -m kernels.muon.muon_scaling
 import torch
 
 SCALAR_MODES = ("polarexpress", "jordan", "moonlight")
-PERROW_MODES = ("normuon", "unormuon")
+PERROW_MODES = ("normuon", "unormuon", "unormuon_spectral")
 ALL_MODES = SCALAR_MODES + PERROW_MODES
-DEFAULT_MODE = "unormuon"
+DEFAULT_MODE = "unormuon_spectral"
 
 PERROW_BETA2 = 0.95
 PERROW_EPS = 1e-8
+# Target spectral norm of the update for `unormuon_spectral` (scale-invariant gain). ~k*sqrt(cols/rows)
+# per-row -> ~2-3 at projection aspect ratios (rows/cols ~ 2.5-4). The one LR-band knob; tune per run.
+SPECTRAL_GAIN = 4.5
 
 
 def is_perrow(mode):
@@ -77,9 +86,14 @@ def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):
     v.mul_(beta2).add_(row_sq, alpha=1.0 - beta2)                 # EMA in place
     Ohat = Of / v.sqrt().add(eps).unsqueeze(-1)                   # per-row RMS normalize -> (M, rows, cols)
     fro = Ohat.flatten(-2).norm(dim=-1).clamp_min(1e-12)         # per-slice Frobenius -> (M,)
-    # unormuon target sqrt(min/rows): = cols when tall (the box's `n`), = 1 when wide (rows orthonormal).
-    num = float(min(rows, cols)) if mode == "unormuon" else (rows * cols) ** 0.5
-    factor = (0.2 * num) / fro                                    # (M,)  [lr folded out]
+    mn = float(min(rows, cols))
+    if mode == "normuon":
+        C = 0.2 * (rows * cols) ** 0.5                            # rows -> unit RMS (0.2*sqrt(m*n))
+    elif mode == "unormuon":
+        C = 0.2 * mn                                              # leverage-correct, moonlight-band (grows w/ sqrt(rows))
+    else:                                                         # unormuon_spectral: scale-invariant gain k
+        C = SPECTRAL_GAIN * mn ** 0.5                             # per-row norm -> k*sqrt(min/rows); spectral norm ~= k
+    factor = C / fro                                             # (M,)  [lr folded out]
     return (Ohat * factor.view(-1, 1, 1)).to(O.dtype)
 
 
@@ -98,7 +112,7 @@ def _selfcheck():                                                # pragma: no co
             dead = (rn < 0.1 * rn.mean()).float().mean().item()
             assert cv < 0.05, f"{mode} {m}x{n}: CV {cv:.3f} not uniform"
             assert dead == 0.0, f"{mode} {m}x{n}: {dead:.0%} dead rows"
-            print(f"{mode:>9} {m:>5}x{n:<5}  row-norm CV {cv:.4f}  dead {dead:.0%}  mean {rn.mean():.3f}")
+            print(f"{mode:>17} {m:>5}x{n:<5}  row-norm CV {cv:.4f}  dead {dead:.0%}  mean {rn.mean():.3f}")
         s_ml = scalar_scale("moonlight", m, n)
         s_pe = scalar_scale("polarexpress", m, n)
         print(f"          scalar  moonlight {s_ml:.3f}  polarexpress {s_pe:.3f}")
