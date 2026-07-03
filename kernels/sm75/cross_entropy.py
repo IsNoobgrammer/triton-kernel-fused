@@ -65,10 +65,13 @@ def _grad_logits_kernel(L_ptr, Lse_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
 
 def _grad_logits_inplace(logits, lse, labels, nv, ignore_index):
     M, Vv = logits.shape
-    BLOCK_M, BLOCK_V = 32, 256
+    # T4 ce_probe tile sweep (2026-07-04): 8x1024/w4 = 213 GB/s vs the old 32x256/w4 = 170 GB/s
+    # (wide contiguous-V tiles win on this bandwidth-bound pass). In-place kernel -> no @autotune
+    # (autotune re-runs corrupt the buffer, the Liger NaN trap); config is hard-coded from the sweep.
+    BLOCK_M, BLOCK_V = 8, 1024
     _grad_logits_kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(Vv, BLOCK_V))](
         logits, lse, labels, nv, M, Vv, ignore_index,
-        logits.stride(0), logits.stride(1), BLOCK_M=BLOCK_M, BLOCK_V=BLOCK_V)
+        logits.stride(0), logits.stride(1), BLOCK_M=BLOCK_M, BLOCK_V=BLOCK_V, num_warps=4)
     return logits
 
 
@@ -108,7 +111,11 @@ class _CEFusedFwdBwd(torch.autograd.Function):
     # grad_out; backward is one scalar multiply. grad_weight accumulates in weight.dtype via
     # addmm_ (beta=1) — no fp32 (V,H) buffer, no per-chunk mm temp, no backward cast.
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, hidden, weight, labels, ignore_index, budget):
+        # custom_fwd disables autocast inside: the chunk GEMMs manage their own dtypes and use
+        # out=/addmm_ variants that autocast cannot rewrite (under AMP, mm(...) would silently run
+        # fp16 while out=gh stays fp32 -> dtype error). Callers under AMP pass fp16 hidden/weight.
         N, Hd = hidden.shape
         V = weight.shape[0]
         C = _chunk_rows(N, V, budget)
@@ -145,6 +152,7 @@ class _CEFusedFwdBwd(torch.autograd.Function):
         return loss
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
         gh, gw = ctx.saved_tensors                                       # already scaled by 1/n_valid
         return (gh * grad_out.to(gh.dtype) if gh is not None else None,
