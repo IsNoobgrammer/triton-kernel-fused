@@ -137,6 +137,11 @@ class FusedConvRouterCuDNN(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, top_k, num_experts):
         import torch.nn.functional as F
+        # AMP-safe: cast x/weight to the ACTIVE autocast dtype so the saved tensors match what the
+        # conv actually ran in (else backward mixes bf16 grads with saved fp32 weight). bias stays fp32.
+        if torch.is_autocast_enabled("cuda"):
+            _dt = torch.get_autocast_dtype("cuda")
+            x, weight = x.to(_dt), weight.to(_dt)
         B, S, H = x.shape
         E, _, K = weight.shape
         xc = x.transpose(1, 2).contiguous()                     # (B,H,S) once, reused in bwd
