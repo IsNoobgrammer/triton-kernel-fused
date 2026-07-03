@@ -28,11 +28,13 @@ AURORA family (an orthogonalization METHOD, not a post-scale: it re-runs the pol
                       the polar rebuilds orthogonality -> a leverage-balanced near-orthogonal factor
                       (this is exactly the prescale mechanism NorMuon/U-NorMuon skip). K = AURORA_K:
                       K=1 (one polar) matches the paper's K=2 for our task at HALF the cost; K=2 = the
-                      paper's full method. Magnitude = k*sqrt(cols/rows) (same band as unormuon_spectral).
+                      paper's full method. Magnitude = RMS_TARGET*sqrt(max(rows,cols)) -> update RMS 0.2,
+                      AdamW band (same convention as moonlight/normuon and DeepSeek-V4's Muon).
 
-`aurora` (K=1) is the DEFAULT: Aurora-quality leverage correction at ONE polar solve. Switching the
-default from the old `polarexpress` changes the effective LR band, so retune LR (k=SPECTRAL_GAIN is the
-one magnitude knob = target spectral norm; K=AURORA_K trades polar solves for fidelity to paper Aurora).
+`aurora` (K=1) is the DEFAULT: Aurora-quality leverage correction at ONE polar solve, in the AdamW LR
+band — moonlight, normuon and aurora all target update RMS 0.2 so AdamW LR/WD carry over with no retune.
+The Muon-LR-band conventions remain by design: polarexpress/jordan (paper-faithful aspect scale; their
+AdamW-band twin IS moonlight) and unormuon_spectral (spectral-gain k; its AdamW-band twin IS normuon).
 
 Aurora's *iterative* variant (interleave rescale + re-orthogonalize, K polar solves) is NOT here — it
 replaces the Newton-Schulz itself rather than post-scaling its output, so it belongs with newton_schulz.
@@ -49,8 +51,12 @@ DEFAULT_MODE = "aurora"
 
 PERROW_BETA2 = 0.95
 PERROW_EPS = 1e-8
-# Target spectral norm of the update (scale-invariant gain) for `unormuon_spectral` and `aurora`.
-# ~k*sqrt(cols/rows) per-row -> ~2-3 at projection aspect ratios (rows/cols ~ 2.5-4). LR-band knob.
+# AdamW-band magnitude: update RMS ~= 0.2 (Moonlight convention, = DeepSeek-V4's sqrt(max(n,m))*gamma).
+# For a (near-)orthogonal O, RMS(O) = 1/sqrt(max(rows,cols)), so RMS_TARGET*sqrt(max) pins RMS at 0.2
+# and AdamW LR/WD carry over unchanged. moonlight, normuon and aurora (default) all use this band.
+RMS_TARGET = 0.2
+# Target spectral norm of the update (scale-invariant gain) for `unormuon_spectral` ONLY — the one
+# remaining Muon-LR-band mode by design. ~k*sqrt(cols/rows) per-row at projection aspect ratios.
 SPECTRAL_GAIN = 4.5
 # aurora polar-solve iterations. K=1 (prescale + one polar) matches the paper's K=2 for our task at
 # HALF the cost (measured: closer to K=2 than K=2's own K=3 iterate). K=2 = the paper's full method.
@@ -89,16 +95,20 @@ def is_aurora(mode):
     return mode in AURORA_MODES
 
 
-def aurora_update(M, polar_fn, gain=SPECTRAL_GAIN, K=AURORA_K, beta=AURORA_BETA, eps=PERROW_EPS):
-    """Aurora: iterate {leverage-prescale rows, re-orthogonalize} K times, then scale to spectral gain.
+def aurora_update(M, polar_fn, gain=None, K=AURORA_K, beta=AURORA_BETA, eps=PERROW_EPS):
+    """Aurora: iterate {leverage-prescale rows, re-orthogonalize} K times, then scale to the AdamW band.
 
     M: (B, rows, cols) batch of momenta. polar_fn: the arch's orthogonalizer (returns U V^T, same shape).
     Each iteration divides rows by a (damped) row-norm and re-runs the polar, so the output is a
     leverage-BALANCED near-orthogonal factor (rows ~ sqrt(cols/rows)), unlike a post-hoc row rescale
     which breaks orthogonality. K=1 (one polar) matches the paper's K=2 for our task; K=2 = the paper.
-    Returns gain * X_K (per-row norm ~ gain*sqrt(cols/rows) = spectral norm ~ gain). Cost: K polar solves.
+    gain=None (default) -> RMS_TARGET*sqrt(max(rows,cols)): update RMS ~= 0.2, AdamW LR/WD reusable
+    (same band as moonlight/normuon). Pass an explicit gain for a spectral-norm convention instead.
+    Cost: K polar solves.
     """
     rows, cols = M.shape[-2], M.shape[-1]
+    if gain is None:
+        gain = RMS_TARGET * (max(rows, cols) ** 0.5)
     tgt = (min(rows, cols) / rows) ** 0.5                        # sqrt(cols/rows) tall, 1 wide
     dt = M.dtype
     X = M.float()
@@ -157,6 +167,13 @@ def _selfcheck():                                                # pragma: no co
         s_ml = scalar_scale("moonlight", m, n)
         s_pe = scalar_scale("polarexpress", m, n)
         print(f"          scalar  moonlight {s_ml:.3f}  polarexpress {s_pe:.3f}")
+        # aurora AdamW-band check: identity polar on an already-orthogonal input -> update RMS ~= 0.2
+        Q = torch.linalg.qr(torch.randn(1, max(m, n), min(m, n), device=dev))[0][:, :m, :] \
+            if m >= n else torch.linalg.qr(torch.randn(1, n, m, device=dev))[0].transpose(-2, -1)
+        T = aurora_update(Q, lambda x: x, K=1)
+        rms = T.pow(2).mean().sqrt().item()
+        assert abs(rms - RMS_TARGET) / RMS_TARGET < 0.05, f"aurora {m}x{n}: RMS {rms:.4f} != {RMS_TARGET}"
+        print(f"           aurora {m:>5}x{n:<5}  update RMS {rms:.4f} (AdamW band, target {RMS_TARGET})")
     print("muon_scaling self-check PASS")
 
 

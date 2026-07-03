@@ -85,12 +85,14 @@ class FusedMuon(optim.Optimizer):
         correct but moonlight-band magnitude that grows with sqrt(rows)), 'unormuon_spectral' (leverage-
         correct AND scale-invariant — rows -> k*sqrt(cols/rows), spectral norm ~= k = SPECTRAL_GAIN).
       AURORA (orthogonalization method, K polar solves): 'aurora' (DEFAULT) — iterate {prescale rows,
-        re-orthogonalize} `aurora_k` times then scale to spectral gain k; K=1 matches paper Aurora (K=2)
-        at half cost. Prescaling the input (vs post-scaling the output) lets the polar rebuild
-        orthogonality, which the post-hoc unormuon* modes cannot.
-    DEFAULT is 'aurora' (K=1). NOTE: behavioral change from the old 'polarexpress' default — it fixes
-    neuron death and sets a scale-invariant update magnitude (SPECTRAL_GAIN is the LR-band knob), so
-    RETUNE LR; pass scale_mode='polarexpress' for the old behavior. Per-row/aurora modes use the eager
+        re-orthogonalize} `aurora_k` times then scale to the AdamW band (update RMS 0.2, RMS_TARGET*
+        sqrt(max(rows,cols)) — same convention as moonlight/normuon and DeepSeek-V4's Muon); K=1 matches
+        paper Aurora (K=2) at half cost. Prescaling the input (vs post-scaling the output) lets the
+        polar rebuild orthogonality, which the post-hoc unormuon* modes cannot.
+    DEFAULT is 'aurora' (K=1): fixes neuron death AND keeps AdamW LR/WD reusable (moonlight, normuon
+    and aurora all target update RMS 0.2 — one less HP to tune). Only polarexpress/jordan and
+    unormuon_spectral keep Muon-band magnitudes, by design (paper-faithful conventions); pass
+    scale_mode='polarexpress' for the old default behavior. Per-row/aurora modes use the eager
     apply (not the CUDA-graph capture path). `aurora_k` sets aurora's polar-solve count.
     """
 

@@ -209,23 +209,25 @@ Three families ship, all in `kernels/muon/muon_scaling.py` (shared by `sm75` and
 
 | `scale_mode` | Family | What it does | Update magnitude | LR band |
 |---|---|---|---|---|
-| `"aurora"` **(default)** | prescale | Divide rows by their norm, then re-orthogonalize (`aurora_k` passes). Rebuilds orthogonality on rectangular matrices, so no neuron death. | spectral norm ≈ `k` (`SPECTRAL_GAIN=4.5`) | Muon LR **÷ k** (≈ `0.02/4.5`); retune |
+| `"aurora"` **(default)** | prescale | Divide rows by their norm, then re-orthogonalize (`aurora_k` passes). Rebuilds orthogonality on rectangular matrices, so no neuron death. | RMS ≈ AdamW update (`RMS_TARGET=0.2`) | **reuse your AdamW LR** |
 | `"polarexpress"` (alias `"jordan"`) | scalar | `× max(1, rows/cols)**0.5` — the aspect-ratio scale of the Polar-Express / Keller-Jordan baseline. | spectral norm ≈ 1 | classic **Muon LR** (~`0.02`) |
 | `"moonlight"` | scalar | `× 0.2·sqrt(max(rows, cols))` — update RMS matched to AdamW's. | RMS ≈ AdamW update | **reuse your AdamW LR** |
 | `"normuon"` | per-row | Per-row EMA second-moment normalize → unit RMS per neuron. | RMS ≈ AdamW update | **AdamW LR** band |
 | `"unormuon"` | per-row | Same, target `0.2·min(rows,cols)` (leverage-correct, but magnitude grows with width). | ~`0.2·sqrt(rows·(cols/rows))` | moonlight band, larger — tune |
 | `"unormuon_spectral"` | per-row | Same normalize, target spectral norm `k`. Post-hoc, so slightly breaks orthogonality. | spectral norm ≈ `k` | Muon LR **÷ k** |
 
-So, to answer the common question directly: **`moonlight` (and `normuon`) are built so the update matches an
-AdamW update — keep your AdamW learning rate.** `polarexpress`/`jordan` give a unit-spectral-norm step, so
-they want the classic Muon LR (~`0.02`). The default `aurora` and `unormuon_spectral` target a spectral norm
-of `k = SPECTRAL_GAIN` (4.5), so their step is ~`k×` larger than a unit-norm step — **divide your Muon LR by
-`k`** as a starting point, then tune.
+So, to answer the common question directly: **`aurora` (the default), `moonlight` and `normuon` all target
+update RMS `0.2` — the Moonlight/DeepSeek-V4 convention — so you keep your AdamW learning rate and weight
+decay.** One less hyperparameter to tune. The remaining modes are paper-faithful conventions kept for
+reproduction: `polarexpress`/`jordan` give a unit-spectral-norm step (classic Muon LR, ~`0.02`), and
+`unormuon_spectral` targets spectral norm `k = SPECTRAL_GAIN` (4.5), i.e. Muon LR ÷ `k`. Note the collapse
+is mathematical, not a design choice: an AdamW-band `polarexpress` *is* `moonlight`, and an AdamW-band
+`unormuon_spectral` *is* `normuon` — they differ only in the scalar.
 
 <Aside type="caution">
-Switching `scale_mode` moves the LR band — a good LR for one mode is wrong for another. The `lr=0.02`
-constructor default sits in the `polarexpress` (unit-spectral-norm) band; if you use the `aurora` default,
-start around `lr ≈ 0.02/k` and tune from there.
+Switching to a Muon-band mode moves the LR band — a good LR for one mode is wrong for another. The
+`lr=0.02` constructor default sits in the `polarexpress` (unit-spectral-norm) band; every AdamW-band mode
+(`aurora`, `moonlight`, `normuon`) instead wants your usual AdamW LR (e.g. `3e-4`-ish).
 </Aside>
 
 **Why the default is `aurora` (leverage / "neuron death").** On a *tall* weight (rows ≫ cols) the plain
@@ -237,14 +239,14 @@ polar (cheaper, but a post-hoc row rescale slightly breaks the orthogonal spectr
 square, any mode is equivalent and the plain `polarexpress` is the cheapest.
 
 ```python
-# reuse your AdamW LR for the matrix group:
+# default: leverage-aware AND AdamW-band — reuse your AdamW LR:
+muon = FusedMuon(matrix_params, lr=3e-4)                             # scale_mode="aurora", aurora_k=1
+
+# same LR band, scalar / per-row variants:
 muon = FusedMuon(matrix_params, lr=3e-4, scale_mode="moonlight")
 
-# classic unit-norm Muon:
+# classic unit-norm Muon (paper convention):
 muon = FusedMuon(matrix_params, lr=0.02, scale_mode="polarexpress")
-
-# default leverage-aware step (retune LR down by ~k):
-muon = FusedMuon(matrix_params, lr=4e-3, scale_mode="aurora")        # aurora_k=1
 ```
 
 ## Scaling the Newton-Schulz iteration count
