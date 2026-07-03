@@ -949,7 +949,7 @@ def bench_muon(layers=6):
     if BiBoMuon is not None:
         d = _muon_parity(
             lambda ps: FusedMuon(ps, lr=3e-4, weight_decay=WD, coeffs=_QUINTIC,
-                                 ns_dtype=torch.float32, scale_mode="moonlight"),
+                                 ns_dtype=torch.float32, scale_mode="polar"),
             lambda ps: BiBoMuon(ps, lr=3e-4, momentum=0.95, weight_decay=WD), shapes)
         print(f"  parity  fused(quintic,fp32) vs BiBo Muon   = {d:.2e}  {'PASS' if d < 1e-4 else 'FAIL'}  (trusted anchor)")
     else:

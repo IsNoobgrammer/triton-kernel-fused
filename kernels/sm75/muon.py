@@ -77,26 +77,19 @@ class FusedMuon(optim.Optimizer):
 
     Only 2D and 3D params with a grad are stepped (3D experts orthogonalized per slice); route 1D params
     and conv kernels to AdamW upstream. `scale_mode` sets the POST-Newton-Schulz update scaling; it does
-    NOT touch the NS iteration or its coefficients. All modes live in kernels/muon/muon_scaling.py:
-      SCALAR (per-matrix constant): 'polarexpress' (alias 'jordan') = max(1, rows/cols)**0.5;
-        'moonlight' = 0.2*sqrt(max(rows,cols)) (consistent-RMS, AdamW-band LR).
-      PER-ROW (leverage-aware, fixes rectangular-matrix neuron death; per-row EMA second moment in
-        optimizer state, round-trips in state_dict): 'normuon' (rows->unit RMS), 'unormuon' (leverage-
-        correct but moonlight-band magnitude that grows with sqrt(rows)), 'unormuon_spectral' (leverage-
-        correct AND scale-invariant — rows -> k*sqrt(cols/rows), spectral norm ~= k = SPECTRAL_GAIN).
-      AURORA (orthogonalization method, K polar solves): 'aurora' (DEFAULT) — iterate {prescale rows,
-        re-orthogonalize} `aurora_k` times then scale to the AdamW band (update RMS 0.2, RMS_TARGET*
-        sqrt(max(rows,cols)) — same convention as moonlight/normuon and DeepSeek-V4's Muon); K=1 matches
-        paper Aurora (K=2) at half cost. Prescaling the input (vs post-scaling the output) lets the
-        polar rebuild orthogonality, which the post-hoc unormuon* modes cannot.
-    DEFAULT is 'aurora' (K=1): fixes neuron death AND keeps AdamW LR/WD reusable (moonlight, normuon
-    and aurora all target update RMS 0.2 — one less HP to tune). Only polarexpress/jordan and
-    unormuon_spectral keep Muon-band magnitudes, by design (paper-faithful conventions); pass
-    scale_mode='polarexpress' for the old default behavior. Per-row/aurora modes use the eager
-    apply (not the CUDA-graph capture path). `aurora_k` sets aurora's polar-solve count.
+    NOT touch the NS iteration or its coefficients. Every mode targets update RMS 0.2 (the Moonlight /
+    DeepSeek-V4 convention) so AdamW LR and weight decay carry over unchanged; the modes differ only in
+    the update's ROW SHAPE (see kernels/muon/muon_scaling.py):
+      'polar'   : plain orthogonalized update x 0.2*sqrt(max(rows,cols)). Tall matrices get leverage-
+                  skewed row norms ("neuron death").
+      'normuon' : per-row EMA normalize AFTER the polar (uniform rows, slightly breaks orthogonality;
+                  EMA state round-trips in state_dict).
+      'aurora'  : DEFAULT — prescale rows BEFORE the polar and re-orthogonalize (`aurora_k` passes,
+                  K=1 matches paper Aurora's K=2 at half cost): uniform rows AND orthogonal.
+    normuon/aurora use the eager apply (not the CUDA-graph capture path).
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
