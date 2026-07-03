@@ -21,14 +21,19 @@ import torch.optim as optim
 
 from kernels.muon import muon_scaling as _scaling
 
-# Polar-Express per-iteration NS coefficients (nprime06/parameter-golf, verbatim). 5 tuples = 5 NS steps;
-# tuple i is used at iteration i. The first is aggressive (expand small singular values fast), then settle.
+# Polar-Express per-iteration NS coefficients (arXiv 2505.16932, Alg. 1, l0=1e-3). 8 tuples = 8 NS steps;
+# tuple i is used at iteration i. The first is aggressive (expand small singular values fast), then settle
+# to the FIXED-POINT tail (1.875,-1.25,0.375), whose f(1)=1.875-1.25+0.375=1.0 exactly -> converges to
+# kappa 1 (the old 5-tuple tail had f(1)=1.06 and could not reach 1). Repeat the last tuple for >8 steps.
 _PE_COEFFS = (
-    (8.156554524902461,  -22.48329292557795,  15.878769915207462),
-    (4.042929935166739,   -2.808917465908714,   0.5000178451051316),
-    (3.8916678022926607,  -2.772484153217685,   0.5060648178503393),
-    (3.285753657755655,   -2.3681294933425376,  0.46449024233003106),
-    (2.3465413258596377,  -1.7097828382687081,  0.42323551169305323),
+    (8.28721201814563,   -23.595886519098837, 17.300387312530933),
+    (4.107059111542203,   -2.9478499167379106,  0.5448431082926601),
+    (3.9486908534822946,  -2.908902115962949,   0.5518191394370137),
+    (3.3184196573706015,  -2.488488024314874,   0.51004894012372),
+    (2.300652019954817,   -1.6689039845747493,  0.4188073119525673),
+    (1.891301407787398,   -1.2679958271945868,  0.37680408948524835),
+    (1.8750014808534479,  -1.2500016453999487,  0.3750001645474248),
+    (1.875,               -1.25,                0.375),
 )
 
 
