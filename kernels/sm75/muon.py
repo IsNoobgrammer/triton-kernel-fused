@@ -25,6 +25,7 @@ from kernels.muon import muon_scaling as _scaling
 # tuple i is used at iteration i. The first is aggressive (expand small singular values fast), then settle
 # to the FIXED-POINT tail (1.875,-1.25,0.375), whose f(1)=1.875-1.25+0.375=1.0 exactly -> converges to
 # kappa 1 (the old 5-tuple tail had f(1)=1.06 and could not reach 1). Repeat the last tuple for >8 steps.
+# Kept as the reference minimax schedule; no longer the default (see _DSV4_COEFFS).
 _PE_COEFFS = (
     (8.28721201814563,   -23.595886519098837, 17.300387312530933),
     (4.107059111542203,   -2.9478499167379106,  0.5448431082926601),
@@ -36,8 +37,16 @@ _PE_COEFFS = (
     (1.875,               -1.25,                0.375),
 )
 
+# DEFAULT: DeepSeek-V4's hybrid schedule (arXiv 2606.19348) — 8x Keller-Jordan quintic (a=3.44 lifts tiny
+# singular values ~3.4x/iter, ~2x faster than the PE tail's 1.875) + 2x pinned polish (f(1)=1, f'(1)=0)
+# that locks the KJ band [0.68,1.13] onto 1. Chosen for square (r=1) matrices, whose sigma_min sits below
+# PE-8's l0=1e-3 design floor (hard edge ~1/(2n)): measured kappa at r=1 decay=2, n=2048 — PE-8 5160 vs
+# this 446 (aurora_k1: 470 vs 40.5; aurora_k2: 3.45 vs 1.00). r>=2 identical (kappa 1.00 both). Cost:
+# 10 NS iters vs PE-8's 8 (+25%).
+_DSV4_COEFFS = ((3.4445, -4.7750, 2.0315),) * 8 + ((2.0, -1.5, 0.5),) * 2
 
-def newton_schulz(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7):
+
+def newton_schulz(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7):
     """Orthogonalize G (drive singular values -> 1) via Polar-Express Newton-Schulz (per-iteration coeffs).
 
     2D weights are unsqueezed to (1,A,B); 3D stacked experts (E,A,B) batch over E. Normalization is fp32
@@ -90,7 +99,7 @@ class FusedMuon(optim.Optimizer):
     """
 
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode=_scaling.DEFAULT_MODE,
+                 coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)

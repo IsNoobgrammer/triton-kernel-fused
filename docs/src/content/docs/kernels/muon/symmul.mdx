@@ -1,4 +1,4 @@
----
+﻿---
 title: Symmetric-matmul Newton-Schulz (symmul)
 description: The symmul backend — compute one triangle of each symmetric Newton-Schulz GEMM and mirror it, for ~half the GEMM FLOPs. How to enable/disable it, its full API, and measured performance.
 ---
@@ -58,7 +58,7 @@ never regress.
 ### `newton_schulz_symmul`
 
 ```python
-newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7, force_eager=False)
+newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7, force_eager=False)
 ```
 
 Drop-in replacement for `newton_schulz` running the two symmetric GEMMs on the triangle+mirror kernel.
@@ -68,7 +68,7 @@ orientation as the champion; the only change is halved symmetric-GEMM FLOPs.
 | Argument | Default | Notes |
 |---|---|---|
 | `G` | — | Input matrix `(A, B)` or batched stack `(E, A, B)`. |
-| `coeffs` | `_PE_COEFFS` | Per-iteration `(a, b, c)` tuples; the count **is** the iteration count. |
+| `coeffs` | `_DSV4_COEFFS` | Per-iteration `(a, b, c)` tuples; the count **is** the iteration count. |
 | `ns_dtype` | `torch.float16` | Iteration compute dtype. Normalization is always fp32. |
 | `eps` | `1e-7` | Normalization floor. |
 | `force_eager` | `False` | Bypass `torch.compile` for a pure-Triton (CUDA-graph-capturable) body. Used by the optimizer's `use_graph` path. |

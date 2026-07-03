@@ -806,9 +806,9 @@ def _make_baseline_ns(ns_dtype):
     sum-of-squares overflows); the iteration GEMMs run in ns_dtype — so baseline-fp16 vs fused-fp16 is a
     fair same-precision fusion comparison. Plain fn so --compile can wrap it (compile WORKS for fp16/fp32
     on T4; it SKIPS bf16 — which is exactly why bf16 isn't a T4 baseline)."""
-    _PE_COEFFS = _arch_muon._PE_COEFFS
+    _COEFFS = _arch_muon._DSV4_COEFFS                      # same default as the fused path (fair comparison)
 
-    def baseline_ns(G, coeffs=_PE_COEFFS, eps=1e-7):
+    def baseline_ns(G, coeffs=_COEFFS, eps=1e-7):
         was_2d = G.ndim == 2
         if was_2d:
             G = G.unsqueeze(0)

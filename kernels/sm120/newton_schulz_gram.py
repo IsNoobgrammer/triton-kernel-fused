@@ -1,4 +1,4 @@
-"""Gram-space Newton-Schulz ("gram NS") — iterate on the n x n Gram matrix, not on X.
+﻿"""Gram-space Newton-Schulz ("gram NS") — iterate on the n x n Gram matrix, not on X.
 
 Math (same identity as Dao-AILab/gram-newton-schulz): one X-space NS step is
 X <- C X with C = aI + bA + cA^2, A = X X^T. Every C_k and A_k is a polynomial in
@@ -32,7 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-from kernels.sm75.muon import _PE_COEFFS, newton_schulz as _newton_schulz_cublas
+from kernels.sm75.muon import _DSV4_COEFFS, newton_schulz as _newton_schulz_cublas
 from kernels.sm120.newton_schulz_symmul import (
     SYMMUL_MIN_DIM, _bmmt_configs, symmul, symmul_axpy, newton_schulz_symmul,
 )
@@ -130,7 +130,7 @@ def symmul2(S1, S2, out=None):
     return Y
 
 
-def newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
+def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7,
                        gram_dtype=None, restart_at=GRAM_RESTART_AT, force_eager=False):
     """Polar-Express NS via the Gram recurrence: R <- C^2 R, Q <- C Q, X_out = Q X0.
 
@@ -185,7 +185,7 @@ def newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
 class GramNewtonSchulz:
     """Dao-style callable API (mirrors Dao-AILab/gram-newton-schulz):
 
-        gram_NS = GramNewtonSchulz(ns_coefficients=_PE_COEFFS,
+        gram_NS = GramNewtonSchulz(ns_coefficients=_DSV4_COEFFS,
                                    gram_newton_schulz_reset_iterations=[3])
         Y = gram_NS(X)
 
@@ -194,7 +194,7 @@ class GramNewtonSchulz:
     Find placements for custom coefficients with `autotune_restarts`.
     """
 
-    def __init__(self, ns_coefficients=_PE_COEFFS,
+    def __init__(self, ns_coefficients=_DSV4_COEFFS,
                  gram_newton_schulz_reset_iterations=(GRAM_RESTART_AT,),
                  ns_dtype=torch.float16, gram_dtype=None):
         self.coeffs = tuple(tuple(float(v) for v in row) for row in ns_coefficients)
@@ -315,7 +315,7 @@ if __name__ == "__main__":                              # pragma: no cover
     _args = _ap.parse_args()
     if _args.autotune_restarts or _args.coefs:
         _coeffs = (tuple(tuple(float(v) for v in row.split(",")) for row in _args.coefs.split(";"))
-                   if _args.coefs else _PE_COEFFS)
+                   if _args.coefs else _DSV4_COEFFS)
         autotune_restarts(_coeffs, num_restarts=_args.num_restarts)
     else:
         _selfcheck_and_bench()

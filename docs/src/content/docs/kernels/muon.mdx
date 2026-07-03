@@ -355,7 +355,7 @@ Og = newton_schulz_gram(G, ns_dtype=torch.float16)     # Gram-space — up to ~1
 ```
 
 All three accept a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches
-over `E`, and share the signature `(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7)` (gram adds
+over `E`, and share the signature `(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7)` (gram adds
 `gram_dtype`, `restart_at`). Normalization is always done in fp32 (an fp16 sum-of-squares of a unit `512²`
 matrix would overflow); the iteration GEMMs run in `ns_dtype`. Each fast variant **self-gates** to the
 implementation below it where it would lose, so small matrices never regress:
@@ -374,7 +374,7 @@ own `coeffs` — a tuple of `(a, b, c)` tuples — to use a different recipe. Th
 number of Newton-Schulz iterations:
 
 ```python
-# 5 Polar-Express steps (the default _PE_COEFFS)
+# the default: 10 steps of the DeepSeek-V4 hybrid (_DSV4_COEFFS)
 from kernels.sm120 import newton_schulz_symmul
 O = newton_schulz_symmul(G)
 
@@ -385,24 +385,31 @@ my_coeffs = (
     (3.4445, -4.7750, 2.0315),   # step 3
 )
 O = newton_schulz_symmul(G, coeffs=my_coeffs)          # runs 3 iterations
-opt = FusedMuon(matrix_params, lr=0.02, coeffs=my_coeffs)   # same recipe inside the optimizer
+opt = FusedMuon(matrix_params, coeffs=my_coeffs)       # same recipe inside the optimizer
 ```
+
+The default `_DSV4_COEFFS` is DeepSeek-V4's hybrid schedule (arXiv 2606.19348): 8 steps of the
+Keller-Jordan quintic `(3.4445, -4.7750, 2.0315)` — whose large `a` lifts tiny singular values fast —
+then 2 polish steps of `(2, -1.5, 0.5)`, whose fixed point pins singular values at exactly 1. It was
+chosen over the 8-step Polar-Express schedule (`_PE_COEFFS`, still exported) for **square matrices**:
+a square Gaussian update starts with `sigma_min/sigma_max ~ 1/(2n)`, below Polar-Express's `1e-3` design
+floor, and the hybrid reaches ~11x better conditioning there (identical on rectangular, at 10 vs 8 steps).
 
 ### Scaling the iteration count
 
-Because each tuple is one iteration, you scale the count just by passing a longer `coeffs`. The Polar-Express
-defaults are tuned per-step for 5 steps; for **more** steps, repeat the settled (last) tuple to reach `N`:
+Because each tuple is one iteration, you scale the count just by passing a longer `coeffs` — for more
+steps, repeat the settled (last) tuple to reach `N`:
 
 ```python
-from kernels.sm75.muon import _PE_COEFFS    # the 5 tuned tuples
+from kernels.sm75.muon import _DSV4_COEFFS    # the 10 default tuples
 
-def pe_coeffs(n_iters: int):
-    """Polar-Express coeffs scaled to n_iters: keep the 5 tuned tuples, repeat the last to extend."""
-    if n_iters <= len(_PE_COEFFS):
-        return _PE_COEFFS[:n_iters]
-    return _PE_COEFFS + (_PE_COEFFS[-1],) * (n_iters - len(_PE_COEFFS))
+def scaled_coeffs(n_iters: int):
+    """Default coeffs scaled to n_iters: truncate, or repeat the last (polish) tuple to extend."""
+    if n_iters <= len(_DSV4_COEFFS):
+        return _DSV4_COEFFS[:n_iters]
+    return _DSV4_COEFFS + (_DSV4_COEFFS[-1],) * (n_iters - len(_DSV4_COEFFS))
 
-opt = FusedMuon(matrix_params, lr=0.02, coeffs=pe_coeffs(10))   # 10-step Newton-Schulz
+opt = FusedMuon(matrix_params, coeffs=scaled_coeffs(12))   # 12-step Newton-Schulz
 ```
 
 More steps give tighter orthogonalization (SV closer to 1) at a linear cost in matmuls. On Blackwell the

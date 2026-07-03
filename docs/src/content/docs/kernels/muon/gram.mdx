@@ -1,4 +1,4 @@
----
+﻿---
 title: Gram-space Newton-Schulz (gram)
 description: The gram backend — iterate on the small n x n Gram matrix so the rectangular GEMMs collapse into one final apply, for up to ~1.8x over symmul. Enable/disable, the GramNewtonSchulz callable, restart lists, and the autotune_restarts tool.
 ---
@@ -90,7 +90,7 @@ more steps or hit instability with custom coefficients, add restarts — and let
 ### `newton_schulz_gram`
 
 ```python
-newton_schulz_gram(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7,
+newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7,
                    gram_dtype=None, restart_at=3, force_eager=False)
 ```
 
@@ -100,7 +100,7 @@ Gram-space Newton-Schulz. Same coefficients/normalization/orientation as the cha
 | Argument | Default | Notes |
 |---|---|---|
 | `G` | — | Input `(A, B)` or batched `(E, A, B)`. |
-| `coeffs` | `_PE_COEFFS` | Per-iteration `(a, b, c)` tuples; count = iteration count. |
+| `coeffs` | `_DSV4_COEFFS` | Per-iteration `(a, b, c)` tuples; count = iteration count. |
 | `ns_dtype` | `torch.float16` | Iteration compute dtype (normalization always fp32). |
 | `eps` | `1e-7` | Normalization floor. |
 | `gram_dtype` | `None` | dtype of the `n³` Gram loop; `None` = `ns_dtype`. Measured **not** a stabilizer — prefer a restart. |
@@ -113,10 +113,10 @@ A Dao-style callable that mirrors the upstream API, for use outside the optimize
 
 ```python
 from kernels.sm120 import GramNewtonSchulz
-from kernels.sm75.muon import _PE_COEFFS
+from kernels.sm75.muon import _DSV4_COEFFS
 
 gram_NS = GramNewtonSchulz(
-    ns_coefficients=_PE_COEFFS,
+    ns_coefficients=_DSV4_COEFFS,
     gram_newton_schulz_reset_iterations=[3],   # or [2, 4] for two restarts
 )
 Y = gram_NS(X)
@@ -124,7 +124,7 @@ Y = gram_NS(X)
 
 | Argument | Default | Notes |
 |---|---|---|
-| `ns_coefficients` | `_PE_COEFFS` | List of `(a, b, c)` per iteration. |
+| `ns_coefficients` | `_DSV4_COEFFS` | List of `(a, b, c)` per iteration. |
 | `gram_newton_schulz_reset_iterations` | `(3,)` | 1-based iterations to restart after. Validated to `[1, len(coeffs)-1]` (a restart after the last iteration is a no-op and is rejected). |
 | `ns_dtype` | `torch.float16` | Iteration compute dtype. |
 | `gram_dtype` | `None` | Gram-loop dtype override. |

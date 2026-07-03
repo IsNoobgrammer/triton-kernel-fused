@@ -29,7 +29,7 @@ to the EXACT cuBLAS NS, so small matrices are bit-for-bit the champion. Only the
 """
 import torch
 
-from kernels.sm75.muon import newton_schulz, _PE_COEFFS  # noqa: F401
+from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS  # noqa: F401
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
 from kernels.sm120.newton_schulz_gram import newton_schulz_gram

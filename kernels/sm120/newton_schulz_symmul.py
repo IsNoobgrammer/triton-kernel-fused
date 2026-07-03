@@ -1,4 +1,4 @@
-"""Symmetric-matmul ("symmul") Newton-Schulz — the amalgamated lever (sm120 / Blackwell).
+﻿"""Symmetric-matmul ("symmul") Newton-Schulz — the amalgamated lever (sm120 / Blackwell).
 
 NEW, ADDITIVE, FLAGGED. The champion `kernels.sm75.muon.newton_schulz` (cuBLAS bmm + baddbmm
 fold) is UNTOUCHED. This adds an ORTHOGONAL optimization dimension on top of it: the two NS
@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
-from kernels.sm75.muon import _PE_COEFFS, newton_schulz as _newton_schulz_cublas  # noqa: F401
+from kernels.sm75.muon import _DSV4_COEFFS, newton_schulz as _newton_schulz_cublas  # noqa: F401
 
 
 # Shape-dispatch threshold on the GRAM dim (min(rows,cols)): at/above this the symmetric FLOP cut
@@ -266,7 +266,7 @@ def _amalg_eager(X, coeffs):
 AMALG_COMPILE = _amalg_compiled is not None
 
 
-def newton_schulz_symmul(G, coeffs=_PE_COEFFS, ns_dtype=torch.float16, eps=1e-7, force_eager=False):
+def newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7, force_eager=False):
     """Polar-Express Newton-Schulz with the two SYMMETRIC GEMMs done by the symmul kernel.
 
     Bit-for-bit the same algorithm as `kernels.sm75.muon.newton_schulz` (same PE coeffs, same
