@@ -19,6 +19,8 @@ from collections import defaultdict
 import torch
 import torch.optim as optim
 
+from kernels.muon import muon_scaling as _scaling
+
 # Polar-Express per-iteration NS coefficients (nprime06/parameter-golf, verbatim). 5 tuples = 5 NS steps;
 # tuple i is used at iteration i. The first is aggressive (expand small singular values fast), then settle.
 _PE_COEFFS = (
@@ -69,20 +71,27 @@ class FusedMuon(optim.Optimizer):
     """Polar-Express Muon with foreach + baddbmm + configurable NS dtype (bf16 baseline / fp16 for T4).
 
     Only 2D and 3D params with a grad are stepped (3D experts orthogonalized per slice); route 1D params
-    and conv kernels to AdamW upstream. `scale_mode` sets the POST-Newton-Schulz update multiplier (the
-    `alpha` in `p += -lr*scale*update`); it does NOT touch the NS iteration or its coefficients.
-    'polarexpress' (default, alias 'jordan') = max(1, rows/cols)**0.5 — the aspect-ratio scale of the
-    Polar-Express baseline. 'moonlight' = 0.2*sqrt(max(rows,cols)) — a consistent-RMS scale (AdamW-band LR).
+    and conv kernels to AdamW upstream. `scale_mode` sets the POST-Newton-Schulz update scaling; it does
+    NOT touch the NS iteration or its coefficients. All modes live in kernels/muon/muon_scaling.py:
+      SCALAR (per-matrix constant): 'polarexpress' (alias 'jordan') = max(1, rows/cols)**0.5;
+        'moonlight' = 0.2*sqrt(max(rows,cols)) (consistent-RMS, AdamW-band LR).
+      PER-ROW (leverage-aware, fixes rectangular-matrix neuron death): 'normuon' (rows->unit RMS),
+        'unormuon' (rows->sqrt(cols/rows), the leverage-CORRECT target). Both keep a per-row EMA
+        second moment in optimizer state (round-trips in state_dict).
+    DEFAULT is 'unormuon'. NOTE: this is a behavioral change from the old 'polarexpress' default — it
+    fixes neuron death on tall matrices but lands in moonlight's LR band, so RETUNE LR accordingly; pass
+    scale_mode='polarexpress' for the old behavior. Per-row modes use the eager apply (not the CUDA-graph
+    capture path).
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode="polarexpress",
+                 coeffs=_PE_COEFFS, ns_dtype=torch.float16, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype
-        self.scale_mode = scale_mode
+        self.scale_mode = _scaling.validate(scale_mode)
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
         # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
         # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
@@ -105,10 +114,7 @@ class FusedMuon(optim.Optimizer):
         self._graph_failed = False
 
     def _scale(self, p):
-        r, c = p.shape[-2], p.shape[-1]
-        if self.scale_mode == "moonlight":
-            return 0.2 * (max(r, c) ** 0.5)
-        return max(1, r / c) ** 0.5                                   # polarexpress / jordan (aspect-ratio scale)
+        return _scaling.scalar_scale(self.scale_mode, p.shape[-2], p.shape[-1])
 
     def _plan(self, group, params):
         """Build (once, cached) the same-shape grouping + one persistent (M,r,c) batched momentum buffer
@@ -132,7 +138,10 @@ class FusedMuon(optim.Optimizer):
             anchor = ps[0]
             if "muon_mom" not in self.state[anchor]:                 # don't clobber a loaded checkpoint
                 self.state[anchor]["muon_mom"] = torch.zeros((M, r, c), device=anchor.device, dtype=self.ns_dtype)
-            scale = 0.2 * (max(r, c) ** 0.5) if self.scale_mode == "moonlight" else max(1, r / c) ** 0.5
+            perrow = _scaling.is_perrow(self.scale_mode)
+            if perrow and "scale_v" not in self.state[anchor]:       # per-row EMA state (round-trips in state_dict)
+                self.state[anchor]["scale_v"] = _scaling.perrow_state(M, r, anchor.device)
+            scale = 1.0 if perrow else _scaling.scalar_scale(self.scale_mode, r, c)
             # split members into row-chunks bounded by ns_batch_elems (params kept whole; ≥1 param/chunk)
             row_cap = max(1, self.ns_batch_elems // (r * c))
             chunks, cur, cur_rows, start = [], [], 0, 0
@@ -238,8 +247,8 @@ class FusedMuon(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self.use_graph:
-            self._graph_step()
+        if self.use_graph and not _scaling.is_perrow(self.scale_mode):
+            self._graph_step()                                    # captured graph supports scalar scales only
             return loss
 
         for group in self.param_groups:
@@ -257,10 +266,12 @@ class FusedMuon(optim.Optimizer):
             plan = self._plan(group, params)
             if wd != 0:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
+            perrow = _scaling.is_perrow(self.scale_mode)
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
-                alpha = -lr * g["scale"]
+                v_all = self.state[g["anchor"]].get("scale_v")       # (M,r) EMA state for per-row modes
+                alpha = -lr * g["scale"]                              # scalar modes fold the scale here
                 for members, start, crows in g["chunks"]:            # bounded row-chunks (memory cap)
                     mom_c = mom[start:start + crows]                  # view into the persistent buffer
                     gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
@@ -270,9 +281,12 @@ class FusedMuon(optim.Optimizer):
                     mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
                     out = newton_schulz(u, self.coeffs, self.ns_dtype)
+                    if perrow:                                        # leverage-aware per-row rescale (scale folded into out)
+                        out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],
-                                        [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
+                                        [out[o:o + n].reshape(p.shape) for p, o, n in members],
+                                        alpha=(-lr if perrow else alpha))
 
         return loss
 
@@ -349,11 +363,19 @@ class DistributedMuon(FusedMuon):
                 blob = torch.empty(sum(sizes), device=ref.device, dtype=ref.dtype)
             dist.broadcast(blob, src=src, group=self.pg)
             off = 0
+            perrow = _scaling.is_perrow(self.scale_mode)
             for i, n in zip(idxs, sizes):
                 p, g = ordered[i]
                 u = blob[off:off + n].view_as(p); off += n
                 lr, wd = g["lr"], g["weight_decay"]
                 if wd != 0:
                     p.mul_(1.0 - lr * wd)
-                p.add_(u, alpha=-lr * self._scale(p))
+                if perrow:                                            # per-row rescale (identical on every rank -> still bit-consistent)
+                    uu = u.unsqueeze(0) if u.ndim == 2 else u
+                    st = self.state[p]
+                    if "scale_v" not in st:
+                        st["scale_v"] = _scaling.perrow_state(uu.shape[0], uu.shape[1], p.device)
+                    p.add_(_scaling.apply_perrow(self.scale_mode, uu, st["scale_v"]).reshape(p.shape), alpha=-lr)
+                else:
+                    p.add_(u, alpha=-lr * self._scale(p))
         return loss

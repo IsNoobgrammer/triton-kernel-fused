@@ -33,6 +33,7 @@ from kernels.sm75.muon import newton_schulz, _PE_COEFFS  # noqa: F401
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
 from kernels.sm120.newton_schulz_gram import newton_schulz_gram
+from kernels.muon import muon_scaling as _scaling
 
 # Blackwell mem-gated knee (peak<=baseline at both sizes); sm75 uses 4M. Callers can still override.
 NS_BATCH_ELEMS = 8 * 1024 * 1024
@@ -77,7 +78,8 @@ class FusedMuon(_FusedMuon75):
 
     @torch.no_grad()
     def step(self, closure=None):
-        if not self.use_symmul or self.use_graph:
+        # per-row scale modes always take the eager symmul/gram apply below (captured-graph EMA not wired)
+        if not self.use_symmul or (self.use_graph and not _scaling.is_perrow(self.scale_mode)):
             return super().step(closure)                  # pure-cuBLAS champion (or the graph path)
         loss = None
         if closure is not None:
@@ -92,9 +94,11 @@ class FusedMuon(_FusedMuon75):
             plan = self._plan(group, params)
             if wd != 0:
                 torch._foreach_mul_(params, 1.0 - lr * wd)
+            perrow = _scaling.is_perrow(self.scale_mode)
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]
+                v_all = self.state[g["anchor"]].get("scale_v")   # (M,r) EMA state for per-row modes
                 alpha = -lr * g["scale"]
                 for members, start, crows in g["chunks"]:
                     mom_c = mom[start:start + crows]
@@ -104,8 +108,11 @@ class FusedMuon(_FusedMuon75):
                     mom_c.mul_(momentum).add_(gbuf)
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
                     out = self._ns(u)                     # gram NS (default) or symmul NS
+                    if perrow:                            # leverage-aware per-row rescale (scale folded into out)
+                        out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
                     torch._foreach_add_([p for p, _, _ in members],
-                                        [out[o:o + n].reshape(p.shape) for p, o, n in members], alpha=alpha)
+                                        [out[o:o + n].reshape(p.shape) for p, o, n in members],
+                                        alpha=(-lr if perrow else alpha))
         return loss
 
     def _compute(self, work, decay):
