@@ -256,10 +256,16 @@ def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidd
                 print(f"\n=== CE {vname} (N={N} V={V}) — eager OOM, kernel standalone ===")
                 print(f"  forward {kf:7.3f} ms | fwd+bwd {kfb:7.3f} ms | peak {peak_k:6.0f} MB "
                       f"| grad rel {grel_m:.2e} ({'PASS' if grel_m < 1.5e-2 else 'CHECK'})  [ENABLES training where eager OOMs]")
+            if PROFILE and vname == "ce_192MB":
+                _profile(f"fused CE {vname} fwd+bwd", kstep, leaves=[h2, w2], iters=5)
             del h2, w2; torch.cuda.empty_cache()
         except Exception as ex:
             print(f"\n=== CE {vname} ===\n  FAILED: {type(ex).__name__}: {str(ex).splitlines()[0]}")
             torch.cuda.empty_cache()
+    if PROFILE and eager_ok:
+        he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
+        _profile("compiled-eager CE fwd+bwd", lambda: Eg(he, we).backward(), leaves=[he, we], iters=5)
+        del he, we; torch.cuda.empty_cache()
 
 
 # ───────────────────────── XSA ─────────────────────────
