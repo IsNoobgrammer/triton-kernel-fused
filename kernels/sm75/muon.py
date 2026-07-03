@@ -282,6 +282,8 @@ class FusedMuon(optim.Optimizer):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
+                    if _scaling.prescale_needed(self.scale_mode, r, c):   # aurora: leverage-prescale before NS
+                        u = _scaling.leverage_prescale(u)
                     out = newton_schulz(u, self.coeffs, self.ns_dtype)
                     if perrow:                                        # leverage-aware per-row rescale (scale folded into out)
                         out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
@@ -349,6 +351,8 @@ class DistributedMuon(FusedMuon):
             buf = st["momentum_buffer"]
             buf.mul_(g["momentum"]).add_(gr)
             u = gr.add(buf, alpha=g["momentum"]) if g["nesterov"] else buf
+            if _scaling.prescale_needed(self.scale_mode, p.shape[-2], p.shape[-1]):   # aurora prescale (tall)
+                u = _scaling.leverage_prescale(u)
             upd[i] = newton_schulz(u, self.coeffs, self.ns_dtype).to(p.dtype)
 
         # 2) one broadcast per source rank of its packed owned-updates blob; every rank then applies.

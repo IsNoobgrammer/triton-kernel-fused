@@ -107,6 +107,8 @@ class FusedMuon(_FusedMuon75):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
+                    if _scaling.prescale_needed(self.scale_mode, r, c):   # aurora: leverage-prescale before NS
+                        u = _scaling.leverage_prescale(u)
                     out = self._ns(u)                     # gram NS (default) or symmul NS
                     if perrow:                            # leverage-aware per-row rescale (scale folded into out)
                         out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])

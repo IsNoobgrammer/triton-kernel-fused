@@ -16,16 +16,22 @@ then a global Frobenius factor sets the overall scale. Faithful to the Tilde alg
   unormuon          : same Ohat, scale -> 0.2*min(rows,cols)/||Ohat||_F   (leverage-CORRECT target;
                       faithful to the Tilde box, BUT its magnitude ~ 0.2*sqrt(rows)*sqrt(cols/rows)
                       GROWS with model width sqrt(rows) -> not scale-invariant, and large)
-  unormuon_spectral : same Ohat, scale -> k*sqrt(min(rows,cols))/||Ohat||_F   (DEFAULT). Same uniform
-                      leverage-correct rows, but the overall gain is SCALE-INVARIANT: per-row norm =
-                      k*sqrt(cols/rows), i.e. the update's spectral norm ~= k regardless of model width
-                      (modular / spectral-norm view). k = SPECTRAL_GAIN. At the SwiGLU proj ratio
-                      (rows/cols ~ 2.7) this is ~k*0.6; k=4.5 -> ~2.7, identical for d=2048 or 4096.
+  unormuon_spectral : same Ohat, scale -> k*sqrt(min(rows,cols))/||Ohat||_F. Same uniform leverage-
+                      correct rows, SCALE-INVARIANT gain: per-row norm = k*sqrt(cols/rows), update
+                      spectral norm ~= k = SPECTRAL_GAIN. Post-hoc row-rescale of ONE polar, so it
+                      BREAKS orthogonality/spectrum (SV diff ~1e-2 vs Aurora).
+  unormuon_aurora   : DEFAULT. `leverage_prescale` the momentum (divide each row by its L2 norm)
+                      BEFORE Newton-Schulz, then the SAME spectral post-scale. The single polar then
+                      orthogonalizes an already leverage-balanced matrix -> a genuinely near-orthogonal,
+                      row-uniform factor = Aurora's K=2 output, at ONE polar (Aurora's iterative = K
+                      polars). Measured: closer to Aurora(K=2) than Aurora's own K=3 iterate on tall
+                      skewed inputs; SV spectrum preserved (diff ~1e-4). Same magnitude as
+                      unormuon_spectral (k), so no LR change vs it. Prescale is a no-op for rows<=cols.
       where  v_t = beta2*v_{t-1} + (1-beta2)*mean_cols(O*O)   (per-row EMA second moment)
 
-`unormuon_spectral` is the DEFAULT: leverage-correct uniform rows at a scale-invariant, small gain
-(~2-3 for projection matrices). Switching the default from the old `polarexpress` changes the effective
-LR band, so retune LR (k=SPECTRAL_GAIN is the one knob — it IS the target spectral norm of the update).
+`unormuon_aurora` is the DEFAULT: Aurora-quality leverage correction at one polar solve + one row
+reduction + one divide. Switching the default from the old `polarexpress` changes the effective LR band,
+so retune LR (k=SPECTRAL_GAIN is the one knob — it IS the target spectral norm of the update).
 
 Aurora's *iterative* variant (interleave rescale + re-orthogonalize, K polar solves) is NOT here — it
 replaces the Newton-Schulz itself rather than post-scaling its output, so it belongs with newton_schulz.
@@ -35,9 +41,9 @@ Self-check: python -m kernels.muon.muon_scaling
 import torch
 
 SCALAR_MODES = ("polarexpress", "jordan", "moonlight")
-PERROW_MODES = ("normuon", "unormuon", "unormuon_spectral")
+PERROW_MODES = ("normuon", "unormuon", "unormuon_spectral", "unormuon_aurora")
 ALL_MODES = SCALAR_MODES + PERROW_MODES
-DEFAULT_MODE = "unormuon_spectral"
+DEFAULT_MODE = "unormuon_aurora"
 
 PERROW_BETA2 = 0.95
 PERROW_EPS = 1e-8
@@ -69,6 +75,20 @@ def perrow_state(M, rows, device):
     """EMA second-moment buffer for a per-row mode: one value per (stacked-matrix, row). Persisted in
     optimizer state so it round-trips through state_dict, exactly like the momentum buffer."""
     return torch.zeros((M, rows), device=device, dtype=torch.float32)
+
+
+def prescale_needed(mode, rows, cols):
+    """Whether to leverage-prescale the momentum before Newton-Schulz (aurora mode, tall only)."""
+    return mode == "unormuon_aurora" and rows > cols
+
+
+def leverage_prescale(u, eps=PERROW_EPS):
+    """Aurora(K=1, beta=0): divide each row of the momentum by its L2 norm BEFORE Newton-Schulz, so the
+    single polar solve produces a leverage-balanced near-orthogonal factor (matches Aurora's K=2 output
+    within its own fp16 convergence noise) at ZERO extra polar cost. u: (M, rows, cols). fp32 reduction
+    (fp16 sum-of-squares overflows). Caller gates on prescale_needed (tall matrices only)."""
+    r = u.float().norm(dim=-1, keepdim=True).clamp_min(eps)
+    return (u.float() / r).to(u.dtype)
 
 
 def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):
