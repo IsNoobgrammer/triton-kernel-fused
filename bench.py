@@ -41,6 +41,7 @@ if "--dump-triton" in sys.argv:
 import torch
 import torch.nn.functional as F
 import triton
+import triton.language as tl
 from triton.testing import do_bench
 
 # Auto-detect the kernels.<arch> package for THIS GPU (highest shipped arch <= the device capability)
@@ -266,6 +267,89 @@ def bench_ce(N=16384, H=512, V=81000):   # BiBo training: B16*S1024 tokens, hidd
         he = hid.clone().requires_grad_(True); we = w.clone().requires_grad_(True)
         _profile("compiled-eager CE fwd+bwd", lambda: Eg(he, we).backward(), leaves=[he, we], iters=5)
         del he, we; torch.cuda.empty_cache()
+
+
+# ───────── CE probes: grad-logits tile sweep + tl.dot GEMM handicap (sparsity GO/NO-GO) ─────────
+@triton.jit
+def _probe_gemm_kernel(A, B, Cc, M, Nn, K, sam, sak, sbk, sbn, scm, scn,
+                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    # minimal dense tl.dot GEMM — NOT a candidate kernel, only measures the sm-specific
+    # tl.dot-vs-cuBLAS handicap `h` at the CE grad-GEMM shapes (a sparse GEMM starts from this).
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    a_ptrs = A + rm[:, None] * sam + rk[None, :] * sak
+    b_ptrs = B + rk[:, None] * sbk + rn[None, :] * sbn
+    for k in range(0, K, BK):
+        a = tl.load(a_ptrs, mask=(rm[:, None] < M) & (rk[None, :] + k < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(rk[:, None] + k < K) & (rn[None, :] < Nn), other=0.0)
+        acc += tl.dot(a, b)
+        a_ptrs += BK * sak
+        b_ptrs += BK * sbk
+    c_ptrs = Cc + rm[:, None] * scm + rn[None, :] * scn
+    tl.store(c_ptrs, acc.to(Cc.dtype.element_ty), mask=(rm[:, None] < M) & (rn[None, :] < Nn))
+
+
+def bench_ce_probe(N=16384, H=512, V=81000):
+    """GO/NO-GO probes for the two CE speed levers left by the 2026-07-04 T4 profile
+    (GEMMs 146ms = ties cuBLAS; _grad_logits 26.8ms @ ~198GB/s; _fwd_reduce 12.5ms):
+
+    (a) _grad_logits tile sweep on a scratch chunk — the prod kernel writes IN PLACE so it
+        cannot @autotune (the Liger NaN trap); this sweeps configs safely. If a config beats
+        BM32/BV256/w4 by >10%, hard-code it.
+    (b) dense tl.dot GEMM handicap h vs cuBLAS at the GEMM2/GEMM3 shapes. CCE-style grad
+        sparsity (skip tiles with max softmax p < 2^-12) wins iff (1-skip)*h < 1:
+        h<=2 GO (needs skip>50%), h~3 marginal (needs >67%), h>=6 dead on this arch."""
+    from kernels.sm75.cross_entropy import _grad_logits_kernel, _chunk_rows
+    C = _chunk_rows(N, V)
+    logits = torch.randn(C, V, device=DEV, dtype=DTYPE) * 0.05
+    lse = torch.logsumexp(logits.float(), 1)
+    lab = torch.randint(0, V, (C,), device=DEV)
+    nv = torch.tensor(float(N), device=DEV, dtype=torch.float32)
+
+    print(f"\n(ce_probe a: _grad_logits tile sweep, scratch chunk C={C} V={V} — prod = BM32/BV256/w4;"
+          f" prod profile said {26.8/14:.2f} ms/chunk)")
+    for bm, bv, wp in [(32, 256, 4), (32, 256, 8), (16, 512, 4), (16, 512, 8),
+                       (64, 256, 8), (32, 512, 8), (8, 1024, 4)]:
+        def stepfn(bm=bm, bv=bv, wp=wp):
+            _grad_logits_kernel[(triton.cdiv(C, bm), triton.cdiv(V, bv))](
+                logits, lse, lab, nv, C, V, -100, logits.stride(0), logits.stride(1),
+                BLOCK_M=bm, BLOCK_V=bv, num_warps=wp)
+        ms = _fwd_ms(stepfn)
+        print(f"  BM={bm:3d} BV={bv:4d} warps={wp}: {ms:7.3f} ms | {C*V*2*2/ms/1e6:5.0f} GB/s")
+
+    w = torch.randn(V, H, device=DEV, dtype=DTYPE) * 0.1
+    hc = torch.randn(C, H, device=DEV, dtype=DTYPE) * 0.1
+    print(f"\n(ce_probe b: tl.dot dense handicap h vs cuBLAS — sparsity wins iff (1-skip)*h < 1)")
+    for name, a, b in [("GEMM2 (C,V)@(V,H)", logits, w), ("GEMM3 (V,C)@(C,H)", logits.t(), hc)]:
+        M, K = a.shape
+        Nn = b.shape[1]
+        out = torch.empty(M, Nn, device=DEV, dtype=DTYPE)
+        ms_cublas = _fwd_ms(lambda a=a, b=b: torch.mm(a, b))
+        best = (float("inf"), None)
+        for bm, bn, bk, wp in [(64, 64, 64, 4), (128, 64, 32, 4), (64, 128, 32, 4),
+                               (32, 64, 64, 4), (64, 64, 32, 2)]:
+            def tstep(a=a, b=b, out=out, bm=bm, bn=bn, bk=bk, wp=wp, M=M, Nn=Nn, K=K):
+                _probe_gemm_kernel[(triton.cdiv(M, bm), triton.cdiv(Nn, bn))](
+                    a, b, out, M, Nn, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                    out.stride(0), out.stride(1), BM=bm, BN=bn, BK=bk,
+                    num_warps=wp, num_stages=2)
+            try:
+                ms = _fwd_ms(tstep)
+            except Exception as ex:
+                print(f"    {name} BM{bm}/BN{bn}/BK{bk}/w{wp}: FAILED {type(ex).__name__}")
+                continue
+            if ms < best[0]:
+                best = (ms, f"BM{bm}/BN{bn}/BK{bk}/w{wp}")
+        h = best[0] / ms_cublas
+        verdict = "GO" if h <= 2 else ("MARGINAL" if h <= 3 else "DEAD on this arch")
+        print(f"  {name}: cuBLAS {ms_cublas:7.3f} ms | best tl.dot {best[0]:7.3f} ms ({best[1]}) "
+              f"| h = {h:.2f}x -> sparsity needs skip > {max(0.0, 1 - 1/h)*100:.0f}%  [{verdict}]")
+    print("  NOTE: skip fraction is data-dependent (real-training softmax is peaked; CCE reports >99%"
+          " tiles filtered late in training). h is the arch constant — that's the GO/NO-GO here.")
 
 
 # ───────────────────────── XSA ─────────────────────────
@@ -1059,6 +1143,7 @@ def bench_muon(layers=6):
 
 
 BENCHES = {"ce": bench_ce, "ce_fit": bench_ce_fit, "ce_oom": bench_ce_oom,
+           "ce_probe": bench_ce_probe,
            "muon": bench_muon, "muon_big": lambda: bench_muon(layers=24),
            "ce_sweep": bench_ce_sweep,
            "xsa": bench_xsa, "router": bench_router_full,
