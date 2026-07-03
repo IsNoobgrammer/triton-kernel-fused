@@ -111,11 +111,14 @@ class _CEFusedFwdBwd(torch.autograd.Function):
     # grad_out; backward is one scalar multiply. grad_weight accumulates in weight.dtype via
     # addmm_ (beta=1) — no fp32 (V,H) buffer, no per-chunk mm temp, no backward cast.
     @staticmethod
-    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, hidden, weight, labels, ignore_index, budget):
-        # custom_fwd disables autocast inside: the chunk GEMMs manage their own dtypes and use
-        # out=/addmm_ variants that autocast cannot rewrite (under AMP, mm(...) would silently run
-        # fp16 while out=gh stays fp32 -> dtype error). Callers under AMP pass fp16 hidden/weight.
+        # AMP-safe, dtype-agnostic: under autocast, cast BOTH gemm operands to the active autocast
+        # dtype up front so every op (incl. out=/addmm_, which autocast cannot rewrite) sees one
+        # consistent dtype. Without this, autocast rewrote mm() to the AMP dtype while out=gh kept
+        # hidden's original dtype -> dtype error. No autocast -> inputs pass through untouched.
+        if torch.is_autocast_enabled("cuda"):
+            dt = torch.get_autocast_dtype("cuda")
+            hidden, weight = hidden.to(dt), weight.to(dt)
         N, Hd = hidden.shape
         V = weight.shape[0]
         C = _chunk_rows(N, V, budget)
@@ -152,7 +155,6 @@ class _CEFusedFwdBwd(torch.autograd.Function):
         return loss
 
     @staticmethod
-    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
         gh, gw = ctx.saved_tensors                                       # already scaled by 1/n_valid
         return (gh * grad_out.to(gh.dtype) if gh is not None else None,
