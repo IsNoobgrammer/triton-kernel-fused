@@ -67,7 +67,8 @@ FusedMuon(
     nesterov=True,
     weight_decay=0.0,
     ns_dtype=torch.float16,            # fp16 (tensor cores); fp32 = safe fallback, bf16 = Ampere/Hopper
-    scale_mode="polarexpress",         # "polarexpress" (alias "jordan") | "moonlight"
+    scale_mode="aurora",               # update scaling -> see "Update scaling" (changes the LR band)
+    aurora_k=None,                     # aurora polar-solve count; None = default (1)
     ns_batch_elems=8 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate); sm120 knee = 8M
     use_symmul=True,                   # MASTER Triton switch. False = pure-cuBLAS champion (no Triton)
     use_gram=True,                     # when Triton is on: Gram-space NS (default) vs symmul NS
@@ -97,7 +98,8 @@ AdamW for everything else.
 | `nesterov` | `True` | Use Nesterov momentum. |
 | `weight_decay` | `0.0` | Decoupled (AdamW-style) weight decay. |
 | `ns_dtype` | `torch.float16` | Newton-Schulz compute dtype. **fp16** for T4 tensor cores; **fp32** for a numerically-safe fallback; **bf16** only on Ampere/Hopper. Normalization is always fp32 regardless. |
-| `scale_mode` | `"polarexpress"` | The **post-Newton-Schulz update multiplier** (`p += -lr·scale·update`) — it does **not** touch the NS iteration or its coefficients. `"polarexpress"` (alias `"jordan"`) = `max(1, rows/cols)**0.5`, the aspect-ratio scale of the Polar-Express baseline. `"moonlight"` = `0.2·sqrt(max(rows, cols))`, a consistent-RMS scale that puts the LR in the AdamW band. |
+| `scale_mode` | `"aurora"` | How the orthogonalized update is scaled before `-lr`. Sets the **LR band** — see [Update scaling](#update-scaling-scale_mode) for every mode and its band. Default `"aurora"` is leverage-aware (fixes the tall-matrix "neuron death" issue). |
+| `aurora_k` | `None` | Number of prescale→orthogonalize passes for `scale_mode="aurora"` (`None` = 1). `1` matches the paper's `2` for our matrices at half the cost; `2` = full paper Aurora. Ignored for non-aurora modes. |
 | `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
 | `use_symmul` | `True` (sm120) | **Master Triton switch.** `True` runs a Triton Newton-Schulz backend (gram or symmul, per `use_gram`); `False` runs the pure-cuBLAS champion with **no Triton launched at all** (a Triton-free environment or an exact-reference run). When `False`, `use_gram` and `gram_restarts` are ignored. See [Three Newton-Schulz backends](#three-newton-schulz-backends). |
 | `use_gram` | `True` (sm120) | When Triton is on (`use_symmul=True`), selects the **Gram-space** NS (default, fastest) over the symmetric-matmul NS. Both self-gate by shape and fall back to cuBLAS for small matrices, so parity is preserved either way. See the [gram sub-page](/kernels/muon/gram/). |
@@ -195,6 +197,55 @@ both 75M and 302M, vs 4M's ~2.0×). Same class, same API — just the Blackwell-
 Newton-Schulz dtype stays **fp16** on every arch: bf16's 7 mantissa bits orthogonalize less precisely than
 fp16's 10, and Blackwell runs fp16 on full-rate tensor cores, so fp16 is both tighter and fast.
 </Aside>
+
+## Update scaling (`scale_mode`)
+
+Newton-Schulz returns an (approximately) orthogonal factor whose singular values are all ~1. Before it is
+applied as `p += -lr · update`, that factor is **scaled** — and the scale sets what magnitude of step a
+given `lr` produces, i.e. **which LR band you tune in.** Change `scale_mode` and you change the LR band; the
+NS iteration and its coefficients are untouched.
+
+Three families ship, all in `kernels/muon/muon_scaling.py` (shared by `sm75` and `sm120`):
+
+| `scale_mode` | Family | What it does | Update magnitude | LR band |
+|---|---|---|---|---|
+| `"aurora"` **(default)** | prescale | Divide rows by their norm, then re-orthogonalize (`aurora_k` passes). Rebuilds orthogonality on rectangular matrices, so no neuron death. | spectral norm ≈ `k` (`SPECTRAL_GAIN=4.5`) | Muon LR **÷ k** (≈ `0.02/4.5`); retune |
+| `"polarexpress"` (alias `"jordan"`) | scalar | `× max(1, rows/cols)**0.5` — the aspect-ratio scale of the Polar-Express / Keller-Jordan baseline. | spectral norm ≈ 1 | classic **Muon LR** (~`0.02`) |
+| `"moonlight"` | scalar | `× 0.2·sqrt(max(rows, cols))` — update RMS matched to AdamW's. | RMS ≈ AdamW update | **reuse your AdamW LR** |
+| `"normuon"` | per-row | Per-row EMA second-moment normalize → unit RMS per neuron. | RMS ≈ AdamW update | **AdamW LR** band |
+| `"unormuon"` | per-row | Same, target `0.2·min(rows,cols)` (leverage-correct, but magnitude grows with width). | ~`0.2·sqrt(rows·(cols/rows))` | moonlight band, larger — tune |
+| `"unormuon_spectral"` | per-row | Same normalize, target spectral norm `k`. Post-hoc, so slightly breaks orthogonality. | spectral norm ≈ `k` | Muon LR **÷ k** |
+
+So, to answer the common question directly: **`moonlight` (and `normuon`) are built so the update matches an
+AdamW update — keep your AdamW learning rate.** `polarexpress`/`jordan` give a unit-spectral-norm step, so
+they want the classic Muon LR (~`0.02`). The default `aurora` and `unormuon_spectral` target a spectral norm
+of `k = SPECTRAL_GAIN` (4.5), so their step is ~`k×` larger than a unit-norm step — **divide your Muon LR by
+`k`** as a starting point, then tune.
+
+<Aside type="caution">
+Switching `scale_mode` moves the LR band — a good LR for one mode is wrong for another. The `lr=0.02`
+constructor default sits in the `polarexpress` (unit-spectral-norm) band; if you use the `aurora` default,
+start around `lr ≈ 0.02/k` and tune from there.
+</Aside>
+
+**Why the default is `aurora` (leverage / "neuron death").** On a *tall* weight (rows ≫ cols) the plain
+orthogonalized update has row norms that follow the matrix's leverage scores — some neurons get a large
+update, others near zero, and the small ones can stall (the Tilde/Aurora finding). Square matrices are fine
+(uniform rows). `aurora` fixes this by **prescaling rows before the polar** so the orthogonalization rebuilds
+a leverage-balanced factor; `normuon`/`unormuon`/`unormuon_spectral` fix it by **rescaling rows after** the
+polar (cheaper, but a post-hoc row rescale slightly breaks the orthogonal spectrum). If all your matrices are
+square, any mode is equivalent and the plain `polarexpress` is the cheapest.
+
+```python
+# reuse your AdamW LR for the matrix group:
+muon = FusedMuon(matrix_params, lr=3e-4, scale_mode="moonlight")
+
+# classic unit-norm Muon:
+muon = FusedMuon(matrix_params, lr=0.02, scale_mode="polarexpress")
+
+# default leverage-aware step (retune LR down by ~k):
+muon = FusedMuon(matrix_params, lr=4e-3, scale_mode="aurora")        # aurora_k=1
+```
 
 ## Scaling the Newton-Schulz iteration count
 
