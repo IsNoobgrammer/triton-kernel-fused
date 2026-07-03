@@ -118,11 +118,13 @@ def _glu_bwd(grad_out, gate_up, row_act):
 class BatchedGLU(torch.autograd.Function):
     """PolyGLU activation: out = act_{row}(gate) * up, with a per-row activation code."""
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, gate_up, row_act):
         ctx.save_for_backward(gate_up, row_act)
         return _glu_fwd(gate_up, row_act)
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
         gate_up, row_act = ctx.saved_tensors
         return _glu_bwd(grad_out.contiguous(), gate_up, row_act), None
@@ -229,6 +231,7 @@ def _sort_by_expert(idx, wt, E):
 # ───────────────────────── grouped path ─────────────────────────
 class _GroupedMoE(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float16)
     def forward(ctx, x, idx, wt, gate_up_proj, down_proj, act_codes):
         ntok, H = x.shape
         top_k = idx.shape[1]; E = gate_up_proj.shape[0]; I = gate_up_proj.shape[1] // 2
@@ -252,6 +255,7 @@ class _GroupedMoE(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
         (x_s, gate_up, inter, eo, st, sw, order, te, ts, e_start, e_end, row_act,
          gate_up_proj, down_proj) = ctx.saved_tensors
@@ -376,7 +380,11 @@ class _PerExpertMoE(torch.autograd.Function):
     2× the GEMMs of forward (dX AND dW per fwd GEMM — irreducible matmul autodiff), but no glue."""
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float16)
     def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes):
+        # cast_inputs: under AMP every float arg arrives fp16 and autocast is DISABLED inside, so
+        # forward GEMMs, saved tensors, and the manual backward stay dtype-consistent (without this,
+        # autocast rewrote the fwd GEMMs to fp16 while saving fp32 weights -> fp16 x fp32 in bwd).
         N, H = hidden.shape
         E = act_codes.shape[0]                  # total routed experts (GLU + specials)
         codes = act_codes.tolist()              # 0/1/2 = GLU (weight slot e), 3 = Identity, 4 = Zero
@@ -409,6 +417,7 @@ class _PerExpertMoE(torch.autograd.Function):
         return out.to(hidden.dtype)
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
         x_s, st, sw, order, row_act, gate_up_proj, down_proj = ctx.saved_tensors
         gate_up_l, inter_l, eo_l = ctx.lists
