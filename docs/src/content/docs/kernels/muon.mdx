@@ -72,7 +72,7 @@ FusedMuon(
     ns_batch_elems=8 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate); sm120 knee = 8M
     use_symmul=True,                   # MASTER Triton switch. False = pure-cuBLAS champion (no Triton)
     use_gram=True,                     # when Triton is on: Gram-space NS (default) vs symmul NS
-    gram_restarts=None,                # override gram restart placement; None = the tuned default ([3])
+    gram_restarts=None,                # override gram restart placement; None = the tuned default ([4, 6])
     use_graph=False,                   # opt-in CUDA-graph capture (off by default; captures the NS too)
 )
 ```
@@ -103,7 +103,7 @@ AdamW for everything else.
 | `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
 | `use_symmul` | `True` (sm120) | **Master Triton switch.** `True` runs a Triton Newton-Schulz backend (gram or symmul, per `use_gram`); `False` runs the pure-cuBLAS champion with **no Triton launched at all** (a Triton-free environment or an exact-reference run). When `False`, `use_gram` and `gram_restarts` are ignored. See [Three Newton-Schulz backends](#three-newton-schulz-backends). |
 | `use_gram` | `True` (sm120) | When Triton is on (`use_symmul=True`), selects the **Gram-space** NS (default, fastest) over the symmetric-matmul NS. Both self-gate by shape and fall back to cuBLAS for small matrices, so parity is preserved either way. See the [gram sub-page](/kernels/muon/gram/). |
-| `gram_restarts` | `None` | Override the gram NS restart placement (an int, a list like `[2, 4]`, or `()` for none). `None` uses the tuned default `[3]`. Only relevant when the gram backend is active; needed mainly for **custom `coeffs`** — find the right value with [`autotune_restarts`](/kernels/muon/gram/#autotune_restarts). |
+| `gram_restarts` | `None` | Override the gram NS restart placement (an int, a list like `[2, 4]`, or `()` for none). `None` uses the tuned default `[4, 6]` (autotuned for the default `_DSV4_COEFFS`; the old 8-step `_PE_COEFFS` wanted `[3]`). Placement is per-coefficient-schedule — for **custom `coeffs`**, find it with [`autotune_restarts`](/kernels/muon/gram/#autotune_restarts). |
 | `use_graph` | `False` | Capture the step as a CUDA graph and replay it. The captured body runs the active Triton NS too (forced to its eager path, which is graph-capturable). **Speed is a wash** and **memory is a penalty on a realistic (mixed-shape) model** — leave it off unless you've measured a win on your exact model. Bit-identical to eager (verified `0.0` over 6 steps, all three backends). See [The CUDA-graph path](#the-cuda-graph-path-use_graph) for the measured tradeoff. Bakes in static `lr`/`wd`/`momentum`. |
 
 ### Three Newton-Schulz backends
@@ -351,7 +351,7 @@ from kernels.sm120 import newton_schulz, newton_schulz_symmul, newton_schulz_gra
 G = torch.randn(2048, 8192, device="cuda", dtype=torch.float16)
 O  = newton_schulz(G, ns_dtype=torch.float16)          # pure cuBLAS — the reference champion
 Os = newton_schulz_symmul(G, ns_dtype=torch.float16)   # symmetric-matmul — ~1.4-1.5x, parity 8.5e-5
-Og = newton_schulz_gram(G, ns_dtype=torch.float16)     # Gram-space — up to ~1.8x over symmul, restart@3
+Og = newton_schulz_gram(G, ns_dtype=torch.float16)     # Gram-space — up to ~1.8x over symmul, restarts [4, 6]
 ```
 
 All three accept a 2D matrix (unsqueezed to `(1, A, B)` internally) or a 3D stack `(E, A, B)` that batches

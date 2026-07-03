@@ -1,10 +1,9 @@
-"""sm120 Muon for Blackwell — FusedMuon defaults to the GRAM-SPACE Newton-Schulz (restart@3).
+﻿"""sm120 Muon for Blackwell — FusedMuon defaults to the GRAM-SPACE Newton-Schulz (restarts [4, 6]).
 
 Gram NS (kernels/sm120/newton_schulz_gram.py): every NS iterate is a polynomial in G = X X^T,
 so the loop runs on the n x n Gram (R <- C^2 R, Q <- C Q, ALL products symmetric-halved by the
 symmul kernels) with ONE rectangular apply X = Q X at the end — the five B@X GEMMs are gone.
-Dao-style restart@3 re-anchors to X mid-run: parity matches the cuBLAS champion to the 4th
-digit at kappa 1e2..1e6 (fp32 alone does NOT stabilize — measured). Gates: gram needs
+Dao-style restarts re-anchor to X mid-run (fp32 alone does NOT stabilize — measured); the placement is autotuned per coefficient schedule: [4, 6] for the 10-iter _DSV4_COEFFS default. Gates: gram needs
 r = m/n >= 1.5 and dim >= 2048, else symmul NS, else cuBLAS — no regime regresses.
 MEASURED (RTX PRO 6000): NS-level 1.81x vs symmul at (2048,8192), 2.24x batched; end-to-end
 step (3 layers d=4096) 118ms vs symmul 145ms vs cuBLAS 190ms, param parity 1.8e-4, peak mem
@@ -40,7 +39,7 @@ NS_BATCH_ELEMS = 8 * 1024 * 1024
 
 
 class FusedMuon(_FusedMuon75):
-    """sm120 FusedMuon — DEFAULTS to gram NS (restart@3) -> symmul -> cuBLAS by shape gates.
+    """sm120 FusedMuon — DEFAULTS to gram NS (restarts [4, 6]) -> symmul -> cuBLAS by shape gates.
 
     use_gram=False falls back to the symmul-default behavior documented below.
 

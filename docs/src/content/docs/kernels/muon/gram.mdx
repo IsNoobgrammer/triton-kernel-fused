@@ -36,10 +36,10 @@ Gram is the default backend (`use_gram=True`). It is reached with the master Tri
 ```python
 from kernels.sm120 import FusedMuon
 
-opt = FusedMuon(matrix_params, lr=0.02)                          # default: gram NS + restart@3
-opt = FusedMuon(matrix_params, lr=0.02, use_gram=False)          # symmul NS instead
-opt = FusedMuon(matrix_params, lr=0.02, use_symmul=False)        # pure cuBLAS, no Triton
-opt = FusedMuon(matrix_params, lr=0.02, gram_restarts=[2, 4])    # custom restart placement
+opt = FusedMuon(matrix_params)                          # default: gram NS + restarts [4, 6]
+opt = FusedMuon(matrix_params, use_gram=False)          # symmul NS instead
+opt = FusedMuon(matrix_params, use_symmul=False)        # pure cuBLAS, no Triton
+opt = FusedMuon(matrix_params, gram_restarts=[3])       # custom restart placement
 ```
 
 <Aside type="caution">
@@ -66,7 +66,8 @@ the gram path.
 a **restart** (Dao's term): part-way through, materialize `X = Q·X`, recompute a fresh Gram from it, and
 reset `Q`. Re-anchoring to the real `X` restores self-correction.
 
-Measured on RTX PRO 6000 with log-spaced singular values, error vs the fp32-SVD polar factor:
+Measured on RTX PRO 6000 with log-spaced singular values, error vs the fp32-SVD polar factor — this
+table used the 8-step Polar-Express schedule (`_PE_COEFFS`), for which a single restart suffices:
 
 | kappa | champion (cuBLAS) | plain gram | gram fp32-loop | **gram restart@3** |
 |---|---|---|---|---|
@@ -75,14 +76,18 @@ Measured on RTX PRO 6000 with log-spaced singular values, error vs the fp32-SVD 
 | 1e6 | 0.7439 | 0.7852 | 0.7768 | **0.7439** |
 
 The lesson: running the Gram loop in **fp32 does not help** (the Gram's small eigenvalues are `σ²`, already
-crushed at fp16 formation — the failure is algorithmic, not roundoff), but a single **restart@3** matches
-the champion to the 4th digit at every conditioning level. `restart_at=3` is therefore the default; the
-`gram_dtype` knob is kept but measured unnecessary as a stabilizer.
+crushed at fp16 formation — the failure is algorithmic, not roundoff); restarts are the fix, and their
+**placement is per-coefficient-schedule**. The default 10-step `_DSV4_COEFFS` needs **two** restarts —
+autotuned to `[4, 6]` (worst error ratio 0.92 vs the champion at kappa `1e2`-`1e6`, i.e. slightly better;
+every single-restart placement either drifts, best `[5]` at 3.1x, or produces NaN in fp16 — the KJ
+quintic's large coefficients are harsher in Gram space than Polar-Express's). `restart_at=(4, 6)` is
+therefore the default; the `gram_dtype` knob is kept but measured unnecessary as a stabilizer — fp32
+does not rescue bad placements either.
 
 <Aside type="note">
-For **5** Newton-Schulz steps, one restart (`[3]`) is the sweet spot for speed and stability. If you run
-more steps or hit instability with custom coefficients, add restarts — and let
-[`autotune_restarts`](#autotune_restarts) pick the placement.
+Bringing your own `coeffs`? The shipped `[4, 6]` is tuned for `_DSV4_COEFFS` only — let
+[`autotune_restarts`](#autotune_restarts) pick the placement (and consider `num_restarts=2` for schedules
+of ~10 steps or more).
 </Aside>
 
 ## API
@@ -91,7 +96,7 @@ more steps or hit instability with custom coefficients, add restarts — and let
 
 ```python
 newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7,
-                   gram_dtype=None, restart_at=3, force_eager=False)
+                   gram_dtype=None, restart_at=(4, 6), force_eager=False)
 ```
 
 Gram-space Newton-Schulz. Same coefficients/normalization/orientation as the champion; falls back to
@@ -104,7 +109,7 @@ Gram-space Newton-Schulz. Same coefficients/normalization/orientation as the cha
 | `ns_dtype` | `torch.float16` | Iteration compute dtype (normalization always fp32). |
 | `eps` | `1e-7` | Normalization floor. |
 | `gram_dtype` | `None` | dtype of the `n³` Gram loop; `None` = `ns_dtype`. Measured **not** a stabilizer — prefer a restart. |
-| `restart_at` | `3` | 1-based iteration(s) after which to restart. An int, a list (`[2, 4]` = after the 2nd **and** 4th), or `None`/`()` for none (only safe for well-conditioned input). |
+| `restart_at` | `(4, 6)` | 1-based iteration(s) after which to restart. An int, a list (`[2, 4]` = after the 2nd **and** 4th), or `None`/`()` for none (only safe for well-conditioned input). Default autotuned for `_DSV4_COEFFS`. |
 | `force_eager` | `False` | Pure-Triton (CUDA-graph-capturable) body; used by the optimizer's `use_graph` path. |
 
 ### `GramNewtonSchulz` (callable)
@@ -117,7 +122,7 @@ from kernels.sm75.muon import _DSV4_COEFFS
 
 gram_NS = GramNewtonSchulz(
     ns_coefficients=_DSV4_COEFFS,
-    gram_newton_schulz_reset_iterations=[3],   # or [2, 4] for two restarts
+    gram_newton_schulz_reset_iterations=[4, 6],   # the tuned default
 )
 Y = gram_NS(X)
 ```
@@ -125,20 +130,20 @@ Y = gram_NS(X)
 | Argument | Default | Notes |
 |---|---|---|
 | `ns_coefficients` | `_DSV4_COEFFS` | List of `(a, b, c)` per iteration. |
-| `gram_newton_schulz_reset_iterations` | `(3,)` | 1-based iterations to restart after. Validated to `[1, len(coeffs)-1]` (a restart after the last iteration is a no-op and is rejected). |
+| `gram_newton_schulz_reset_iterations` | `(4, 6)` | 1-based iterations to restart after. Validated to `[1, len(coeffs)-1]` (a restart after the last iteration is a no-op and is rejected). |
 | `ns_dtype` | `torch.float16` | Iteration compute dtype. |
 | `gram_dtype` | `None` | Gram-loop dtype override. |
 
 ### `autotune_restarts`
 
 Grid-search the best restart placement(s) for a **custom** coefficient set — essential when you bring your
-own coefficients, since their ideal restart may differ from the shipped `[3]`:
+own coefficients, since their ideal restart may differ from the shipped `[4, 6]`:
 
 ```python
 from kernels.sm120 import autotune_restarts
 
-best = autotune_restarts(my_coeffs, num_restarts=1)   # -> e.g. [3]
-opt  = FusedMuon(matrix_params, lr=0.02, coeffs=my_coeffs, gram_restarts=best)
+best = autotune_restarts(my_coeffs, num_restarts=2)   # -> e.g. [4, 6]
+opt  = FusedMuon(matrix_params, coeffs=my_coeffs, gram_restarts=best)
 ```
 
 It scores every combination of `num_restarts` positions on ill-conditioned inputs (`kappa = 1e2/1e4/1e6`)

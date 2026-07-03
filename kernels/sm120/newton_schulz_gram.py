@@ -20,9 +20,12 @@ matrices) plain gram drifts (vs-truth 0.193 vs champion 0.122 at kappa=1e2) and
 fp32 does NOT fix it (0.207 — the Gram's small eigenvalues are sigma^2, already
 crushed at fp16 formation; the failure is algorithmic, not roundoff). Dao's
 RESTART is the fix: materialize X = Q X mid-run, refresh R, reset Q — re-anchoring
-restores self-correction. MEASURED (RTX PRO 6000): restart@3 matches the champion
-to the 4th digit at kappa = 1e2/1e4/1e6, costs ~1.5r once. restart_at=3 is the
-DEFAULT; gram_dtype=torch.float32 is kept as a flag but measured unnecessary.
+restores self-correction. Each restart costs ~1.5r. The placement is autotuned PER
+COEFFICIENT SCHEDULE: the 10-iter _DSV4_COEFFS default needs restarts [4, 6]
+(worst-ratio 0.92 vs champion at kappa 1e2..1e6; any single restart drifts or NaNs
+in fp16); the old 8-iter _PE_COEFFS wanted restart@3 (champion parity to the 4th
+digit, measured RTX PRO 6000). gram_dtype=torch.float32 is kept as a flag but
+measured unnecessary — and it does not rescue bad placements either.
 
 Self-check + local bench: python -m kernels.sm120.newton_schulz_gram
 """
@@ -43,10 +46,14 @@ from kernels.sm120.newton_schulz_symmul import (
 # r=2 1.27-1.30x, r=2.7 1.65x, r=4 1.81x (2.24x batched) -> knee at 1.5.
 GRAM_MIN_RATIO = 1.5
 
-# Restart after this iteration (1-based; Dao recommends 1 restart for 5 NS steps).
-# Ill-conditioned eval: restart@3 == champion parity at kappa 1e2..1e6; without it
-# (and with fp32) gram drifts. None disables (only safe for well-conditioned input).
-GRAM_RESTART_AT = 3
+# Restarts after these iterations (1-based). Autotuned per coefficient schedule on
+# ill-conditioned input (kappa 1e2..1e6): the 10-iter _DSV4_COEFFS default needs TWO
+# re-anchors — [4, 6] scores worst-ratio 0.92 vs the cuBLAS champion (i.e. slightly
+# better), while every single restart either drifts (best [5]: 3.1x) or NaNs in fp16.
+# (The old 8-iter _PE_COEFFS wanted restart@3.) fp32 gram is NOT a fix (measured
+# worse). None/() disables — only safe for well-conditioned input. Re-tune for custom
+# coeffs with autotune_restarts.
+GRAM_RESTART_AT = (4, 6)
 
 
 @triton.autotune(configs=_bmmt_configs(), key=["M", "K"])
@@ -141,7 +148,8 @@ def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7,
     gram_dtype: dtype of the n^3 Gram loop (default ns_dtype; measured NOT a stabilizer).
     restart_at: 1-based iteration(s) after which to refresh X/R/Q — an int, an iterable
         of ints ([2, 4] restarts after iterations 2 AND 4), or None/() for no restarts
-        (only safe for well-conditioned input). Default GRAM_RESTART_AT (3 of 5).
+        (only safe for well-conditioned input). Default GRAM_RESTART_AT ([4, 6] of 10,
+        autotuned for _DSV4_COEFFS).
     """
     n, m = G.shape[-2], G.shape[-1]
     r = max(n, m) / min(n, m)
@@ -195,7 +203,7 @@ class GramNewtonSchulz:
     """
 
     def __init__(self, ns_coefficients=_DSV4_COEFFS,
-                 gram_newton_schulz_reset_iterations=(GRAM_RESTART_AT,),
+                 gram_newton_schulz_reset_iterations=GRAM_RESTART_AT,
                  ns_dtype=torch.float16, gram_dtype=None):
         self.coeffs = tuple(tuple(float(v) for v in row) for row in ns_coefficients)
         self.resets = tuple(gram_newton_schulz_reset_iterations or ())
@@ -248,7 +256,9 @@ def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1
             out = newton_schulz_gram(X, coeffs, ns_dtype, restart_at=resets)
             e = ((out.double() - truth).norm() / truth.norm()).item()
             errs.append((kappa, e))
-            score = max(score, e / max(e_ref, 1e-12))
+            # NaN/inf must LOSE, not silently win: max(0.0, nan) is 0.0 in Python
+            ratio = e / max(e_ref, 1e-12)
+            score = max(score, ratio if math.isfinite(ratio) else float("inf"))
         if verbose:
             detail = "  ".join(f"kappa=1e{int(math.log10(k))}: {e:.4e}" for k, e in errs)
             print(f"restarts {list(resets)}: worst-ratio-vs-champion {score:.4f}  ({detail})", flush=True)
@@ -278,12 +288,11 @@ def _selfcheck_and_bench():                             # pragma: no cover
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     variants = {
-        "champion (cuBLAS)": lambda X: _newton_schulz_cublas(X),
-        "symmul NS":         lambda X: newton_schulz_symmul(X),
-        "gram NS":           lambda X: newton_schulz_gram(X),
-        "gram NS restart@3": lambda X: newton_schulz_gram(X, restart_at=3),
-        "gram NS fp32-gram": lambda X: newton_schulz_gram(X, gram_dtype=torch.float32),
-        "gram NS fp32+r@3":  lambda X: newton_schulz_gram(X, gram_dtype=torch.float32, restart_at=3),
+        "champion (cuBLAS)":  lambda X: _newton_schulz_cublas(X),
+        "symmul NS":          lambda X: newton_schulz_symmul(X),
+        "gram NS (default)":  lambda X: newton_schulz_gram(X),                   # restarts GRAM_RESTART_AT
+        "gram NS no-restart": lambda X: newton_schulz_gram(X, restart_at=()),
+        "gram NS fp32-gram":  lambda X: newton_schulz_gram(X, gram_dtype=torch.float32),
     }
     shapes = [(2048, 8192), (2048, 4096), (2048, 2048), (3072, 8192)]
     for n, m in shapes:
