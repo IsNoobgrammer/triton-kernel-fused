@@ -150,6 +150,22 @@ N=4096/V=32000) as the optimization set; T4 ce_fit = held-out.
   compiled std CE still fastest when logits fit (CE is the memory/OOM play). int8 + recompute REMOVED
   (dominated). Ported to BiBo `src/kernels/fused_ce.py`.
 
+## CE REOPENED (memory-pareto) — 2026-07-04
+Objective changed: max memory saving at held speed (was: min latency at matched memory).
+Memory ledger of the converged champion at T4 shape (N=16384 V=81000 H=512): chunk transient
+192MB (budget dial, keep) + **gw fp32 (V,H) 166MB + per-chunk mm temp 83MB + backward
+gw*sc 166MB + cast 83MB — all avoidable, none of it the budget.**
+- iter1 (pushed 5335879): fold 1/n_valid INTO _grad_logits_kernel (device-scalar tl.load, no
+  host sync) -> grad magnitudes ~1/N -> gw accumulates in weight.dtype via in-place
+  gw.addmm_(logits.t(), hc) (beta=1, cuBLAS fp32 internal compute). Kills fp32 accumulator,
+  per-chunk temp, backward product+cast. Also: GEMM2 out=gh chunk (no temp+copy);
+  needs_input_grad gating (frozen lm_head / eval skips GEMM+buffer).
+- Predicted T4: peak 904 -> ~650MB, latency <=260ms (the removed add_ pass alone was
+  ~13x(83+166+166)MB = ~5.4GB HBM traffic/step ~ 17ms on T4). grad_weight rel expected
+  7e-4 -> ~2e-3 (13 fp16 chunk-to-chunk adds); gate 1.5e-2. If T4 fails the gate, fallback =
+  fp32 accumulator behind a flag (do NOT pre-add the flag).
+- AWAIT: `python bench.py --compile ce ce_sweep` on T4.
+
 ## Round 3b (XSA beats inductor) — 2026-06-28
 - XSA was 0.86x fwd+bwd vs compiled (README "fallback only"). Diagnosed: the kernel launched
   **one program per (b,kv,s) row, BLOCK_D=128**, doing cross-lane D-reductions — the SAME
