@@ -508,6 +508,25 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     fires at the same step, decay is timing-irrelevant; if the tail flattens, decay
     consolidates). dashboard_wd.png rebuilt device-matched (T4 dropped); red verticals mark
     warmup-end 500 / decay-start 4800. Low side (0.007-0.05, v14) pending.
+- [olm v14 DONE - LOW-SIDE wd on RTX 6000; "peak at 0.2" RETRACTED, basin is NOISE-DOMINATED]
+  Full device-matched curve, frac / AUC (mean, lower=better):
+    0.007: .505/.680 | 0.01: .439/.650 = BEST BOTH | 0.02: .562/.712 | 0.05: .567/.722 |
+    0.1: .526/.705 | 0.2: .507/.698 | 0.3: .573/.716 | 0.5: .544/.722 | 0.7: .627/.762 |
+    1.0: .568/.750.
+  THREE findings that kill the clean-peak story:
+  * wd 0.01 BEST on BOTH final frac AND AUC, BOTH seeds good (0.462/0.415) - not one lucky
+    run; AUC agreeing = whole trajectory better. s1 = best run of the study (frac 0.415,
+    d2 0.559, d3 0.310).
+  * NON-MONOTONE: 0.01 great, 0.02/0.05 WORSE than both 0.01 AND 0.1, then 0.1/0.2 good, then
+    downslope. No physical reason 0.02 < neighbors -> seed-timing noise DOMINATES the wd signal.
+  * DEVICE FLIP: T4 had 0.01 (0.511) WORSE than 0.1 (0.493); RTX has 0.01 (0.439) BETTER than
+    0.1 (0.526). Opposite verdict across hardware.
+  VERDICT: NO sharp reproducible wd optimum at this scale/budget/2-seeds - a BROAD NOISY BASIN
+  ~0.01-0.2 (all good; middle 0.02-0.05 & high 0.3+ worse; best moves with seed+hardware).
+  "Peak at 0.2" (v12+v13) was seed-dependent, RETRACTED. Practical: use small wd 0.01-0.2,
+  exact value within noise; ranking 0.01 vs 0.1 vs 0.2 would need 4-6+ seeds (flat basin,
+  likely not worth it). Emergence-timing noise caps wd resolution here. dashboard_wd.png =
+  full 10-point device-matched curve.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
