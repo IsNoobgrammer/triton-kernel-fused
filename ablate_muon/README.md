@@ -19,44 +19,32 @@ is pure-torch matmuls; nothing here imports Triton.
 (`FusedMuon` imports torch and a pure-torch scaling module; no triton, no einops, no extras.)
 On a bare box without torch: `pip install torch` (a CUDA build matching your driver).
 
-## Run it — Kaggle T4 x2 (recommended: uses BOTH GPUs)
+## Run it — one command (auto-detects T4 x2)
 
 New Notebook → Settings → Accelerator = **GPU T4 x2**. Then one cell:
 
 ```python
 !git clone --depth 1 https://github.com/IsNoobgrammer/triton-kernel-fused
 %cd triton-kernel-fused
-!PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python ablate_muon/run_ablation.py --shard 0 --nshards 2 > /tmp/g0.log 2>&1 &
-!PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 python ablate_muon/run_ablation.py --shard 1 --nshards 2 > /tmp/g1.log 2>&1 &
-!wait; PYTHONPATH=. python ablate_muon/run_ablation.py --merge
+!bash ablate_muon/run.sh
 ```
 
-Two processes, one pinned per GPU (each runs half the arms), then `--merge` prints the combined
-table. Watch progress with `!tail -f /tmp/g0.log` in another cell. ~half the wall-clock of x1.
+`run.sh` detects the GPU count. On **T4 x2** it forks two processes — shard 0 (even-indexed
+arms) on GPU 0, shard 1 (odd) on GPU 1, in parallel — each streaming to the **console AND** its
+own log (`ablate_muon/logs/g0.log`, `g1.log`, prefixed `[gpu0]`/`[gpu1]`), then auto-merges into
+`results.jsonl` + the final table. On a single GPU it runs all arms sequentially. Force single
+with `bash ablate_muon/run.sh 1`. Watch a GPU live: `!tail -f ablate_muon/logs/g0.log`.
 
-Note: on Kaggle, `!cmd &` backgrounding across the `!wait` can be flaky between separate cells —
-if so, put all three lines in **one** `!bash -c '...'` cell, or use the shell block below.
+Runtime: ~3000 steps/arm, a few minutes each on T4. x1 ~20-30 min total; x2 ~half that.
 
-Shell (most reliable, one block):
+Manual equivalent (same one-process-per-GPU pattern as `bench/run.sh`):
 ```bash
-git clone --depth 1 https://github.com/IsNoobgrammer/triton-kernel-fused
-cd triton-kernel-fused
 export PYTHONPATH=.
 CUDA_VISIBLE_DEVICES=0 python ablate_muon/run_ablation.py --shard 0 --nshards 2 &
 CUDA_VISIBLE_DEVICES=1 python ablate_muon/run_ablation.py --shard 1 --nshards 2 &
 wait
-python ablate_muon/run_ablation.py --merge
+python ablate_muon/run_ablation.py --merge          # combined table
 ```
-
-## Run it — single GPU (T4 x1)
-```bash
-git clone --depth 1 https://github.com/IsNoobgrammer/triton-kernel-fused
-cd triton-kernel-fused
-PYTHONPATH=. python ablate_muon/run_ablation.py
-```
-Runs all 6 arms sequentially in one process, prints live, ends with the table.
-
-Runtime: ~3000 steps/arm, a few minutes each on T4. x1 ~20-30 min total; x2 ~half that.
 
 ## What runs (edit `run_ablation.py` → `ARMS` / `COMMON`)
 | arm | what |
