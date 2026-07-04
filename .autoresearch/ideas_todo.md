@@ -305,6 +305,16 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   Watch: cautious (LM-predicted-good) and scap (wd substitute) - grok said slow/failed but
   grok punishes weak/targeted compression, LM should reward it. If scap smax >> 2.0 the
   cap binds; if ~2.0 it is a near-no-op.
+- [olm v5 DONE] mechanism re-bench vs ns8 floor 0.556-0.560 (final frac, seed 0):
+  xorth 0.565 NULL | grad_rep 0.562 NULL | scap2.0 0.563 NULL (may be non-binding) |
+  cautious2.0 0.598 MILD HARM (slower, same as grok - weak decay = slow escape even
+  online at this budget; LM-good prediction REFUTED on proxy) | repulse1e-3 0.692 HARM
+  (never learns depth-2, MI~0, regresses - weight repulsion blocks the composition
+  circuit) | grokfast2.0 0.721 HARM+UNSTABLE (acc DEGRADES 0.12->0.07 end; online fresh
+  data makes the grad EMA average over DIFFERENT samples so amplifying the "slow
+  component" amplifies staleness - flips from grok-null to olm-harmful).
+  VERDICT: zero mechanism beats the floor on the validated proxy. Only normuon (v4) wins.
+  No v6 survivors to confirm. Mechanism-addition family CLOSED on olm too.
 - NEXT: v6 = 2-seed confirm of v5 survivors -> real LM. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
