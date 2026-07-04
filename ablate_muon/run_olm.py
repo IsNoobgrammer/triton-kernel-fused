@@ -33,9 +33,9 @@ COMMON = dict(steps=6000, batch=768)
 # iter/coeff axis dead here too (-> ns8 confirmed cheapest-tied = perf-per-flop win)?
 #   aurora_k1 8 iter (ns_kj=6) = current default | aurora_k1 10 iter (ns_kj=8) = dsv4_10 |
 #   aurora_k2 8 iter (ns_kj=6, k2)
+# default (ns6/8-iter) baseline already known from v7: s0 0.535 / s1 0.451 - NOT re-run
+# (deterministic). Only the NEW configs here; compare against that known floor.
 ARMS = [
-    dict(arm="default", seed=0),
-    dict(arm="default", seed=1),
     dict(arm="default", seed=0, ns_kj=8),
     dict(arm="default", seed=1, ns_kj=8),
     dict(arm="default", seed=0, aurora_k=2),
