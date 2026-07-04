@@ -42,9 +42,17 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
+# v11 (piggy-backed on this launch): SCALE-MODE comparison for the emergence/phase-transition
+# plot the user wants - aurora_k1 (have) / aurora_k2 (have) vs normuon vs base polar. We only
+# had BROKEN-BIAS normuon and ZERO polar on olm; generate clean fixed-bias curves. Fixed
+# 8-iter KJ, wd 0.1; vary only scale_mode. Combine w/ embedded aurora curves at plot time.
 ARMS = [
     dict(arm="default", seed=s, wd=w)
     for w in (0.01, 0.03, 0.05, 0.2)
+    for s in (0, 1)
+] + [
+    dict(arm="default", seed=s, scale_mode=m)
+    for m in ("normuon", "polar")
     for s in (0, 1)
 ]
 
