@@ -62,7 +62,18 @@ expert↔op MI per layer (higher = more specialized; ~1.85 is the ceiling under 
 `per-op` accuracy. The load balancer (DeepSeek-V3 selection-bias) fires every `bias_tokens`
 (300k) tokens — a slow global fairness nudge that leaves per-batch routing free to specialize.
 
+## Online LM-emulator (one-epoch regime)
+
+`bash ablate_muon/run.sh olm` runs the SECOND harness: single-epoch compositional modular
+arithmetic (left-fold op chains, depth 1-4 Zipf mix). Fresh samples every step — no sample
+is ever repeated, so memorization is impossible and all progress is compression, emulating
+the compute-bound language-modeling regime. Compression is calibrated to LM: init CE
+ln(97)=4.58 nats, LM-matched target frac ~0.09 (like 81k-vocab LM going 11.3 -> ~1.0 nats).
+Read `frac` in the output as "fraction of initial entropy remaining" and compare arms at
+budget. Arms/config in `run_olm.py`; task in `olm.py`.
+
 ## Files
 - `grok_moe.py` — model + data + `run(cfg)->dict` (importable; bootstraps `FusedMuon`).
-- `run_ablation.py` — the driver + arm list + table.
-- `results.jsonl` — one JSON per arm (written on run), includes full acc/MI curve.
+- `run_ablation.py` — the grok driver + arm list + table.
+- `olm.py` / `run_olm.py` — online LM-emulator task + driver (`bash run.sh olm`).
+- `results.jsonl` / `results_olm.jsonl` — one JSON per arm, includes full curves.

@@ -101,26 +101,31 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d, h, E, top_k):
+    def __init__(self, d, h, E, top_k, dense=False):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
         self.attn = nn.MultiheadAttention(d, h, batch_first=True)
-        self.moe = MoE(d, E, top_k)
+        self.moe = None if dense else MoE(d, E, top_k)
+        self.mlp = (nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+                    if dense else None)
 
     def forward(self, x, mask):
         hh = self.ln1(x)
         a, _ = self.attn(hh, hh, hh, attn_mask=mask, need_weights=False)
         x = x + a
+        if self.moe is None:
+            return x + self.mlp(self.ln2(x))
         n, s, d = x.shape
         return x + self.moe(self.ln2(x).reshape(n * s, d)).reshape(n, s, d)
 
 
 class GrokMoENet(nn.Module):
-    def __init__(self, vocab, d=128, layers=3, heads=4, E=8, top_k=2, seq=4):
+    def __init__(self, vocab, d=128, layers=3, heads=4, E=8, top_k=2, seq=4, dense_layers=()):
         super().__init__()
         self.tok = nn.Embedding(vocab, d)
         self.pos = nn.Embedding(seq, d)
-        self.blocks = nn.ModuleList(Block(d, heads, E, top_k) for _ in range(layers))
+        self.blocks = nn.ModuleList(Block(d, heads, E, top_k, dense=(i in dense_layers))
+                                    for i in range(layers))
         self.lnf = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab, bias=False)
         self.register_buffer("mask", torch.triu(torch.ones(seq, seq, dtype=torch.bool), 1))
@@ -205,7 +210,8 @@ def run(cfg):
                 FusedMuon([q for q in hidden if q.ndim == 3], lr=c["muon_lr"],
                           weight_decay=0.0 if c["cautious"] > 0 else ewd,
                           coeffs=_DSV4_COEFFS, ns_dtype=torch.float16)]
-    expert_ws = [b.moe.w1 for b in model.blocks] + [b.moe.w2 for b in model.blocks]
+    mblocks = [b for b in model.blocks if b.moe is not None]
+    expert_ws = [b.moe.w1 for b in mblocks] + [b.moe.w2 for b in mblocks]
     tag = make_tag(c)
     print(f"[{tag}] E={c['experts']} topk={c['top_k']} repulse={c['repulse']} wd={c['wd']} "
           f"params={n_par/1e6:.2f}M train={sum(len(y) for _, y in tr)} heldout={len(yte)} "
@@ -252,7 +258,7 @@ def run(cfg):
                     w.grad.copy_((isq @ G).reshape_as(w.grad).to(w.grad.dtype))
         if c["niche"] > 0:                                         # fitness-sharing lr: scale expert
             with torch.no_grad():                                  # grads by inverse recent load
-                for b in model.blocks:
+                for b in mblocks:
                     f = (b.moe.load + 1) / (b.moe.load.sum() + c["experts"])
                     s = (1.0 / (c["experts"] * f)).pow(c["niche"]).clamp(0.5, 2.0)
                     b.moe.w1.grad *= s.view(-1, 1, 1)
@@ -295,23 +301,23 @@ def run(cfg):
                     w.add_(w - w.mean(0, keepdim=True), alpha=c["repulse"])
         tok_count += c["batch"]
         if tok_count >= c["bias_tokens"]:
-            for b in model.blocks:
+            for b in mblocks:
                 b.moe.update_bias(c["bias_factor"])
             tok_count = 0
         if step % c["eval_every"] == 0 or step == c["steps"]:
             model.eval()
             with torch.no_grad():
-                preds, top1s = [], [[] for _ in model.blocks]
+                preds, top1s = [], [[] for _ in mblocks]
                 for i in range(0, len(yte), 8192):
                     preds.append(model(xte[i:i + 8192]).argmax(-1))
-                    for li, b in enumerate(model.blocks):
+                    for li, b in enumerate(mblocks):
                         top1s[li].append(b.moe._last_top1.reshape(-1, 4)[:, -1])
                 pred = torch.cat(preds)
                 hit = (pred == yte).float()
                 acc = hit.mean().item()
                 per_op = [hit[op_te == i].mean().item() for i in range(len(OPS))]
                 mis = [_mi(torch.cat(t), op_te, c["experts"], len(OPS)) for t in top1s]
-                loads = [b.moe.load / b.moe.load.sum().clamp_min(1) for b in model.blocks]
+                loads = [b.moe.load / b.moe.load.sum().clamp_min(1) for b in mblocks]
                 lmin = min(l.min().item() for l in loads)
             model.train()
             best = max(best, acc)

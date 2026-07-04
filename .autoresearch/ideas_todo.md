@@ -238,6 +238,29 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
 - FIVE-WAVE VERDICT: 13 mechanisms screened, zero beat Muon + wd 2.0 on grok. The polar
   + full-spectrum decay pair is the frontier on this testbed. Remaining discriminating
   power lives in the LM regime.
+
+## G. ONLINE LM-EMULATOR (opened 2026-07-04, user pivot - THE testbed going forward)
+
+User reframe, accepted: grok = memorize-then-generalize = WRONG regime for LM. New eval
+= single-epoch online stream: fresh compositional mod-97 chains every step (depth 1-4,
+Zipf mix 0.4/0.3/0.2/0.1, left-fold eval), val held out by key, sample space >> stream
+(no repeats ever) -> memorization impossible, all progress = compression. Emulates the
+compute-bound LM regime at toy cost. Harness: ablate_muon/olm.py + run_olm.py
+(`bash ablate_muon/run.sh olm`), 4-layer model, T4-ready.
+COMPRESSION CALIBRATION: LM 81k vocab starts at ln(81920)=11.3 nats CE, strong models
+land ~1.0 nat => frac ~0.09 of initial entropy remains. Ours: init ln(97)=4.575 nats,
+LM-matched target ~0.41-0.5 nats at 6000x768 budget. Metric `frac` = CE/ln(97).
+Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/hard.
+- [RUNNING olm wave 1] default wd0.1 x2 seeds, default wd2.0 (regime check: grok-optimal
+  wd predicted to HURT online), adamw x2 seeds, dense_first=2 arch arm.
+- PREDICTIONS ON RECORD: (a) wd optimum flips small in the online regime; (b) Muon>AdamW
+  gap shrinks vs grok's 2.4x but stays positive (matches 137M LM screen ~2x); (c) deep
+  depths (3-4) learn slowest = the discriminating tail; (d) frac plateaus per-depth like
+  an LM scaling curve.
+- Old grok harness retained for mechanism-vs-regime contrasts (a mechanism that wins
+  ONLINE but not on grok = LM specialist, e.g. normuon pattern).
+- MNIST-1D: fallback if this task cannot discriminate optimizers (user); arch-bias
+  objection stands, revisit only on olm failure.
 - [DOWNRANKED] SAM-style sharpness aware: 2x grad cost fails perf-per-flop by construction;
   only if a 1-extra-forward variant appears.
 
