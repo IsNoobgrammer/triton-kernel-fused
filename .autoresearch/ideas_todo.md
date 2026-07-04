@@ -184,11 +184,29 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
   compute-side win candidate for LM phase, pairs with the perf-per-flop goal.
 - ROUND STATUS after wave 4: FOUR waves, every mechanism <= baseline Muon + wd 2.0
   (repulsion harmful, decor null, per-module wd null, grokfast null/redundant, lookahead
-  harmful). On the grok testbed Muon+wd sits at/near the frontier - its polar already
-  bundles the benefits these mechanisms try to add (direction filtering, magnitude
-  normalization, compression pressure). Grok-MoE testbed CLOSED for optimizer mechanisms;
-  remaining paradigm candidates (cautious decay, sigma-cap, normuon, Dion low-rank, EMA
-  precond) target the LM regime and need the LM harness to discriminate.
+  harmful). Testbed-close call OVERRULED by user: work the ledger backlog first (wave 5).
+
+### Wave 5 (RUNNING, 10 arms - ledger backlog + user combos; user: retry repulsion at
+### VERY low beta = aux-loss regime, and test combos rep+load+grokfast)
+- micro-repulsion beta {1e-4, 1e-5}: compounding drift (1+b)^3000 = 1.35x / 1.03x - the
+  blowup that killed 1e-2 does not apply; acts as a weak diversity prior in the update.
+- grad_rep 0.5: grad-space repulsion, g_e += b*(g_e - mean_E g) - the sign-flip of decor
+  (which was null); amplifies each expert's deviation BEFORE momentum+polar.
+- xorth (x2 seeds): cross-expert grad whitening along E axis (E x E gram inverse-sqrt via
+  eigh, E=8 ~free) - section "Muon-native #3", genuinely ours, first run.
+- niche 0.5: fitness-sharing lr - expert grads scaled (1/(E*load_frac))^0.5 in [0.5,2];
+  load read FREE from the router's own load buffer.
+- scap 2.0 @ wd 0.1: sigma-cap as wd SUBSTITUTE - persistent-power-iteration smax estimate,
+  clip only the top singular value post-step. First test of the LM-ranked idea (2) on grok:
+  can targeted spectral compression replace uniform decay for generalization?
+- cautious 2.0: sign-masked decay (decay only where the step already shrinks |w|; FusedMuon
+  wd=0, manual post-step). LM-ranked idea (1) screened on grok.
+- combos (user ask): rep1e-4 + gf2; rep1e-4 + niche0.5 + gf2.
+- Still in backlog after this wave: specialization annealing (needs per-expert entropy
+  plumbing), MI-guided bias (router-side), Shapley (heavy), tournament (heavy), low-rank
+  EMA deflation (needs L0 first), degree-7 polys / specnorm / per-group iters (coeff axis,
+  moot on grok - LM only), SinkGD/LEO full-optimizer arm (scale calibration needed),
+  momentum sweep (hp - excluded by user directive), mixed task families (harness change).
 - [DOWNRANKED] SAM-style sharpness aware: 2x grad cost fails perf-per-flop by construction;
   only if a 1-extra-forward variant appears.
 

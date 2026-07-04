@@ -144,7 +144,8 @@ def _mi(top1, op, E, n_ops):
 _DEF = dict(arm="default", seed=0, frac=0.45, p=97, steps=3000, batch=768, d=128, layers=3,
             experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=2.0, adamw_wd=1.0, expert_wd=None,
             bias_tokens=300_000, bias_factor=0.01, repulse=0.0, decor=0.0,
-            grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5, eval_every=200,
+            grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
+            grad_rep=0.0, xorth=0, niche=0.0, scap=0.0, cautious=0.0, eval_every=200,
             op_mix=(0.4, 0.3, 0.2, 0.1))
 
 
@@ -162,6 +163,18 @@ def make_tag(c):
         t += f"_gf{c['grokfast']}"
     if c.get("lookahead"):
         t += f"_la{c['lookahead']}"
+    if c.get("grad_rep"):
+        t += f"_gr{c['grad_rep']}"
+    if c.get("xorth"):
+        t += "_xo"
+    if c.get("niche"):
+        t += f"_ni{c['niche']}"
+    if c.get("scap"):
+        t += f"_sc{c['scap']}"
+    if c.get("cautious"):
+        t += f"_cw{c['cautious']}"
+    if c["wd"] != 2.0:
+        t += f"_wd{c['wd']}"
     if c["steps"] != 3000:
         t += f"_{c['steps']}st"
     return t
@@ -185,11 +198,13 @@ def run(cfg):
                                   weight_decay=c["adamw_wd"], betas=(0.9, 0.98))]
     else:
         ewd = c["wd"] if c["expert_wd"] is None else c["expert_wd"]
+        hwd = 0.0 if c["cautious"] > 0 else c["wd"]                # cautious: manual sign-masked decay
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
                 FusedMuon([q for q in hidden if q.ndim == 2], lr=c["muon_lr"],
-                          weight_decay=c["wd"], coeffs=_DSV4_COEFFS, ns_dtype=torch.float16),
+                          weight_decay=hwd, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16),
                 FusedMuon([q for q in hidden if q.ndim == 3], lr=c["muon_lr"],
-                          weight_decay=ewd, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16)]
+                          weight_decay=0.0 if c["cautious"] > 0 else ewd,
+                          coeffs=_DSV4_COEFFS, ns_dtype=torch.float16)]
     expert_ws = [b.moe.w1 for b in model.blocks] + [b.moe.w2 for b in model.blocks]
     tag = make_tag(c)
     print(f"[{tag}] E={c['experts']} topk={c['top_k']} repulse={c['repulse']} wd={c['wd']} "
@@ -201,6 +216,9 @@ def run(cfg):
     gf_ema = {}                                                    # grokfast: EMA of grads per param
     slow = ({q: q.detach().clone() for q in model.parameters()}    # lookahead: slow weights
             if c["lookahead"] else None)
+    prev = ({q: q.detach().clone() for q in hidden}                # cautious: pre-step weights
+            if c["cautious"] > 0 else None)
+    scap_v = {}                                                    # sigma-cap: power-iteration vectors
     tok_count, grok_step, best, curve = 0, None, 0.0, []
     for step in range(1, c["steps"] + 1):
         ops = torch.multinomial(mix, c["batch"], replacement=True, generator=g)
@@ -219,6 +237,26 @@ def run(cfg):
             with torch.no_grad():                                  # shrink the shared component of the
                 for w in expert_ws:                                # expert-stack grads along the E axis
                     w.grad -= c["decor"] * w.grad.mean(0, keepdim=True)
+        if c["grad_rep"] > 0:                                      # grad-space repulsion: amplify each
+            with torch.no_grad():                                  # expert's deviation from the mean grad
+                for w in expert_ws:
+                    w.grad += c["grad_rep"] * (w.grad - w.grad.mean(0, keepdim=True))
+        if c["xorth"]:                                             # cross-expert orthogonalization:
+            with torch.no_grad():                                  # whiten expert grads along E (E x E
+                for w in expert_ws:                                # gram inverse-sqrt, E=8 so ~free)
+                    G = w.grad.reshape(w.shape[0], -1).float()
+                    C = G @ G.mT
+                    C = C / C.diagonal().mean().clamp_min(1e-12)
+                    ev, V = torch.linalg.eigh(C)
+                    isq = V @ torch.diag(ev.clamp_min(1e-6).rsqrt()) @ V.mT
+                    w.grad.copy_((isq @ G).reshape_as(w.grad).to(w.grad.dtype))
+        if c["niche"] > 0:                                         # fitness-sharing lr: scale expert
+            with torch.no_grad():                                  # grads by inverse recent load
+                for b in model.blocks:
+                    f = (b.moe.load + 1) / (b.moe.load.sum() + c["experts"])
+                    s = (1.0 / (c["experts"] * f)).pow(c["niche"]).clamp(0.5, 2.0)
+                    b.moe.w1.grad *= s.view(-1, 1, 1)
+                    b.moe.w2.grad *= s.view(-1, 1, 1)
         if c["grokfast"] > 0:                                      # grokfast: amplify the slow (shared,
             with torch.no_grad():                                  # generalizing) grad component
                 for q in model.parameters():
@@ -233,6 +271,24 @@ def run(cfg):
                 for q in model.parameters():
                     slow[q].lerp_(q, c["la_beta"])
                     q.copy_(slow[q])
+        if c["scap"] > 0:                                          # sigma-cap: clip only the runaway TOP
+            with torch.no_grad():                                  # singular value (targeted wd substitute)
+                for q in hidden:
+                    W = q if q.ndim == 3 else q.unsqueeze(0)
+                    v = scap_v.get(q)
+                    if v is None:                                  # persistent power-iteration vector
+                        v = F.normalize(torch.randn(W.shape[0], W.shape[2], device=dev), dim=-1)
+                        scap_v[q] = v
+                    u = torch.einsum("brc,bc->br", W.float(), v)
+                    v.copy_(F.normalize(torch.einsum("brc,br->bc", W.float(), u), dim=-1))
+                    s = torch.einsum("brc,bc->br", W.float(), v).norm(dim=-1)
+                    W *= (c["scap"] / s.clamp_min(1e-12)).clamp(max=1.0).view(-1, 1, 1).to(W.dtype)
+        if prev is not None:                                       # cautious wd: decay ONLY where the
+            with torch.no_grad():                                  # step already shrinks |w| (never
+                for q in hidden:                                   # fight the update's signal)
+                    u = q - prev[q]
+                    q.sub_(c["muon_lr"] * c["cautious"] * q * (u * q < 0))
+                    prev[q].copy_(q)
         if c["repulse"] > 0:
             with torch.no_grad():
                 for w in expert_ws:
@@ -267,7 +323,9 @@ def run(cfg):
                   + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], repulse=c["repulse"], wd=c["wd"],
                 adamw_wd=c["adamw_wd"], expert_wd=c["expert_wd"], decor=c["decor"],
-                grokfast=c["grokfast"], lookahead=c["lookahead"], steps=c["steps"],
+                grokfast=c["grokfast"], lookahead=c["lookahead"], grad_rep=c["grad_rep"],
+                xorth=c["xorth"], niche=c["niche"], scap=c["scap"], cautious=c["cautious"],
+                steps=c["steps"],
                 acc=round(acc, 5), best_acc=round(best, 5), grok_step=grok_step,
                 per_op=[round(a, 4) for a in per_op], mi_final=[round(m, 3) for m in mis],
                 curve=curve)

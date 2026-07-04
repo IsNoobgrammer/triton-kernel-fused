@@ -23,20 +23,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 COMMON = dict(steps=3000, batch=768, p=97, frac=0.45, wd=2.0, experts=8, top_k=2,
               bias_tokens=300_000, op_mix=(0.4, 0.3, 0.2, 0.1))
 
-# Wave 4 — ALGORITHMIC mechanisms, no hp sweeps (wave 3 double-null closed the wd and
-# decorrelation axes; baseline grok band = 1800-2200, bar = grok >=400 steps earlier
-# at acc parity):
-#  - grokfast (Lee 2024): g += lam*EMA(g) — amplify the slow/shared grad component
-#    BEFORE Muon's polar. Paper: up to ~50x faster grokking on Adam; Muon combo untested.
-#  - lookahead (Zhang 2019): slow/fast weights, slow.lerp_(fast, 0.5) every k steps —
-#    implicit averaging toward flat minima, no signal cost.
+# Wave 5 — ledger backlog, 6 new mechanisms + user-requested combos (baseline band
+# 1800-2200, bar: grok >=400 earlier at acc parity, or clear MI/structure win):
+#  - micro-repulsion 1e-4/1e-5 (user: aux-loss regime; compounding drift only ~1.35x)
+#  - grad-space repulsion (amplify each expert's deviation, inverse of decor)
+#  - xorth: cross-expert grad whitening along E (E x E gram inv-sqrt) — Muon-native, ours
+#  - niche: fitness-sharing lr (expert grads scaled by inverse recent load)
+#  - scap: sigma-cap as wd SUBSTITUTE (wd 0.1 + clip top singular value @2.0 post-step)
+#  - cautious: sign-masked wd 2.0 (decay only where the step already shrinks |w|)
+#  - combos: rep+gf, rep+niche+gf (user ask)
 ARMS = [
-    dict(arm="default", seed=0, grokfast=2.0),
-    dict(arm="default", seed=1, grokfast=2.0),
-    dict(arm="default", seed=0, grokfast=5.0),
-    dict(arm="default", seed=0, lookahead=5),
-    dict(arm="default", seed=1, lookahead=5),
-    dict(arm="default", seed=0, grokfast=2.0, lookahead=5),
+    dict(arm="default", seed=0, repulse=1e-4),
+    dict(arm="default", seed=0, repulse=1e-5),
+    dict(arm="default", seed=0, grad_rep=0.5),
+    dict(arm="default", seed=0, xorth=1),
+    dict(arm="default", seed=1, xorth=1),
+    dict(arm="default", seed=0, niche=0.5),
+    dict(arm="default", seed=0, scap=2.0, wd=0.1),
+    dict(arm="default", seed=0, cautious=2.0),
+    dict(arm="default", seed=0, repulse=1e-4, grokfast=2.0),
+    dict(arm="default", seed=0, repulse=1e-4, niche=0.5, grokfast=2.0),
 ]
 
 
@@ -52,6 +58,18 @@ def _tag(r):
         t += f"_gf{r['grokfast']}"
     if r.get("lookahead"):
         t += f"_la{r['lookahead']}"
+    if r.get("grad_rep"):
+        t += f"_gr{r['grad_rep']}"
+    if r.get("xorth"):
+        t += "_xo"
+    if r.get("niche"):
+        t += f"_ni{r['niche']}"
+    if r.get("scap"):
+        t += f"_sc{r['scap']}"
+    if r.get("cautious"):
+        t += f"_cw{r['cautious']}"
+    if r.get("wd", 2.0) != 2.0:
+        t += f"_wd{r['wd']}"
     if r.get("steps", 3000) != 3000:
         t += f"_{r['steps']}st"
     return t
