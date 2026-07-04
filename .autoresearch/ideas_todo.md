@@ -294,6 +294,9 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   ORDERING not magnitude (normuon edge ~6% frac here vs 0.026 nats at 137M).
   => olm is now the CHEAP SCREEN for the mechanism backlog. Rescreen candidates here
   before spending 120M-token LM runs. normuon promoted: LM candidate + BiBo.
+- NS8-DEFAULT FLOOR (olm, deterministic): seed0 0.560 / seed1 0.556 - tighter than and
+  slightly under the dsv4_10 floor (0.566/0.592), reconfirming ns8 tied-or-better + cheaper.
+  Do NOT re-run default each wave (user); compare mechanisms (seed 0) to 0.560.
 - [olm v5 RUNNING] mechanism re-bench on validated proxy. Default now ns8 (6 KJ) aurora_k1
   (user call: normuon is a candidate for real LM/BiBo, NOT the toy default; ns8 = tied +
   cheaper). Mechanisms extracted to mech.py (shared; grok_moe keeps its inline copies).

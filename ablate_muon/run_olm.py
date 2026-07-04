@@ -26,9 +26,9 @@ COMMON = dict(steps=6000, batch=768)
 # must clear that spread to count. Survivors -> 2-seed confirm (v6) -> real LM.
 #   cautious = LM-predicted-good (compression without signal tax); scap = wd substitute
 #   (smax logged now); repulse/grad_rep/xorth/grokfast = grok-null, regime re-test.
+# default (ns8) floor already measured, seed0 0.560 / seed1 0.556 — deterministic, NOT
+# re-run here. Compare each mechanism (seed 0) against the 0.556-0.560 floor.
 ARMS = [
-    dict(arm="default", seed=0),
-    dict(arm="default", seed=1),
     dict(arm="default", seed=0, cautious=2.0),
     dict(arm="default", seed=0, scap=2.0),
     dict(arm="default", seed=0, repulse=1e-3),
@@ -99,7 +99,13 @@ def main():
     results = []
     for i, a in enumerate(mine, 1):
         print(f"\n===== shard {args.shard} arm {i}/{len(mine)}: {a} =====", flush=True)
-        r = run({**COMMON, **a})
+        try:
+            r = run({**COMMON, **a})
+        except Exception as e:                                     # one bad arm must not kill the shard
+            import traceback
+            print(f"[shard {args.shard}] arm {a} FAILED: {e}", flush=True)
+            traceback.print_exc()
+            continue
         results.append(r)
         with open(out, "a") as f:
             f.write(json.dumps(r) + "\n")

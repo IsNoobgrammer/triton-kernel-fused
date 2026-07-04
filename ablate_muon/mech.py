@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.no_grad()
 def pre_step(cfg, params, expert_ws, mblocks, state):
     if cfg.get("decor", 0) > 0:                                   # subtract shared expert grad
         for w in expert_ws:
@@ -43,6 +44,7 @@ def pre_step(cfg, params, expert_ws, mblocks, state):
                 q.grad += cfg["grokfast"] * e
 
 
+@torch.no_grad()
 def post_step(cfg, params, hidden, expert_ws, mblocks, state, dev, muon_lr, step):
     if cfg.get("repulse", 0) > 0:                                 # weight repulsion (PSO anti-avg)
         for w in expert_ws:
