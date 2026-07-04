@@ -283,11 +283,21 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
      more capacity; 1 seed). Needs equal-param rerun before believing.
   Seed variance high (adamw 0.087 vs 0.218) but Muon>AdamW gap >> seed spread = robust.
   NEXT olm run reports dist-matched frac/acc directly (eval fix pushed a58f5a4).
-- PROXY VALIDATION PLAN (before trusting olm for promotions): olm wave 2 = normuon +
-  ns8 + k2 arms. LM ground truth exists (137M screen: normuon WON -0.026@1200, ns8/k2
-  tied). If olm reproduces that ordering, it is a validated LM proxy; if it calls
-  normuon harmful (as grok wrongly did), olm inherits grok's blind spot and only real
-  LM discriminates. Falsifiable, cheap, decisive.
+- [PROXY VALIDATED 2026-07-04 - olm wave v4] olm REPRODUCES the 137M-LM ordering:
+  final frac (lower=better): normuon 0.527/0.561 (2 seeds, NO overlap with default) <
+  ns8 0.560 ~ default 0.566/0.592 ~ k2 0.568. normuon WON (matches LM won), ns8 & k2
+  TIED inside default band (matches LM tied). normuon depth-2 0.313 vs default 0.156 =
+  2x on the composition zone; transitions earlier AND converges lower (both signals
+  agree). DECISIVE: normuon was grok-HARMFUL (sign flip) - olm lands it on the LM side,
+  i.e. olm DISAGREES WITH GROK exactly where grok lied. Not mere correlation; captures
+  the compute-bound regime. Caveats: n=2 (normuon/default), n=1 (ns8/k2); proxy keeps
+  ORDERING not magnitude (normuon edge ~6% frac here vs 0.026 nats at 137M).
+  => olm is now the CHEAP SCREEN for the mechanism backlog. Rescreen candidates here
+  before spending 120M-token LM runs. normuon promoted: LM candidate + BiBo.
+- NEXT (olm wave v5): rescreen the survivors/untested on the validated proxy -
+  cautious decay, sigma-cap (smax-logged), xorth, grokfast, Dion low-rank, + the
+  param/compute-matched df0/df1 arch question (dense-compute MoE = 8x FLOPs of a dense
+  layer, so df0 vs df1 is NOT compute-matched - decide sparse-compute or equal-FLOP).
 - PREDICTIONS ON RECORD: (a) wd optimum flips small in the online regime; (b) Muon>AdamW
   gap shrinks vs grok's 2.4x but stays positive (matches 137M LM screen ~2x); (c) deep
   depths (3-4) learn slowest = the discriminating tail; (d) frac plateaus per-depth like
