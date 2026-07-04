@@ -56,10 +56,6 @@ def _tag(r):
             t += f"_k{r['aurora_k']}"
         if r.get("ns_kj", 6) != 6:
             t += f"_ns{r['ns_kj']}"
-    if r["arm"] == "dion":
-        t += f"_rf{r.get('rank_frac', 0.25)}"
-    if r["arm"] in ("leo", "sinkgd", "dion") and r.get("muon_lr", 1e-3) != 1e-3:
-        t += f"_lr{r['muon_lr']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
                      ("grokfast", "gf"), ("lookahead", "la")):

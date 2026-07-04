@@ -337,6 +337,14 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   Bar: reach ~0.560 floor => a cheaper optimizer at Muon quality = big perf-per-flop win.
   Note SinkGD-as-NS-PRECOND was refuted 3x on kappa; this tests it as a FULL optimizer
   (different claim - row/col norm as the whole update, not a Muon prescale).
+- [olm v6 DONE - CHEAP NS-FREE OPTIMIZERS ALL REJECTED] LEO, SinkGD, Dion all land far
+  above the Muon ns8 floor 0.56 (LEO worst, ~0.99 dead; SinkGD bad; Dion best-of-the-three
+  but still very bad). Even Dion rf1.0 (full-rank sanity) did not reach Muon. Verdict: the
+  NS orthogonalization does real work that row/col-norm (SinkGD/LEO) and low-rank power
+  iteration (Dion) cannot cheaply replace at this scale/regime. Consistent with the earlier
+  'sinkhorn != orthogonalizer' finding, now confirmed for FULL optimizers not just preconds.
+  CODE REMOVED (alt_opt.py deleted, arms unwired) - family closed. 'same perf, less compute'
+  via cheaper-than-NS optimizer = dead end; the compute win stays ns8 (fewer NS iters).
 - [olm v7 QUEUED - new instrument + winners together + combo + capacity-bound]
   INSTRUMENT UPGRADE (user-directed): bias balancer every 10 STEPS (was ~every 391 steps
   = 300k tok / 768 samples -> only ~15 updates/run = collapse cause); pad-masked load, MI,

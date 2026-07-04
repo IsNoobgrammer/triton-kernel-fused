@@ -169,7 +169,13 @@ extra utilization is free-but-unrewarded. Convert-to-win test = a CAPACITY-BOUND
 - **Rejected (do not pursue)**: weight/grad repulsion, decorrelation, cross-expert
   orthogonalization, fitness-sharing, grokfast, lookahead, sigma-cap (as tested), cautious
   decay. All null-or-harmful in the correct regime.
-- **Still open**: Dion-style low-rank orthogonalization (compute-side lever, untested);
+- **Cheap NS-free optimizers (v6) — ALL REJECTED, code removed**: LEO, SinkGD, Dion all
+  land far above the Muon ns8 floor 0.56 (LEO dead ~0.99, SinkGD bad, Dion best-of-three
+  but still very bad; even Dion rf1.0 full-rank did not reach Muon). NS orthogonalization
+  does real work that row/col-norm and low-rank power iteration cannot cheaply replace at
+  this scale. The 'same perf via cheaper-than-NS optimizer' route is a dead end; the compute
+  win stays ns8 (fewer NS iterations, quality-tied).
+- **Still open**:
   compute-matched df0/df1 arch study; deeper-composition olm (bigger model/budget) to get
   depths 3-6 into the learnable range and widen the discrimination window; scap with a
   binding (lower) cap + smax logging to confirm the non-binding hypothesis.

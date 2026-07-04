@@ -79,7 +79,6 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
             scale_mode="aurora", aurora_k=1, ns_kj=6,                   # DEFAULT = ns8 (6 KJ) aurora_k1
-            sink_iters=5, rank_frac=0.25,                               # alt optimizers (alt_opt.py)
             repulse=0.0, decor=0.0, grad_rep=0.0, xorth=0, niche=0.0,   # mechanism knobs (mech.py)
             scap=0.0, cautious=0.0, grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
@@ -105,12 +104,6 @@ def make_tag(c):
             t += f"_k{c['aurora_k']}"
         if c["ns_kj"] != 6:                                       # default is ns8 (6 KJ)
             t += f"_ns{c['ns_kj']}"
-    if c["arm"] == "dion":
-        t += f"_rf{c['rank_frac']}"
-    if c["arm"] == "sinkgd" and c["sink_iters"] != 5:
-        t += f"_si{c['sink_iters']}"
-    if c["arm"] in ("leo", "sinkgd", "dion") and c["muon_lr"] != 1e-3:
-        t += f"_lr{c['muon_lr']}"
     if c["mult"] != 4:
         t += f"_m{c['mult']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
@@ -169,18 +162,6 @@ def run(cfg):
     if c["arm"] == "adamw":
         opts = [torch.optim.AdamW(model.parameters(), lr=c["lr"],
                                   weight_decay=c["adamw_wd"], betas=(0.9, 0.98))]
-    elif c["arm"] in ("sinkgd", "dion", "leo"):                    # cheap NS-free optimizers
-        import alt_opt
-        adam = torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98))
-        if c["arm"] == "sinkgd":
-            hopt = alt_opt.SinkGD(hidden, lr=c["muon_lr"], weight_decay=c["wd"],
-                                  iters=c["sink_iters"])
-        elif c["arm"] == "leo":
-            hopt = alt_opt.LEO(hidden, lr=c["muon_lr"], weight_decay=c["wd"])
-        else:
-            hopt = alt_opt.Dion(hidden, lr=c["muon_lr"], weight_decay=c["wd"],
-                                rank_frac=c["rank_frac"])
-        opts = [adam, hopt]
     else:
         hwd = 0.0 if c["cautious"] > 0 else c["wd"]                # cautious does manual masked decay
         mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=_coeffs(c["ns_kj"]),
@@ -284,7 +265,6 @@ def run(cfg):
                   + f" | eff/{E} {' '.join(f'{e:.1f}' for e in eff)}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
-                rank_frac=c["rank_frac"], sink_iters=c["sink_iters"], muon_lr=c["muon_lr"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),
