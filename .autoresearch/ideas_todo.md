@@ -397,6 +397,21 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   THROUGH-LINE: v4/v5 normuon+xorth wins were collapsed-expert artifacts. Fix the balancer ->
   plain Muon+ns8 is the frontier; the mechanisms only help when something else is broken.
   Awaiting user's inductive biases on normuon/xo.
+- [olm v7 COMPOSITIONAL + SPEC re-analysis (user prompt)] Re-ranked on the axes I skipped:
+  * DEPTH-2 (compositional gen) same-seed @6000: default 0.225/0.421 BEST; normuon 0.180;
+    xorth 0.138; combo 0.152/0.141. Variants LOSE HARDER on composition than on aggregate
+    frac (aggregate cushioned by depth-1 which all nail). depth-3 same story. Reinforces
+    default-wins, does not rescue variants. NOTE depth-2 is TRAINED (25%) = IID gen not pure
+    OOD.
+  * SPEC: utilization maxed ~7.5/8 everywhere (non-differentiating). Healthy-regime spec
+    modest+undifferentiated; xorth does NOT specialize more than default (0.13/0.24/0.15 vs
+    0.13/0.26/0.20) - its spec edge was ALSO a broken-bias artifact. spec is CAPACITY-driven
+    (mult=1 arms highest spec 0.39-0.47) not optimizer-driven, and ANTI-correlated with loss
+    (capacity-starved = more spec, worse loss).
+  * HARNESS GAP: no TRUE OOD test (all depths trained). PROPOSE v8: train depths <=4, eval
+    5-6 (length/composition EXTRAPOLATION) - the real test of optimizer inductive bias;
+    algorithm-finder extrapolates, depth-fitter collapses to chance. Add held-out-depth OOD
+    eval alongside IID. This is where a subtle normuon/xorth bias could still surface.
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
