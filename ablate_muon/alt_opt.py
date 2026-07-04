@@ -9,7 +9,9 @@
   should approach Muon.
 - LEO (github.com/vukrosic/leo-optimizer): Lion-style double-EMA momentum + ONE-SHOT
   element-wise row/col normalization (D/row_norm + D/col_norm), RMS-scaled to align_const.
-  No matmuls; element-wise only. Paper defaults lr 0.01, betas (0.9,0.99), align 0.3.
+  No matmuls; element-wise only. betas (0.9,0.99), align 0.3. TUNED lr = 1e-3 (repo
+  ablation best; ultra-sensitive, diverges at lr>=0.1 - the 0.01 in the README example is
+  NOT the tuned value). Repo's own bench: LEO much worse than Muon (val 5.46 vs 1.77).
 
 Both handle 2D and stacked-3D (E, m, n) params (FusedMuon batches the latter natively).
 Updates are scaled to RMS 0.2 so lr is shared with Muon/AdamW in the olm harness.
@@ -57,7 +59,7 @@ class SinkGD(Optimizer):
 
 
 class LEO(Optimizer):
-    def __init__(self, params, lr=1e-2, betas=(0.9, 0.99), weight_decay=0.0, align=0.3):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.99), weight_decay=0.0, align=0.3):
         super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay, align=align))
 
     @torch.no_grad()

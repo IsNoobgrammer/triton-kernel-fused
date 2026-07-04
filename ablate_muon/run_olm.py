@@ -30,8 +30,8 @@ COMMON = dict(steps=6000, batch=768)
 # to Muon ns8 floor 0.556-0.560. dion rf1.0 = sanity (should ~ Muon). LEO/SinkGD run at
 # their own recommended lr (element-wise/row-col, 0 GEMMs). Dion = low-rank NS.
 ARMS = [
-    dict(arm="leo",    seed=0, muon_lr=1e-2),               # LEO paper lr
-    dict(arm="leo",    seed=0, muon_lr=3e-3),               # lr robustness
+    dict(arm="leo",    seed=0, muon_lr=1e-3),               # LEO tuned best (repo ablation)
+    dict(arm="leo",    seed=0, muon_lr=3e-3),               # upper edge (repo: ultra-sensitive)
     dict(arm="sinkgd", seed=0, muon_lr=1e-3),
     dict(arm="sinkgd", seed=0, muon_lr=3e-3),
     dict(arm="dion",   seed=0, rank_frac=0.25),
