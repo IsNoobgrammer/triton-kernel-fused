@@ -439,6 +439,30 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   = same. VERDICT: 8-iter aurora_k1 (= current default) wins on quality AND compute at this
   scale. Coeff/aurora axis: no gain to be had by spending more here. Plots ->
   .autoresearch/plots/emergence/ (v8).
+- [olm v9 DONE - coeff-family / cheaper-iters, vs 8-iter KJ floor (0.535/0.451)]
+  * 6-iter (ns_4, KJx4+2pin, 18 GEMMs): tracks but WORSE both seeds - s0 0.542 / s1 0.484
+    (vs 0.535/0.451). Dropping 2 iters is NOT free at this scale; 8-iter stays the floor.
+  * PE-8 (Polar-Express minimax 8-tuple, different coeff FAMILY): REJECTED. s0 NaN'd @<250
+    steps (eff collapsed 2.0/8), s1 emerged LATE and WORST (frac 0.580, depth-2 0.138) with
+    the HIGHEST spec (collapse-in-disguise). The PE minimax schedule assumes a singular-value
+    range our tiny d=128 fp16 updates fall outside (overshoot->NaN or underdrive->no learning).
+  VERDICT: coeff/iter axis CLOSED - KJ 8-iter beats 6/10-iter, k2, and PE-8. Dashboard
+  re-pointed to v9 (8it vs 6it vs pe8). Plots -> .autoresearch/plots/emergence/ (v9).
+- [olm v10 DONE - WEIGHT-DECAY sweep, THE dominant knob, first time swept on olm] Fixed
+  8-iter KJ aurora_k1, vary muon wd, 2 seeds, rank on AUC. Final frac (mean) / depth-2:
+    wd 0.01: 0.556/0.466 (0.511) | 0.03: 0.554/0.566* (0.560) | 0.05: 0.557/0.548 (0.553) |
+    wd 0.1 (anchor): 0.535/0.451 (0.493) | wd 0.2: 0.427/0.463 (0.445) = NEW CHAMP.
+  HIGHER wd IS BETTER: monotone improvement 0.05->0.1->0.2; wd=0.2 s0 hits frac 0.427 with
+  depth-2 0.541 / depth-3 0.272 / depth-4 0.130 = deepest composition seen (vs 0.1's d2
+  0.225/0.421). Higher compression pressure -> stronger sparse-signal emergence. This
+  VALIDATES the grok wd finding on olm AND the direction transfers (higher=better).
+  * PREDICTION (a) "wd optimum flips SMALL online" = REFUTED. Optimum drops from grok's 2.0
+    but stays WELL ABOVE conventional 0.1 (>=0.2). We have been running everything at the
+    SUBOPTIMAL wd=0.1 - the whole coeff/scale-mode axis was benched under-decayed.
+  * Ceiling: wd=2.0 was DEAD (v2 regime check) -> optimum in (0.2, ~1.0). NEXT: probe up
+    0.3/0.5/0.7 to bracket the peak.
+  * (*wd=0.03 s1 = outlier bad-timing seed, depth-2 collapsed to 0.08 while 0.01/0.05 s1 fine
+    - ignore; AUC smooths it.)
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
