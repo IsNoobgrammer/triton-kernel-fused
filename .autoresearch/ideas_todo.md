@@ -378,6 +378,25 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   perf-per-flop. Survives only if v8 multi-seed shows an ADDITIVE frac win over healthy
   baseline. Fix if kept: batch 6 grams -> one (6,8,8) eigh, and/or run every-N-steps
   (amortize). Else drop.
+- [olm v7 FULL TABLE - REVERSAL] Under FIXED bias (healthy eff ~7.5/8 everywhere), same-seed
+  final frac: default s0 0.535/s1 0.451 = BEST; normuon s0 0.549 (+0.014 WORSE); xorth s0
+  0.559 (+0.024 worse, no spec advantage: 0.13/0.24/0.15 ~ default 0.13/0.26/0.20); combo
+  normuon+xo 0.558/0.559 (+0.023/+0.108 worse). Plain Muon+ns8 beats every variant same-seed,
+  AND default s1 cracked deepest composition (d2 0.42, d3 0.18).
+  * NORMUON MoE-WIN was a BROKEN-BIAS ARTIFACT: v4 (broken) normuon +0.035 better -> v7
+    (fixed) -0.014 worse. Sign flipped with the balancer. RESOLVES Aurora tension (Aurora:
+    normuon worse @1.1B) - healthy MoE regime now agrees. RETRACT normuon MoE promotion.
+    (Dense 137M normuon win is separate - no MoE balancer there - still open for real-LM.)
+  * XORTH REJECTED: utilization now free (bias fix), no spec edge, +20% compute. Dead.
+  * COMBO = variance-damper not winner: consistent 0.558/0.559 but KILLS the upside
+    (default's lucky deep-transition seed 0.451 never happens under combo).
+  * mult=1 CRIPPLED the model (plain acc 0.096, degrading) - not a clean capacity test; BUT
+    combo stabilized it (0.096->0.443 acc, rising) = normuon/xorth are STABILIZERS in
+    degenerate regimes (matches normuon's Moonlight bf16-guardrail origin), not healthy-regime
+    loss wins.
+  THROUGH-LINE: v4/v5 normuon+xorth wins were collapsed-expert artifacts. Fix the balancer ->
+  plain Muon+ns8 is the frontier; the mechanisms only help when something else is broken.
+  Awaiting user's inductive biases on normuon/xo.
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
