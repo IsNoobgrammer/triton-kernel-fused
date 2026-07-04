@@ -177,6 +177,11 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
   finding (grok wd optimum 2-4 vs LM convention 0.1; Omnigrok: embeddings want different
   regularization). Trivial: parameter groups. Test on grok first (wd_emb x wd_attn x wd_expert
   small factorial), the winning ratio then becomes the LM sweep candidate.
+- [UPDATED 2026-07-04] LM wd sweep WIDENED to {0.1, 0.3, 0.6, 1.0, 2.0} + cautious-wd arm.
+  Rationale (user push, accepted): our LM benchmark is 100-120M tokens into ~137M params =
+  token/param < 1, 2-3 epochs -> data-constrained / memorization-capable regime, structurally
+  near grok, NOT Chinchilla compute-bound. Expect wd optimum well above 0.1 here, shifting
+  back down as token/param grows - the wd(data-budget) curve is the deliverable for BiBo.
 - [TODO] Specialization annealing: per-expert lr ~ routing entropy (diffuse expert -> explore
   with high lr; specialized expert -> consolidate with low lr / higher wd). Needs router stats
   in the optimizer (harness-level plumbing) - after repulsion/decorrelation verdicts.
