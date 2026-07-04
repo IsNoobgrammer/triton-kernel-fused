@@ -294,10 +294,17 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   ORDERING not magnitude (normuon edge ~6% frac here vs 0.026 nats at 137M).
   => olm is now the CHEAP SCREEN for the mechanism backlog. Rescreen candidates here
   before spending 120M-token LM runs. normuon promoted: LM candidate + BiBo.
-- NEXT (olm wave v5): rescreen the survivors/untested on the validated proxy -
-  cautious decay, sigma-cap (smax-logged), xorth, grokfast, Dion low-rank, + the
-  param/compute-matched df0/df1 arch question (dense-compute MoE = 8x FLOPs of a dense
-  layer, so df0 vs df1 is NOT compute-matched - decide sparse-compute or equal-FLOP).
+- [olm v5 RUNNING] mechanism re-bench on validated proxy. Default now ns8 (6 KJ) aurora_k1
+  (user call: normuon is a candidate for real LM/BiBo, NOT the toy default; ns8 = tied +
+  cheaper). Mechanisms extracted to mech.py (shared; grok_moe keeps its inline copies).
+  Arms: default x2 (floor), cautious2.0, scap2.0 (smax logged), repulse1e-3, grad_rep0.5,
+  xorth, grokfast2.0. Bar: clear the 2-seed default spread (v4: 0.566-0.592 frac).
+  Watch: cautious (LM-predicted-good) and scap (wd substitute) - grok said slow/failed but
+  grok punishes weak/targeted compression, LM should reward it. If scap smax >> 2.0 the
+  cap binds; if ~2.0 it is a near-no-op.
+- NEXT: v6 = 2-seed confirm of v5 survivors -> real LM. Also still open: Dion low-rank
+  (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
+  layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
 - PREDICTIONS ON RECORD: (a) wd optimum flips small in the online regime; (b) Muon>AdamW
   gap shrinks vs grok's 2.4x but stays positive (matches 137M LM screen ~2x); (c) deep
   depths (3-4) learn slowest = the discriminating tail; (d) frac plateaus per-depth like

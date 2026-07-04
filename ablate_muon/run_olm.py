@@ -20,17 +20,21 @@ COMMON = dict(steps=6000, batch=768)
 #  - wd optimum flips small online (grok-optimal 2.0 should HURT -> regime check)
 #  - Muon vs AdamW gap in the compute-bound regime (the gap that matters for BiBo)
 #  - dense-first-1 (default) vs all-MoE contrast
-# v4 wave: PROXY VALIDATION. Does olm reproduce the 137M-LM ordering we already own?
-# LM ground truth (perf round): normuon WON (-0.026@1200, growing), ns8 TIED, k2 TIED.
-# If olm ranks normuon>default and ns8/k2~default, it is a validated LM proxy and the
-# whole mechanism backlog gets rescreened here at toy cost. 2 baseline seeds = noise floor.
+# v5 wave: RE-BENCH the mechanism backlog on the VALIDATED proxy (default is now ns8).
+# grok (wrong regime) called these harmful/null; olm is the LM-correct screen. Noise
+# floor from 2 default seeds (v4: default seeds spanned frac 0.566-0.592). A mechanism
+# must clear that spread to count. Survivors -> 2-seed confirm (v6) -> real LM.
+#   cautious = LM-predicted-good (compression without signal tax); scap = wd substitute
+#   (smax logged now); repulse/grad_rep/xorth/grokfast = grok-null, regime re-test.
 ARMS = [
     dict(arm="default", seed=0),
     dict(arm="default", seed=1),
-    dict(arm="default", seed=0, scale_mode="normuon"),
-    dict(arm="default", seed=1, scale_mode="normuon"),
-    dict(arm="default", seed=0, ns_kj=6),                    # ns8 = 6 KJ + 2 pin
-    dict(arm="default", seed=0, aurora_k=2),                 # k2
+    dict(arm="default", seed=0, cautious=2.0),
+    dict(arm="default", seed=0, scap=2.0),
+    dict(arm="default", seed=0, repulse=1e-3),
+    dict(arm="default", seed=0, grad_rep=0.5),
+    dict(arm="default", seed=0, xorth=1),
+    dict(arm="default", seed=0, grokfast=2.0),
 ]
 
 
@@ -45,8 +49,15 @@ def _tag(r):
             t += f"_{r['scale_mode']}"
         if r.get("aurora_k", 1) != 1:
             t += f"_k{r['aurora_k']}"
-        if r.get("ns_kj", 8) != 8:
+        if r.get("ns_kj", 6) != 6:
             t += f"_ns{r['ns_kj']}"
+    for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
+                     ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
+                     ("grokfast", "gf"), ("lookahead", "la")):
+        if r.get(key):
+            t += f"_{pre}{r[key]}"
+    if r.get("xorth"):
+        t += "_xo"
     if r.get("steps", 6000) != 6000:
         t += f"_{r['steps']}st"
     return t

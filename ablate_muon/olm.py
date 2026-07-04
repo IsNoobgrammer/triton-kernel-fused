@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mech                                                            # noqa: E402
 from grok_moe import FusedMuon, _DSV4_COEFFS, GrokMoENet, _mi          # noqa: E402
 
 _KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)               # KJ quintic + pinned tail
@@ -76,7 +77,9 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             dense_first=1, bias_tokens=300_000, bias_factor=0.01, nval=4096,
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
-            scale_mode="aurora", aurora_k=1, ns_kj=8,                   # Muon variant knobs
+            scale_mode="aurora", aurora_k=1, ns_kj=6,                   # DEFAULT = ns8 (6 KJ) aurora_k1
+            repulse=0.0, decor=0.0, grad_rep=0.0, xorth=0, niche=0.0,   # mechanism knobs (mech.py)
+            scap=0.0, cautious=0.0, grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
 
 
@@ -98,8 +101,15 @@ def make_tag(c):
             t += f"_{c['scale_mode']}"
         if c["aurora_k"] != 1:
             t += f"_k{c['aurora_k']}"
-        if c["ns_kj"] != 8:
+        if c["ns_kj"] != 6:                                       # default is ns8 (6 KJ)
             t += f"_ns{c['ns_kj']}"
+    for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
+                     ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
+                     ("grokfast", "gf"), ("lookahead", "la")):
+        if c.get(key):
+            t += f"_{pre}{c[key]}"
+    if c.get("xorth"):
+        t += "_xo"
     if c["steps"] != 6000:
         t += f"_{c['steps']}st"
     return t
@@ -149,11 +159,15 @@ def run(cfg):
         opts = [torch.optim.AdamW(model.parameters(), lr=c["lr"],
                                   weight_decay=c["adamw_wd"], betas=(0.9, 0.98))]
     else:
-        mkw = dict(lr=c["muon_lr"], weight_decay=c["wd"], coeffs=_coeffs(c["ns_kj"]),
+        hwd = 0.0 if c["cautious"] > 0 else c["wd"]                # cautious does manual masked decay
+        mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=_coeffs(c["ns_kj"]),
                    ns_dtype=torch.float16, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"])
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
                 FusedMuon([q for q in hidden if q.ndim == 2], **mkw),
                 FusedMuon([q for q in hidden if q.ndim == 3], **mkw)]
+    all_params = list(model.parameters())
+    expert_ws = ([b.moe.w1 for b in mblocks] + [b.moe.w2 for b in mblocks])
+    mstate = {}                                                    # per-run mechanism buffers
     tag = make_tag(c)
     lnP = math.log(P)
     floor = _floor(c["noise"])
@@ -180,6 +194,7 @@ def run(cfg):
             yb[flip] = torch.randint(0, P, (int(flip.sum()),), device=dev, generator=g)
         loss = F.cross_entropy(model(xb), yb)
         loss.backward()
+        mech.pre_step(c, all_params, expert_ws, mblocks, mstate)      # grad-space mechanisms
         # WSD schedule (LM-standard), identical for AdamW and Muon: linear warmup ->
         # stable -> cosine decay to min_lr_frac over the final decay_frac of steps.
         if c["warmup"] and step <= c["warmup"]:
@@ -196,6 +211,7 @@ def run(cfg):
                 gp.setdefault("base_lr", gp["lr"])
                 gp["lr"] = scale * gp["base_lr"]
             o.step(); o.zero_grad(set_to_none=True)
+        mech.post_step(c, all_params, hidden, expert_ws, mblocks, mstate, dev, c["muon_lr"], step)
         tok_count += c["batch"]
         if tok_count >= c["bias_tokens"]:
             for b in mblocks:
@@ -236,6 +252,7 @@ def run(cfg):
                 frac=round(vloss / lnP, 4), acc=round(acc, 5), best_acc=round(best, 5),
                 per_depth=[round(a, 4) for a in per_d],
                 per_depth_ce=[round(l, 4) for l in per_dce],
+                scap_smax=round(mstate.get("scap_smax", 0.0), 3),
                 mi_final=[round(m, 3) for m in mis], curve=curve)
 
 
