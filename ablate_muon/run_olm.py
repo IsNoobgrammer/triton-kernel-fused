@@ -20,18 +20,17 @@ COMMON = dict(steps=6000, batch=768)
 #  - wd optimum flips small online (grok-optimal 2.0 should HURT -> regime check)
 #  - Muon vs AdamW gap in the compute-bound regime (the gap that matters for BiBo)
 #  - dense-first-1 (default) vs all-MoE contrast
-# v3 wave: recalibrated task (shallow mix, div depth-1 only) + LM-standard WSD schedule
-# (warmup 500 -> stable -> cosine decay over last 20%, IDENTICAL for both optimizers -
-# user call: match LM practice). Wave-1 result: adamw AND muon-wd2.0 flatlined at chance
-# with no warmup; muon wd0.1 learned. The no-warmup muon arm tests "muon does not need
-# warmup" as a perf-per-flop claim.
+# v4 wave: PROXY VALIDATION. Does olm reproduce the 137M-LM ordering we already own?
+# LM ground truth (perf round): normuon WON (-0.026@1200, growing), ns8 TIED, k2 TIED.
+# If olm ranks normuon>default and ns8/k2~default, it is a validated LM proxy and the
+# whole mechanism backlog gets rescreened here at toy cost. 2 baseline seeds = noise floor.
 ARMS = [
     dict(arm="default", seed=0),
     dict(arm="default", seed=1),
-    dict(arm="adamw",   seed=0),
-    dict(arm="adamw",   seed=1),
-    dict(arm="default", seed=0, warmup=0),
-    dict(arm="default", seed=0, dense_first=0),
+    dict(arm="default", seed=0, scale_mode="normuon"),
+    dict(arm="default", seed=1, scale_mode="normuon"),
+    dict(arm="default", seed=0, ns_kj=6),                    # ns8 = 6 KJ + 2 pin
+    dict(arm="default", seed=0, aurora_k=2),                 # k2
 ]
 
 
@@ -41,6 +40,13 @@ def _tag(r):
         t += f"_df{r['dense_first']}"
     if r.get("warmup", 500) != 500:
         t += f"_wu{r['warmup']}"
+    if r["arm"] != "adamw":
+        if r.get("scale_mode", "aurora") != "aurora":
+            t += f"_{r['scale_mode']}"
+        if r.get("aurora_k", 1) != 1:
+            t += f"_k{r['aurora_k']}"
+        if r.get("ns_kj", 8) != 8:
+            t += f"_ns{r['ns_kj']}"
     if r.get("steps", 6000) != 6000:
         t += f"_{r['steps']}st"
     return t

@@ -29,6 +29,13 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from grok_moe import FusedMuon, _DSV4_COEFFS, GrokMoENet, _mi          # noqa: E402
 
+_KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)               # KJ quintic + pinned tail
+
+
+def _coeffs(ns_kj):
+    """ns_kj KJ iterations + 2 pinned = the Muon NS schedule (default 8 = dsv4_10; 6 = ns8)."""
+    return (_KJ,) * ns_kj + (_PIN,) * 2
+
 P, NUM_OPS = 97, 4
 EQ, PAD = P + NUM_OPS, P + NUM_OPS + 1                                # token ids
 VOCAB = P + NUM_OPS + 2
@@ -69,6 +76,7 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             dense_first=1, bias_tokens=300_000, bias_factor=0.01, nval=4096,
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
+            scale_mode="aurora", aurora_k=1, ns_kj=8,                   # Muon variant knobs
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
 
 
@@ -85,6 +93,13 @@ def make_tag(c):
         t += f"_df{c['dense_first']}"
     if c.get("warmup", 500) != 500:
         t += f"_wu{c['warmup']}"
+    if c["arm"] != "adamw":
+        if c["scale_mode"] != "aurora":
+            t += f"_{c['scale_mode']}"
+        if c["aurora_k"] != 1:
+            t += f"_k{c['aurora_k']}"
+        if c["ns_kj"] != 8:
+            t += f"_ns{c['ns_kj']}"
     if c["steps"] != 6000:
         t += f"_{c['steps']}st"
     return t
@@ -134,11 +149,11 @@ def run(cfg):
         opts = [torch.optim.AdamW(model.parameters(), lr=c["lr"],
                                   weight_decay=c["adamw_wd"], betas=(0.9, 0.98))]
     else:
+        mkw = dict(lr=c["muon_lr"], weight_decay=c["wd"], coeffs=_coeffs(c["ns_kj"]),
+                   ns_dtype=torch.float16, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"])
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
-                FusedMuon([q for q in hidden if q.ndim == 2], lr=c["muon_lr"],
-                          weight_decay=c["wd"], coeffs=_DSV4_COEFFS, ns_dtype=torch.float16),
-                FusedMuon([q for q in hidden if q.ndim == 3], lr=c["muon_lr"],
-                          weight_decay=c["wd"], coeffs=_DSV4_COEFFS, ns_dtype=torch.float16)]
+                FusedMuon([q for q in hidden if q.ndim == 2], **mkw),
+                FusedMuon([q for q in hidden if q.ndim == 3], **mkw)]
     tag = make_tag(c)
     lnP = math.log(P)
     floor = _floor(c["noise"])
@@ -215,6 +230,7 @@ def run(cfg):
                   f"frac {vloss/lnP:.3f} acc {acc:.4f} d " + " ".join(f"{a:.3f}" for a in per_d)
                   + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
+                scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 steps=c["steps"], loss=round(vloss, 4), gap=round(vloss - floor, 4),
                 frac=round(vloss / lnP, 4), acc=round(acc, 5), best_acc=round(best, 5),
