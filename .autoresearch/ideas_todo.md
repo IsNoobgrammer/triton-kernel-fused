@@ -267,6 +267,22 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   v3 recalibrated. NEW: online MI spreads across MULTIPLE MoE layers (0.51/0.32/0.34) and
   appears LATE w/ learning onset - unlike grok's last-layer-only; regime-specific, read as
   early-learning MI given low acc.
+- [olm wave v3 DONE - recalibrated task + WSD + warmup, UNIFORM eval metric (pre-dist-fix);
+  dist-matched acc recomputed by hand from per-depth]. KEY RESULTS:
+  1. WARMUP RESCUES ADAMW: v2 adamw dead@chance -> v3 adamw learns (d1 0.087/0.218).
+     Confirms v2 flatline = Adam cold-start second moments, not regime. Fair test valid.
+  2. HEADLINE (fair: matched WSD+warmup+lr, online/compute-bound regime): Muon CRUSHES
+     AdamW. Dist-matched acc Muon ~0.46/0.41 vs AdamW ~0.05/0.11 (4-9x); depth-1
+     ~0.88 vs ~0.15; Muon cracks depth-2 (0.10-0.16) AdamW does not (0.02-0.03).
+     Strongest perf-per-flop result of the round - LM-like regime, everything matched.
+  3. WARMUP ROBUSTNESS ASYMMETRY (new): Muon-no-warmup LEARNS (d1 0.574, faster early
+     0.478@2k vs warmed 0.260, plateaus lower) vs AdamW-no-warmup COLLAPSES (v2 chance).
+     Muon warmup-robust, AdamW warmup-dependent. Refines "muon needs no warmup".
+  4. df0 all-MoE matched/beat df1 dense-first, reached deepest (d3=0.110, dist-acc ~0.43)
+     - CONTRADICTS grok dense-early finding BUT confounded (df0 = 4 MoE layers vs df1 3 =
+     more capacity; 1 seed). Needs equal-param rerun before believing.
+  Seed variance high (adamw 0.087 vs 0.218) but Muon>AdamW gap >> seed spread = robust.
+  NEXT olm run reports dist-matched frac/acc directly (eval fix pushed a58f5a4).
 - PROXY VALIDATION PLAN (before trusting olm for promotions): olm wave 2 = normuon +
   ns8 + k2 arms. LM ground truth exists (137M screen: normuon WON -0.026@1200, ns8/k2
   tied). If olm reproduces that ordering, it is a validated LM proxy; if it calls
