@@ -179,6 +179,17 @@ def auc(y):
     return trap(f, s) / (s[-1] - s[0])
 
 
+def wsd(grid, total=6000, warmup=500, decay_frac=0.2, min_lr=0.1):
+    """WSD LR multiplier (olm.py): linear warmup -> stable 1.0 -> cosine decay to min_lr.
+    Identical for every run at 6000 steps, so it overlays as a shared reference line."""
+    g = np.asarray(grid, float); out = np.ones_like(g)
+    wu = g <= warmup; out[wu] = g[wu] / warmup
+    t0 = total * (1 - decay_frac); dec = g > t0
+    prog = (g[dec] - t0) / max(total - t0, 1)
+    out[dec] = min_lr + (1 - min_lr) * 0.5 * (1 + np.cos(np.pi * prog))
+    return out
+
+
 def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None):
     for name, r in runs.items():
         if r.get(key) is None:
@@ -188,9 +199,16 @@ def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None):
     if floor is not None:
         ax.axhline(floor, color="k", ls=":", lw=1, label=f"floor {floor:.3f}")
     ax.set_xlabel("step"); ax.set_ylabel(ylab); ax.set_title(title)
-    ax.grid(alpha=0.3); ax.legend(fontsize=6, ncol=2)
+    ax.grid(alpha=0.3); ax.legend(fontsize=6, ncol=2, loc="upper right")
     if ylim:
         ax.set_ylim(*ylim)
+    # WSD LR-schedule reference (shared by all runs): dark line on a right-hand axis so its
+    # true 0-1 shape (warmup / stable / cosine-decay) shows without distorting the metric.
+    ax2 = ax.twinx()
+    g = np.linspace(0, STEPS[-1], 400)
+    ax2.plot(g, wsd(g), color="k", lw=2.2, ls="-.", alpha=0.85, zorder=0, label="WSD LR mult")
+    ax2.set_ylim(0, 1.08); ax2.set_ylabel("LR mult (WSD)", fontsize=8)
+    ax2.legend(loc="lower left", fontsize=6)
 
 
 def _bar(ax, runs, col, cfgs, clabel, fn, ylab, title):
