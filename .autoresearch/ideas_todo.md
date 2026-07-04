@@ -131,6 +131,15 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
   MI for its own sake (fitness-sharing lesson generalizes).
 - adamw awd0.3 mid-layer MI hits 0.65 while acc 0.14 - more evidence mid-layer MI is a
   memorization-routing artifact, inversely related to generalization if anything.
+- STANDING DIAGNOSTIC (2026-07-04): mid-layer MI = memorization marker. Evidence gradient:
+  awd0.3 never-groks 0.65 > awd0.1 0.28 > grokked-adamw scar 0.57-vestigial > muon 0.00.
+  Hypothesis: memorized per-op lookup features are op-separable early (router splits);
+  the generalizing shared Fourier circuit is op-shared until readout (specialize last layer
+  only - both grokked arms agree, L_last MI 1.00). AdamW groks ON TOP of its 5000-step
+  memorization scaffold (scar persists); Muon transitions 2.4x faster + spectral spreading
+  -> scar never consolidates. USE: rising mid-layer MI in a new arm = memorizing, not
+  generalizing. Untested causal check (not queued): uniform-routing L1 in grokked adamw
+  should be acc-neutral (vestigial); L_last should hurt in both.
 - Wave 3 (pushed): decor {0.5, 1.0} x2 seeds (idea #3 grad-space variant: g_e -= decor*
   mean_E g before step) + ewd {3.0, 4.0}. NOTE decor acts on grads pre-momentum/pre-polar,
   not on the post-NS update (FusedMuon internals untouched) - screen-grade approximation.
