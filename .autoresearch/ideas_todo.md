@@ -486,6 +486,20 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   broken-bias normuon "win" was an artifact). polar/base-muon = never tested on olm before,
   now confirmed WEAKEST - vindicates the "base muon less probable" prior. util (eff ~7.5)
   and spec FLAT across all four - the entire difference is composition quality.
+- [olm v12+v13 DONE - DEVICE-MATCHED wd curve on RTX 6000, peak CONFIRMED at wd 0.2]
+  Re-ran on RTX 6000 (v13: 0.1/0.2; v12: 0.3/0.5/0.7/1.0). TWO findings:
+  * DEVICE SHIFT is real: RTX 6000 frac runs ~+0.03-0.06 vs T4 (wd0.1 0.526 vs 0.493;
+    wd0.2 0.507 vs 0.445). fp16 NS / cublas differ across hardware -> ALWAYS device-match a
+    sweep before comparing points. (Why the re-run mattered.)
+  * PEAK SURVIVES at wd 0.2 on-device: mean frac 0.2=0.507 < 0.1=0.526 < 0.5=0.544 <
+    1.0=0.568 < 0.3=0.573 < 0.7=0.627. wd 0.2 wins; 0.1 close; then downslope 0.3-1.0 toward
+    the dead 2.0, with RISING SEED FRAGILITY (wd0.7 s1 NEVER emerged: frac 0.687, d1 0.277).
+    wd0.2 s1 = standout (d2 0.492, d3 0.262, d4 0.073). Ordering matches T4 -> device shift
+    raises the floor but preserves the wd ranking.
+  * SCHEDULE INSIGHT (from the WSD overlay): the biggest depth-2 emergence jumps fire during
+    the DECAY phase (steps 4800-6000, LR 1.0->0.1) - LR decay triggers/accelerates the final
+    composition. dashboard_wd.png rebuilt device-matched (T4 points dropped). Low side
+    (0.007-0.05, v14) pending -> completes the curve left of the peak.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
