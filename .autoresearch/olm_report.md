@@ -36,6 +36,26 @@ great on grok and useless on LM (or vice-versa). So olm emulates the LM regime a
 - Also tracked: per-depth accuracy (the learning hierarchy), MI(expert, depth) per layer,
   min expert load, and (for scap) the power-iteration smax.
 
+## 2b. Metric glossary (range / what each end means)
+
+- **frac** = val_CE/ln(97). Range ~0.09..1.0. 1.0 = untrained (no compression); 0.092 = noise
+  floor (best possible, = LM residual ~0.09). LOWER = better. PRIMARY metric.
+- **gap** = val_CE - floor(0.423 nats). 0 = perfect; higher = worse. frac in absolute nats.
+- **acc** = Zipf-weighted accuracy. ~0.01 (chance, 1/97) .. ~0.95 (ceiling; NOT 1.0 - 5% label
+  noise is unwinnable). Higher = better.
+- **d1..d6** = per-depth acc (same range). The learning hierarchy: d1 fast/first, d6 hard/last.
+- **spec** = MI(expert,depth)/min(H(expert),H(depth)). Range 0..1. 0 = experts interchangeable
+  (no division of labor); 1 = expert fully determined by task (max specialization). Higher =
+  more functional diversity - DIAGNOSTIC for the MoE goal, not a loss target on its own.
+- **eff/E** = exp(H(load)), range 1..E(=8). E = perfectly uniform (best utilization, no
+  collapse); 1 = all tokens to one expert (total collapse). Higher = better. (Replaces noisy
+  minload = least-used expert fraction, range 0..0.125.)
+
+READ TOGETHER (spec x eff): high-eff+high-spec = IDEAL (all alive, differentiated); low-eff+
+high-spec = specialization-by-collapse (what scap did - bad); high-eff+low-spec = redundant
+generalists; low-eff+low-spec = worst. Promotion bar = frac<=floor (no acc cost) AND high eff
+(no collapse) AND positive spec (differentiated), all at once.
+
 ## 3. Calibration journey (v1 -> v5)
 
 | ver | change | outcome |
