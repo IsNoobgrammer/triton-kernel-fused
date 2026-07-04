@@ -258,6 +258,15 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   dense_first=1 (layer 1 dense, 2-4 MoE, user call); all-MoE df0 = contrast arm.
 - [RUNNING olm wave 1] default df1 wd0.1 x2 seeds, default wd2.0 (regime check:
   grok-optimal wd predicted to HURT online), adamw x2 seeds, df0 all-MoE contrast.
+- [olm wave v2 DONE - too-hard task, NO WSD; superseded by v3 but regime checks stand]
+  Three clean regime confirmations at 6000 steps: (a) Muon wd2.0 DEAD (frac 0.995, flat,
+  MI 0) - grok-optimal wd kills online learning, regime flip REAL; (b) AdamW DEAD both
+  seeds (frac 0.995) - BUT confounded by zero warmup (Adam cold-start second moments in a
+  one-pass stream), NOT yet a fair "adamw fails" claim -> v3 warmup arm decides; (c) Muon
+  wd0.1 LEARNS (frac 0.82-0.88 df1/df0). Task too hard (best 0.82 vs target 0.3-0.5) ->
+  v3 recalibrated. NEW: online MI spreads across MULTIPLE MoE layers (0.51/0.32/0.34) and
+  appears LATE w/ learning onset - unlike grok's last-layer-only; regime-specific, read as
+  early-learning MI given low acc.
 - PROXY VALIDATION PLAN (before trusting olm for promotions): olm wave 2 = normuon +
   ns8 + k2 arms. LM ground truth exists (137M screen: normuon WON -0.026@1200, ns8/k2
   tied). If olm reproduces that ordering, it is a validated LM proxy; if it calls
