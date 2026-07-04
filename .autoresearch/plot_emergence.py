@@ -211,6 +211,10 @@ def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None):
     ax.grid(alpha=0.3); ax.legend(fontsize=6, ncol=2, loc="upper right")
     if ylim:
         ax.set_ylim(*ylim)
+    # WSD phase boundaries: warmup ends at 500, cosine decay starts at steps*(1-decay_frac).
+    ax.axvline(500, color="red", ls="--", lw=1.2, alpha=0.7, label="warmup end (500)")
+    ax.axvline(STEPS[-1] * 0.8, color="red", ls="--", lw=1.2, alpha=0.7,
+               label=f"decay start ({int(STEPS[-1] * 0.8)})")
     # WSD LR-schedule reference (shared by all runs): dark line on a right-hand axis so its
     # true 0-1 shape (warmup / stable / cosine-decay) shows without distorting the metric.
     ax2 = ax.twinx()
