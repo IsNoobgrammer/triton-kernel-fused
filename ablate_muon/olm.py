@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mech                                                            # noqa: E402
 import metrics                                                         # noqa: E402
 from grok_moe import FusedMuon, _DSV4_COEFFS, GrokMoENet              # noqa: E402
+from kernels.sm75.muon import _PE_COEFFS                              # noqa: E402  (Polar-Express PE-8)
 
 _KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)               # KJ quintic + pinned tail
 
@@ -78,7 +79,8 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             dense_first=1, bias_every=10, bias_factor=0.01, mult=4, nval=4096,
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
-            scale_mode="aurora", aurora_k=1, ns_kj=6,                   # DEFAULT = ns8 (6 KJ) aurora_k1
+            scale_mode="aurora", aurora_k=1, ns_kj=6, coeffs="kj",      # DEFAULT = ns8 (6 KJ) aurora_k1
+            #  coeffs: "kj" -> KJ*ns_kj + 2 pin;  "pe" -> Polar-Express PE-8 (8 iters)
             repulse=0.0, decor=0.0, grad_rep=0.0, xorth=0, niche=0.0,   # mechanism knobs (mech.py)
             scap=0.0, cautious=0.0, grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
@@ -102,7 +104,9 @@ def make_tag(c):
             t += f"_{c['scale_mode']}"
         if c["aurora_k"] != 1:
             t += f"_k{c['aurora_k']}"
-        if c["ns_kj"] != 6:                                       # default = 8 iters (6 KJ + 2 pin)
+        if c["coeffs"] == "pe":
+            t += "_pe8"                                           # Polar-Express PE-8 schedule
+        elif c["ns_kj"] != 6:                                     # default = 8 iters (6 KJ + 2 pin)
             t += f"_it{c['ns_kj'] + 2}"                           # TOTAL NS iters (avoid ns_kj confusion)
     if c["mult"] != 4:
         t += f"_m{c['mult']}"
@@ -164,7 +168,8 @@ def run(cfg):
                                   weight_decay=c["adamw_wd"], betas=(0.9, 0.98))]
     else:
         hwd = 0.0 if c["cautious"] > 0 else c["wd"]                # cautious does manual masked decay
-        mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=_coeffs(c["ns_kj"]),
+        nsc = _PE_COEFFS if c["coeffs"] == "pe" else _coeffs(c["ns_kj"])
+        mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=nsc,
                    ns_dtype=torch.float16, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"])
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
                 FusedMuon([q for q in hidden if q.ndim == 2], **mkw),
@@ -265,6 +270,7 @@ def run(cfg):
                   + f" | eff/{E} {' '.join(f'{e:.1f}' for e in eff)}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
+                coeffs=c["coeffs"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),

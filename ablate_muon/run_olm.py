@@ -33,13 +33,15 @@ COMMON = dict(steps=6000, batch=768)
 # iter/coeff axis dead here too (-> ns8 confirmed cheapest-tied = perf-per-flop win)?
 #   aurora_k1 8 iter (ns_kj=6) = current default | aurora_k1 10 iter (ns_kj=8) = dsv4_10 |
 #   aurora_k2 8 iter (ns_kj=6, k2)
-# default (ns6/8-iter) baseline already known from v7: s0 0.535 / s1 0.451 - NOT re-run
-# (deterministic). Only the NEW configs here; compare against that known floor.
+# v9 wave: coefficient-family / cheaper-iters exploration (default ns8=8-iter floor known:
+# s0 0.535 / s1 0.451). NEW configs only, 2 seeds each -> compare MEANS to that floor.
+#   ns_4+2  = KJ*4 + 2 pin = 6 iters (even cheaper than the 8-iter default - does it hold?)
+#   PE-8    = Polar-Express minimax 8-iter schedule (different coeff FAMILY) + aurora
 ARMS = [
-    dict(arm="default", seed=0, ns_kj=8),
-    dict(arm="default", seed=1, ns_kj=8),
-    dict(arm="default", seed=0, aurora_k=2),
-    dict(arm="default", seed=1, aurora_k=2),
+    dict(arm="default", seed=0, ns_kj=4),
+    dict(arm="default", seed=1, ns_kj=4),
+    dict(arm="default", seed=0, coeffs="pe"),
+    dict(arm="default", seed=1, coeffs="pe"),
 ]
 
 
@@ -54,7 +56,9 @@ def _tag(r):
             t += f"_{r['scale_mode']}"
         if r.get("aurora_k", 1) != 1:
             t += f"_k{r['aurora_k']}"
-        if r.get("ns_kj", 6) != 6:
+        if r.get("coeffs", "kj") == "pe":
+            t += "_pe8"
+        elif r.get("ns_kj", 6) != 6:
             t += f"_it{r['ns_kj'] + 2}"                           # total NS iters
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
