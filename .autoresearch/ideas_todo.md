@@ -356,6 +356,15 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   Arms: default s0/s1 (RE-baseline under new bias), normuon, xorth, normuon+xorth combo
   (s0/s1), capacity-bound mult=1 default + combo. Tests: combo = loss+utilization both?
   capacity-bound = does xorth utilization edge become a loss edge when task needs all E?
+- [olm v7 BIG EARLY RESULT] The bias-cadence fix (every 10 steps) improved LOSS, not just
+  the utilization metric: DEFAULT s1 frac 0.556 (broken bias) -> 0.451 (fixed), eff 7.3-7.6/8
+  (was collapsed), depth-2 acc 0.16->0.42, depth-3 0.04->0.18. Dead experts were a REAL
+  capacity leak; reviving them unlocked deeper composition. => (a) FLOOR RESETS to ~0.45;
+  ALL prior verdicts (normuon win, mechanism nulls) were under broken-bias/collapsed regime
+  and must be re-read under healthy utilization; (b) my "xorth utilization is free-but-
+  unrewarded" call was WRONG - utilization IS rewarded here, the broken bias masked it, so
+  the healthy baseline now captures most of it and xorth must ADD on top (higher bar, cleaner
+  test). Await full v7 table for per-arm verdicts.
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
