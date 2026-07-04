@@ -79,18 +79,21 @@ class MoE(nn.Module):
         self.register_buffer("bias", torch.zeros(E))
         self.register_buffer("load", torch.zeros(E))
 
-    def forward(self, x):                                          # x: (N, d)
+    def forward(self, x, real=None):                              # x: (N, d); real: (N,) non-pad mask
         scores = torch.sigmoid(self.router(x).float())
         sel = scores + self.bias
         _, idx = torch.topk(sel, self.top_k, dim=-1, sorted=False)
         w = scores.gather(-1, idx)
         w = w / (w.sum(-1, keepdim=True) + 1e-20)
-        if self.training:
-            self.load += torch.bincount(idx.flatten(), minlength=self.E).float()
+        if self.training:                                         # load over REAL tokens only (no pad)
+            li = idx if real is None else idx[real]
+            if li.numel():
+                self.load += torch.bincount(li.flatten(), minlength=self.E).float()
         h = torch.einsum("nd,edh->neh", x, self.w1)
         h = torch.einsum("neh,ehd->ned", F.gelu(h), self.w2)
         hk = h.gather(1, idx.unsqueeze(-1).expand(-1, -1, h.shape[-1]).long())
-        self._last_top1 = idx[:, 0]
+        self._last_top1 = idx[:, 0]                               # grok-harness compat
+        self._last_idx, self._last_w = idx, w                     # (N,k) top-k experts + combine wts
         return (hk * w.unsqueeze(-1).to(h.dtype)).sum(1)
 
     @torch.no_grad()
@@ -101,39 +104,41 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d, h, E, top_k, dense=False):
+    def __init__(self, d, h, E, top_k, dense=False, mult=4):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
         self.attn = nn.MultiheadAttention(d, h, batch_first=True)
-        self.moe = None if dense else MoE(d, E, top_k)
+        self.moe = None if dense else MoE(d, E, top_k, mult)
         self.mlp = (nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
                     if dense else None)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, real=None):
         hh = self.ln1(x)
         a, _ = self.attn(hh, hh, hh, attn_mask=mask, need_weights=False)
         x = x + a
         if self.moe is None:
             return x + self.mlp(self.ln2(x))
         n, s, d = x.shape
-        return x + self.moe(self.ln2(x).reshape(n * s, d)).reshape(n, s, d)
+        rm = None if real is None else real.reshape(n * s)
+        return x + self.moe(self.ln2(x).reshape(n * s, d), rm).reshape(n, s, d)
 
 
 class GrokMoENet(nn.Module):
-    def __init__(self, vocab, d=128, layers=3, heads=4, E=8, top_k=2, seq=4, dense_layers=()):
+    def __init__(self, vocab, d=128, layers=3, heads=4, E=8, top_k=2, seq=4, dense_layers=(),
+                 mult=4):
         super().__init__()
         self.tok = nn.Embedding(vocab, d)
         self.pos = nn.Embedding(seq, d)
-        self.blocks = nn.ModuleList(Block(d, heads, E, top_k, dense=(i in dense_layers))
+        self.blocks = nn.ModuleList(Block(d, heads, E, top_k, dense=(i in dense_layers), mult=mult)
                                     for i in range(layers))
         self.lnf = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab, bias=False)
         self.register_buffer("mask", torch.triu(torch.ones(seq, seq, dtype=torch.bool), 1))
 
-    def forward(self, x):
+    def forward(self, x, pad_mask=None):
         h = self.tok(x) + self.pos.weight[None, : x.shape[1]]
         for b in self.blocks:
-            h = b(h, self.mask)
+            h = b(h, self.mask, pad_mask)
         return self.head(self.lnf(h[:, -1]))
 
 

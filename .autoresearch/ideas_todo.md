@@ -337,6 +337,17 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   Bar: reach ~0.560 floor => a cheaper optimizer at Muon quality = big perf-per-flop win.
   Note SinkGD-as-NS-PRECOND was refuted 3x on kappa; this tests it as a FULL optimizer
   (different claim - row/col norm as the whole update, not a Muon prescale).
+- [olm v7 QUEUED - new instrument + winners together + combo + capacity-bound]
+  INSTRUMENT UPGRADE (user-directed): bias balancer every 10 STEPS (was ~every 391 steps
+  = 300k tok / 768 samples -> only ~15 updates/run = collapse cause); pad-masked load, MI,
+  utilization (loss already pad-free); soft top-2 WEIGHTED MI (both selected experts by
+  combine weight, not top-1); metrics.py: effective-experts exp(H(load)) + spec-fraction
+  MI/ceiling replace noisy minload. bias_factor 0.01 (600 updates/run). mult knob for
+  narrow/capacity-bound experts. Gauge: 768 samples/step, ~6.2 real tok/sample = ~4750
+  real tok/step, 14 positions incl pad.
+  Arms: default s0/s1 (RE-baseline under new bias), normuon, xorth, normuon+xorth combo
+  (s0/s1), capacity-bound mult=1 default + combo. Tests: combo = loss+utilization both?
+  capacity-bound = does xorth utilization edge become a loss edge when task needs all E?
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).

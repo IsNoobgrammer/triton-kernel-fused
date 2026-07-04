@@ -26,18 +26,20 @@ COMMON = dict(steps=6000, batch=768)
 # must clear that spread to count. Survivors -> 2-seed confirm (v6) -> real LM.
 #   cautious = LM-predicted-good (compression without signal tax); scap = wd substitute
 #   (smax logged now); repulse/grad_rep/xorth/grokfast = grok-null, regime re-test.
-# v6 wave: CHEAP NS-FREE OPTIMIZERS (the 'same quality, much less compute' arm). Compare
-# to Muon ns8 floor 0.556-0.560. dion rf1.0 = sanity (should ~ Muon). LEO/SinkGD run at
-# their own recommended lr (element-wise/row-col, 0 GEMMs). Dion = low-rank NS.
+# v7 wave: NEW INSTRUMENT (bias every 10 steps, pad-masked load, soft top-2 MI,
+# effective-experts) + the winners run together + normuon x xorth combo + capacity-bound.
+# NOTE: bias cadence changed -> re-measure default floor under the new regime.
+#   normuon = loss win; xorth = utilization win (orthogonal); combo = both?
+#   capacity-bound (mult=1, narrow experts) = does xorth's utilization edge pay off in loss?
 ARMS = [
-    dict(arm="leo",    seed=0, muon_lr=1e-3),               # LEO tuned best (repo ablation)
-    dict(arm="leo",    seed=0, muon_lr=3e-3),               # upper edge (repo: ultra-sensitive)
-    dict(arm="sinkgd", seed=0, muon_lr=1e-3),
-    dict(arm="sinkgd", seed=0, muon_lr=3e-3),
-    dict(arm="dion",   seed=0, rank_frac=0.25),
-    dict(arm="dion",   seed=0, rank_frac=0.5),
-    dict(arm="dion",   seed=0, rank_frac=1.0),              # sanity: ~ Muon
-    dict(arm="dion",   seed=1, rank_frac=0.5),
+    dict(arm="default", seed=0),
+    dict(arm="default", seed=1),
+    dict(arm="default", seed=0, scale_mode="normuon"),
+    dict(arm="default", seed=0, xorth=1),
+    dict(arm="default", seed=0, scale_mode="normuon", xorth=1),   # combo
+    dict(arm="default", seed=1, scale_mode="normuon", xorth=1),
+    dict(arm="default", seed=0, mult=1),                          # capacity-bound baseline
+    dict(arm="default", seed=0, mult=1, scale_mode="normuon", xorth=1),  # capacity-bound combo
 ]
 
 
@@ -65,6 +67,8 @@ def _tag(r):
             t += f"_{pre}{r[key]}"
     if r.get("xorth"):
         t += "_xo"
+    if r.get("mult", 4) != 4:
+        t += f"_m{r['mult']}"
     if r.get("steps", 6000) != 6000:
         t += f"_{r['steps']}st"
     return t
@@ -75,10 +79,10 @@ def _table(results):
     print("ONLINE LM-EMULATOR  (one epoch, fresh data, 5% noise; gap = CE above the 0.42-nat floor)")
     print("=" * 108)
     for r in results:
-        mi = "/".join(f"{m:.2f}" for m in r["mi_final"])
-        pd = " ".join(f"{a:.2f}" for a in r["per_depth"])
-        print(f"{_tag(r):26s} CE {r['loss']:.4f}  gap {r.get('gap', -1):+.4f}  frac {r['frac']:.3f}  "
-              f"acc {r['acc']:.4f}  d1-6 {pd}  MI(L) {mi}")
+        spec = "/".join(f"{s:.2f}" for s in r.get("spec_frac", r.get("mi_final", [])))
+        eff = "/".join(f"{e:.1f}" for e in r.get("eff_experts", []))
+        print(f"{_tag(r):30s} frac {r['frac']:.3f}  acc {r['acc']:.4f}  "
+              f"spec {spec:14s}  eff/{r.get('experts', 8)} {eff}")
     print("=" * 108)
 
 

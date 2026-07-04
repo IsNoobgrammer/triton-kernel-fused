@@ -28,7 +28,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mech                                                            # noqa: E402
-from grok_moe import FusedMuon, _DSV4_COEFFS, GrokMoENet, _mi          # noqa: E402
+import metrics                                                         # noqa: E402
+from grok_moe import FusedMuon, _DSV4_COEFFS, GrokMoENet              # noqa: E402
 
 _KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)               # KJ quintic + pinned tail
 
@@ -74,7 +75,7 @@ def _pad_left(tok, dev, maxseq):
 
 _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads=4,
             experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=0.1, adamw_wd=0.1,
-            dense_first=1, bias_tokens=300_000, bias_factor=0.01, nval=4096,
+            dense_first=1, bias_every=10, bias_factor=0.01, mult=4, nval=4096,
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
             scale_mode="aurora", aurora_k=1, ns_kj=6,                   # DEFAULT = ns8 (6 KJ) aurora_k1
@@ -110,6 +111,8 @@ def make_tag(c):
         t += f"_si{c['sink_iters']}"
     if c["arm"] in ("leo", "sinkgd", "dion") and c["muon_lr"] != 1e-3:
         t += f"_lr{c['muon_lr']}"
+    if c["mult"] != 4:
+        t += f"_m{c['mult']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
                      ("grokfast", "gf"), ("lookahead", "la")):
@@ -154,7 +157,8 @@ def run(cfg):
         vy[flip] = torch.randint(0, P, (int(flip.sum()),), device=dev, generator=gval)
 
     model = GrokMoENet(VOCAB, c["d"], c["layers"], c["heads"], c["experts"], c["top_k"],
-                       seq=maxseq, dense_layers=tuple(range(c["dense_first"]))).to(dev)
+                       seq=maxseq, dense_layers=tuple(range(c["dense_first"])),
+                       mult=c["mult"]).to(dev)
     mblocks = [b for b in model.blocks if b.moe is not None]
     n_par = sum(q.numel() for q in model.parameters())
 
@@ -196,7 +200,8 @@ def run(cfg):
 
     g = torch.Generator(device=dev).manual_seed(c["seed"] + 7)
     mix = torch.tensor(c["depth_mix"], device=dev)
-    tok_count, best, curve = 0, 0.0, []
+    E = c["experts"]
+    best, curve = 0.0, []
     for step in range(1, c["steps"] + 1):
         deps = torch.multinomial(mix, c["batch"], replacement=True, generator=g)
         xb, yb = [], []
@@ -211,7 +216,7 @@ def run(cfg):
         if c["noise"] > 0:                                            # same noise in the stream
             flip = torch.rand(len(yb), device=dev, generator=g) < c["noise"]
             yb[flip] = torch.randint(0, P, (int(flip.sum()),), device=dev, generator=g)
-        loss = F.cross_entropy(model(xb), yb)
+        loss = F.cross_entropy(model(xb, pad_mask=(xb != PAD)), yb)   # load counts real tokens only
         loss.backward()
         mech.pre_step(c, all_params, expert_ws, mblocks, mstate)      # grad-space mechanisms
         # WSD schedule (LM-standard), identical for AdamW and Muon: linear warmup ->
@@ -231,49 +236,65 @@ def run(cfg):
                 gp["lr"] = scale * gp["base_lr"]
             o.step(); o.zero_grad(set_to_none=True)
         mech.post_step(c, all_params, hidden, expert_ws, mblocks, mstate, dev, c["muon_lr"], step)
-        tok_count += c["batch"]
-        if tok_count >= c["bias_tokens"]:
+        if mblocks and step % c["bias_every"] == 0:                   # DSv3 balancer every N steps
             for b in mblocks:
                 b.moe.update_bias(c["bias_factor"])
-            tok_count = 0
         if step % c["eval_every"] == 0 or step == c["steps"]:
             model.eval()
             with torch.no_grad():
-                celoss, preds, top1s = [], [], [[] for _ in mblocks]
+                celoss, preds = [], []
+                lab_idx = [[] for _ in mblocks]                       # answer-position top-k experts
+                lab_w = [[] for _ in mblocks]                         # ...and combine weights
+                evload = [torch.zeros(E, device=dev) for _ in mblocks]  # utilization over real tokens
                 for i in range(0, len(vy), 8192):
-                    lg = model(vx[i:i + 8192])
+                    xb_ = vx[i:i + 8192]
+                    pm = (xb_ != PAD)
+                    lg = model(xb_, pad_mask=pm)
                     celoss.append(F.cross_entropy(lg, vy[i:i + 8192], reduction="none"))
                     preds.append(lg.argmax(-1))
+                    rm = pm.reshape(-1)
                     for li, b in enumerate(mblocks):
-                        top1s[li].append(b.moe._last_top1.reshape(-1, maxseq)[:, -1])
+                        k = b.moe.top_k
+                        lab_idx[li].append(b.moe._last_idx.reshape(-1, maxseq, k)[:, -1, :])
+                        lab_w[li].append(b.moe._last_w.reshape(-1, maxseq, k)[:, -1, :])
+                        fi = b.moe._last_idx[rm].reshape(-1)          # real-token routing
+                        evload[li] += torch.bincount(fi, minlength=E).float()
                 ce = torch.cat(celoss)
                 pred = torch.cat(preds)
                 hit = (pred == vy).float()
                 per_d = [hit[vd == i].mean().item() for i in range(maxd)]
                 per_dce = [ce[vd == i].mean().item() for i in range(maxd)]
-                mixw = torch.tensor(c["depth_mix"], device=dev)       # eval on TRAIN distribution
-                mixw = mixw / mixw.sum()                              # (LM-faithful; unpins the tail)
-                vloss = sum(w * l for w, l in zip(mixw.tolist(), per_dce))
-                acc = sum(w * a for w, a in zip(mixw.tolist(), per_d))
-                mis = [_mi(torch.cat(t), vd, c["experts"], maxd) for t in top1s]
-                lmin = min((b.moe.load / b.moe.load.sum().clamp_min(1)).min().item()
-                           for b in mblocks) if mblocks else 0.0
+                mixw = (torch.tensor(c["depth_mix"], device=dev))     # eval on TRAIN distribution
+                mixw = (mixw / mixw.sum()).tolist()                   # (LM-faithful; unpins the tail)
+                vloss = sum(w * l for w, l in zip(mixw, per_dce))
+                acc = sum(w * a for w, a in zip(mixw, per_d))
+                mi, spec, eff = [], [], []                            # soft top-2 MI + utilization
+                for li in range(len(mblocks)):
+                    m, s = metrics.soft_mi(torch.cat(lab_idx[li]), torch.cat(lab_w[li]),
+                                           vd, E, maxd)
+                    mi.append(m); spec.append(s)
+                    eff.append(metrics.load_stats(evload[li])["eff"])
+                mineff = min(eff) if eff else E
             model.train()
             best = max(best, acc)
             curve.append([step, round(vloss, 4), round(acc, 5)])
             print(f"[{tag}] step {step:5d} val_CE {vloss:.4f} gap {vloss-floor:+.4f} "
                   f"frac {vloss/lnP:.3f} acc {acc:.4f} d " + " ".join(f"{a:.3f}" for a in per_d)
-                  + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
+                  + f" | spec {' '.join(f'{s:.2f}' for s in spec)}"
+                  + f" | eff/{E} {' '.join(f'{e:.1f}' for e in eff)}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 rank_frac=c["rank_frac"], sink_iters=c["sink_iters"], muon_lr=c["muon_lr"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
-                steps=c["steps"], loss=round(vloss, 4), gap=round(vloss - floor, 4),
-                frac=round(vloss / lnP, 4), acc=round(acc, 5), best_acc=round(best, 5),
+                mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
+                gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),
+                acc=round(acc, 5), best_acc=round(best, 5),
                 per_depth=[round(a, 4) for a in per_d],
                 per_depth_ce=[round(l, 4) for l in per_dce],
                 scap_smax=round(mstate.get("scap_smax", 0.0), 3),
-                mi_final=[round(m, 3) for m in mis], curve=curve)
+                mi_soft=[round(m, 3) for m in mi], spec_frac=[round(s, 3) for s in spec],
+                eff_experts=[round(e, 2) for e in eff], min_eff=round(mineff, 2),
+                curve=curve)
 
 
 if __name__ == "__main__":                                            # smoke: python olm.py
