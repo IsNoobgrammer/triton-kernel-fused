@@ -42,14 +42,13 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
-# v13 wave: DEVICE-MATCHED anchors - re-run wd 0.1 and 0.2 on the RTX 6000 so the whole wd
-# curve is on ONE device (v12's 0.3-1.0 also runs here; the old 0.1/0.2 numbers were T4, and
-# fp16 NS / cublas can differ across hardware). 2 seeds each, aurora_k1 8-iter KJ. At plot
-# time, REPLACE the embedded T4 0.1/0.2 points with these + merge v12 -> fully device-consistent
-# dashboard_wd.png. (Deliberate re-run, user call: hardware-consistency, not a redundant bench.)
+# v14 wave: LOW-SIDE wd sweep on the RTX 6000 - map the LEFT of the peak device-matched.
+# v12 (0.3-1.0) turns over above 0.2; probe below with 0.007/0.01/0.02/0.05 (0.02 & 0.007 are
+# NEW; 0.01/0.05 device-matched vs their T4 numbers). 2 seeds each, aurora_k1 8-iter KJ.
+# Full device-consistent curve = v14 (0.007-0.05) + v13 (0.1/0.2) + v12 (0.3-1.0).
 ARMS = [
     dict(arm="default", seed=s, wd=w)
-    for w in (0.1, 0.2)
+    for w in (0.007, 0.01, 0.02, 0.05)
     for s in (0, 1)
 ]
 
