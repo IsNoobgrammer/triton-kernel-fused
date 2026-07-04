@@ -34,10 +34,10 @@ EQ, PAD = P + NUM_OPS, P + NUM_OPS + 1                                # token id
 VOCAB = P + NUM_OPS + 2
 
 
-def _sample(depth, n, g, dev, inv):
+def _sample(depth, n, g, dev, inv, nops=NUM_OPS):
     """n random depth-`depth` chains -> (tokens (n, 2*depth+2), result, unique int key)."""
     v = torch.randint(0, P, (n, depth + 1), device=dev, generator=g)
-    o = torch.randint(0, NUM_OPS, (n, depth), device=dev, generator=g)
+    o = torch.randint(0, nops, (n, depth), device=dev, generator=g)
     fix = (o == 3) & (v[:, 1:] == 0)                                  # div needs nonzero rhs
     v[:, 1:][fix] = torch.randint(1, P, (int(fix.sum()),), device=dev, generator=g)
     r = v[:, 0]
@@ -67,8 +67,8 @@ def _pad_left(tok, dev, maxseq):
 _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads=4,
             experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=0.1, adamw_wd=0.1,
             dense_first=1, bias_tokens=300_000, bias_factor=0.01, nval=4096,
-            eval_every=250, max_depth=6, noise=0.05,
-            depth_mix=(0.3, 0.25, 0.2, 0.125, 0.075, 0.05))
+            eval_every=250, max_depth=6, noise=0.05, div_deep=0,
+            depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
 
 
 def _floor(eps):
@@ -95,10 +95,13 @@ def run(cfg):
     inv = torch.tensor([0] + [pow(b, P - 2, P) for b in range(1, P)], device=dev)
     maxd, maxseq = c["max_depth"], 2 * c["max_depth"] + 2
 
+    def _nops(dep):                                                   # v3: div is a depth-1 skill;
+        return NUM_OPS if (dep == 1 or c["div_deep"]) else 3          # deep chains use +,-,* only
+
     gval = torch.Generator(device=dev).manual_seed(1234)              # FROZEN val stream
     vx, vy, vd, vkeys = [], [], [], {}
     for dep in range(1, maxd + 1):
-        tokd, rd, keyd = _sample(dep, c["nval"] * 2, gval, dev, inv)  # oversample, keep first
+        tokd, rd, keyd = _sample(dep, c["nval"] * 2, gval, dev, inv, _nops(dep))
         seen, pick = set(), []                                        # nval unique keys
         for i, k in enumerate(keyd.tolist()):
             if k not in seen:
@@ -150,7 +153,7 @@ def run(cfg):
             n = int((deps == dep - 1).sum())
             if n == 0:
                 continue
-            tok, r, key = _sample(dep, n, g, dev, inv)
+            tok, r, key = _sample(dep, n, g, dev, inv, _nops(dep))
             keep = ~torch.isin(key, vkeys[dep])                       # ONLINE: val never trains
             xb.append(_pad_left(tok[keep], dev, maxseq)); yb.append(r[keep])
         xb, yb = torch.cat(xb), torch.cat(yb)
