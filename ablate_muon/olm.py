@@ -189,18 +189,22 @@ def run(cfg):
         if step % c["eval_every"] == 0 or step == c["steps"]:
             model.eval()
             with torch.no_grad():
-                losses, preds, top1s = [], [], [[] for _ in mblocks]
+                celoss, preds, top1s = [], [], [[] for _ in mblocks]
                 for i in range(0, len(vy), 8192):
                     lg = model(vx[i:i + 8192])
-                    losses.append(F.cross_entropy(lg, vy[i:i + 8192], reduction="sum"))
+                    celoss.append(F.cross_entropy(lg, vy[i:i + 8192], reduction="none"))
                     preds.append(lg.argmax(-1))
                     for li, b in enumerate(mblocks):
                         top1s[li].append(b.moe._last_top1.reshape(-1, maxseq)[:, -1])
-                vloss = (torch.stack(losses).sum() / len(vy)).item()
+                ce = torch.cat(celoss)
                 pred = torch.cat(preds)
                 hit = (pred == vy).float()
-                acc = hit.mean().item()
                 per_d = [hit[vd == i].mean().item() for i in range(maxd)]
+                per_dce = [ce[vd == i].mean().item() for i in range(maxd)]
+                mixw = torch.tensor(c["depth_mix"], device=dev)       # eval on TRAIN distribution
+                mixw = mixw / mixw.sum()                              # (LM-faithful; unpins the tail)
+                vloss = sum(w * l for w, l in zip(mixw.tolist(), per_dce))
+                acc = sum(w * a for w, a in zip(mixw.tolist(), per_d))
                 mis = [_mi(torch.cat(t), vd, c["experts"], maxd) for t in top1s]
                 lmin = min((b.moe.load / b.moe.load.sum().clamp_min(1)).min().item()
                            for b in mblocks) if mblocks else 0.0
@@ -215,6 +219,7 @@ def run(cfg):
                 steps=c["steps"], loss=round(vloss, 4), gap=round(vloss - floor, 4),
                 frac=round(vloss / lnP, 4), acc=round(acc, 5), best_acc=round(best, 5),
                 per_depth=[round(a, 4) for a in per_d],
+                per_depth_ce=[round(l, 4) for l in per_dce],
                 mi_final=[round(m, 3) for m in mis], curve=curve)
 
 
