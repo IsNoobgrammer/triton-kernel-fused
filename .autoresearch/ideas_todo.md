@@ -365,6 +365,12 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   unrewarded" call was WRONG - utilization IS rewarded here, the broken bias masked it, so
   the healthy baseline now captures most of it and xorth must ADD on top (higher bar, cleaner
   test). Await full v7 table for per-arm verdicts.
+- [olm v7 SEED VARIANCE CAVEAT] default s0 0.535 vs s1 0.451 = 0.084 frac spread (phase-
+  transition timing: s1 cracked depth-2 to 0.42, s0 to 0.22). This spread > the arm-to-arm
+  deltas we chase -> single-seed arms (normuon/xorth/combo/capacity in v7) are NOT separable
+  from noise. Both seeds beat old floor 0.556 so bias fix is robust, but per-arm verdicts
+  need MULTI-SEED. v8 = 3 seeds each on top 2-3 configs, compare means; or longer budget to
+  converge the transition tail. Emergence variance is intrinsic (sharp seed-dependent jumps).
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
