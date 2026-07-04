@@ -493,6 +493,14 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   EXHAUSTED: aurora_k1 is the frontier, cheaper modes lose. Dashboard: dashboard_scale.png.
   CAVEAT: comparison at wd 0.1; re-confirm aurora_k1 dominance at the v10 optimum (wd 0.2)
   only if a reason appears - low prior it flips.
+  * [SECONDARY, user-spotted] polar also has the LOWEST expert util (eff mean 7.40 vs
+    normuon 7.6 / aurora 7.47), concentrated in the LAST MoE layer (s0 7.1) - small
+    (~0.2/8, near noise, mostly s1) but SAME root cause as its depth-2 loss: scale mode acts
+    on EXPERT weights (router is AdamW-side); polar's non-uniform row norms let experts drift
+    to uneven output magnitudes, the selection-only bias balancer can't cancel a persistent
+    magnitude asymmetry -> load concentrates. aurora/normuon uniform per-row RMS keeps
+    experts balanced. One coherent weakness (row non-uniformity), not two - secondary
+    confirmation, not worth chasing.
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
