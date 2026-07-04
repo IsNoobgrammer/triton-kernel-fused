@@ -144,6 +144,21 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
   mean_E g before step) + ewd {3.0, 4.0}. NOTE decor acts on grads pre-momentum/pre-polar,
   not on the post-NS update (FusedMuon internals untouched) - screen-grade approximation.
 
+### Wave 3 induction (T4 x2, 2026-07-04) - DOUBLE NULL, round converging
+- decor {0.5, 1.0} and ewd {3.0, 4.0}: ALL arms grok 1800-2200 (baseline band), acc ~1.0,
+  MI 1.00, minload -> 0. Nothing separates from seed noise (+-200-400 steps).
+- ROUND PATTERN after 3 waves: state repulsion HARMFUL, update decorrelation NULL, per-module
+  expert wd NULL both directions. No optimizer-side specialization intervention beats plain
+  Muon + uniform wd 2.0 + BiBo balancer. Specialization self-organizes (last layer, 1 bit,
+  exactly enough) and acc saturates at 1.0.
+- STANDING CAVEAT: this task saturates post-grok - there is NO HEADROOM for specialization
+  to pay off in acc. A discriminating test needs a task family where acc does NOT saturate
+  (mixed mod-arith + sorting + copy under skew, per section E note). Remaining queue items
+  (annealing, Shapley, tournament) are heavy and would inherit the same saturation problem -
+  do not run them on this testbed.
+- Round wins to keep: Muon 2.4x AdamW on MoE-grok; wd law extends to AdamW (monotone 0.1->
+  1.0); mid-layer-MI memorization diagnostic; dense-early/MoE-late confirmed twice.
+
 ### Swarm / evolutionary imports
 - [REJECTED 2026-07-04] Expert weight repulsion (PSO anti-averaging): W_e += beta*(W_e - mean_E W)
   after step. T4 wave 1 (ablate_muon, 3000 steps): beta=1e-3 DELAYS grok 1800->2800 with ZERO MI
@@ -163,20 +178,24 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
 ### Game theory imports
 - [NOTED] BiBo bias balancer IS congestion pricing (selection-only tax, sign updates). Already
   shipped; do not duplicate at optimizer level.
-- [TODO] Correlated-equilibrium / decorrelated updates: penalize alignment between expert
-  UPDATES (not weights): after batched polar, compute E x E gram of flattened updates, shrink
-  the common component: O_e -= gamma * mean_E(O). "Don't all learn the same thing this step."
-  Cheap (one mean); differs from weight repulsion (acts on the step, not the state).
+- [NULL 2026-07-04] Correlated-equilibrium / decorrelated updates (g_e -= gamma*mean_E g,
+  grad-space screen): wave 3, gamma {0.5, 1.0} x2 seeds - grok 2000-2200 vs baseline
+  1800-2200, acc/MI identical, even FULL removal of the common component (gamma=1) changes
+  nothing. Reading: top-k routing already decorrelates expert grads (non-selected experts get
+  ~zero grad per token), so the shared component is tiny - the "all experts learn the same
+  thing" failure mode does not exist under a working router. Post-polar E x E gram variant
+  not worth building given the grad-space null. CLOSED at this scale.
 - [TODO, heavy] Shapley-style credit: scale expert lr by marginal-contribution estimate
   (leave-one-out routing on a probe batch). O(E) extra forwards; only if MI metric shows
   specialization stalls and we need credit assignment to explain why.
 
 ### Information theory imports
-- [TODO #2] Per-module weight decay (rate-distortion: different compression rates per module
-  class - embeddings / attn / experts / norms / router). Directly extends the wd-dominance
-  finding (grok wd optimum 2-4 vs LM convention 0.1; Omnigrok: embeddings want different
-  regularization). Trivial: parameter groups. Test on grok first (wd_emb x wd_attn x wd_expert
-  small factorial), the winning ratio then becomes the LM sweep candidate.
+- [CLOSED-NULL 2026-07-04] Per-module weight decay, expert-vs-attn axis: ewd 0.5 REJECTED
+  (slows grok, lowers MI, wave 2); ewd {3.0, 4.0} NULL (grok/acc/MI == baseline wd 2.0,
+  wave 3; ewd4 slight end-of-run acc wobble = top of plateau). Expert stacks sit on the same
+  wd 2-4 plateau as everything else - no per-module ratio to extract on THIS task. Keep
+  uniform hidden wd. The emb/norm/router axes were not swept (AdamW-side); only revisit if
+  an LM-side signal appears.
 - [UPDATED 2026-07-04] LM wd sweep WIDENED to {0.1, 0.3, 0.6, 1.0, 2.0} + cautious-wd arm.
   Rationale (user push, accepted): our LM benchmark is 100-120M tokens into ~137M params =
   token/param < 1, 2-3 epochs -> data-constrained / memorization-capable regime, structurally
