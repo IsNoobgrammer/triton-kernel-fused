@@ -496,10 +496,18 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     the dead 2.0, with RISING SEED FRAGILITY (wd0.7 s1 NEVER emerged: frac 0.687, d1 0.277).
     wd0.2 s1 = standout (d2 0.492, d3 0.262, d4 0.073). Ordering matches T4 -> device shift
     raises the floor but preserves the wd ranking.
-  * SCHEDULE INSIGHT (from the WSD overlay): the biggest depth-2 emergence jumps fire during
-    the DECAY phase (steps 4800-6000, LR 1.0->0.1) - LR decay triggers/accelerates the final
-    composition. dashboard_wd.png rebuilt device-matched (T4 points dropped). Low side
-    (0.007-0.05, v14) pending -> completes the curve left of the peak.
+  * SCHEDULE INSIGHT [CORRECTED - user caught my overclaim]: emergence is NOT decay-triggered.
+    The rising configs start lifting ~step 4000-4500, while LR is STILL FLAT at 1.0 (decay
+    starts 4800). DECISIVE PROOF decay is not the trigger: the schedule is IDENTICAL for every
+    run, yet emergence timing/magnitude vary wildly by seed (wd0.2 s0 d2 0.15 vs s1 0.49, same
+    wd+decay) - if decay pulled the trigger all seeds would fire at 4800. So the driver is
+    SEED-DEPENDENT circuit formation (grokking phase transition on its own cumulative-step
+    clock) = our "seed = timing noise" finding. Decay just sits near where the intrinsic
+    transition fires; alignment is coincidental. Whether decay SHARPENS the already-started
+    tail is UNPROVEN from this data - clean test = a constant-LR (no-decay) arm (if emergence
+    fires at the same step, decay is timing-irrelevant; if the tail flattens, decay
+    consolidates). dashboard_wd.png rebuilt device-matched (T4 dropped); red verticals mark
+    warmup-end 500 / decay-start 4800. Low side (0.007-0.05, v14) pending.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
