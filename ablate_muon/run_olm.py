@@ -26,15 +26,18 @@ COMMON = dict(steps=6000, batch=768)
 # must clear that spread to count. Survivors -> 2-seed confirm (v6) -> real LM.
 #   cautious = LM-predicted-good (compression without signal tax); scap = wd substitute
 #   (smax logged now); repulse/grad_rep/xorth/grokfast = grok-null, regime re-test.
-# default (ns8) floor already measured, seed0 0.560 / seed1 0.556 — deterministic, NOT
-# re-run here. Compare each mechanism (seed 0) against the 0.556-0.560 floor.
+# v6 wave: CHEAP NS-FREE OPTIMIZERS (the 'same quality, much less compute' arm). Compare
+# to Muon ns8 floor 0.556-0.560. dion rf1.0 = sanity (should ~ Muon). LEO/SinkGD run at
+# their own recommended lr (element-wise/row-col, 0 GEMMs). Dion = low-rank NS.
 ARMS = [
-    dict(arm="default", seed=0, cautious=2.0),
-    dict(arm="default", seed=0, scap=2.0),
-    dict(arm="default", seed=0, repulse=1e-3),
-    dict(arm="default", seed=0, grad_rep=0.5),
-    dict(arm="default", seed=0, xorth=1),
-    dict(arm="default", seed=0, grokfast=2.0),
+    dict(arm="leo",    seed=0, muon_lr=1e-2),               # LEO paper lr
+    dict(arm="leo",    seed=0, muon_lr=3e-3),               # lr robustness
+    dict(arm="sinkgd", seed=0, muon_lr=1e-3),
+    dict(arm="sinkgd", seed=0, muon_lr=3e-3),
+    dict(arm="dion",   seed=0, rank_frac=0.25),
+    dict(arm="dion",   seed=0, rank_frac=0.5),
+    dict(arm="dion",   seed=0, rank_frac=1.0),              # sanity: ~ Muon
+    dict(arm="dion",   seed=1, rank_frac=0.5),
 ]
 
 
@@ -44,13 +47,17 @@ def _tag(r):
         t += f"_df{r['dense_first']}"
     if r.get("warmup", 500) != 500:
         t += f"_wu{r['warmup']}"
-    if r["arm"] != "adamw":
+    if r["arm"] == "default":
         if r.get("scale_mode", "aurora") != "aurora":
             t += f"_{r['scale_mode']}"
         if r.get("aurora_k", 1) != 1:
             t += f"_k{r['aurora_k']}"
         if r.get("ns_kj", 6) != 6:
             t += f"_ns{r['ns_kj']}"
+    if r["arm"] == "dion":
+        t += f"_rf{r.get('rank_frac', 0.25)}"
+    if r["arm"] in ("leo", "sinkgd", "dion") and r.get("muon_lr", 1e-3) != 1e-3:
+        t += f"_lr{r['muon_lr']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
                      ("grokfast", "gf"), ("lookahead", "la")):

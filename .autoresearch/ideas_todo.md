@@ -315,7 +315,17 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   component" amplifies staleness - flips from grok-null to olm-harmful).
   VERDICT: zero mechanism beats the floor on the validated proxy. Only normuon (v4) wins.
   No v6 survivors to confirm. Mechanism-addition family CLOSED on olm too.
-- NEXT: v6 = 2-seed confirm of v5 survivors -> real LM. Also still open: Dion low-rank
+- [olm v6 RUNNING] CHEAP NS-FREE OPTIMIZERS ('same quality, less compute' arm), alt_opt.py:
+  * SinkGD (2502.06742): Sinkhorn alternating row/col RMS normalize of momentum, 0 GEMMs.
+  * LEO (github vukrosic/leo-optimizer): Lion double-EMA + one-shot row/col normalize to
+    align_const, element-wise, 0 GEMMs. Own lr (0.01 / 3e-3 arms).
+  * Dion (2504.05295): low-rank orthonormalization, amortized power iter + error feedback,
+    rank_frac {0.25, 0.5, 1.0}. rf1.0 = sanity (should ~ Muon floor 0.560).
+  Arms: leo lr{1e-2,3e-3}, sinkgd lr{1e-3,3e-3}, dion rf{0.25,0.5,1.0}, dion rf0.5 s1.
+  Bar: reach ~0.560 floor => a cheaper optimizer at Muon quality = big perf-per-flop win.
+  Note SinkGD-as-NS-PRECOND was refuted 3x on kappa; this tests it as a FULL optimizer
+  (different claim - row/col norm as the whole update, not a Muon prescale).
+- NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
 - PREDICTIONS ON RECORD: (a) wd optimum flips small in the online regime; (b) Muon>AdamW
