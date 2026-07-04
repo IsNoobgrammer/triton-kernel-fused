@@ -100,13 +100,29 @@ seed1 0.556. Every mechanism tested at seed 0; must clear ~0.560 to count.
 |---|---|---|---|
 | grad_rep 0.5 | 0.562 | NULL | routing already decorrelates experts; nothing to add |
 | scap 2.0 | 0.563 | NULL | top-sv clip; likely non-binding (smax ~1.5 at init) |
-| xorth | 0.565 | NULL | E-axis whitening; no signal (our own idea, still null) |
+| xorth | 0.565 | NULL on loss / WIN on utilization | see note below |
 | cautious 2.0 | 0.598 | MILD HARM | sign-masking halves effective decay -> slower escape; LM-good prediction REFUTED at this budget |
 | repulse 1e-3 | 0.692 | HARM | blocks the depth-2 composition circuit (d2 stuck 0.02, MI~0, regresses) |
 | grokfast 2.0 | 0.721 | HARM + UNSTABLE | online fresh data -> grad EMA averages over DIFFERENT samples -> amplifying the "slow component" amplifies staleness; acc degrades 0.12->0.07 |
 
-Zero mechanism beats the floor. Only normuon (a scaling refinement, not an added mechanism)
-wins.
+Zero mechanism beats the floor ON LOSS. Only normuon (a scaling refinement) wins on loss.
+
+**xorth utilization finding (v5, on the MoE-specialization axis the round originally targeted):**
+Grading v5 on frac alone missed this. On expert utilization + per-layer specialization,
+xorth (our cross-expert gradient whitening along the E axis) is the winner and acc-neutral:
+
+| arm | frac | acc | minload | MI (3 sparse layers) |
+|---|---|---|---|---|
+| default | 0.560 | 0.47 | 0.031 | 0.00 / 0.24 / 0.44 |
+| xorth | 0.565 | 0.46 | 0.039 | 0.32 / 0.23 / 0.48 |
+| scap | 0.563 | 0.47 | 0.001 | 0.48 / 0.16 / 0.49 |
+
+xorth specializes ALL three sparse layers (default's first is dead at MI 0.00) AND keeps
+load healthy (no collapse), AND holds accuracy at the floor — the exact "acc-neutral
+functional diversity" bar the MoE round set. scap also specializes but collapses load
+(minload 0.001). NOT yet a loss win: the task saturates at floor with 2-3 experts, so the
+extra utilization is free-but-unrewarded. Convert-to-win test = a CAPACITY-BOUND regime
+(more experts / harder multi-task data / narrower experts) where all E are genuinely needed.
 
 ## 7. Conclusions and intuitions
 

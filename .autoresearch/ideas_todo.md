@@ -306,15 +306,27 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   grok punishes weak/targeted compression, LM should reward it. If scap smax >> 2.0 the
   cap binds; if ~2.0 it is a near-no-op.
 - [olm v5 DONE] mechanism re-bench vs ns8 floor 0.556-0.560 (final frac, seed 0):
-  xorth 0.565 NULL | grad_rep 0.562 NULL | scap2.0 0.563 NULL (may be non-binding) |
+  xorth 0.565 [CORRECTED from NULL - see utilization note] | grad_rep 0.562 NULL |
+  scap2.0 0.563 NULL-loss (may be non-binding) |
   cautious2.0 0.598 MILD HARM (slower, same as grok - weak decay = slow escape even
   online at this budget; LM-good prediction REFUTED on proxy) | repulse1e-3 0.692 HARM
   (never learns depth-2, MI~0, regresses - weight repulsion blocks the composition
   circuit) | grokfast2.0 0.721 HARM+UNSTABLE (acc DEGRADES 0.12->0.07 end; online fresh
   data makes the grad EMA average over DIFFERENT samples so amplifying the "slow
   component" amplifies staleness - flips from grok-null to olm-harmful).
-  VERDICT: zero mechanism beats the floor on the validated proxy. Only normuon (v4) wins.
-  No v6 survivors to confirm. Mechanism-addition family CLOSED on olm too.
+  VERDICT (loss/compression): zero mechanism beats the floor. Only normuon (v4) wins on loss.
+  [XORTH RECLASSIFIED 2026-07-04, user caught it]: on the MoE-SPECIALIZATION+UTILIZATION
+  axis (the round's original objective, not compression), xorth (our cross-expert grad
+  whitening) is the WINNER and acc-neutral. At step 6000: MI 0.32/0.23/0.48 = specialized
+  in ALL 3 sparse layers (default leaves layer-1 dead at MI 0.00), minload 0.039 = healthy
+  utilization no collapse, acc 0.46 = at floor. scap specializes too (0.48/0.16/0.49) but
+  COLLAPSES load (minload 0.001); xorth gets specialization AND utilization AND acc. This
+  is exactly the "acc-neutral functional diversity" bar the MoE round set. NOT yet a loss
+  win because this task saturates at floor with 2-3 experts -> extra utilization is free
+  but UNREWARDED. To convert to a quality win need a CAPACITY-BOUND regime (more experts /
+  harder-multitask data / narrower experts) where the task actually needs all E experts.
+  -> xorth reopened as a candidate FOR THE UTILIZATION/CAPACITY axis; design a capacity-
+  bound olm variant to test if its utilization edge becomes a loss edge.
 - [olm v6 RUNNING] CHEAP NS-FREE OPTIMIZERS ('same quality, less compute' arm), alt_opt.py:
   * SinkGD (2502.06742): Sinkhorn alternating row/col RMS normalize of momentum, 0 GEMMs.
   * LEO (github vukrosic/leo-optimizer): Lion double-EMA + one-shot row/col normalize to
