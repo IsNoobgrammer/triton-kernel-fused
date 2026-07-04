@@ -26,20 +26,23 @@ COMMON = dict(steps=6000, batch=768)
 # must clear that spread to count. Survivors -> 2-seed confirm (v6) -> real LM.
 #   cautious = LM-predicted-good (compression without signal tax); scap = wd substitute
 #   (smax logged now); repulse/grad_rep/xorth/grokfast = grok-null, regime re-test.
-# v7 wave: NEW INSTRUMENT (bias every 10 steps, pad-masked load, soft top-2 MI,
-# effective-experts) + the winners run together + normuon x xorth combo + capacity-bound.
-# NOTE: bias cadence changed -> re-measure default floor under the new regime.
-#   normuon = loss win; xorth = utilization win (orthogonal); combo = both?
-#   capacity-bound (mult=1, narrow experts) = does xorth's utilization edge pay off in loss?
+# v8 wave: DEFAULT NS-CONFIG comparison, MULTI-SEED (v7 killed normuon/xorth as broken-bias
+# artifacts; plain Muon+ns8 is the frontier). Now tune its NS budget on the validated proxy.
+# 3 configs x 3 seeds to beat the ~0.084 seed spread; compare MEANS. Does more NS fidelity
+# (10 iter) or more aurora passes (k2) beat the cheap ns8 (8 iter), or is the iter axis dead
+# here too (-> ns8 confirmed cheapest-tied = perf-per-flop win)?
+#   aurora_k1 8 iter (ns_kj=6) = current default | aurora_k1 10 iter (ns_kj=8) = dsv4_10 |
+#   aurora_k2 8 iter (ns_kj=6, k2)
 ARMS = [
     dict(arm="default", seed=0),
     dict(arm="default", seed=1),
-    dict(arm="default", seed=0, scale_mode="normuon"),
-    dict(arm="default", seed=0, xorth=1),
-    dict(arm="default", seed=0, scale_mode="normuon", xorth=1),   # combo
-    dict(arm="default", seed=1, scale_mode="normuon", xorth=1),
-    dict(arm="default", seed=0, mult=1),                          # capacity-bound baseline
-    dict(arm="default", seed=0, mult=1, scale_mode="normuon", xorth=1),  # capacity-bound combo
+    dict(arm="default", seed=2),
+    dict(arm="default", seed=0, ns_kj=8),
+    dict(arm="default", seed=1, ns_kj=8),
+    dict(arm="default", seed=2, ns_kj=8),
+    dict(arm="default", seed=0, aurora_k=2),
+    dict(arm="default", seed=1, aurora_k=2),
+    dict(arm="default", seed=2, aurora_k=2),
 ]
 
 

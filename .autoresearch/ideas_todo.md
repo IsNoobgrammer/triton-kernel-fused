@@ -408,10 +408,13 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     0.13/0.26/0.20) - its spec edge was ALSO a broken-bias artifact. spec is CAPACITY-driven
     (mult=1 arms highest spec 0.39-0.47) not optimizer-driven, and ANTI-correlated with loss
     (capacity-starved = more spec, worse loss).
-  * HARNESS GAP: no TRUE OOD test (all depths trained). PROPOSE v8: train depths <=4, eval
-    5-6 (length/composition EXTRAPOLATION) - the real test of optimizer inductive bias;
-    algorithm-finder extrapolates, depth-fitter collapses to chance. Add held-out-depth OOD
-    eval alongside IID. This is where a subtle normuon/xorth bias could still surface.
+  * OOD-eval idea DROPPED (user): depth-4 already ~chance, so held-out depth-5/6
+    extrapolation would measure nothing. No headroom for a length-OOD test at this scale.
+- [olm v8 QUEUED] DEFAULT NS-CONFIG comparison, multi-seed (normuon/xorth done, dead).
+  3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
+  current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
+  Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
+  the iter/coeff axis DEAD here too (as on grok) -> ns8 = cheapest-tied, perf-per-flop win.
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
