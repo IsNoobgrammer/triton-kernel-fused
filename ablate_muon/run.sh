@@ -31,10 +31,10 @@ echo "[run.sh] detected $GPU_COUNT GPU(s); logs -> $LOGDIR"
 if [ "$GPU_COUNT" -ge 2 ] && [ "$FORCE_SINGLE" != "1" ]; then
     echo "[run.sh] DUAL-GPU: shard 0 on GPU 0, shard 1 on GPU 1 (parallel)"
     CUDA_VISIBLE_DEVICES=0 python -u ablate_muon/run_ablation.py --shard 0 --nshards 2 \
-        2>&1 | sed 's/^/[gpu0] /' | tee "$LOGDIR/g0.log" &
+        2>&1 | sed -u 's/^/[gpu0] /' | tee "$LOGDIR/g0.log" &
     P0=$!
     CUDA_VISIBLE_DEVICES=1 python -u ablate_muon/run_ablation.py --shard 1 --nshards 2 \
-        2>&1 | sed 's/^/[gpu1] /' | tee "$LOGDIR/g1.log" &
+        2>&1 | sed -u 's/^/[gpu1] /' | tee "$LOGDIR/g1.log" &
     P1=$!
     wait $P0 $P1
     echo "[run.sh] both GPUs done — merging"
