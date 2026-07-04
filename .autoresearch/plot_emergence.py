@@ -19,37 +19,35 @@ LNP = np.log(97)
 FLOOR = 0.0924
 STEPS = [1000, 2000, 3000, 4000, 4500, 5000, 5500, 6000]
 
-# v8 NS-config comparison. Per arm: config color-key, seed, frac/d2/d3 trajectories,
-# and FINAL per-depth acc (d1..d6), per-layer spec, per-layer eff.
+# v9 coefficient/iteration comparison. Per arm: config color-key, seed, frac/d2/d3
+# trajectories, FINAL per-depth acc (d1..d6), per-layer spec, per-layer eff.
+# 8-iter KJ = the champ (floor); 6-iter (ns_4) = cheaper KJ; PE-8 = Polar-Express minimax
+# (rejected: s0 NaN'd - not plottable - and s1 emerged late & worst).
 RUNS = {
- "8-iter (ns8, default)": dict(c="8it", s=0,
+ "8-iter KJ (champ)": dict(c="8it", s=0,
     frac=[.997,.796,.722,.584,.573,.566,.550,.535], d2=[.016,.036,.113,.135,.144,.156,.194,.225],
     d3=[.015,.022,.026,.032,.032,.038,.047,.056], dfin=[.947,.225,.056,.023,.016,.019],
     spec=[.13,.26,.20], eff=[7.5,7.4,7.5]),
- "8-iter (ns8) s1": dict(c="8it", s=1,
+ "8-iter KJ (champ) s1": dict(c="8it", s=1,
     frac=[.997,.872,.684,.560,.517,.489,.464,.451], d2=[.016,.019,.022,.094,.179,.232,.309,.421],
     d3=[.018,.017,.022,.031,.050,.080,.120,.177], dfin=[.948,.421,.177,.068,.031,.018],
     spec=[.17,.19,.25], eff=[7.6,7.5,7.3]),
- "10-iter (dsv4_10)": dict(c="10it", s=0,
-    frac=[.997,.804,.709,.610,.603,.602,.595,.592], d2=[.015,.021,.024,.021,.020,.018,.021,.022],
-    d3=[.016,.021,.021,.022,.021,.022,.019,.021], dfin=[.947,.022,.021,.019,.015,.015],
-    spec=[.08,.49,.54], eff=[7.6,7.7,7.7]),
- "10-iter (dsv4_10) s1": dict(c="10it", s=1,
-    frac=[.996,.858,.732,.717,.706,.634,.612,.609], d2=[.016,.020,.026,.040,.059,.073,.093,.090],
-    d3=[.016,.017,.020,.021,.022,.025,.030,.032], dfin=[.584,.090,.032,.023,.019,.021],
-    spec=[.13,.30,.36], eff=[7.4,7.1,6.9]),
- "k2 (aurora_k2)": dict(c="k2", s=0,
-    frac=[.997,.835,.723,.611,.592,.585,.568,.558], d2=[.015,.039,.067,.093,.098,.103,.131,.156],
-    d3=[.016,.021,.023,.025,.025,.029,.034,.034], dfin=[.947,.156,.034,.021,.015,.017],
-    spec=[.09,.27,.16], eff=[7.5,7.1,7.6]),
- "k2 (aurora_k2) s1": dict(c="k2", s=1,
-    frac=[.996,.871,.713,.603,.583,.555,.509,.495], d2=[.016,.022,.039,.132,.143,.171,.313,.386],
-    d3=[.016,.017,.023,.024,.020,.021,.024,.027], dfin=[.946,.386,.027,.022,.019,.018],
-    spec=[.04,.38,.32], eff=[7.8,7.5,7.5]),
+ "6-iter (ns_4)": dict(c="6it", s=0,
+    frac=[.997,.794,.668,.583,.573,.567,.552,.542], d2=[.018,.032,.126,.144,.144,.156,.176,.205],
+    d3=[.016,.019,.028,.037,.038,.042,.049,.060], dfin=[.947,.205,.060,.026,.017,.019],
+    spec=[.23,.28,.13], eff=[7.6,7.1,7.5]),
+ "6-iter (ns_4) s1": dict(c="6it", s=1,
+    frac=[.996,.865,.733,.616,.581,.539,.500,.484], d2=[.014,.021,.035,.094,.112,.141,.186,.240],
+    d3=[.015,.021,.019,.026,.032,.045,.076,.098], dfin=[.940,.240,.098,.050,.025,.019],
+    spec=[.07,.19,.20], eff=[7.4,7.5,7.3]),
+ "PE-8 (s0 NaN'd) s1": dict(c="pe8", s=1,
+    frac=[.996,.875,.720,.696,.695,.687,.603,.580], d2=[.017,.023,.048,.080,.078,.088,.107,.138],
+    d3=[.016,.019,.018,.027,.031,.030,.036,.045], dfin=[.560,.138,.045,.020,.019,.021],
+    spec=[.19,.36,.28], eff=[7.5,6.9,7.1]),
 }
-COL = {"8it": "tab:blue", "10it": "tab:red", "k2": "tab:green"}
-CFGS = ["8it", "10it", "k2"]
-CLABEL = {"8it": "8-iter (ns8)", "10it": "10-iter", "k2": "k2"}
+COL = {"8it": "tab:blue", "6it": "tab:orange", "pe8": "tab:red"}
+CFGS = ["8it", "6it", "pe8"]
+CLABEL = {"8it": "8-iter KJ", "6it": "6-iter (ns_4)", "pe8": "PE-8"}
 
 
 def load():
@@ -134,15 +132,15 @@ def dashboard(runs):
          "Effective experts (util; higher=better)")
     _bar(ax[2, 2], runs, lambda r: np.mean(r["spec"]) if r["spec"] else 0, "spec frac",
          "Specialization (mean over layers)")
-    fig.suptitle("OLM v8 KPI dashboard — 8-iter (blue) vs 10-iter (red) vs k2 (green), 2 seeds each",
-                 fontsize=14)
+    fig.suptitle("OLM v9 KPI dashboard — 8-iter KJ champ (blue) vs 6-iter ns_4 (orange) vs "
+                 "PE-8 (red, s0 NaN'd)", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.savefig(os.path.join(OUT, "dashboard.png"), dpi=120); plt.close(fig)
 
 
 def main():
     runs, real = load()
-    print(f"[plot] source: {'results_olm.jsonl' if real else 'embedded v8'}\n")
+    print(f"[plot] source: {'results_olm.jsonl' if real else 'embedded v9'}\n")
     print(f"{'run':24s} {'frac':>6s} {'d2':>6s} {'d3':>6s} {'AUC':>6s} {'eff':>5s} {'spec':>5s}")
     for name, r in runs.items():
         print(f"{name:24s} {r['frac'][-1]:6.3f} {r['d2'][-1]:6.3f} {r['d3'][-1]:6.3f} "
@@ -151,12 +149,12 @@ def main():
 
     # individual plots
     for key, ylab, title, fn, floor, ylim in [
-        ("frac", "frac (val CE / ln 97; lower=better)", "OLM v8 — compression (frac)",
+        ("frac", "frac (val CE / ln 97; lower=better)", "OLM v9 — compression (frac)",
          "emergence_curves.png", FLOOR, (0.4, 1.02)),
         ("d2", "depth-2 accuracy (higher=better)",
-         "OLM v8 — DEPTH-2 (learning from SPARSE compositional signal)", "depth2_accuracy.png",
+         "OLM v9 — DEPTH-2 (learning from SPARSE compositional signal)", "depth2_accuracy.png",
          None, (0, 0.5)),
-        ("d3", "depth-3 accuracy (higher=better)", "OLM v8 — DEPTH-3 (even sparser signal)",
+        ("d3", "depth-3 accuracy (higher=better)", "OLM v9 — DEPTH-3 (even sparser signal)",
          "depth3_accuracy.png", None, (0, 0.2))]:
         fig, a = plt.subplots(figsize=(9, 6))
         _line(a, runs, key, ylab, title, floor=floor, ylim=ylim)
