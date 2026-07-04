@@ -428,6 +428,17 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   need 10 -> right at THEIR scale. Optimal iter count is SCALE-DEPENDENT, not universal.
   "8 beats 10" is an OLM-small-scale result; don't extrapolate to big models. What transfers:
   iter count is a live knob olm CAN resolve (grok could not); at small scale go cheaper.
+- [olm v8 COMPLETE - 2 seeds each, NS-config verdict] final frac (mean) / AUC:
+  8-iter (ns8): 0.493 / 0.676 | k2: 0.527 / 0.701 | 10-iter (dsv4_10): 0.601 / 0.727.
+  PAIRED (same-seed) ranking CLEAN both seeds: 8-iter < k2 < 10-iter (s0: .535/.558/.592;
+  s1: .451/.495/.609). Neither more NS iters (10) nor more aurora passes (k2) beats the
+  cheap 8-iter aurora_k1 - both are WORSE. Compositional: 8-iter cracks depth-2 (s1 0.42)
+  and depth-3 (s1 0.18); 10-iter FAILS depth-2 (chance ~0.02, both seeds) with high spec
+  (0.5, collapse-in-disguise); k2 cracks depth-2 (s1 0.39) but not depth-3 (0.03).
+  AUC seed-spread ~3x tighter than final (8-iter 0.023 vs 0.084) - noise-robust ranking
+  = same. VERDICT: 8-iter aurora_k1 (= current default) wins on quality AND compute at this
+  scale. Coeff/aurora axis: no gain to be had by spending more here. Plots ->
+  .autoresearch/plots/emergence/ (v8).
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is

@@ -23,16 +23,14 @@ LNP = np.log(97)
 FLOOR = 0.0924                                                        # 5% noise floor (frac)
 
 STEPS = [1000, 2000, 3000, 4000, 4500, 5000, 5500, 6000]
-# label -> (config, seed, frac trajectory over STEPS). From v7 console (fixed-bias regime).
+# label -> (config, seed, frac trajectory over STEPS). v8 NS-config comparison (fixed bias).
 V7 = {
-    "ns8 (default)":      ("ns8", 0, [0.997, 0.796, 0.722, 0.584, 0.573, 0.566, 0.550, 0.535]),
-    "ns8 (default) s1":   ("ns8", 1, [0.997, 0.872, 0.684, 0.560, 0.517, 0.489, 0.464, 0.451]),
-    "normuon":            ("normuon", 0, [0.997, 0.808, 0.743, 0.599, 0.582, 0.574, 0.559, 0.549]),
-    "xorth":              ("xorth", 0, [0.997, 0.850, 0.706, 0.599, 0.587, 0.581, 0.568, 0.559]),
-    "normuon+xorth":      ("combo", 0, [0.997, 0.801, 0.748, 0.596, 0.582, 0.575, 0.565, 0.558]),
-    "normuon+xorth s1":   ("combo", 1, [0.996, 0.860, 0.678, 0.582, 0.577, 0.572, 0.563, 0.559]),
-    "capacity mult=1":    ("cap", 0, [0.997, 0.864, 0.732, 0.700, 0.695, 0.694, 0.687, 0.686]),
-    "capacity combo":     ("capcombo", 0, [0.997, 0.847, 0.726, 0.711, 0.679, 0.620, 0.599, 0.592]),
+    "8-iter (ns8, default)":  ("8it", 0, [0.997, 0.796, 0.722, 0.584, 0.573, 0.566, 0.550, 0.535]),
+    "8-iter (ns8) s1":        ("8it", 1, [0.997, 0.872, 0.684, 0.560, 0.517, 0.489, 0.464, 0.451]),
+    "10-iter (dsv4_10)":      ("10it", 0, [0.997, 0.804, 0.709, 0.610, 0.603, 0.602, 0.595, 0.592]),
+    "10-iter (dsv4_10) s1":   ("10it", 1, [0.996, 0.858, 0.732, 0.717, 0.706, 0.634, 0.612, 0.609]),
+    "k2 (aurora_k2)":         ("k2", 0, [0.997, 0.835, 0.723, 0.611, 0.592, 0.585, 0.568, 0.558]),
+    "k2 (aurora_k2) s1":      ("k2", 1, [0.996, 0.871, 0.713, 0.603, 0.583, 0.555, 0.509, 0.495]),
 }
 
 
@@ -93,14 +91,14 @@ def main():
         plt.plot(steps, frac, ls, marker="o", ms=3, label=name)
     plt.axhline(FLOOR, color="k", ls=":", lw=1, label=f"noise floor {FLOOR:.3f}")
     plt.xlabel("training step"); plt.ylabel("frac  (val CE / ln 97;  lower = better)")
-    plt.title("olm v7 emergence curves — compression vs training step\n(one epoch, 5% noise; sharp phase transitions -> timing is the seed noise)")
+    plt.title("olm v8 NS-config emergence curves — compression vs step\n8-iter (ns8) vs 10-iter (dsv4_10) vs k2, 2 seeds each (one epoch, 5% noise)")
     plt.legend(fontsize=8, ncol=2); plt.grid(alpha=0.3); plt.ylim(0.4, 1.02)
     plt.tight_layout(); plt.savefig(os.path.join(OUT, "emergence_curves.png"), dpi=130)
     plt.close()
 
     # ---- Fig 2: seed-noise story (paired configs with 2 seeds) ----
     plt.figure(figsize=(9, 6))
-    pairs = {"ns8 (default)": "tab:blue", "normuon+xorth": "tab:orange"}
+    pairs = {"8-iter": "tab:blue", "10-iter": "tab:red", "k2": "tab:green"}
     for base, col in pairs.items():
         for name, (arm, seed, steps, frac) in runs.items():
             if name.startswith(base):
@@ -109,7 +107,7 @@ def main():
                          label=f"{name} (final {frac[-1]:.3f}, AUC {auc(steps, frac):.3f})")
     plt.axhline(FLOOR, color="k", ls=":", lw=1)
     plt.xlabel("training step"); plt.ylabel("frac (lower = better)")
-    plt.title("Seed noise is TIMING, not destination\nsame config, 2 seeds: endpoints diverge, curves track until the tail")
+    plt.title("v8 NS-config, 2 seeds each: 8-iter (blue) < k2 (green) < 10-iter (red)\nsame-seed ranking is consistent despite the timing noise in the tail")
     plt.legend(fontsize=8); plt.grid(alpha=0.3); plt.ylim(0.4, 1.02)
     plt.tight_layout(); plt.savefig(os.path.join(OUT, "seed_noise.png"), dpi=130)
     plt.close()
