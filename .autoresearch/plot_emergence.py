@@ -1,10 +1,14 @@
-"""OLM ablation dashboard — lots of plots. Compression (frac), compositional learning from
-SPARSE signal (depth-2/3, the real-LM axis), utilization (eff), specialization (spec), and
-noise-robust curve metrics (AUC). Saves individual PNGs + one dashboard.png to plots/emergence/.
+"""OLM ablation KPI dashboards — ACCUMULATING store, one dashboard per ablation axis.
 
-Reads .autoresearch/results_olm.jsonl if present (per_depth in curve); else uses embedded v8.
+Design: every benched run is embedded ONCE below, grouped by axis (coeff / wd / scale).
+New waves ADD entries — we never reset. Each axis renders its own dashboard_<axis>.png +
+frac/depth2/depth3 curves, so new data is always plotted against the old data on the same
+instrument. The champ (8-iter KJ aurora_k1, wd 0.1) appears in every axis as the anchor.
+
+Metrics: frac (compression, lower=better), depth-2/3 (emergence from SPARSE signal = the
+real-LM axis), eff (utilization), spec (specialization), AUC (noise-robust curve metric).
+  python plot_emergence.py
 """
-import json
 import os
 
 import matplotlib
@@ -15,15 +19,17 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "plots", "emergence")
 os.makedirs(OUT, exist_ok=True)
-LNP = np.log(97)
 FLOOR = 0.0924
 STEPS = [1000, 2000, 3000, 4000, 4500, 5000, 5500, 6000]
 
-# v9 coefficient/iteration comparison. Per arm: config color-key, seed, frac/d2/d3
-# trajectories, FINAL per-depth acc (d1..d6), per-layer spec, per-layer eff.
-# 8-iter KJ = the champ (floor); 6-iter (ns_4) = cheaper KJ; PE-8 = Polar-Express minimax
-# (rejected: s0 NaN'd - not plottable - and s1 emerged late & worst).
-RUNS = {
+# ---------------------------------------------------------------------------------------
+# THE STORE. Per run: c=config color-key, s=seed, frac/d2/d3 trajectories (over STEPS),
+# FINAL per-depth acc (d1..d6), per-layer spec, per-layer eff. ADD new waves here.
+# ---------------------------------------------------------------------------------------
+
+# --- AXIS: coefficient / iteration (all wd 0.1, aurora_k1 base) -------------------------
+# v8 (8it/10it/k2) + v9 (6it/pe8). 8-iter KJ = champ.
+RUNS_COEFF = {
  "8-iter KJ (champ)": dict(c="8it", s=0,
     frac=[.997,.796,.722,.584,.573,.566,.550,.535], d2=[.016,.036,.113,.135,.144,.156,.194,.225],
     d3=[.015,.022,.026,.032,.032,.038,.047,.056], dfin=[.947,.225,.056,.023,.016,.019],
@@ -32,6 +38,22 @@ RUNS = {
     frac=[.997,.872,.684,.560,.517,.489,.464,.451], d2=[.016,.019,.022,.094,.179,.232,.309,.421],
     d3=[.018,.017,.022,.031,.050,.080,.120,.177], dfin=[.948,.421,.177,.068,.031,.018],
     spec=[.17,.19,.25], eff=[7.6,7.5,7.3]),
+ "10-iter (dsv4_10)": dict(c="10it", s=0,
+    frac=[.997,.804,.709,.610,.603,.602,.595,.592], d2=[.015,.021,.024,.021,.020,.018,.021,.022],
+    d3=[.016,.021,.021,.022,.021,.022,.019,.021], dfin=[.947,.022,.021,.019,.015,.015],
+    spec=[.08,.49,.54], eff=[7.6,7.7,7.7]),
+ "10-iter (dsv4_10) s1": dict(c="10it", s=1,
+    frac=[.996,.858,.732,.717,.706,.634,.612,.609], d2=[.016,.020,.026,.040,.059,.073,.093,.090],
+    d3=[.016,.017,.020,.021,.022,.025,.030,.032], dfin=[.584,.090,.032,.023,.019,.021],
+    spec=[.13,.30,.36], eff=[7.4,7.1,6.9]),
+ "k2 (aurora_k2)": dict(c="k2", s=0,
+    frac=[.997,.835,.723,.611,.592,.585,.568,.558], d2=[.015,.039,.067,.093,.098,.103,.131,.156],
+    d3=[.016,.021,.023,.025,.025,.029,.034,.034], dfin=[.947,.156,.034,.021,.015,.017],
+    spec=[.09,.27,.16], eff=[7.5,7.1,7.6]),
+ "k2 (aurora_k2) s1": dict(c="k2", s=1,
+    frac=[.996,.871,.713,.603,.583,.555,.509,.495], d2=[.016,.022,.039,.132,.143,.171,.313,.386],
+    d3=[.016,.017,.023,.024,.020,.021,.024,.027], dfin=[.946,.386,.027,.022,.019,.018],
+    spec=[.04,.38,.32], eff=[7.8,7.5,7.5]),
  "6-iter (ns_4)": dict(c="6it", s=0,
     frac=[.997,.794,.668,.583,.573,.567,.552,.542], d2=[.018,.032,.126,.144,.144,.156,.176,.205],
     d3=[.016,.019,.028,.037,.038,.042,.049,.060], dfin=[.947,.205,.060,.026,.017,.019],
@@ -45,53 +67,109 @@ RUNS = {
     d3=[.016,.019,.018,.027,.031,.030,.036,.045], dfin=[.560,.138,.045,.020,.019,.021],
     spec=[.19,.36,.28], eff=[7.5,6.9,7.1]),
 }
-COL = {"8it": "tab:blue", "6it": "tab:orange", "pe8": "tab:red"}
-CFGS = ["8it", "6it", "pe8"]
-CLABEL = {"8it": "8-iter KJ", "6it": "6-iter (ns_4)", "pe8": "PE-8"}
+COL_COEFF = {"8it": "tab:blue", "10it": "tab:red", "k2": "tab:green", "6it": "tab:orange",
+             "pe8": "tab:purple"}
+CFGS_COEFF = ["8it", "6it", "10it", "k2", "pe8"]
+CLABEL_COEFF = {"8it": "8-iter KJ", "6it": "6-iter", "10it": "10-iter", "k2": "k2", "pe8": "PE-8"}
+
+# --- AXIS: weight decay (all 8-iter KJ aurora_k1; wd 0.1 = the champ, same run) ---------
+# v10 sweep. HIGHER wd better; wd 0.2 = new champ. wd 0.1 reuses the coeff champ curves.
+RUNS_WD = {
+ "wd 0.01": dict(c="wd001", s=0,
+    frac=[.997,.823,.714,.594,.581,.572,.562,.556], d2=[.018,.022,.063,.104,.129,.138,.151,.157],
+    d3=[.017,.018,.022,.028,.030,.034,.038,.048], dfin=[.946,.157,.048,.023,.020,.019],
+    spec=[.02,.23,.22], eff=[7.7,7.4,7.5]),
+ "wd 0.01 s1": dict(c="wd001", s=1,
+    frac=[.996,.892,.678,.595,.540,.508,.480,.466], d2=[.016,.019,.023,.061,.116,.180,.263,.328],
+    d3=[.015,.022,.023,.024,.041,.066,.099,.141], dfin=[.947,.328,.141,.056,.024,.016],
+    spec=[.19,.27,.22], eff=[7.7,7.0,7.4]),
+ "wd 0.03": dict(c="wd003", s=0,
+    frac=[.997,.822,.696,.597,.584,.580,.564,.554], d2=[.014,.047,.079,.104,.112,.117,.140,.162],
+    d3=[.015,.018,.024,.027,.032,.034,.033,.040], dfin=[.946,.162,.040,.021,.019,.016],
+    spec=[.12,.26,.15], eff=[7.4,7.5,7.6]),
+ "wd 0.03 s1": dict(c="wd003", s=1,
+    frac=[.996,.892,.722,.614,.605,.599,.587,.566], d2=[.016,.018,.022,.022,.020,.024,.051,.080],
+    d3=[.015,.019,.021,.022,.019,.025,.024,.027], dfin=[.946,.080,.027,.021,.020,.023],
+    spec=[.14,.27,.27], eff=[7.4,7.1,7.0]),
+ "wd 0.05": dict(c="wd005", s=0,
+    frac=[.997,.810,.697,.587,.577,.571,.561,.557], d2=[.017,.023,.088,.121,.135,.136,.152,.157],
+    d3=[.016,.015,.024,.027,.028,.032,.038,.041], dfin=[.946,.157,.041,.025,.021,.021],
+    spec=[.07,.28,.25], eff=[7.6,7.4,7.2]),
+ "wd 0.05 s1": dict(c="wd005", s=1,
+    frac=[.996,.846,.714,.702,.679,.612,.563,.548], d2=[.014,.023,.050,.084,.081,.096,.148,.176],
+    d3=[.015,.023,.021,.029,.031,.031,.047,.063], dfin=[.584,.176,.063,.030,.022,.019],
+    spec=[.11,.21,.23], eff=[7.7,7.5,7.2]),
+ "wd 0.1 (champ)": dict(c="wd01", s=0,
+    frac=[.997,.796,.722,.584,.573,.566,.550,.535], d2=[.016,.036,.113,.135,.144,.156,.194,.225],
+    d3=[.015,.022,.026,.032,.032,.038,.047,.056], dfin=[.947,.225,.056,.023,.016,.019],
+    spec=[.13,.26,.20], eff=[7.5,7.4,7.5]),
+ "wd 0.1 (champ) s1": dict(c="wd01", s=1,
+    frac=[.997,.872,.684,.560,.517,.489,.464,.451], d2=[.016,.019,.022,.094,.179,.232,.309,.421],
+    d3=[.018,.017,.022,.031,.050,.080,.120,.177], dfin=[.948,.421,.177,.068,.031,.018],
+    spec=[.17,.19,.25], eff=[7.6,7.5,7.3]),
+ "wd 0.2 (NEW champ)": dict(c="wd02", s=0,
+    frac=[.997,.821,.652,.525,.490,.471,.444,.427], d2=[.016,.026,.085,.165,.259,.319,.440,.541],
+    d3=[.019,.020,.026,.060,.089,.131,.188,.272], dfin=[.946,.541,.272,.130,.057,.018],
+    spec=[.07,.22,.21], eff=[7.9,7.6,7.5]),
+ "wd 0.2 (NEW champ) s1": dict(c="wd02", s=1,
+    frac=[.996,.851,.708,.692,.636,.540,.479,.463], d2=[.013,.022,.056,.085,.096,.264,.473,.499],
+    d3=[.015,.016,.024,.026,.028,.074,.220,.297], dfin=[.637,.499,.297,.109,.030,.022],
+    spec=[.32,.27,.19], eff=[7.5,7.4,7.3]),
+}
+COL_WD = {"wd001": "#c6dbef", "wd003": "#9ecae1", "wd005": "#6baed6", "wd01": "#3182bd",
+          "wd02": "#08306b"}                                        # blues: light=low wd, dark=high
+CFGS_WD = ["wd001", "wd003", "wd005", "wd01", "wd02"]
+CLABEL_WD = {"wd001": "wd 0.01", "wd003": "wd 0.03", "wd005": "wd 0.05", "wd01": "wd 0.1",
+             "wd02": "wd 0.2"}
+
+# --- AXIS: scale mode (all wd 0.1, 8-iter KJ) ------------------------------------------
+# aurora_k1 (= coeff champ) + aurora_k2 (= k2) HAVE curves. normuon + polar land with v11 -
+# ADD them here when the run finishes (same schema).
+RUNS_SCALE = {
+ "aurora_k1 (champ)": dict(c="ak1", s=0,
+    frac=[.997,.796,.722,.584,.573,.566,.550,.535], d2=[.016,.036,.113,.135,.144,.156,.194,.225],
+    d3=[.015,.022,.026,.032,.032,.038,.047,.056], dfin=[.947,.225,.056,.023,.016,.019],
+    spec=[.13,.26,.20], eff=[7.5,7.4,7.5]),
+ "aurora_k1 (champ) s1": dict(c="ak1", s=1,
+    frac=[.997,.872,.684,.560,.517,.489,.464,.451], d2=[.016,.019,.022,.094,.179,.232,.309,.421],
+    d3=[.018,.017,.022,.031,.050,.080,.120,.177], dfin=[.948,.421,.177,.068,.031,.018],
+    spec=[.17,.19,.25], eff=[7.6,7.5,7.3]),
+ "aurora_k2": dict(c="ak2", s=0,
+    frac=[.997,.835,.723,.611,.592,.585,.568,.558], d2=[.015,.039,.067,.093,.098,.103,.131,.156],
+    d3=[.016,.021,.023,.025,.025,.029,.034,.034], dfin=[.947,.156,.034,.021,.015,.017],
+    spec=[.09,.27,.16], eff=[7.5,7.1,7.6]),
+ "aurora_k2 s1": dict(c="ak2", s=1,
+    frac=[.996,.871,.713,.603,.583,.555,.509,.495], d2=[.016,.022,.039,.132,.143,.171,.313,.386],
+    d3=[.016,.017,.023,.024,.020,.021,.024,.027], dfin=[.946,.386,.027,.022,.019,.018],
+    spec=[.04,.38,.32], eff=[7.8,7.5,7.5]),
+ # --- v11 PENDING: add "normuon"/"normuon s1"/"polar"/"polar s1" here when the run lands ---
+}
+COL_SCALE = {"ak1": "tab:blue", "ak2": "tab:green", "normuon": "tab:orange", "polar": "tab:red"}
+CFGS_SCALE = ["ak1", "ak2", "normuon", "polar"]
+CLABEL_SCALE = {"ak1": "aurora_k1", "ak2": "aurora_k2", "normuon": "normuon", "polar": "polar"}
+
+AXES = [
+    ("coeff", "coefficient / iteration axis (wd 0.1, aurora_k1)", RUNS_COEFF, COL_COEFF,
+     CFGS_COEFF, CLABEL_COEFF),
+    ("wd", "weight-decay axis (8-iter KJ aurora_k1) - HIGHER wd better", RUNS_WD, COL_WD,
+     CFGS_WD, CLABEL_WD),
+    ("scale", "scale-mode axis (wd 0.1, 8-iter KJ)", RUNS_SCALE, COL_SCALE, CFGS_SCALE,
+     CLABEL_SCALE),
+]
 
 
-def load():
-    p = os.path.join(HERE, "results_olm.jsonl")
-    if os.path.exists(p):
-        runs = {}
-        ok = True
-        for line in open(p):
-            if not line.strip():
-                continue
-            r = json.loads(line)
-            if not r["curve"] or len(r["curve"][0]) < 4:
-                ok = False; break
-            cu = r["curve"]
-            runs[r.get("tag", r.get("arm"))] = dict(
-                c=r.get("arm", "?"), s=r["seed"], steps=[c[0] for c in cu],
-                frac=[c[1] for c in cu], d2=[c[3][1] for c in cu], d3=[c[3][2] for c in cu],
-                dfin=r["per_depth"], spec=r.get("spec_frac", []), eff=r.get("eff_experts", []))
-        if ok and runs:
-            return runs, True
-    return {k: dict(steps=STEPS, **v) for k, v in RUNS.items()}, False
-
-
-def auc(steps, y):
-    s, f = np.array(steps, float), np.array(y, float)
-    if len(s) < 2:
-        return float(f[-1])
+def auc(y):
+    s, f = np.array(STEPS, float), np.array(y, float)
     trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return trap(f, s) / (s[-1] - s[0])
 
 
-def by_cfg(runs, fn):
-    """fn(run)->scalar; returns {cfg: [values over its seeds]}."""
-    out = {c: [] for c in CFGS}
-    for r in runs.values():
-        if r["c"] in out:
-            out[r["c"]].append(fn(r))
-    return out
-
-
-def _line(ax, runs, key, ylab, title, floor=None, ylim=None):
+def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None):
     for name, r in runs.items():
-        ax.plot(r["steps"], r[key], "--" if r["s"] == 1 else "-", color=COL.get(r["c"]),
-                marker="o", ms=3, label=name)
+        if r.get(key) is None:
+            continue
+        ax.plot(STEPS, r[key], "--" if r["s"] == 1 else "-", color=col.get(r["c"]),
+                marker="o", ms=3, label=f"{name} ({r[key][-1]:.3f})")
     if floor is not None:
         ax.axhline(floor, color="k", ls=":", lw=1, label=f"floor {floor:.3f}")
     ax.set_xlabel("step"); ax.set_ylabel(ylab); ax.set_title(title)
@@ -100,68 +178,68 @@ def _line(ax, runs, key, ylab, title, floor=None, ylim=None):
         ax.set_ylim(*ylim)
 
 
-def _bar(ax, runs, fn, ylab, title, better="low"):
-    m = by_cfg(runs, fn)
-    x = np.arange(len(CFGS))
-    means = [np.mean(m[c]) for c in CFGS]
-    ax.bar(x, means, color=[COL[c] for c in CFGS], alpha=0.8)
-    for i, c in enumerate(CFGS):                                    # seed dots
+def _bar(ax, runs, col, cfgs, clabel, fn, ylab, title):
+    m = {c: [fn(r) for r in runs.values() if r["c"] == c] for c in cfgs}
+    present = [c for c in cfgs if m[c]]
+    x = np.arange(len(present))
+    ax.bar(x, [np.mean(m[c]) for c in present], color=[col[c] for c in present], alpha=0.8)
+    for i, c in enumerate(present):                                 # seed dots
         ax.scatter([i] * len(m[c]), m[c], color="k", s=18, zorder=3)
-    ax.set_xticks(x); ax.set_xticklabels([CLABEL[c] for c in CFGS], fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels([clabel[c] for c in present], fontsize=8, rotation=15)
     ax.set_ylabel(ylab); ax.set_title(title); ax.grid(alpha=0.3, axis="y")
 
 
-def dashboard(runs):
+def dashboard(axname, title, runs, col, cfgs, clabel):
     fig, ax = plt.subplots(3, 3, figsize=(17, 13))
-    _line(ax[0, 0], runs, "frac", "frac (lower=better)", "Compression (frac) vs step",
+    _line(ax[0, 0], runs, col, "frac", "frac (lower=better)", "Compression (frac) vs step",
           floor=FLOOR, ylim=(0.4, 1.02))
-    _line(ax[0, 1], runs, "d2", "depth-2 acc", "Depth-2 (sparse signal) vs step", ylim=(0, 0.5))
-    _line(ax[0, 2], runs, "d3", "depth-3 acc", "Depth-3 (sparser) vs step", ylim=(0, 0.2))
+    _line(ax[0, 1], runs, col, "d2", "depth-2 acc", "Depth-2 (sparse signal) vs step", ylim=(0, 0.6))
+    _line(ax[0, 2], runs, col, "d3", "depth-3 acc", "Depth-3 (sparser) vs step", ylim=(0, 0.32))
     # per-depth final bars (grouped by depth, config colors, mean over seeds)
-    m = {c: np.mean([r["dfin"] for r in runs.values() if r["c"] == c], axis=0) for c in CFGS}
-    nd = len(next(iter(m.values()))); xx = np.arange(nd)
-    for i, c in enumerate(CFGS):
-        ax[1, 0].bar(xx + (i - 1) * 0.27, m[c], 0.27, color=COL[c], label=CLABEL[c])
+    present = [c for c in cfgs if any(r["c"] == c for r in runs.values())]
+    m = {c: np.mean([r["dfin"] for r in runs.values() if r["c"] == c], axis=0) for c in present}
+    nd = len(next(iter(m.values()))); xx = np.arange(nd); w = 0.8 / len(present)
+    for i, c in enumerate(present):
+        ax[1, 0].bar(xx + (i - len(present) / 2) * w + w / 2, m[c], w, color=col[c], label=clabel[c])
     ax[1, 0].set_xticks(xx); ax[1, 0].set_xticklabels([f"d{d+1}" for d in range(nd)])
-    ax[1, 0].set_ylabel("final acc"); ax[1, 0].set_title("Final accuracy by depth (learning hierarchy)")
+    ax[1, 0].set_ylabel("final acc"); ax[1, 0].set_title("Final accuracy by depth (hierarchy)")
     ax[1, 0].legend(fontsize=7); ax[1, 0].grid(alpha=0.3, axis="y")
-    _bar(ax[1, 1], runs, lambda r: r["frac"][-1], "frac", "Final frac (dots=seeds)")
-    _bar(ax[1, 2], runs, lambda r: auc(r["steps"], r["frac"]), "AUC frac", "AUC frac (noise-robust)")
-    _bar(ax[2, 0], runs, lambda r: r["d2"][-1], "depth-2 acc", "Final depth-2 (sparse signal)")
-    _bar(ax[2, 1], runs, lambda r: np.mean(r["eff"]) if r["eff"] else 0, "eff experts",
-         "Effective experts (util; higher=better)")
-    _bar(ax[2, 2], runs, lambda r: np.mean(r["spec"]) if r["spec"] else 0, "spec frac",
-         "Specialization (mean over layers)")
-    fig.suptitle("OLM v9 KPI dashboard — 8-iter KJ champ (blue) vs 6-iter ns_4 (orange) vs "
-                 "PE-8 (red, s0 NaN'd)", fontsize=14)
+    _bar(ax[1, 1], runs, col, cfgs, clabel, lambda r: r["frac"][-1], "frac", "Final frac (dots=seeds)")
+    _bar(ax[1, 2], runs, col, cfgs, clabel, lambda r: auc(r["frac"]), "AUC frac", "AUC frac (noise-robust)")
+    _bar(ax[2, 0], runs, col, cfgs, clabel, lambda r: r["d2"][-1], "depth-2 acc",
+         "Final depth-2 (sparse signal)")
+    _bar(ax[2, 1], runs, col, cfgs, clabel, lambda r: np.mean(r["eff"]) if r["eff"] else 0,
+         "eff experts", "Effective experts (util; higher=better)")
+    _bar(ax[2, 2], runs, col, cfgs, clabel, lambda r: np.mean(r["spec"]) if r["spec"] else 0,
+         "spec frac", "Specialization (mean over layers)")
+    fig.suptitle(f"OLM KPI dashboard - {title}", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
-    fig.savefig(os.path.join(OUT, "dashboard.png"), dpi=120); plt.close(fig)
+    fig.savefig(os.path.join(OUT, f"dashboard_{axname}.png"), dpi=120); plt.close(fig)
 
 
 def main():
-    runs, real = load()
-    print(f"[plot] source: {'results_olm.jsonl' if real else 'embedded v9'}\n")
-    print(f"{'run':24s} {'frac':>6s} {'d2':>6s} {'d3':>6s} {'AUC':>6s} {'eff':>5s} {'spec':>5s}")
-    for name, r in runs.items():
-        print(f"{name:24s} {r['frac'][-1]:6.3f} {r['d2'][-1]:6.3f} {r['d3'][-1]:6.3f} "
-              f"{auc(r['steps'], r['frac']):6.3f} {np.mean(r['eff']) if r['eff'] else 0:5.1f} "
-              f"{np.mean(r['spec']) if r['spec'] else 0:5.2f}")
-
-    # individual plots
-    for key, ylab, title, fn, floor, ylim in [
-        ("frac", "frac (val CE / ln 97; lower=better)", "OLM v9 — compression (frac)",
-         "emergence_curves.png", FLOOR, (0.4, 1.02)),
-        ("d2", "depth-2 accuracy (higher=better)",
-         "OLM v9 — DEPTH-2 (learning from SPARSE compositional signal)", "depth2_accuracy.png",
-         None, (0, 0.5)),
-        ("d3", "depth-3 accuracy (higher=better)", "OLM v9 — DEPTH-3 (even sparser signal)",
-         "depth3_accuracy.png", None, (0, 0.2))]:
-        fig, a = plt.subplots(figsize=(9, 6))
-        _line(a, runs, key, ylab, title, floor=floor, ylim=ylim)
-        fig.tight_layout(); fig.savefig(os.path.join(OUT, fn), dpi=130); plt.close(fig)
-
-    dashboard(runs)
-    print(f"\n[plot] wrote dashboard.png + emergence/depth2/depth3 -> {OUT}")
+    for axname, title, runs, col, cfgs, clabel in AXES:
+        if not runs:
+            continue
+        print(f"\n=== {axname}: {title} ===")
+        print(f"{'run':24s} {'frac':>6s} {'d2':>6s} {'d3':>6s} {'AUC':>6s} {'eff':>5s} {'spec':>5s}")
+        for name, r in runs.items():
+            print(f"{name:24s} {r['frac'][-1]:6.3f} {r['d2'][-1]:6.3f} {r['d3'][-1]:6.3f} "
+                  f"{auc(r['frac']):6.3f} {np.mean(r['eff']) if r['eff'] else 0:5.1f} "
+                  f"{np.mean(r['spec']) if r['spec'] else 0:5.2f}")
+        dashboard(axname, title, runs, col, cfgs, clabel)
+        # individual curves per axis (the user's priority: compression + emergence depth>1)
+        for key, ylab, ttl, fn, floor, ylim in [
+            ("frac", "frac (lower=better)", "compression / phase transition", f"frac_{axname}.png",
+             FLOOR, (0.4, 1.02)),
+            ("d2", "depth-2 acc", "DEPTH-2 emergence (sparse signal)", f"depth2_{axname}.png",
+             None, (0, 0.6)),
+            ("d3", "depth-3 acc", "DEPTH-3 emergence (sparser)", f"depth3_{axname}.png",
+             None, (0, 0.32))]:
+            fig, a = plt.subplots(figsize=(9, 6))
+            _line(a, runs, col, key, ylab, f"OLM {axname} - {ttl}", floor=floor, ylim=ylim)
+            fig.tight_layout(); fig.savefig(os.path.join(OUT, fn), dpi=130); plt.close(fig)
+    print(f"\n[plot] wrote dashboard_/frac_/depth2_/depth3_ per axis -> {OUT}")
 
 
 if __name__ == "__main__":
