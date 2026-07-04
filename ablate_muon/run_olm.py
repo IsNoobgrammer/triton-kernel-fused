@@ -20,12 +20,17 @@ COMMON = dict(steps=6000, batch=768)
 #  - wd optimum flips small online (grok-optimal 2.0 should HURT -> regime check)
 #  - Muon vs AdamW gap in the compute-bound regime (the gap that matters for BiBo)
 #  - dense-first-1 (default) vs all-MoE contrast
+# v3 wave: recalibrated task (shallow mix, div depth-1 only) + LM-standard WSD schedule
+# (warmup 500 -> stable -> cosine decay over last 20%, IDENTICAL for both optimizers -
+# user call: match LM practice). Wave-1 result: adamw AND muon-wd2.0 flatlined at chance
+# with no warmup; muon wd0.1 learned. The no-warmup muon arm tests "muon does not need
+# warmup" as a perf-per-flop claim.
 ARMS = [
     dict(arm="default", seed=0),
     dict(arm="default", seed=1),
-    dict(arm="default", seed=0, wd=2.0),
     dict(arm="adamw",   seed=0),
     dict(arm="adamw",   seed=1),
+    dict(arm="default", seed=0, warmup=0),
     dict(arm="default", seed=0, dense_first=0),
 ]
 
@@ -34,6 +39,8 @@ def _tag(r):
     t = f"olm_{r['arm']}_s{r['seed']}_wd{r['wd'] if r['arm'] != 'adamw' else r['adamw_wd']}"
     if r.get("dense_first"):
         t += f"_df{r['dense_first']}"
+    if r.get("warmup", 500) != 500:
+        t += f"_wu{r['warmup']}"
     if r.get("steps", 6000) != 6000:
         t += f"_{r['steps']}st"
     return t

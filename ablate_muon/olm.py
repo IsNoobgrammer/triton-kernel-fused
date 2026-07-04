@@ -68,6 +68,7 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=0.1, adamw_wd=0.1,
             dense_first=1, bias_tokens=300_000, bias_factor=0.01, nval=4096,
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
+            warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
 
 
@@ -82,6 +83,8 @@ def make_tag(c):
     t = f"olm_{c['arm']}_s{c['seed']}_wd{c['wd'] if c['arm'] != 'adamw' else c['adamw_wd']}"
     if c["dense_first"]:
         t += f"_df{c['dense_first']}"
+    if c.get("warmup", 500) != 500:
+        t += f"_wu{c['warmup']}"
     if c["steps"] != 6000:
         t += f"_{c['steps']}st"
     return t
@@ -162,7 +165,21 @@ def run(cfg):
             yb[flip] = torch.randint(0, P, (int(flip.sum()),), device=dev, generator=g)
         loss = F.cross_entropy(model(xb), yb)
         loss.backward()
+        # WSD schedule (LM-standard), identical for AdamW and Muon: linear warmup ->
+        # stable -> cosine decay to min_lr_frac over the final decay_frac of steps.
+        if c["warmup"] and step <= c["warmup"]:
+            scale = step / c["warmup"]
+        else:
+            t0 = c["steps"] * (1 - c["decay_frac"])
+            if step > t0:
+                prog = (step - t0) / max(c["steps"] - t0, 1)
+                scale = c["min_lr_frac"] + (1 - c["min_lr_frac"]) * 0.5 * (1 + math.cos(math.pi * prog))
+            else:
+                scale = 1.0
         for o in opts:
+            for gp in o.param_groups:
+                gp.setdefault("base_lr", gp["lr"])
+                gp["lr"] = scale * gp["base_lr"]
             o.step(); o.zero_grad(set_to_none=True)
         tok_count += c["batch"]
         if tok_count >= c["bias_tokens"]:
@@ -194,7 +211,7 @@ def run(cfg):
                   f"frac {vloss/lnP:.3f} acc {acc:.4f} d " + " ".join(f"{a:.3f}" for a in per_d)
                   + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
-                dense_first=c["dense_first"], noise=c["noise"], max_depth=maxd,
+                dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 steps=c["steps"], loss=round(vloss, 4), gap=round(vloss - floor, 4),
                 frac=round(vloss / lnP, 4), acc=round(acc, 5), best_acc=round(best, 5),
                 per_depth=[round(a, 4) for a in per_d],
