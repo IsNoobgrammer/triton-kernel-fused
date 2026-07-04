@@ -478,6 +478,21 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     the compression->composition story that makes wd dominant; watch d1-vs-d2 tradeoff in the
     v12 upward sweep (does d1 keep eroding at wd 0.3/0.5, marking a composition-vs-precision
     optimum?).
+- [olm v11 DONE - SCALE-MODE axis CLOSED, all at wd 0.1 / 8-iter KJ] final frac (mean) /
+  depth-2 (mean):
+    aurora_k1 0.493/0.323 = WINS | aurora_k2 0.527/0.271 | normuon 0.555/0.169 |
+    polar (base muon) 0.561/0.137 = WORST.
+  aurora_k1 wins on BOTH frac and composition. normuon LOSES (confirms fixed-bias v7:
+  broken-bias normuon "win" was an artifact). polar/base-muon = never tested on olm before,
+  now confirmed WEAKEST - vindicates the "base muon less probable" prior. util (eff ~7.5)
+  and spec FLAT across all four - the entire difference is composition quality.
+  MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
+  polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
+  = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
+  orthogonality matter for the compositional circuit; only aurora has both. Scale-mode axis
+  EXHAUSTED: aurora_k1 is the frontier, cheaper modes lose. Dashboard: dashboard_scale.png.
+  CAVEAT: comparison at wd 0.1; re-confirm aurora_k1 dominance at the v10 optimum (wd 0.2)
+  only if a reason appears - low prior it flips.
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
