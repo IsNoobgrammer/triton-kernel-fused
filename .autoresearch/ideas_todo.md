@@ -422,6 +422,12 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   on grok) - olm is more discriminating. => cutting NS iters 10->8 is beneficial here, not
   just free. TAG FIXED: was "_ns8" (=ns_kj=8=10 iters, CONFUSING) -> now "_it10" (total
   iters). k2 arm still pending.
+  SCALE CAVEAT (do NOT over-claim): NS iters-to-converge scale with matrix size/spectrum.
+  Our expert mats tiny (128x512, well-conditioned) -> converge in few iters, so 8 suffices
+  and dsv4_10's extra KJ iters overshoot/hurt. DeepSeek's much larger mats may genuinely
+  need 10 -> right at THEIR scale. Optimal iter count is SCALE-DEPENDENT, not universal.
+  "8 beats 10" is an OLM-small-scale result; don't extrapolate to big models. What transfers:
+  iter count is a live knob olm CAN resolve (grok could not); at small scale go cheaper.
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
