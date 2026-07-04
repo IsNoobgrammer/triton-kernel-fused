@@ -196,11 +196,21 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
   wd 2-4 plateau as everything else - no per-module ratio to extract on THIS task. Keep
   uniform hidden wd. The emb/norm/router axes were not swept (AdamW-side); only revisit if
   an LM-side signal appears.
-- [UPDATED 2026-07-04] LM wd sweep WIDENED to {0.1, 0.3, 0.6, 1.0, 2.0} + cautious-wd arm.
-  Rationale (user push, accepted): our LM benchmark is 100-120M tokens into ~137M params =
-  token/param < 1, 2-3 epochs -> data-constrained / memorization-capable regime, structurally
-  near grok, NOT Chinchilla compute-bound. Expect wd optimum well above 0.1 here, shifting
-  back down as token/param grows - the wd(data-budget) curve is the deliverable for BiBo.
+- [DEMOTED 2026-07-04, same day] LM wd sweep: user call, accepted - wd is a HYPERPARAMETER,
+  not a method; in LM it must stay small or it eats signal. Sweeping it is not the round's
+  deliverable. Keep ONE thin control arm (wd 0.3) to bound the axis; the wd findings stay as
+  DIAGNOSIS (they identify compression pressure as the active ingredient), not as the knob.
+- [REFRAMED 2026-07-04] LM phase = ALGORITHM arms at fixed conventional wd 0.1, ranked:
+  (1) cautious / sign-aligned decay (2510.12402) - decay only where it does not fight the
+      update; structural fix for "compression eats signal", not a compromise scalar.
+  (2) sigma-cap: cap/soft-threshold only runaway TOP singular values of W post-step -
+      targeted compression on the directions wd exists to police, zero pressure on the
+      rest. Muon-native (reuse NS machinery / power iter), unexplored as wd replacement.
+  (3) normuon at 121M - best prior LM-screen arm (-0.026 @1200, growing) despite being
+      grok-harmful: benefit lives exactly in the signal-rich LM regime. Sign-flip now
+      EXPECTED under the regime framing, not anomalous.
+  (4) light low-rank EMA preconditioner (original round-1 ask, never run): rank-k EMA of
+      grad subspace preconditioning Muon input - curvature memory. Only if budget remains.
 - [TODO] Specialization annealing: per-expert lr ~ routing entropy (diffuse expert -> explore
   with high lr; specialized expert -> consolidate with low lr / higher wd). Needs router stats
   in the optimizer (harness-level plumbing) - after repulsion/decorrelation verdicts.
