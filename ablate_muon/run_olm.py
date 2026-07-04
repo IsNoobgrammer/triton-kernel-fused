@@ -42,14 +42,17 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
-# v12 wave: WD UPWARD sweep - v10 found HIGHER wd better (0.2 champ 0.445 mean beats 0.1's
-# 0.493; monotone up). Ceiling known dead at 2.0. Bracket the peak: probe 0.3/0.5/0.7/1.0 x
-# 2 seeds, rank on AUC. Everything else fixed at 8-iter KJ aurora_k1. wd 0.2 = known anchor
-# (0.427/0.463), NOT re-run. RUN THIS ONLY AFTER capturing the v10+v11 (wd/normuon/polar)
-# results from the previous launch - it replaces those arms.
+# v11 wave: SCALE-MODE comparison for the emergence/phase-transition plot. Compare against
+# the EMBEDDED aurora_k1 + aurora_k2 curves (both wd 0.1, 8-iter KJ) - so normuon and polar
+# MUST also be wd 0.1, 8-iter KJ (only scale_mode differs). Matched 4-way: aurora_k1 (have) /
+# aurora_k2 (have) / normuon (new) / polar=base-muon (new). 2 seeds each. Do NOT re-run
+# aurora (already benched). Plot: frac (compression/phase-transition) + depth-2/3 (emergence).
+# NOTE: comparison is at wd 0.1; v10 found 0.2 is the real optimum, but matching the aurora
+# curves requires 0.1 here - re-test any interesting mode at wd 0.2 later.
+# (v12 = WD UPWARD sweep 0.3/0.5/0.7/1.0 comes AFTER this - bracket the peak; 2.0 dead.)
 ARMS = [
-    dict(arm="default", seed=s, wd=w)
-    for w in (0.3, 0.5, 0.7, 1.0)
+    dict(arm="default", seed=s, scale_mode=m)
+    for m in ("normuon", "polar")
     for s in (0, 1)
 ]
 
