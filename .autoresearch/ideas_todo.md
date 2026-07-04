@@ -371,6 +371,13 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   from noise. Both seeds beat old floor 0.556 so bias fix is robust, but per-arm verdicts
   need MULTI-SEED. v8 = 3 seeds each on top 2-3 configs, compare means; or longer budget to
   converge the transition tail. Emergence variance is intrinsic (sharp seed-dependent jumps).
+- [xorth WALL-CLOCK TAX ~20%] xorth = 5k steps when muon/normuon done 6k. Cause: 6 eigh
+  calls/step (w1,w2 x 3 MoE layers) on 8x8 grams - trivial math, high launch overhead,
+  36k tiny eigh/run. xorth case now WEAKENED twice: (1) bias fix gives healthy eff ~7.5/8
+  FREE on default, so its utilization win is mostly already delivered; (2) +20% compute for
+  perf-per-flop. Survives only if v8 multi-seed shows an ADDITIVE frac win over healthy
+  baseline. Fix if kept: batch 6 grams -> one (6,8,8) eigh, and/or run every-N-steps
+  (amortize). Else drop.
 - NEXT: real LM for any olm survivor. Also still open: Dion low-rank
   (compute-side), param/compute-matched df0/df1 (dense-compute MoE = 8x FLOPs of dense
   layer, so as-is NOT compute-matched - decide sparse-compute or equal-FLOP first).
