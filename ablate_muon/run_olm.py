@@ -42,15 +42,15 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
-# v14 wave: LOW-SIDE wd sweep on the RTX 6000 - map the LEFT of the peak device-matched.
-# v12 (0.3-1.0) turns over above 0.2; probe below with 0.007/0.01/0.02/0.05 (0.02 & 0.007 are
-# NEW; 0.01/0.05 device-matched vs their T4 numbers). 2 seeds each, aurora_k1 8-iter KJ.
-# Full device-consistent curve = v14 (0.007-0.05) + v13 (0.1/0.2) + v12 (0.3-1.0).
-ARMS = [
-    dict(arm="default", seed=s, wd=w)
-    for w in (0.007, 0.01, 0.02, 0.05)
-    for s in (0, 1)
-]
+# v15 wave: COEFF/ITER axis re-bench on RTX 6000 (device-match; T4 had the coeff curve, but
+# we found a hardware shift). ns_8 (8-iter, default ns_kj=6) at wd 0.1 IS the v13 wd0.1 run -
+# do NOT re-run it; anchor the plot to that. NEW device-matched arms = ns_6 / ns_10 / PE-8, all
+# wd 0.1 aurora_k1, 2 seeds. (Capture v14 low-side first - this replaces those arms.)
+ARMS = (
+    [dict(arm="default", seed=s, ns_kj=4) for s in (0, 1)]        # ns_6 = 6-iter (KJ*4+2pin)
+    + [dict(arm="default", seed=s, ns_kj=8) for s in (0, 1)]      # ns_10 = 10-iter (dsv4_10)
+    + [dict(arm="default", seed=s, coeffs="pe") for s in (0, 1)]  # PE-8 (Polar-Express)
+)
 
 
 def _tag(r):
