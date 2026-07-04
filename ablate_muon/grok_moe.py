@@ -142,9 +142,22 @@ def _mi(top1, op, E, n_ops):
 
 
 _DEF = dict(arm="default", seed=0, frac=0.45, p=97, steps=3000, batch=768, d=128, layers=3,
-            experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=2.0, adamw_wd=1.0,
+            experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=2.0, adamw_wd=1.0, expert_wd=None,
             bias_tokens=300_000, bias_factor=0.01, repulse=0.0, eval_every=200,
             op_mix=(0.4, 0.3, 0.2, 0.1))
+
+
+def make_tag(c):
+    t = f"{c['arm']}_s{c['seed']}"
+    if c.get("repulse"):
+        t += f"_rep{c['repulse']}"
+    if c["arm"] == "adamw":
+        t += f"_awd{c['adamw_wd']}"
+    if c.get("expert_wd") is not None:
+        t += f"_ewd{c['expert_wd']}"
+    if c["steps"] != 3000:
+        t += f"_{c['steps']}st"
+    return t
 
 
 def run(cfg):
@@ -164,11 +177,14 @@ def run(cfg):
         opts = [torch.optim.AdamW(model.parameters(), lr=c["lr"],
                                   weight_decay=c["adamw_wd"], betas=(0.9, 0.98))]
     else:
+        ewd = c["wd"] if c["expert_wd"] is None else c["expert_wd"]
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
-                FusedMuon(hidden, lr=c["muon_lr"], weight_decay=c["wd"],
-                          coeffs=_DSV4_COEFFS, ns_dtype=torch.float16)]
+                FusedMuon([q for q in hidden if q.ndim == 2], lr=c["muon_lr"],
+                          weight_decay=c["wd"], coeffs=_DSV4_COEFFS, ns_dtype=torch.float16),
+                FusedMuon([q for q in hidden if q.ndim == 3], lr=c["muon_lr"],
+                          weight_decay=ewd, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16)]
     expert_ws = [b.moe.w1 for b in model.blocks] + [b.moe.w2 for b in model.blocks]
-    tag = f"{c['arm']}_s{c['seed']}" + (f"_rep{c['repulse']}" if c["repulse"] else "")
+    tag = make_tag(c)
     print(f"[{tag}] E={c['experts']} topk={c['top_k']} repulse={c['repulse']} wd={c['wd']} "
           f"params={n_par/1e6:.2f}M train={sum(len(y) for _, y in tr)} heldout={len(yte)} "
           f"opmix={c['op_mix']}", flush=True)
@@ -224,6 +240,7 @@ def run(cfg):
                   + " ".join(f"{o}={a:.3f}" for o, a in zip(OPS, per_op))
                   + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], repulse=c["repulse"], wd=c["wd"],
+                adamw_wd=c["adamw_wd"], expert_wd=c["expert_wd"], steps=c["steps"],
                 acc=round(acc, 5), best_acc=round(best, 5), grok_step=grok_step,
                 per_op=[round(a, 4) for a in per_op], mi_final=[round(m, 3) for m in mis],
                 curve=curve)
