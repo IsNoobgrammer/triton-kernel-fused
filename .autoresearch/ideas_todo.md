@@ -161,15 +161,34 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
 
 ### Algorithmic paradigm imports (wave 4, opened 2026-07-04 - user directive: mechanisms
 ### like repulsion, NOT hp tuning; wd axis closed as diagnosis-only)
-- [RUNNING wave 4] Grokfast x Muon: g += lam*EMA(g) (alpha 0.98) before the polar -
-  amplify the slow/shared gradient component (signal-processing import: the generalizing
-  direction is the low-frequency part of the grad sequence). Paper (Lee 2024) shows up to
-  ~50x faster grokking on Adam; composition with orthogonalization untested anywhere.
-  Arms: lam {2, 5} x seeds. Bar: grok >=400 steps earlier than 1800-2200 at acc parity.
-- [RUNNING wave 4] Lookahead x Muon (slow/fast weights, k=5 beta=0.5): implicit weight
-  averaging toward flat minima. Mechanism, no signal cost. Also combo arm gf2+la5.
+- [NULL 2026-07-04] Grokfast x Muon: lam=2 = parity (grok ~2000/~2400 vs baseline 1800/2200,
+  both seeds inside noise), lam=5 = SLOWER (grok ~2600-2800, acc 0.984 @3000). Dose-response
+  toward harm. MECHANISM READING: grokfast's 50x on Adam comes from MAGNITUDE amplification
+  of the slow grad component; Muon's polar DISCARDS magnitude (all singular values -> 1) and
+  its momentum already low-pass filters direction. Muon structurally CONTAINS grokfast's
+  benefit - the composition is redundant, and at high lam the stale EMA direction actively
+  fights fresh signal. Transfers: do not stack EMA-amplification tricks on orthogonalizing
+  optimizers.
+- [REJECTED 2026-07-04] Lookahead x Muon (k=5, beta=0.5): strongly harmful - no grok by 3000,
+  acc 0.25-0.27, curves look like baseline at ~half speed. slow.lerp_(fast, 0.5) every 5
+  steps is an effective-lr halving; in a grok regime where escape time scales with lr this
+  is pure slowdown. Flat-minima averaging buys nothing here. Combo gf2+la5 = 0.90 @3000
+  (grokfast partially rescues lookahead's lr cut, still worse than plain baseline).
+- SECONDARY FINDING (real, not promotable): grokfast STEERS SPECIALIZATION LOCATION. gf2 s1
+  put the 1-bit expert split in the MIDDLE layer (MI 1.00 L1, 0.32 L2) at acc 0.997; gf5
+  ended with TWO specialized layers (0.99/1.00); combo likewise (1.04 L1). First mechanism
+  in 4 waves to move specialization off the last layer while grokked. CAVEAT to the
+  mid-layer-MI diagnostic: it means memorization only when acc is FLAT/LOW; in a grokked
+  net a mid-layer split can be a legitimate generalizing configuration.
 - [QUEUED] Dion-style low-rank orthogonalization (orthogonalize only top-r subspace):
   compute-side win candidate for LM phase, pairs with the perf-per-flop goal.
+- ROUND STATUS after wave 4: FOUR waves, every mechanism <= baseline Muon + wd 2.0
+  (repulsion harmful, decor null, per-module wd null, grokfast null/redundant, lookahead
+  harmful). On the grok testbed Muon+wd sits at/near the frontier - its polar already
+  bundles the benefits these mechanisms try to add (direction filtering, magnitude
+  normalization, compression pressure). Grok-MoE testbed CLOSED for optimizer mechanisms;
+  remaining paradigm candidates (cautious decay, sigma-cap, normuon, Dion low-rank, EMA
+  precond) target the LM regime and need the LM harness to discriminate.
 - [DOWNRANKED] SAM-style sharpness aware: 2x grad cost fails perf-per-flop by construction;
   only if a 1-extra-forward variant appears.
 
