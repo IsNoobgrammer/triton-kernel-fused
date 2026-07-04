@@ -143,7 +143,7 @@ def _mi(top1, op, E, n_ops):
 
 _DEF = dict(arm="default", seed=0, frac=0.45, p=97, steps=3000, batch=768, d=128, layers=3,
             experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=2.0, adamw_wd=1.0, expert_wd=None,
-            bias_tokens=300_000, bias_factor=0.01, repulse=0.0, eval_every=200,
+            bias_tokens=300_000, bias_factor=0.01, repulse=0.0, decor=0.0, eval_every=200,
             op_mix=(0.4, 0.3, 0.2, 0.1))
 
 
@@ -155,6 +155,8 @@ def make_tag(c):
         t += f"_awd{c['adamw_wd']}"
     if c.get("expert_wd") is not None:
         t += f"_ewd{c['expert_wd']}"
+    if c.get("decor"):
+        t += f"_dec{c['decor']}"
     if c["steps"] != 3000:
         t += f"_{c['steps']}st"
     return t
@@ -205,6 +207,10 @@ def run(cfg):
         xb, yb = torch.cat(xb), torch.cat(yb)
         loss = F.cross_entropy(model(xb), yb)
         loss.backward()
+        if c["decor"] > 0:                                         # cross-expert update decorrelation:
+            with torch.no_grad():                                  # shrink the shared component of the
+                for w in expert_ws:                                # expert-stack grads along the E axis
+                    w.grad -= c["decor"] * w.grad.mean(0, keepdim=True)
         for o in opts:
             o.step(); o.zero_grad(set_to_none=True)
         if c["repulse"] > 0:
@@ -240,7 +246,8 @@ def run(cfg):
                   + " ".join(f"{o}={a:.3f}" for o, a in zip(OPS, per_op))
                   + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], repulse=c["repulse"], wd=c["wd"],
-                adamw_wd=c["adamw_wd"], expert_wd=c["expert_wd"], steps=c["steps"],
+                adamw_wd=c["adamw_wd"], expert_wd=c["expert_wd"], decor=c["decor"],
+                steps=c["steps"],
                 acc=round(acc, 5), best_acc=round(best, 5), grok_step=grok_step,
                 per_op=[round(a, 4) for a in per_op], mi_final=[round(m, 3) for m in mis],
                 curve=curve)

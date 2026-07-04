@@ -23,18 +23,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 COMMON = dict(steps=3000, batch=768, p=97, frac=0.45, wd=2.0, experts=8, top_k=2,
               bias_tokens=300_000, op_mix=(0.4, 0.3, 0.2, 0.1))
 
-# Wave 2 (wave 1 done: Muon groks 1800-2200, repulsion REJECTED, adamw truncated/wd-heavy):
-#  - fair AdamW control: wd sweep at 6000 steps (dense prior: AdamW groks ~5500 at its best wd)
-#  - per-module wd (idea #2): expert stacks at wd 0.5 vs attn 2.0 — does it stop post-grok
-#    expert collapse (minload->0, MI 1.48->1.00) without slowing grok?
-#  - default at 6000 steps: does MI keep decaying / more experts die after grok?
+# Wave 3 (wave 2 done: AdamW fair control groks @5000 = Muon 2.4x faster; expert_wd 0.5
+# REJECTED-low: slows grok AND lowers MI, only keeps dead experts alive; post-grok state
+# is STABLE at MI 1.00 / 2-way split, not ongoing decay):
+#  - expert_wd HIGHER direction (3.0, 4.0): experts want MORE compression than attn?
+#  - cross-expert update decorrelation (idea #3): grad_e -= decor*mean_E(grad) on expert
+#    stacks before the step — acts on the UPDATE (repulsion on state is rejected).
 ARMS = [
-    dict(arm="adamw",   seed=0, adamw_wd=0.1, steps=6000),
-    dict(arm="adamw",   seed=0, adamw_wd=0.3, steps=6000),
-    dict(arm="adamw",   seed=0, adamw_wd=1.0, steps=6000),
-    dict(arm="default", seed=0, expert_wd=0.5),
-    dict(arm="default", seed=1, expert_wd=0.5),
-    dict(arm="default", seed=0, steps=6000),
+    dict(arm="default", seed=0, decor=0.5),
+    dict(arm="default", seed=0, decor=1.0),
+    dict(arm="default", seed=1, decor=1.0),
+    dict(arm="default", seed=0, expert_wd=3.0),
+    dict(arm="default", seed=1, expert_wd=3.0),
+    dict(arm="default", seed=0, expert_wd=4.0),
 ]
 
 
@@ -44,6 +45,8 @@ def _tag(r):
         t += f"_awd{r['adamw_wd']}"
     if r.get("expert_wd") is not None:
         t += f"_ewd{r['expert_wd']}"
+    if r.get("decor"):
+        t += f"_dec{r['decor']}"
     if r.get("steps", 3000) != 3000:
         t += f"_{r['steps']}st"
     return t

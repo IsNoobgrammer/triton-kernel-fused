@@ -116,6 +116,25 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
 - AdamW shows nonzero mid-layer MI (0.11-0.13) where Muon shows 0.00 - memorization-phase
   routing artifact, not specialization; do not over-read.
 
+### Wave 2 induction (T4 x2, 2026-07-04)
+- FAIR ADAMW CONTROL DONE: awd sweep monotone (0.1 = memorized-dead acc 0.037 w/ train loss
+  0.009; 0.3 = crawl 0.136; 1.0 = GROKS @5000, acc 0.9996). wd law holds for AdamW same as
+  Muon. Headline now honest: Muon groks 1800-2200 vs AdamW 5000 at each one's workable wd
+  -> ~2.4x on MoE, matching the dense prior. "awd 1.0 too high" hypothesis REFUTED.
+- expert_wd 0.5 (idea #2, LOW direction) REJECTED: slows grok (0.46/0.88 @3000, no grok, vs
+  baseline 1800-2200) AND lowers MI (0.37/0.48). Keeps experts alive (minload 0.05-0.08) but
+  alive-and-undifferentiated: low wd lets experts retain memorization. Rate-distortion says
+  experts want MORE compression -> wave 3 tests ewd 3.0/4.0 (HIGH direction).
+- Post-grok "collapse" is STABLE CONVERGENCE, not decay: default @6000 pins MI at exactly
+  1.00 bits and acc 0.9995 from 3000-6000. Minimal 2-way expert split is the equilibrium
+  under wd 2.0 + slow balancer. Acc unaffected -> MI is diagnostic, not target; do not chase
+  MI for its own sake (fitness-sharing lesson generalizes).
+- adamw awd0.3 mid-layer MI hits 0.65 while acc 0.14 - more evidence mid-layer MI is a
+  memorization-routing artifact, inversely related to generalization if anything.
+- Wave 3 (pushed): decor {0.5, 1.0} x2 seeds (idea #3 grad-space variant: g_e -= decor*
+  mean_E g before step) + ewd {3.0, 4.0}. NOTE decor acts on grads pre-momentum/pre-polar,
+  not on the post-NS update (FusedMuon internals untouched) - screen-grade approximation.
+
 ### Swarm / evolutionary imports
 - [REJECTED 2026-07-04] Expert weight repulsion (PSO anti-averaging): W_e += beta*(W_e - mean_E W)
   after step. T4 wave 1 (ablate_muon, 3000 steps): beta=1e-3 DELAYS grok 1800->2800 with ZERO MI
