@@ -1,12 +1,8 @@
-"""Emergence-curve plots + noise-robust curve metrics for the olm ablation.
+"""OLM ablation dashboard — lots of plots. Compression (frac), compositional learning from
+SPARSE signal (depth-2/3, the real-LM axis), utilization (eff), specialization (spec), and
+noise-robust curve metrics (AUC). Saves individual PNGs + one dashboard.png to plots/emergence/.
 
-WHY: frac@final has huge seed variance because the task learns by a sharp phase transition
-whose TIMING is seed-sensitive. The trajectory (AUC, step-to-threshold) is far less noisy
-than the endpoint. This renders labeled figures + prints the curve metrics.
-
-Data: reads .autoresearch/results_olm.jsonl (curve field) if present; else uses the v7
-trajectories embedded below (parsed from the v7 console output, 2026-07-04). Saves PNGs to
-.autoresearch/plots/emergence/.
+Reads .autoresearch/results_olm.jsonl if present (per_depth in curve); else uses embedded v8.
 """
 import json
 import os
@@ -20,119 +16,154 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "plots", "emergence")
 os.makedirs(OUT, exist_ok=True)
 LNP = np.log(97)
-FLOOR = 0.0924                                                        # 5% noise floor (frac)
-
+FLOOR = 0.0924
 STEPS = [1000, 2000, 3000, 4000, 4500, 5000, 5500, 6000]
-# label -> (config, seed, frac trajectory over STEPS). v8 NS-config comparison (fixed bias).
-V7 = {
-    "8-iter (ns8, default)":  ("8it", 0, [0.997, 0.796, 0.722, 0.584, 0.573, 0.566, 0.550, 0.535]),
-    "8-iter (ns8) s1":        ("8it", 1, [0.997, 0.872, 0.684, 0.560, 0.517, 0.489, 0.464, 0.451]),
-    "10-iter (dsv4_10)":      ("10it", 0, [0.997, 0.804, 0.709, 0.610, 0.603, 0.602, 0.595, 0.592]),
-    "10-iter (dsv4_10) s1":   ("10it", 1, [0.996, 0.858, 0.732, 0.717, 0.706, 0.634, 0.612, 0.609]),
-    "k2 (aurora_k2)":         ("k2", 0, [0.997, 0.835, 0.723, 0.611, 0.592, 0.585, 0.568, 0.558]),
-    "k2 (aurora_k2) s1":      ("k2", 1, [0.996, 0.871, 0.713, 0.603, 0.583, 0.555, 0.509, 0.495]),
+
+# v8 NS-config comparison. Per arm: config color-key, seed, frac/d2/d3 trajectories,
+# and FINAL per-depth acc (d1..d6), per-layer spec, per-layer eff.
+RUNS = {
+ "8-iter (ns8, default)": dict(c="8it", s=0,
+    frac=[.997,.796,.722,.584,.573,.566,.550,.535], d2=[.016,.036,.113,.135,.144,.156,.194,.225],
+    d3=[.015,.022,.026,.032,.032,.038,.047,.056], dfin=[.947,.225,.056,.023,.016,.019],
+    spec=[.13,.26,.20], eff=[7.5,7.4,7.5]),
+ "8-iter (ns8) s1": dict(c="8it", s=1,
+    frac=[.997,.872,.684,.560,.517,.489,.464,.451], d2=[.016,.019,.022,.094,.179,.232,.309,.421],
+    d3=[.018,.017,.022,.031,.050,.080,.120,.177], dfin=[.948,.421,.177,.068,.031,.018],
+    spec=[.17,.19,.25], eff=[7.6,7.5,7.3]),
+ "10-iter (dsv4_10)": dict(c="10it", s=0,
+    frac=[.997,.804,.709,.610,.603,.602,.595,.592], d2=[.015,.021,.024,.021,.020,.018,.021,.022],
+    d3=[.016,.021,.021,.022,.021,.022,.019,.021], dfin=[.947,.022,.021,.019,.015,.015],
+    spec=[.08,.49,.54], eff=[7.6,7.7,7.7]),
+ "10-iter (dsv4_10) s1": dict(c="10it", s=1,
+    frac=[.996,.858,.732,.717,.706,.634,.612,.609], d2=[.016,.020,.026,.040,.059,.073,.093,.090],
+    d3=[.016,.017,.020,.021,.022,.025,.030,.032], dfin=[.584,.090,.032,.023,.019,.021],
+    spec=[.13,.30,.36], eff=[7.4,7.1,6.9]),
+ "k2 (aurora_k2)": dict(c="k2", s=0,
+    frac=[.997,.835,.723,.611,.592,.585,.568,.558], d2=[.015,.039,.067,.093,.098,.103,.131,.156],
+    d3=[.016,.021,.023,.025,.025,.029,.034,.034], dfin=[.947,.156,.034,.021,.015,.017],
+    spec=[.09,.27,.16], eff=[7.5,7.1,7.6]),
+ "k2 (aurora_k2) s1": dict(c="k2", s=1,
+    frac=[.996,.871,.713,.603,.583,.555,.509,.495], d2=[.016,.022,.039,.132,.143,.171,.313,.386],
+    d3=[.016,.017,.023,.024,.020,.021,.024,.027], dfin=[.946,.386,.027,.022,.019,.018],
+    spec=[.04,.38,.32], eff=[7.8,7.5,7.5]),
 }
+COL = {"8it": "tab:blue", "10it": "tab:red", "k2": "tab:green"}
+CFGS = ["8it", "10it", "k2"]
+CLABEL = {"8it": "8-iter (ns8)", "10it": "10-iter", "k2": "k2"}
 
 
-def load_runs():
-    """Prefer real results_olm.jsonl; fall back to embedded v7."""
+def load():
     p = os.path.join(HERE, "results_olm.jsonl")
     if os.path.exists(p):
         runs = {}
+        ok = True
         for line in open(p):
             if not line.strip():
                 continue
             r = json.loads(line)
-            steps = [c[0] for c in r["curve"]]
-            frac = [c[1] for c in r["curve"]]
-            runs[f"{r['arm']}_s{r['seed']}"] = (r.get("arm"), r["seed"], steps, frac)
-        return runs, True
-    return {k: (v[0], v[1], STEPS, v[2]) for k, v in V7.items()}, False
+            if not r["curve"] or len(r["curve"][0]) < 4:
+                ok = False; break
+            cu = r["curve"]
+            runs[r.get("tag", r.get("arm"))] = dict(
+                c=r.get("arm", "?"), s=r["seed"], steps=[c[0] for c in cu],
+                frac=[c[1] for c in cu], d2=[c[3][1] for c in cu], d3=[c[3][2] for c in cu],
+                dfin=r["per_depth"], spec=r.get("spec_frac", []), eff=r.get("eff_experts", []))
+        if ok and runs:
+            return runs, True
+    return {k: dict(steps=STEPS, **v) for k, v in RUNS.items()}, False
 
 
-def auc(steps, frac):
-    """Mean frac over training (trapezoidal / range). Lower = compressed faster + deeper."""
-    s, f = np.array(steps, float), np.array(frac, float)
-    trap = getattr(np, "trapezoid", getattr(np, "trapz", None))       # np2 renamed trapz
+def auc(steps, y):
+    s, f = np.array(steps, float), np.array(y, float)
+    if len(s) < 2:
+        return float(f[-1])
+    trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return trap(f, s) / (s[-1] - s[0])
 
 
-def step_to(steps, frac, thr):
-    """First step where frac crosses <= thr (linear interp). None if never."""
-    s, f = np.array(steps, float), np.array(frac, float)
-    for i in range(1, len(f)):
-        if f[i] <= thr:
-            if f[i - 1] <= thr:
-                return s[i - 1]
-            t = (f[i - 1] - thr) / (f[i - 1] - f[i])
-            return s[i - 1] + t * (s[i] - s[i - 1])
-    return None
+def by_cfg(runs, fn):
+    """fn(run)->scalar; returns {cfg: [values over its seeds]}."""
+    out = {c: [] for c in CFGS}
+    for r in runs.values():
+        if r["c"] in out:
+            out[r["c"]].append(fn(r))
+    return out
+
+
+def _line(ax, runs, key, ylab, title, floor=None, ylim=None):
+    for name, r in runs.items():
+        ax.plot(r["steps"], r[key], "--" if r["s"] == 1 else "-", color=COL.get(r["c"]),
+                marker="o", ms=3, label=name)
+    if floor is not None:
+        ax.axhline(floor, color="k", ls=":", lw=1, label=f"floor {floor:.3f}")
+    ax.set_xlabel("step"); ax.set_ylabel(ylab); ax.set_title(title)
+    ax.grid(alpha=0.3); ax.legend(fontsize=6, ncol=2)
+    if ylim:
+        ax.set_ylim(*ylim)
+
+
+def _bar(ax, runs, fn, ylab, title, better="low"):
+    m = by_cfg(runs, fn)
+    x = np.arange(len(CFGS))
+    means = [np.mean(m[c]) for c in CFGS]
+    ax.bar(x, means, color=[COL[c] for c in CFGS], alpha=0.8)
+    for i, c in enumerate(CFGS):                                    # seed dots
+        ax.scatter([i] * len(m[c]), m[c], color="k", s=18, zorder=3)
+    ax.set_xticks(x); ax.set_xticklabels([CLABEL[c] for c in CFGS], fontsize=8)
+    ax.set_ylabel(ylab); ax.set_title(title); ax.grid(alpha=0.3, axis="y")
+
+
+def dashboard(runs):
+    fig, ax = plt.subplots(3, 3, figsize=(17, 13))
+    _line(ax[0, 0], runs, "frac", "frac (lower=better)", "Compression (frac) vs step",
+          floor=FLOOR, ylim=(0.4, 1.02))
+    _line(ax[0, 1], runs, "d2", "depth-2 acc", "Depth-2 (sparse signal) vs step", ylim=(0, 0.5))
+    _line(ax[0, 2], runs, "d3", "depth-3 acc", "Depth-3 (sparser) vs step", ylim=(0, 0.2))
+    # per-depth final bars (grouped by depth, config colors, mean over seeds)
+    m = {c: np.mean([r["dfin"] for r in runs.values() if r["c"] == c], axis=0) for c in CFGS}
+    nd = len(next(iter(m.values()))); xx = np.arange(nd)
+    for i, c in enumerate(CFGS):
+        ax[1, 0].bar(xx + (i - 1) * 0.27, m[c], 0.27, color=COL[c], label=CLABEL[c])
+    ax[1, 0].set_xticks(xx); ax[1, 0].set_xticklabels([f"d{d+1}" for d in range(nd)])
+    ax[1, 0].set_ylabel("final acc"); ax[1, 0].set_title("Final accuracy by depth (learning hierarchy)")
+    ax[1, 0].legend(fontsize=7); ax[1, 0].grid(alpha=0.3, axis="y")
+    _bar(ax[1, 1], runs, lambda r: r["frac"][-1], "frac", "Final frac (dots=seeds)")
+    _bar(ax[1, 2], runs, lambda r: auc(r["steps"], r["frac"]), "AUC frac", "AUC frac (noise-robust)")
+    _bar(ax[2, 0], runs, lambda r: r["d2"][-1], "depth-2 acc", "Final depth-2 (sparse signal)")
+    _bar(ax[2, 1], runs, lambda r: np.mean(r["eff"]) if r["eff"] else 0, "eff experts",
+         "Effective experts (util; higher=better)")
+    _bar(ax[2, 2], runs, lambda r: np.mean(r["spec"]) if r["spec"] else 0, "spec frac",
+         "Specialization (mean over layers)")
+    fig.suptitle("OLM v8 KPI dashboard — 8-iter (blue) vs 10-iter (red) vs k2 (green), 2 seeds each",
+                 fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(os.path.join(OUT, "dashboard.png"), dpi=120); plt.close(fig)
 
 
 def main():
-    runs, real = load_runs()
-    src = "results_olm.jsonl" if real else "embedded v7 console data"
+    runs, real = load()
+    print(f"[plot] source: {'results_olm.jsonl' if real else 'embedded v8'}\n")
+    print(f"{'run':24s} {'frac':>6s} {'d2':>6s} {'d3':>6s} {'AUC':>6s} {'eff':>5s} {'spec':>5s}")
+    for name, r in runs.items():
+        print(f"{name:24s} {r['frac'][-1]:6.3f} {r['d2'][-1]:6.3f} {r['d3'][-1]:6.3f} "
+              f"{auc(r['steps'], r['frac']):6.3f} {np.mean(r['eff']) if r['eff'] else 0:5.1f} "
+              f"{np.mean(r['spec']) if r['spec'] else 0:5.2f}")
 
-    # ---- metrics table ----
-    print(f"[plot_emergence] source: {src}\n")
-    print(f"{'run':22s} {'final':>7s} {'AUC':>7s} {'->0.65':>8s} {'->0.60':>8s}")
-    rows = {}
-    for name, (arm, seed, steps, frac) in runs.items():
-        a = auc(steps, frac)
-        t65, t60 = step_to(steps, frac, 0.65), step_to(steps, frac, 0.60)
-        rows[name] = (frac[-1], a, t65, t60)
-        print(f"{name:22s} {frac[-1]:7.3f} {a:7.3f} "
-              f"{('%.0f' % t65) if t65 else '  --':>8s} {('%.0f' % t60) if t60 else '  --':>8s}")
+    # individual plots
+    for key, ylab, title, fn, floor, ylim in [
+        ("frac", "frac (val CE / ln 97; lower=better)", "OLM v8 — compression (frac)",
+         "emergence_curves.png", FLOOR, (0.4, 1.02)),
+        ("d2", "depth-2 accuracy (higher=better)",
+         "OLM v8 — DEPTH-2 (learning from SPARSE compositional signal)", "depth2_accuracy.png",
+         None, (0, 0.5)),
+        ("d3", "depth-3 accuracy (higher=better)", "OLM v8 — DEPTH-3 (even sparser signal)",
+         "depth3_accuracy.png", None, (0, 0.2))]:
+        fig, a = plt.subplots(figsize=(9, 6))
+        _line(a, runs, key, ylab, title, floor=floor, ylim=ylim)
+        fig.tight_layout(); fig.savefig(os.path.join(OUT, fn), dpi=130); plt.close(fig)
 
-    # ---- Fig 1: all emergence curves ----
-    plt.figure(figsize=(9, 6))
-    for name, (arm, seed, steps, frac) in runs.items():
-        ls = "--" if seed == 1 else "-"
-        plt.plot(steps, frac, ls, marker="o", ms=3, label=name)
-    plt.axhline(FLOOR, color="k", ls=":", lw=1, label=f"noise floor {FLOOR:.3f}")
-    plt.xlabel("training step"); plt.ylabel("frac  (val CE / ln 97;  lower = better)")
-    plt.title("olm v8 NS-config emergence curves — compression vs step\n8-iter (ns8) vs 10-iter (dsv4_10) vs k2, 2 seeds each (one epoch, 5% noise)")
-    plt.legend(fontsize=8, ncol=2); plt.grid(alpha=0.3); plt.ylim(0.4, 1.02)
-    plt.tight_layout(); plt.savefig(os.path.join(OUT, "emergence_curves.png"), dpi=130)
-    plt.close()
-
-    # ---- Fig 2: seed-noise story (paired configs with 2 seeds) ----
-    plt.figure(figsize=(9, 6))
-    pairs = {"8-iter": "tab:blue", "10-iter": "tab:red", "k2": "tab:green"}
-    for base, col in pairs.items():
-        for name, (arm, seed, steps, frac) in runs.items():
-            if name.startswith(base):
-                ls = "--" if seed == 1 else "-"
-                plt.plot(steps, frac, ls, color=col, marker="o", ms=3,
-                         label=f"{name} (final {frac[-1]:.3f}, AUC {auc(steps, frac):.3f})")
-    plt.axhline(FLOOR, color="k", ls=":", lw=1)
-    plt.xlabel("training step"); plt.ylabel("frac (lower = better)")
-    plt.title("v8 NS-config, 2 seeds each: 8-iter (blue) < k2 (green) < 10-iter (red)\nsame-seed ranking is consistent despite the timing noise in the tail")
-    plt.legend(fontsize=8); plt.grid(alpha=0.3); plt.ylim(0.4, 1.02)
-    plt.tight_layout(); plt.savefig(os.path.join(OUT, "seed_noise.png"), dpi=130)
-    plt.close()
-
-    # ---- Fig 3: AUC vs final, grouped by config (noise-robust ranking) ----
-    cfgs = {}
-    for name, (arm, seed, steps, frac) in runs.items():
-        cfgs.setdefault(arm, []).append((frac[-1], auc(steps, frac)))
-    names = list(cfgs)
-    x = np.arange(len(names))
-    fin_m = [np.mean([v[0] for v in cfgs[n]]) for n in names]
-    fin_s = [np.std([v[0] for v in cfgs[n]]) for n in names]
-    auc_m = [np.mean([v[1] for v in cfgs[n]]) for n in names]
-    auc_s = [np.std([v[1] for v in cfgs[n]]) for n in names]
-    plt.figure(figsize=(9, 6))
-    plt.bar(x - 0.2, fin_m, 0.4, yerr=fin_s, capsize=4, label="final frac (noisy)")
-    plt.bar(x + 0.2, auc_m, 0.4, yerr=auc_s, capsize=4, label="AUC / mean frac (robust)")
-    plt.xticks(x, names, rotation=20, ha="right")
-    plt.ylabel("frac (lower = better)")
-    plt.title("Per-config: final-frac vs curve-AUC  (error bar = seed spread)\nAUC error bars are tighter -> less seed noise")
-    plt.legend(); plt.grid(alpha=0.3, axis="y")
-    plt.tight_layout(); plt.savefig(os.path.join(OUT, "auc_vs_final.png"), dpi=130)
-    plt.close()
-
-    print(f"\n[plot_emergence] wrote 3 PNGs -> {OUT}")
+    dashboard(runs)
+    print(f"\n[plot] wrote dashboard.png + emergence/depth2/depth3 -> {OUT}")
 
 
 if __name__ == "__main__":

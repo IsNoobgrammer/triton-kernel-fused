@@ -257,8 +257,8 @@ def run(cfg):
                     eff.append(metrics.load_stats(evload[li])["eff"])
                 mineff = min(eff) if eff else E
             model.train()
-            best = max(best, acc)
-            curve.append([step, round(vloss, 4), round(acc, 5)])
+            best = max(best, acc)                                    # per_depth in curve -> d2/d3 plots
+            curve.append([step, round(vloss, 4), round(acc, 5), [round(a, 4) for a in per_d]])
             print(f"[{tag}] step {step:5d} val_CE {vloss:.4f} gap {vloss-floor:+.4f} "
                   f"frac {vloss/lnP:.3f} acc {acc:.4f} d " + " ".join(f"{a:.3f}" for a in per_d)
                   + f" | spec {' '.join(f'{s:.2f}' for s in spec)}"
