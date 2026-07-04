@@ -207,6 +207,37 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
   EMA deflation (needs L0 first), degree-7 polys / specnorm / per-group iters (coeff axis,
   moot on grok - LM only), SinkGD/LEO full-optimizer arm (scale calibration needed),
   momentum sweep (hp - excluded by user directive), mixed task families (harness change).
+
+### Wave 5 induction (T4 x2, 2026-07-04) - backlog screened, no promotions
+- micro-repulsion 1e-4/1e-5: NULL, clean parity (grok ~2000, acc 0.999). User's aux-loss
+  regime confirmed harmless at these doses - but buys nothing. Dose ladder now complete:
+  1e-5 null, 1e-4 null, 1e-3 -1000 steps, 1e-2 divergence. Family CLOSED with full curve.
+- grad_rep 0.5: NULL (grok ~2000, parity). Same story as decor: routing already
+  decorrelates expert grads; amplifying deviation changes nothing measurable.
+- xorth: NULL, seeds straddle baseline (s1 grok <=2000 vs baseline 2200 = faster; s0 ~2200
+  vs 1800 = slower). No harm from E-axis whitening, no win. Our pre-batched-expert
+  advantage produces no grok-side signal; keep as LM-phase candidate only if free.
+- niche 0.5: NULL (grok ~2000-2200). Load-proportional lr neither helps nor hurts -
+  consistent with bias-balancer redundancy prediction. Family closed.
+- scap 2.0 @ wd 0.1: FAILED to grok (acc 0.15 @3000, mid-MI rising = memorizing).
+  CAVEAT: smax was not logged - unknown whether the cap ever bound; cap 2.0 may be a
+  no-op on these weights. But the mechanism-level reading stands: generalization pressure
+  must act on the WHOLE spectrum (wd shrinks every direction; the memorized solution's
+  components are not confined to the top singular direction). Top-sv clipping alone is
+  not a wd substitute on grok. LM candidacy demoted until an smax-logged rerun says the
+  cap binds.
+- cautious 2.0: SLOWER (acc 0.39 @3000, climbing; mid-MI 0.54 rising). Sign-masking
+  halves effective compression pressure -> behaves like wd ~1.0 per the dose law.
+  On grok, weaker pressure = slower escape, exactly as predicted. Its LM promise
+  (compression without signal tax) is UNTOUCHED by this - grok punishes weak pressure,
+  LM rewards low tax. Still LM-ranked (1), now with a calibration note: match effective
+  decay dose, not nominal.
+- combos: rep1e-4+gf2 NULL at grok point but 2.4x baseline acc at step 1000 (0.34 vs
+  0.14) - grokfast+repulsion accelerates PRE-grok progress, converges to same grok step.
+  rep+ni+gf NULL (transient L1 MI 1.15 @2000, collapses after grok).
+- FIVE-WAVE VERDICT: 13 mechanisms screened, zero beat Muon + wd 2.0 on grok. The polar
+  + full-spectrum decay pair is the frontier on this testbed. Remaining discriminating
+  power lives in the LM regime.
 - [DOWNRANKED] SAM-style sharpness aware: 2x grad cost fails perf-per-flop by construction;
   only if a 1-extra-forward variant appears.
 
