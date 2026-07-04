@@ -37,11 +37,15 @@ COMMON = dict(steps=6000, batch=768)
 # s0 0.535 / s1 0.451). NEW configs only, 2 seeds each -> compare MEANS to that floor.
 #   ns_4+2  = KJ*4 + 2 pin = 6 iters (even cheaper than the 8-iter default - does it hold?)
 #   PE-8    = Polar-Express minimax 8-iter schedule (different coeff FAMILY) + aurora
+# v10 wave: WEIGHT-DECAY sweep - the dominant knob from the whole program (7x generalization
+# speed on grok) that we NEVER swept on olm (only spot-checked: 0.1 works, 2.0 dead=regime
+# check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
+# each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
+# Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
 ARMS = [
-    dict(arm="default", seed=0, ns_kj=4),
-    dict(arm="default", seed=1, ns_kj=4),
-    dict(arm="default", seed=0, coeffs="pe"),
-    dict(arm="default", seed=1, coeffs="pe"),
+    dict(arm="default", seed=s, wd=w)
+    for w in (0.01, 0.03, 0.05, 0.2)
+    for s in (0, 1)
 ]
 
 
