@@ -159,6 +159,20 @@ Potato preset: --p 61 --batch 1024 --steps 4000 (local 3050).
 - Round wins to keep: Muon 2.4x AdamW on MoE-grok; wd law extends to AdamW (monotone 0.1->
   1.0); mid-layer-MI memorization diagnostic; dense-early/MoE-late confirmed twice.
 
+### Algorithmic paradigm imports (wave 4, opened 2026-07-04 - user directive: mechanisms
+### like repulsion, NOT hp tuning; wd axis closed as diagnosis-only)
+- [RUNNING wave 4] Grokfast x Muon: g += lam*EMA(g) (alpha 0.98) before the polar -
+  amplify the slow/shared gradient component (signal-processing import: the generalizing
+  direction is the low-frequency part of the grad sequence). Paper (Lee 2024) shows up to
+  ~50x faster grokking on Adam; composition with orthogonalization untested anywhere.
+  Arms: lam {2, 5} x seeds. Bar: grok >=400 steps earlier than 1800-2200 at acc parity.
+- [RUNNING wave 4] Lookahead x Muon (slow/fast weights, k=5 beta=0.5): implicit weight
+  averaging toward flat minima. Mechanism, no signal cost. Also combo arm gf2+la5.
+- [QUEUED] Dion-style low-rank orthogonalization (orthogonalize only top-r subspace):
+  compute-side win candidate for LM phase, pairs with the perf-per-flop goal.
+- [DOWNRANKED] SAM-style sharpness aware: 2x grad cost fails perf-per-flop by construction;
+  only if a 1-extra-forward variant appears.
+
 ### Swarm / evolutionary imports
 - [REJECTED 2026-07-04] Expert weight repulsion (PSO anti-averaging): W_e += beta*(W_e - mean_E W)
   after step. T4 wave 1 (ablate_muon, 3000 steps): beta=1e-3 DELAYS grok 1800->2800 with ZERO MI

@@ -143,7 +143,8 @@ def _mi(top1, op, E, n_ops):
 
 _DEF = dict(arm="default", seed=0, frac=0.45, p=97, steps=3000, batch=768, d=128, layers=3,
             experts=8, top_k=2, lr=1e-3, muon_lr=1e-3, wd=2.0, adamw_wd=1.0, expert_wd=None,
-            bias_tokens=300_000, bias_factor=0.01, repulse=0.0, decor=0.0, eval_every=200,
+            bias_tokens=300_000, bias_factor=0.01, repulse=0.0, decor=0.0,
+            grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5, eval_every=200,
             op_mix=(0.4, 0.3, 0.2, 0.1))
 
 
@@ -157,6 +158,10 @@ def make_tag(c):
         t += f"_ewd{c['expert_wd']}"
     if c.get("decor"):
         t += f"_dec{c['decor']}"
+    if c.get("grokfast"):
+        t += f"_gf{c['grokfast']}"
+    if c.get("lookahead"):
+        t += f"_la{c['lookahead']}"
     if c["steps"] != 3000:
         t += f"_{c['steps']}st"
     return t
@@ -193,6 +198,9 @@ def run(cfg):
 
     g = torch.Generator(device=dev).manual_seed(c["seed"])
     mix = torch.tensor(c["op_mix"], device=dev)
+    gf_ema = {}                                                    # grokfast: EMA of grads per param
+    slow = ({q: q.detach().clone() for q in model.parameters()}    # lookahead: slow weights
+            if c["lookahead"] else None)
     tok_count, grok_step, best, curve = 0, None, 0.0, []
     for step in range(1, c["steps"] + 1):
         ops = torch.multinomial(mix, c["batch"], replacement=True, generator=g)
@@ -211,8 +219,20 @@ def run(cfg):
             with torch.no_grad():                                  # shrink the shared component of the
                 for w in expert_ws:                                # expert-stack grads along the E axis
                     w.grad -= c["decor"] * w.grad.mean(0, keepdim=True)
+        if c["grokfast"] > 0:                                      # grokfast: amplify the slow (shared,
+            with torch.no_grad():                                  # generalizing) grad component
+                for q in model.parameters():
+                    if q.grad is not None:
+                        e = gf_ema.setdefault(q, torch.zeros_like(q.grad))
+                        e.lerp_(q.grad, 1 - c["gf_alpha"])
+                        q.grad += c["grokfast"] * e
         for o in opts:
             o.step(); o.zero_grad(set_to_none=True)
+        if slow is not None and step % c["lookahead"] == 0:        # lookahead: pull fast weights
+            with torch.no_grad():                                  # toward the slow trajectory
+                for q in model.parameters():
+                    slow[q].lerp_(q, c["la_beta"])
+                    q.copy_(slow[q])
         if c["repulse"] > 0:
             with torch.no_grad():
                 for w in expert_ws:
@@ -247,7 +267,7 @@ def run(cfg):
                   + f" | MI {' '.join(f'{m:.2f}' for m in mis)} | minload {lmin:.3f}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], repulse=c["repulse"], wd=c["wd"],
                 adamw_wd=c["adamw_wd"], expert_wd=c["expert_wd"], decor=c["decor"],
-                steps=c["steps"],
+                grokfast=c["grokfast"], lookahead=c["lookahead"], steps=c["steps"],
                 acc=round(acc, 5), best_acc=round(best, 5), grok_step=grok_step,
                 per_op=[round(a, 4) for a in per_op], mi_final=[round(m, 3) for m in mis],
                 curve=curve)

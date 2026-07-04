@@ -23,19 +23,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 COMMON = dict(steps=3000, batch=768, p=97, frac=0.45, wd=2.0, experts=8, top_k=2,
               bias_tokens=300_000, op_mix=(0.4, 0.3, 0.2, 0.1))
 
-# Wave 3 (wave 2 done: AdamW fair control groks @5000 = Muon 2.4x faster; expert_wd 0.5
-# REJECTED-low: slows grok AND lowers MI, only keeps dead experts alive; post-grok state
-# is STABLE at MI 1.00 / 2-way split, not ongoing decay):
-#  - expert_wd HIGHER direction (3.0, 4.0): experts want MORE compression than attn?
-#  - cross-expert update decorrelation (idea #3): grad_e -= decor*mean_E(grad) on expert
-#    stacks before the step — acts on the UPDATE (repulsion on state is rejected).
+# Wave 4 — ALGORITHMIC mechanisms, no hp sweeps (wave 3 double-null closed the wd and
+# decorrelation axes; baseline grok band = 1800-2200, bar = grok >=400 steps earlier
+# at acc parity):
+#  - grokfast (Lee 2024): g += lam*EMA(g) — amplify the slow/shared grad component
+#    BEFORE Muon's polar. Paper: up to ~50x faster grokking on Adam; Muon combo untested.
+#  - lookahead (Zhang 2019): slow/fast weights, slow.lerp_(fast, 0.5) every k steps —
+#    implicit averaging toward flat minima, no signal cost.
 ARMS = [
-    dict(arm="default", seed=0, decor=0.5),
-    dict(arm="default", seed=0, decor=1.0),
-    dict(arm="default", seed=1, decor=1.0),
-    dict(arm="default", seed=0, expert_wd=3.0),
-    dict(arm="default", seed=1, expert_wd=3.0),
-    dict(arm="default", seed=0, expert_wd=4.0),
+    dict(arm="default", seed=0, grokfast=2.0),
+    dict(arm="default", seed=1, grokfast=2.0),
+    dict(arm="default", seed=0, grokfast=5.0),
+    dict(arm="default", seed=0, lookahead=5),
+    dict(arm="default", seed=1, lookahead=5),
+    dict(arm="default", seed=0, grokfast=2.0, lookahead=5),
 ]
 
 
@@ -47,6 +48,10 @@ def _tag(r):
         t += f"_ewd{r['expert_wd']}"
     if r.get("decor"):
         t += f"_dec{r['decor']}"
+    if r.get("grokfast"):
+        t += f"_gf{r['grokfast']}"
+    if r.get("lookahead"):
+        t += f"_la{r['lookahead']}"
     if r.get("steps", 3000) != 3000:
         t += f"_{r['steps']}st"
     return t
