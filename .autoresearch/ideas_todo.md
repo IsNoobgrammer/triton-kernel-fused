@@ -463,6 +463,21 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     0.3/0.5/0.7 to bracket the peak.
   * (*wd=0.03 s1 = outlier bad-timing seed, depth-2 collapsed to 0.08 while 0.01/0.05 s1 fine
     - ignore; AUC smooths it.)
+  * [MECHANISM, user-spotted] wd0.2 s1 has WORSE depth-1 (0.637 vs wd0.1 s1's 0.948) but
+    BETTER depth-2/3/4 (0.499/0.297/0.109 vs 0.421/0.177/0.068) at ~same frac (0.463 vs
+    0.451). This is the grokking MEMORIZE->GENERALIZE transition, wd = the driving pressure:
+    depth-1 is a finite lookup table (97x97/op) that nails d1 but does NOT compose; the
+    compact Fourier/circular-arithmetic circuit (Nanda et al.) is slightly less pinpoint on
+    d1 but COMPOSES -> d2/3/4 unlock. Higher wd makes the table expensive to store and pushes
+    the model off lookup onto the composable algorithm. The depth-1 DROP is the signature of
+    abandoning the table for the circuit = generalization, not overfit. Frac hides it; only
+    per-depth reveals it. SEED NUANCE: wd0.2 s0 got BOTH (d1 0.946 + d2 0.541 = clean
+    transition); s1 is caught MID-reallocation (d1 plateaued ~0.64, d2 still climbing at
+    step 6000 log: 0.096->0.264->0.473->0.499 over last 1500) - transient of a hard/late
+    transition, not inherent to high wd; longer budget likely recovers d1. => OLM reproduces
+    the compression->composition story that makes wd dominant; watch d1-vs-d2 tradeoff in the
+    v12 upward sweep (does d1 keep eroding at wd 0.3/0.5, marking a composition-vs-precision
+    optimum?).
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
