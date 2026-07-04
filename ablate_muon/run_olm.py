@@ -13,17 +13,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 COMMON = dict(steps=6000, batch=768)
 
-# OLM wave 1: calibration + baselines. Online regime predictions to test:
-#  - wd should now behave LM-like (small optimal; grok-optimal 2.0 should HURT -> regime check)
+# OLM wave 1: calibration + baselines. Default arch = dense first layer, MoE layers 2-4
+# (user call); depth 1-6 Zipf mix; 5% label noise -> CE floor 0.42 nats = frac 0.092,
+# matching LM's residual ~0.09 (the race is toward the floor, never to zero, like text).
+# Regime predictions to test:
+#  - wd optimum flips small online (grok-optimal 2.0 should HURT -> regime check)
 #  - Muon vs AdamW gap in the compute-bound regime (the gap that matters for BiBo)
-#  - dense-first-2 arch arm
+#  - dense-first-1 (default) vs all-MoE contrast
 ARMS = [
     dict(arm="default", seed=0),
     dict(arm="default", seed=1),
     dict(arm="default", seed=0, wd=2.0),
     dict(arm="adamw",   seed=0),
     dict(arm="adamw",   seed=1),
-    dict(arm="default", seed=0, dense_first=2),
+    dict(arm="default", seed=0, dense_first=0),
 ]
 
 
@@ -37,15 +40,15 @@ def _tag(r):
 
 
 def _table(results):
-    print("\n" + "=" * 100)
-    print("ONLINE LM-EMULATOR  (one epoch, fresh data; frac = val CE / ln(97), LM-matched target ~0.09)")
-    print("=" * 100)
+    print("\n" + "=" * 108)
+    print("ONLINE LM-EMULATOR  (one epoch, fresh data, 5% noise; gap = CE above the 0.42-nat floor)")
+    print("=" * 108)
     for r in results:
         mi = "/".join(f"{m:.2f}" for m in r["mi_final"])
         pd = " ".join(f"{a:.2f}" for a in r["per_depth"])
-        print(f"{_tag(r):26s} CE {r['loss']:.4f}  frac {r['frac']:.3f}  acc {r['acc']:.4f}  "
-              f"d1-4 {pd}  MI(L) {mi}")
-    print("=" * 100)
+        print(f"{_tag(r):26s} CE {r['loss']:.4f}  gap {r.get('gap', -1):+.4f}  frac {r['frac']:.3f}  "
+              f"acc {r['acc']:.4f}  d1-6 {pd}  MI(L) {mi}")
+    print("=" * 108)
 
 
 def main():

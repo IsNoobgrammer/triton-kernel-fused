@@ -251,8 +251,18 @@ COMPRESSION CALIBRATION: LM 81k vocab starts at ln(81920)=11.3 nats CE, strong m
 land ~1.0 nat => frac ~0.09 of initial entropy remains. Ours: init ln(97)=4.575 nats,
 LM-matched target ~0.41-0.5 nats at 6000x768 budget. Metric `frac` = CE/ln(97).
 Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/hard.
-- [RUNNING olm wave 1] default wd0.1 x2 seeds, default wd2.0 (regime check: grok-optimal
-  wd predicted to HURT online), adamw x2 seeds, dense_first=2 arch arm.
+- [UPDATED same day, user] v2: +5% label noise (train AND val) -> irreducible CE floor
+  0.4229 nats = frac 0.0924, deliberately == LM residual 0.09: the race is toward an
+  entropy floor, never zero, exactly like text. Metric of record = gap (CE - floor).
+  Depth extended to 6 (Zipf mix 0.30/0.25/0.20/0.125/0.075/0.05). Default arch =
+  dense_first=1 (layer 1 dense, 2-4 MoE, user call); all-MoE df0 = contrast arm.
+- [RUNNING olm wave 1] default df1 wd0.1 x2 seeds, default wd2.0 (regime check:
+  grok-optimal wd predicted to HURT online), adamw x2 seeds, df0 all-MoE contrast.
+- PROXY VALIDATION PLAN (before trusting olm for promotions): olm wave 2 = normuon +
+  ns8 + k2 arms. LM ground truth exists (137M screen: normuon WON -0.026@1200, ns8/k2
+  tied). If olm reproduces that ordering, it is a validated LM proxy; if it calls
+  normuon harmful (as grok wrongly did), olm inherits grok's blind spot and only real
+  LM discriminates. Falsifiable, cheap, decisive.
 - PREDICTIONS ON RECORD: (a) wd optimum flips small in the online regime; (b) Muon>AdamW
   gap shrinks vs grok's 2.4x but stays positive (matches 137M LM screen ~2x); (c) deep
   depths (3-4) learn slowest = the discriminating tail; (d) frac plateaus per-depth like
