@@ -410,7 +410,18 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     (capacity-starved = more spec, worse loss).
   * OOD-eval idea DROPPED (user): depth-4 already ~chance, so held-out depth-5/6
     extrapolation would measure nothing. No headroom for a length-OOD test at this scale.
-- [olm v8 QUEUED] DEFAULT NS-CONFIG comparison, multi-seed (normuon/xorth done, dead).
+- [OLM = THE KEY DELIVERABLE OF THE ROUND] validated single-GPU LM emulator: tracks real-LM
+  optimizer ordering, exposes LM-only phenomena (emergence, phase transitions, per-depth
+  compositional learning), rich cheap metrics (frac/per-depth acc/eff/spec). Reusable
+  instrument - every downstream verdict depends on it.
+- [olm v8 RESULT - NS ITER COUNT MATTERS, cheap wins] 8-iter (ns_kj=6, 6KJ+2pin, DEFAULT)
+  BEATS 10-iter (ns_kj=8, dsv4_10 = DeepSeek): frac 0.535/0.451 vs 0.592/0.609, both seeds
+  (default's unlucky 0.535 still beats both 10-iter seeds). 10-iter s0 stuck at depth-2
+  CHANCE (0.022) while 8-iter cracks it (0.42) - extra 2 KJ iters HURT (likely quintic
+  overshoot the 2 pinned iters cannot clean). CONTRADICTS grok "iter axis dead" (were equal
+  on grok) - olm is more discriminating. => cutting NS iters 10->8 is beneficial here, not
+  just free. TAG FIXED: was "_ns8" (=ns_kj=8=10 iters, CONFUSING) -> now "_it10" (total
+  iters). k2 arm still pending.
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is

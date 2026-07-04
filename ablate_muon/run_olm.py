@@ -55,7 +55,7 @@ def _tag(r):
         if r.get("aurora_k", 1) != 1:
             t += f"_k{r['aurora_k']}"
         if r.get("ns_kj", 6) != 6:
-            t += f"_ns{r['ns_kj']}"
+            t += f"_it{r['ns_kj'] + 2}"                           # total NS iters
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
                      ("grokfast", "gf"), ("lookahead", "la")):

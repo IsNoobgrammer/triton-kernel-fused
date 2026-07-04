@@ -102,8 +102,8 @@ def make_tag(c):
             t += f"_{c['scale_mode']}"
         if c["aurora_k"] != 1:
             t += f"_k{c['aurora_k']}"
-        if c["ns_kj"] != 6:                                       # default is ns8 (6 KJ)
-            t += f"_ns{c['ns_kj']}"
+        if c["ns_kj"] != 6:                                       # default = 8 iters (6 KJ + 2 pin)
+            t += f"_it{c['ns_kj'] + 2}"                           # TOTAL NS iters (avoid ns_kj confusion)
     if c["mult"] != 4:
         t += f"_m{c['mult']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
