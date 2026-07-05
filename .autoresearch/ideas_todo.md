@@ -580,6 +580,19 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     that non-determinism tips the trajectory (s1 stuck this launch, emerged last). So bf16 adds
     ~+/-0.05 run-to-run noise ON TOP of seed noise - expect it, don't expect bit-exact repro.
     fp32 is the choice if exact reproduction is ever needed. Mitigation = AUC + multi-seed (already used).
+- [olm v18 DONE - MUON LR SWEEP; first knob with a CLEAR signal through seed noise] final frac
+  (mean): 3e-4 0.625 | 1e-3 0.513 (BEST) | 2e-3 0.541 | 4e-3 0.700 | 8e-3 0.725. AUC agrees
+  (1e-3/2e-3 lowest). A genuine U-CURVE - lr is coarse enough to separate at 2 seeds, unlike
+  every fine knob. Optimum muon_lr ~= 1e-3 => VALIDATES muon_lr=adamw_lr=1e-3 convention.
+  * 2e-3 = EDGE OF STABILITY: s1 = single best run of the WHOLE study (frac 0.400, d2 0.550,
+    d3 0.324, d4 0.194 - deepest composition ever), but s0 DESTABILIZED (d1 collapsed 0.158).
+    High-variance aggressive option - worth trying at real-LM scale (the deep-composition win)
+    with instability watched.
+  * ABOVE 2e-3 = instability: 4e-3 both seeds degraded, 8e-3 s0 dead (d1 0.03). MECHANISM: high
+    muon_lr -> large orthogonalized steps -> EARLY EXPERT COLLAPSE (eff drops to 3-5 by step
+    1000 at 4e-3/8e-3) -> degraded learning. Below 1e-3 (3e-4) = undertrained/slow.
+  Verdict: keep muon_lr 1e-3 (robust); 2e-3 = risk/reward. dashboard_lr.png (U-curve, first
+  real signal). LR is the frontier-defining knob; fine knobs were all sub-noise.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
