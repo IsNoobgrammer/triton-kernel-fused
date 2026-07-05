@@ -24,7 +24,7 @@ import torch
 SCALAR_MODES = ("polar",)
 PERROW_MODES = ("normuon",)
 AURORA_MODES = ("aurora",)
-AURORA_EMA_MODES = ("aurora_ema",)                                    # aurora prescale + normuon's per-row EMA memory
+AURORA_EMA_MODES = ("aurora_ema", "aurora_ema_v2")                    # aurora + normuon EMA: v1 pre-polar (stays orthogonal), v2 post-polar (normuon-faithful, breaks it)
 ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES + AURORA_EMA_MODES
 DEFAULT_MODE = "aurora"
 
@@ -136,6 +136,26 @@ def aurora_ema_update(M, polar_fn, v_ema, gain=None, beta2=PERROW_BETA2, eps=PER
     D = v_ema.sqrt().clamp_min(eps)                              # EMA-based row scale -> (B, rows)
     X = polar_fn((tgt * (X / D.unsqueeze(-1))).to(dt)).float()  # re-orthogonalize (output stays orthogonal)
     return (gain * X).to(dt)
+
+
+def aurora_ema_v2_update(M, polar_fn, v_ema, gain=None, K=AURORA_K, beta2=PERROW_BETA2, eps=PERROW_EPS):
+    """Aurora THEN normuon post-hoc (the faithful stack): run the full aurora update (prescale +
+    re-orthogonalize), then rescale rows by their EMA 2nd-moment AFTER the polar - exactly where
+    normuon applies it. This DOES break orthogonality (unlike aurora_ema v1's pre-polar EMA), so
+    v1-vs-v2 isolates whether the per-row EMA belongs before or after the orthogonalization.
+
+    v_ema: (B, rows) fp32 EMA buffer, MUTATED IN PLACE (post-ortho row 2nd-moment, like normuon).
+    """
+    rows, cols = M.shape[-2], M.shape[-1]
+    if gain is None:
+        gain = RMS_TARGET * (max(rows, cols) ** 0.5)
+    O = aurora_update(M, polar_fn, gain=gain, K=K).float()      # aurora output: orthogonal, RMS 0.2
+    row_sq = O.mul(O).mean(dim=-1)                              # per-row mean-square -> (B, rows)
+    v_ema.mul_(beta2).add_(row_sq, alpha=1.0 - beta2)          # EMA in place (post-ortho, normuon-style)
+    Ohat = O / v_ema.sqrt().add(eps).unsqueeze(-1)             # per-row rescale (breaks orthogonality)
+    fro = Ohat.flatten(-2).norm(dim=-1).clamp_min(1e-12)       # renorm each slice to the RMS target
+    C = RMS_TARGET * (rows * cols) ** 0.5
+    return (Ohat * (C / fro).view(*fro.shape, 1, 1)).to(M.dtype)
 
 
 def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):

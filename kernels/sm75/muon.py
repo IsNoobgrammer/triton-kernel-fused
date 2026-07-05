@@ -315,8 +315,12 @@ class FusedMuon(optim.Optimizer):
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
                     if aurora:                                        # iterative prescale+re-orthogonalize (K polars)
                         out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
-                    elif aurora_ema:                                  # EMA-prescale + re-orthogonalize (memory, stays orthogonal)
-                        out = _scaling.aurora_ema_update(u, self._polar, v_all[start:start + crows])
+                    elif aurora_ema:                                  # aurora + normuon per-row EMA memory
+                        v_c = v_all[start:start + crows]
+                        if self.scale_mode == "aurora_ema_v2":        # EMA AFTER polar (normuon-faithful; breaks orthogonality)
+                            out = _scaling.aurora_ema_v2_update(u, self._polar, v_c, K=self.aurora_k)
+                        else:                                         # v1: EMA in the prescale (stays orthogonal)
+                            out = _scaling.aurora_ema_update(u, self._polar, v_c)
                     else:
                         out = newton_schulz(u, self.coeffs, self.ns_dtype)
                         if perrow:                                    # leverage-aware per-row rescale (scale folded into out)

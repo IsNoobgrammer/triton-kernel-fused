@@ -50,17 +50,17 @@ COMMON = dict(steps=6000, batch=768)
 # baseline) so the whole curve is SAME-LAUNCH - sidesteps bf16 cross-launch non-determinism (v17).
 # muon_lr matched adamw lr (1e-3) by convention; Muon's controlled-magnitude update may want higher.
 # Rank on AUC + depth-2.
-# v22 wave: AURORA-EMA (best-of-both) @ CONST-LR 10k. New scale mode: aurora's row-PRESCALE but
-# using normuon's per-row EMA 2nd-moment (memory) instead of the instantaneous row norm, then
-# re-orthogonalize -> keeps orthogonality (aurora's deep ceiling) + adds cross-step per-row memory
-# (normuon's breadth). Does the EMA help aurora? Compare aurora_ema {ns8, ns10} vs aurora ns8
-# (same-launch reference, dodges bf16 cross-launch drift). Reference points from v21 (const-LR):
-# aurora ns8 emerged intrinsically (d2 0.56); normuon ns10 best (d2 0.56/d3 0.33/d4 0.19).
-# 2 seeds each = 6 arms, const-LR 10k, bf16-amp, wd 0.1, mlr 1e-3.
+# v22 wave: AURORA-EMA placement test @ CONST-LR 10k - does normuon's per-row EMA help aurora,
+# and does it belong BEFORE or AFTER the polar? 3-way, all ns8, same-launch (dodges bf16 drift):
+#   aurora           = no EMA (reference)
+#   aurora_ema (v1)  = EMA in the PRESCALE, then re-orthogonalize -> output STAYS orthogonal
+#   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
+# v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
+# ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
 ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6) for s in (0, 1)]   # aurora_ema ns8
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=8) for s in (0, 1)]  # aurora_ema ns10
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in (0, 1)]      # aurora ns8 (reference)
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in (0, 1)]        # aurora (no EMA, reference)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6) for s in (0, 1)]   # v1: EMA pre-polar
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6) for s in (0, 1)] # v2: EMA post-polar
 )
 
 
