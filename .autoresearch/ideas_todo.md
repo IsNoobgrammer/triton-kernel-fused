@@ -689,6 +689,27 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     magnitude asymmetry -> load concentrates. aurora/normuon uniform per-row RMS keeps
     experts balanced. One coherent weakness (row non-uniformity), not two - secondary
     confirmation, not worth chasing.
+- [olm v24 DONE - aurora_ema + xorth 0.01 ns8 8-SEED (SEEDS8, const-LR 10k); THE COMBO IS THE
+  WIN] frac per seed: s2 0.404, s9 0.408, s24 0.405, s12 0.431, s2026 0.431, s23 0.443, s69 0.451,
+  s28 0.462. MEAN 0.429 (d2 0.428, d3 0.229, d4 0.114). 8/8 EMERGE - the stall is GONE.
+  HEADLINE: s2, the TOTAL STALL in plain aurora_ema (v23: frac 0.593, d2 0.023, never composed),
+  is RESCUED by xorth -> the DEEPEST seed in the set (frac 0.404, d2 0.547, d3 0.316, d4 0.176).
+  vs aurora_ema (v23) 0.468 / d2 0.327 / d3 0.152 / d4 0.068: combo wins every metric.
+  ROBUSTNESS: even removing xo's BEST seed (s2), ex-best n=7 = 0.433 / d2 0.411 / d3 0.216 /
+  d4 0.106 still beats ema-with-its-STALL-removed n=7 (0.450 / d2 0.371 / d3 0.171 / d4 0.075).
+  So xo's floor (7 weakest) clears ema's cleaned-up average - not a lucky-seed artifact.
+  Two separable effects: (1) STALL RESCUE (removes the ~1/8 catastrophic tail), (2) DEEPER
+  COMPOSITION on already-emerging seeds (fair ex-s2 n=7 gap on d2/d3/d4). d4 0.114 = ~2.5x base
+  aurora (0.045). NOT monotone per-seed (paired, cross-launch +/-0.05 noise): big wins s2/s9/
+  s24/s2026, regressions s23/s69, tie s12/s28 - mean carried by rescue + mid seeds.
+  RECONCILES the v7 xorth-REJECTED / combo-is-variance-damper prior: xorth-on-plain-Muon was
+  null (utilization already free post-bias-fix); xorth-on-aurora_ema is a win. And the v7 "combo
+  = variance damper that KILLS upside" flips sign here - here the thing being damped (the stall)
+  is pure downside, so damping it is pure gain AND it adds depth. Substrate matters: xorth needs
+  aurora_ema's uniform-orthogonal update to have something to decorrelate cleanly.
+  CAVEATS: base aurora still n=2 (v25 8-seed control IN FLIGHT); xo vs v23-ema are cross-launch
+  (bf16 drift) - depth gap is well beyond drift, frac gap partly within it. Dashboard:
+  dashboard_xoema.png. Promote aurora_ema+xorth to real-LM candidate (STRONGER than ema alone).
   3 configs x 3 seeds (beat 0.084 seed spread, compare MEANS): aurora_k1 8-iter (ns_kj=6,
   current default) vs aurora_k1 10-iter (ns_kj=8, dsv4_10) vs aurora_k2 8-iter (k2).
   Q: does more NS fidelity (10it) or aurora k2 beat cheap ns8 on the validated proxy, or is
