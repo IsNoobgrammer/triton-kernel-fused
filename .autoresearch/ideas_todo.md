@@ -618,6 +618,19 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   verdict was BUDGET-DEPENDENT. Real LM trains long => confirm normuon vs aurora at real scale +
   more seeds. Partially resolves Aurora-vs-NorMuon tension (budget-gated). dashboard_v20.png
   (10k eval grid; the depth-2 late-overtake is the money shot). Plot now per-axis-steps capable.
+- [olm v21 DONE - CONSTANT-LR (no decay) 10k; resolves the v20 decay question] frac (mean):
+  normuon ns10 0.462 < aurora ns8 0.471 < aurora ns12 0.491 < normuon ns8 0.496. Per-depth
+  (mean d2/d3/d4): normuon ns10 0.410/0.194/0.108 = BEST; aurora ns8 0.372/0.178/0.095; deep
+  PEAK also normuon ns10 s1 (d3 0.332, d4 0.189 - highest of anyone).
+  REFINED VERDICT (corrects "aurora wins const-LR"): normuon's decay-dependence is an ns8
+  (too-few-NS-iters) problem, NOT intrinsic. normuon ns8 STALLS under const-LR (both seeds d2
+  ~0.24-0.35, never emerge) - THAT was the decay-dependent arm. normuon ns10 EMERGES
+  intrinsically (s1 d2 0.56/d3 0.33/d4 0.19 at ~6-7k, full LR) and is the BEST mode const-LR.
+  aurora ns8 emerges intrinsically too (s1 d2 0.562, robust); aurora ns12 NO help (ns12<=ns8,
+  so ns12~=k2 substitute REFUTED here). ASYMMETRY: more NS fidelity RESCUES normuon (ns8->ns10
+  unlocks emergence) but does nothing for aurora. Both bimodal at 2 seeds (one emerges, one
+  stalls) - emergence is seed-lottery under const-LR. Plot: v21 axis + depth_detail_v21 (const-
+  LR overlay now flat). => normuon viable WITHOUT decay if given ns10; aurora robust at ns8.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and

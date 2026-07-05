@@ -22,7 +22,8 @@ os.makedirs(OUT, exist_ok=True)
 FLOOR = 0.0924
 STEPS = [1000, 2000, 3000, 4000, 4500, 5000, 5500, 6000]
 STEPS_10K = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 9500, 10000]  # v20 eval grid
-STEPS_BY_AXIS = {"v20": STEPS_10K}                                   # axes on a non-default budget
+STEPS_BY_AXIS = {"v20": STEPS_10K, "v21": STEPS_10K}                 # axes on a non-default budget
+DECAYFRAC_BY_AXIS = {"v21": 0.0}                                     # const-LR axes (default WSD = 0.2)
 
 # ---------------------------------------------------------------------------------------
 # THE STORE. Per run: c=config color-key, s=seed, frac/d2/d3 trajectories (over STEPS),
@@ -257,48 +258,107 @@ RUNS_V20 = {
     frac=[.996,.823,.691,.598,.582,.577,.562,.551,.530,.519,.515],
     d1=[.012,.291,.609,.884,.918,.915,.931,.933,.945,.947,.946], d2=[.014,.041,.067,.086,.097,.115,.136,.172,.229,.269,.303],
     d3=[.018,.020,.021,.023,.030,.031,.033,.032,.040,.047,.049], d4=[.016,.017,.022,.018,.021,.022,.021,.023,.025,.022,.023],
+    d5=[.018,.019,.017,.016,.017,.021,.018,.022,.020,.024,.021], d6=[.013,.014,.015,.014,.017,.022,.021,.021,.024,.020,.020],
     dfin=[.946,.303,.049,.023,.021,.020], spec=[.12,.23,.07], eff=[7.4,7.2,7.5]),
  "aurora ns8 s1": dict(c="au8", s=1,
     frac=[.996,.855,.727,.675,.529,.447,.418,.408,.399,.394,.391],
     d1=[.014,.179,.234,.520,.931,.938,.946,.947,.947,.948,.948], d2=[.014,.020,.028,.074,.144,.484,.537,.546,.558,.561,.563],
     d3=[.016,.017,.020,.027,.044,.210,.284,.312,.333,.349,.353], d4=[.013,.019,.019,.019,.025,.087,.138,.156,.178,.198,.203],
+    d5=[.012,.014,.018,.016,.018,.034,.055,.076,.096,.119,.124], d6=[.011,.014,.016,.015,.017,.020,.023,.040,.054,.067,.079],
     dfin=[.948,.563,.353,.203,.124,.079], spec=[.11,.28,.18], eff=[7.6,7.6,7.4]),
  "aurora ns10": dict(c="au10", s=0,
     frac=[.997,.819,.702,.603,.587,.577,.566,.553,.533,.521,.516],
     d1=[.011,.326,.564,.866,.896,.912,.919,.930,.945,.947,.947], d2=[.017,.042,.067,.093,.099,.112,.129,.158,.218,.261,.293],
     d3=[.017,.017,.024,.028,.026,.032,.031,.032,.039,.044,.049], d4=[.015,.017,.018,.021,.021,.023,.021,.024,.019,.025,.021],
+    d5=[.017,.012,.017,.021,.018,.019,.019,.020,.021,.020,.019], d6=[.012,.016,.014,.014,.020,.019,.020,.018,.023,.022,.019],
     dfin=[.947,.293,.049,.021,.019,.019], spec=[.11,.20,.14], eff=[7.7,7.6,7.9]),
  "aurora ns10 s1": dict(c="au10", s=1,
     frac=[.996,.833,.716,.637,.514,.459,.434,.413,.398,.389,.383],
     d1=[.013,.182,.313,.635,.907,.933,.935,.946,.948,.948,.948], d2=[.015,.019,.019,.045,.323,.441,.476,.502,.521,.537,.542],
     d3=[.016,.016,.022,.027,.072,.236,.285,.311,.324,.339,.342], d4=[.016,.017,.018,.019,.026,.064,.122,.151,.174,.192,.202],
+    d5=[.013,.014,.016,.018,.016,.029,.046,.061,.092,.106,.116], d6=[.012,.015,.014,.017,.018,.018,.020,.024,.020,.020,.018],
     dfin=[.948,.542,.342,.202,.116,.018], spec=[.07,.17,.16], eff=[7.7,7.6,7.6]),
  "normuon (WINS)": dict(c="nor", s=0,
     frac=[.997,.846,.680,.585,.569,.509,.479,.462,.413,.391,.381],
     d1=[.010,.204,.694,.915,.932,.939,.941,.938,.946,.945,.946], d2=[.017,.029,.062,.124,.144,.189,.243,.290,.473,.628,.721],
     d3=[.014,.019,.022,.028,.032,.062,.091,.094,.171,.250,.303], d4=[.017,.020,.019,.020,.022,.033,.042,.046,.077,.126,.151],
+    d5=[.014,.015,.017,.017,.019,.021,.025,.027,.046,.065,.076], d6=[.012,.016,.015,.018,.016,.016,.023,.021,.034,.037,.043],
     dfin=[.946,.721,.303,.151,.076,.043], spec=[.12,.20,.16], eff=[7.7,7.8,7.4]),
  "normuon (WINS) s1": dict(c="nor", s=1,
     frac=[.996,.856,.704,.605,.581,.573,.532,.493,.464,.454,.445],
     d1=[.014,.237,.533,.871,.917,.926,.936,.941,.947,.944,.947], d2=[.014,.022,.047,.079,.121,.138,.181,.246,.354,.427,.487],
     d3=[.016,.017,.021,.023,.027,.033,.039,.074,.114,.161,.193], d4=[.017,.015,.015,.019,.020,.021,.026,.023,.024,.028,.026],
+    d5=[.013,.016,.016,.014,.016,.019,.019,.017,.020,.018,.023], d6=[.012,.015,.013,.015,.018,.018,.019,.024,.019,.022,.024],
     dfin=[.947,.487,.193,.026,.023,.024], spec=[.17,.24,.27], eff=[7.7,7.4,7.3]),
  "polar": dict(c="pol", s=0,
     frac=[.996,.846,.737,.610,.585,.576,.569,.562,.542,.529,.522],
     d1=[.013,.206,.513,.848,.913,.922,.925,.931,.943,.946,.948], d2=[.015,.030,.066,.085,.103,.107,.124,.140,.177,.226,.249],
     d3=[.016,.018,.020,.024,.030,.031,.031,.033,.039,.043,.045], d4=[.016,.019,.018,.017,.019,.023,.022,.022,.026,.024,.023],
+    d5=[.014,.014,.018,.016,.018,.019,.019,.020,.021,.022,.018], d6=[.012,.015,.015,.016,.017,.019,.020,.019,.022,.023,.022],
     dfin=[.948,.249,.045,.023,.018,.022], spec=[.24,.25,.12], eff=[7.4,7.2,7.6]),
  "polar s1": dict(c="pol", s=1,
     frac=[.996,.893,.674,.582,.571,.564,.560,.551,.530,.517,.511],
     d1=[.014,.125,.672,.916,.931,.937,.938,.943,.947,.947,.947], d2=[.013,.019,.058,.119,.135,.142,.158,.180,.236,.282,.302],
     d3=[.016,.017,.023,.031,.040,.040,.046,.050,.056,.068,.070], d4=[.016,.018,.019,.019,.021,.020,.026,.021,.024,.023,.025],
+    d5=[.012,.015,.016,.018,.022,.021,.021,.021,.020,.022,.024], d6=[.011,.014,.016,.020,.021,.018,.021,.021,.022,.024,.021],
     dfin=[.947,.302,.070,.025,.024,.021], spec=[.11,.25,.24], eff=[7.2,7.3,7.3]),
 }
 COL_V20 = {"au8": "tab:blue", "au10": "tab:cyan", "nor": "tab:orange", "pol": "tab:red"}
 CFGS_V20 = ["nor", "au8", "au10", "pol"]
 CLABEL_V20 = {"au8": "aurora ns8", "au10": "aurora ns10", "nor": "normuon", "pol": "polar"}
 
+# --- AXIS: normuon vs aurora @ CONSTANT-LR 10k (v21) - decay-lock test ---------------------
+# No decay (decay_frac=0). normuon ns8 = decay-dependent (stalls); normuon ns10 emerges
+# intrinsically + deepest; aurora ns8 robust; aurora ns12 no better than ns8.
+RUNS_V21 = {
+ "aurora ns8": dict(c="au8", s=0,
+    frac=[.997,.840,.736,.625,.592,.577,.570,.561,.553,.544,.543],
+    d1=[.011,.213,.482,.802,.896,.915,.921,.928,.928,.936,.932], d2=[.018,.034,.062,.083,.092,.113,.122,.141,.165,.169,.181],
+    d3=[.017,.017,.021,.024,.026,.031,.029,.033,.035,.036,.034], d4=[.015,.015,.017,.020,.022,.022,.020,.023,.021,.022,.022],
+    dfin=[.932,.181,.034,.022,.021,.021], spec=[.27,.18,.16], eff=[7.2,7.2,7.4]),
+ "aurora ns8 s1": dict(c="au8", s=1,
+    frac=[.996,.908,.717,.596,.564,.455,.414,.406,.400,.398,.398],
+    d1=[.013,.125,.580,.905,.933,.938,.947,.947,.947,.948,.947], d2=[.014,.021,.023,.082,.150,.502,.550,.554,.558,.559,.562],
+    d3=[.014,.019,.023,.026,.037,.160,.298,.312,.326,.332,.321], d4=[.017,.016,.020,.023,.023,.046,.126,.156,.169,.181,.167],
+    dfin=[.947,.562,.321,.167,.095,.054], spec=[.15,.13,.13], eff=[7.6,7.8,7.4]),
+ "aurora ns12": dict(c="au12", s=0,
+    frac=[.997,.824,.694,.622,.604,.592,.581,.559,.551,.544,.540],
+    d1=[.012,.312,.626,.833,.867,.885,.896,.932,.935,.938,.935], d2=[.016,.035,.062,.081,.091,.102,.118,.149,.164,.180,.200],
+    d3=[.015,.017,.025,.025,.027,.028,.032,.033,.033,.041,.039], d4=[.016,.018,.019,.020,.021,.022,.021,.024,.024,.021,.025],
+    dfin=[.935,.200,.039,.025,.020,.021], spec=[.07,.21,.27], eff=[7.9,7.3,7.4]),
+ "aurora ns12 s1": dict(c="au12", s=1,
+    frac=[.996,.876,.739,.644,.546,.489,.472,.459,.449,.446,.441],
+    d1=[.015,.125,.225,.522,.706,.935,.945,.946,.946,.947,.947], d2=[.017,.023,.031,.065,.149,.208,.229,.267,.309,.331,.315],
+    d3=[.016,.017,.018,.024,.055,.086,.096,.129,.141,.135,.146], d4=[.014,.016,.020,.019,.028,.043,.049,.053,.059,.062,.064],
+    dfin=[.947,.315,.146,.064,.033,.026], spec=[.20,.15,.17], eff=[7.9,7.9,7.4]),
+ "normuon ns8": dict(c="nor8", s=0,
+    frac=[.997,.803,.702,.582,.569,.546,.522,.514,.512,.509,.508],
+    d1=[.012,.470,.619,.913,.932,.938,.945,.946,.945,.946,.947], d2=[.017,.024,.108,.141,.151,.224,.315,.342,.345,.347,.348],
+    d3=[.016,.021,.026,.033,.040,.043,.053,.060,.064,.065,.073], d4=[.015,.020,.016,.022,.022,.022,.022,.024,.023,.022,.025],
+    dfin=[.947,.348,.073,.025,.021,.023], spec=[.07,.09,.23], eff=[7.7,7.6,7.4]),
+ "normuon ns8 s1": dict(c="nor8", s=1,
+    frac=[.996,.862,.699,.586,.571,.564,.560,.556,.542,.505,.483],
+    d1=[.015,.248,.560,.902,.929,.934,.942,.944,.940,.941,.938], d2=[.015,.020,.091,.125,.142,.148,.153,.153,.168,.205,.240],
+    d3=[.014,.019,.023,.034,.039,.047,.051,.057,.056,.078,.092], d4=[.017,.016,.019,.015,.021,.023,.025,.026,.023,.029,.043],
+    dfin=[.938,.240,.092,.043,.022,.016], spec=[.13,.25,.17], eff=[7.6,7.3,7.3]),
+ "normuon ns10": dict(c="nor10", s=0,
+    frac=[.997,.800,.649,.581,.571,.566,.562,.562,.558,.545,.531],
+    d1=[.010,.483,.798,.924,.936,.938,.941,.941,.945,.946,.941], d2=[.016,.019,.034,.130,.141,.145,.152,.150,.156,.188,.260],
+    d3=[.015,.021,.024,.026,.035,.046,.048,.052,.052,.054,.056], d4=[.016,.016,.016,.020,.025,.023,.024,.023,.024,.024,.026],
+    dfin=[.941,.260,.056,.026,.022,.021], spec=[.11,.12,.27], eff=[7.4,7.6,7.5]),
+ "normuon ns10 s1": dict(c="nor10", s=1,
+    frac=[.996,.892,.717,.616,.582,.526,.420,.405,.401,.399,.393],
+    d1=[.013,.115,.553,.902,.928,.940,.947,.947,.948,.948,.948], d2=[.015,.018,.022,.022,.104,.215,.544,.555,.557,.557,.559],
+    d3=[.015,.017,.026,.023,.031,.051,.280,.319,.325,.323,.332], d4=[.015,.017,.021,.019,.023,.018,.108,.157,.171,.176,.189],
+    dfin=[.948,.559,.332,.189,.107,.059], spec=[.07,.18,.14], eff=[7.9,7.5,7.7]),
+}
+COL_V21 = {"au8": "tab:blue", "au12": "tab:cyan", "nor8": "tab:orange", "nor10": "tab:red"}
+CFGS_V21 = ["au8", "au12", "nor8", "nor10"]
+CLABEL_V21 = {"au8": "aurora ns8", "au12": "aurora ns12", "nor8": "normuon ns8", "nor10": "normuon ns10"}
+
 AXES = [
+    ("v21", "normuon vs aurora @ CONST-LR (no decay) 10k - normuon ns10 wins intrinsically; "
+     "normuon ns8 decay-dependent; aurora ns8 robust; ns12 no help", RUNS_V21, COL_V21, CFGS_V21, CLABEL_V21),
     ("coeff", "coeff/iter axis (RTX 6000, wd 0.1) - 8/6/10-iter TIE in noise; PE-8 s0 NaN",
      RUNS_COEFF, COL_COEFF, CFGS_COEFF, CLABEL_COEFF),
     ("lr", "muon LR axis (RTX 6000, bf16-amp) - U-curve, optimum 1e-3; 2e-3 = edge of stability",
@@ -329,7 +389,7 @@ def wsd(grid, total=6000, warmup=500, decay_frac=0.2, min_lr=0.1):
     return out
 
 
-def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None, steps=STEPS):
+def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None, steps=STEPS, decay_frac=0.2):
     for name, r in runs.items():
         if r.get(key) is None:
             continue
@@ -341,17 +401,19 @@ def _line(ax, runs, col, key, ylab, title, floor=None, ylim=None, steps=STEPS):
     ax.grid(alpha=0.3); ax.legend(fontsize=6, ncol=2, loc="upper right")
     if ylim:
         ax.set_ylim(*ylim)
-    # WSD phase boundaries: warmup ends at 500, cosine decay starts at steps*(1-decay_frac).
+    # LR-schedule phase boundaries: warmup ends at 500; decay start only if there is a decay.
     total = steps[-1]
     ax.axvline(500, color="red", ls="--", lw=1.2, alpha=0.7, label="warmup end (500)")
-    ax.axvline(total * 0.8, color="red", ls="--", lw=1.2, alpha=0.7,
-               label=f"decay start ({int(total * 0.8)})")
-    # WSD LR-schedule reference (shared by all runs): dark line on a right-hand axis so its
-    # true 0-1 shape (warmup / stable / cosine-decay) shows without distorting the metric.
+    if decay_frac > 0:
+        ax.axvline(total * (1 - decay_frac), color="red", ls="--", lw=1.2, alpha=0.7,
+                   label=f"decay start ({int(total * (1 - decay_frac))})")
+    # LR-schedule reference on a right-hand axis (flat if const-LR, so it's honest per axis).
     ax2 = ax.twinx()
     g = np.linspace(0, total, 400)
-    ax2.plot(g, wsd(g, total=total), color="k", lw=2.2, ls="-.", alpha=0.85, zorder=0, label="WSD LR mult")
-    ax2.set_ylim(0, 1.08); ax2.set_ylabel("LR mult (WSD)", fontsize=8)
+    lab = "LR mult (const)" if decay_frac == 0 else "WSD LR mult"
+    ax2.plot(g, wsd(g, total=total, decay_frac=decay_frac), color="k", lw=2.2, ls="-.",
+             alpha=0.85, zorder=0, label=lab)
+    ax2.set_ylim(0, 1.08); ax2.set_ylabel("LR mult", fontsize=8)
     ax2.legend(loc="lower left", fontsize=6)
 
 
@@ -366,12 +428,12 @@ def _bar(ax, runs, col, cfgs, clabel, fn, ylab, title):
     ax.set_ylabel(ylab); ax.set_title(title); ax.grid(alpha=0.3, axis="y")
 
 
-def dashboard(axname, title, runs, col, cfgs, clabel, steps=STEPS):
+def dashboard(axname, title, runs, col, cfgs, clabel, steps=STEPS, decay_frac=0.2):
     fig, ax = plt.subplots(3, 3, figsize=(17, 13))
     _line(ax[0, 0], runs, col, "frac", "frac (lower=better)", "Compression (frac) vs step",
-          floor=FLOOR, ylim=(0.35, 1.02), steps=steps)
-    _line(ax[0, 1], runs, col, "d2", "depth-2 acc", "Depth-2 (sparse signal) vs step", ylim=(0, 0.75), steps=steps)
-    _line(ax[0, 2], runs, col, "d3", "depth-3 acc", "Depth-3 (sparser) vs step", ylim=(0, 0.4), steps=steps)
+          floor=FLOOR, ylim=(0.35, 1.02), steps=steps, decay_frac=decay_frac)
+    _line(ax[0, 1], runs, col, "d2", "depth-2 acc", "Depth-2 (sparse signal) vs step", ylim=(0, 0.75), steps=steps, decay_frac=decay_frac)
+    _line(ax[0, 2], runs, col, "d3", "depth-3 acc", "Depth-3 (sparser) vs step", ylim=(0, 0.4), steps=steps, decay_frac=decay_frac)
     # per-depth final bars (grouped by depth, config colors, mean over seeds)
     present = [c for c in cfgs if any(r["c"] == c for r in runs.values())]
     m = {c: np.mean([r["dfin"] for r in runs.values() if r["c"] == c], axis=0) for c in present}
@@ -394,16 +456,22 @@ def dashboard(axname, title, runs, col, cfgs, clabel, steps=STEPS):
     fig.savefig(os.path.join(OUT, f"dashboard_{axname}.png"), dpi=120); plt.close(fig)
 
 
-def depth_detail(axname, runs, col, title, steps=STEPS):
+def depth_detail(axname, runs, col, title, steps=STEPS, decay_frac=0.2):
     """Full per-depth emergence: d1/d2/d3/d4 accuracy vs step, all configs overlaid. Only for
     axes that stored d1/d4 trajectories (v20). d1 is 45% of data (saturates), d2 25%, d3 15%,
     d4 8% - so the score is decided at d2/d3, which is where the modes separate."""
-    fig, ax = plt.subplots(2, 2, figsize=(15, 11))
-    for a, key, lab, ylim in [(ax[0, 0], "d1", "depth-1 acc (45% of data)", (0, 1.0)),
-                              (ax[0, 1], "d2", "depth-2 acc (25%)", (0, 0.75)),
-                              (ax[1, 0], "d3", "depth-3 acc (15%)", (0, 0.4)),
-                              (ax[1, 1], "d4", "depth-4 acc (8%)", (0, 0.25))]:
-        _line(a, runs, col, key, lab, f"{key.upper()} emergence", ylim=ylim, steps=steps)
+    spec = [("d1", "depth-1 acc (45% of data)", (0, 1.0)), ("d2", "depth-2 acc (25%)", (0, 0.75)),
+            ("d3", "depth-3 acc (15%)", (0, 0.4)), ("d4", "depth-4 acc (8%)", (0, 0.25)),
+            ("d5", "depth-5 acc (4.5%)", (0, 0.15)), ("d6", "depth-6 acc (2.5%)", (0, 0.1))]
+    spec = [p for p in spec if any(p[0] in r for r in runs.values())]  # only depths with data
+    ncol = 3 if len(spec) > 4 else 2
+    nrow = (len(spec) + ncol - 1) // ncol
+    fig, ax = plt.subplots(nrow, ncol, figsize=(6.7 * ncol, 5.5 * nrow), squeeze=False)
+    axf = ax.flatten()
+    for a, (key, lab, ylim) in zip(axf, spec):
+        _line(a, runs, col, key, lab, f"{key.upper()} emergence", ylim=ylim, steps=steps, decay_frac=decay_frac)
+    for a in axf[len(spec):]:
+        a.axis("off")
     fig.suptitle(f"OLM per-depth detail - {title}", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.savefig(os.path.join(OUT, f"depth_detail_{axname}.png"), dpi=120); plt.close(fig)
@@ -414,13 +482,14 @@ def main():
         if not runs:
             continue
         steps = STEPS_BY_AXIS.get(axname, STEPS)
+        dfrac = DECAYFRAC_BY_AXIS.get(axname, 0.2)
         print(f"\n=== {axname}: {title} ===")
         print(f"{'run':24s} {'frac':>6s} {'d2':>6s} {'d3':>6s} {'AUC':>6s} {'eff':>5s} {'spec':>5s}")
         for name, r in runs.items():
             print(f"{name:24s} {r['frac'][-1]:6.3f} {r['d2'][-1]:6.3f} {r['d3'][-1]:6.3f} "
                   f"{auc(r['frac'], steps):6.3f} {np.mean(r['eff']) if r['eff'] else 0:5.1f} "
                   f"{np.mean(r['spec']) if r['spec'] else 0:5.2f}")
-        dashboard(axname, title, runs, col, cfgs, clabel, steps)
+        dashboard(axname, title, runs, col, cfgs, clabel, steps, dfrac)
         # individual curves per axis (the user's priority: compression + emergence depth>1)
         for key, ylab, ttl, fn, floor, ylim in [
             ("frac", "frac (lower=better)", "compression / phase transition", f"frac_{axname}.png",
@@ -430,10 +499,10 @@ def main():
             ("d3", "depth-3 acc", "DEPTH-3 emergence (sparser)", f"depth3_{axname}.png",
              None, (0, 0.4))]:
             fig, a = plt.subplots(figsize=(9, 6))
-            _line(a, runs, col, key, ylab, f"OLM {axname} - {ttl}", floor=floor, ylim=ylim, steps=steps)
+            _line(a, runs, col, key, ylab, f"OLM {axname} - {ttl}", floor=floor, ylim=ylim, steps=steps, decay_frac=dfrac)
             fig.tight_layout(); fig.savefig(os.path.join(OUT, fn), dpi=130); plt.close(fig)
-        if any("d1" in r for r in runs.values()):                    # full d1-d4 detail (v20)
-            depth_detail(axname, runs, col, title, steps)
+        if any("d1" in r for r in runs.values()):                    # full per-depth detail
+            depth_detail(axname, runs, col, title, steps, dfrac)
     print(f"\n[plot] wrote dashboard_/frac_/depth2_/depth3_ per axis -> {OUT}")
 
 
