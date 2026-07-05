@@ -50,15 +50,17 @@ COMMON = dict(steps=6000, batch=768)
 # baseline) so the whole curve is SAME-LAUNCH - sidesteps bf16 cross-launch non-determinism (v17).
 # muon_lr matched adamw lr (1e-3) by convention; Muon's controlled-magnitude update may want higher.
 # Rank on AUC + depth-2.
-# v19 wave: MOMENTUM SWEEP - Muon heavy-ball momentum {0.88, 0.9, 0.95, 0.98, 0.99} x2 seeds.
-# Fine knob (likely noise-limited like nesterov, but 0.88->0.99 spans ~8x->100x grad memory, so
-# the ends may separate). 0.95 = default, INCLUDED for same-launch anchor (bf16 non-determinism).
-# All else at adopted default (bf16-amp, bf16 NS, aurora_k1, 8-iter, wd 0.1, mlr 1e-3).
-ARMS = [
-    dict(arm="default", seed=s, momentum=m)
-    for m in (0.88, 0.9, 0.95, 0.98, 0.99)
-    for s in (0, 1)
-]
+# v20 wave: SCALE-MODE @ 10k STEPS - re-run the aurora/normuon/polar comparison at LONGER budget
+# so late seeds fully emerge (6k v11 was mid-transition noisy). aurora_k1 at BOTH ns_8 and ns_10
+# (does more NS fidelity help once converged?) vs normuon vs polar. 2 seeds each = 8 arms, all
+# steps=10000, adopted defaults (bf16-amp, bf16 NS, wd 0.1, mlr 1e-3). NOTE: 10k is its own regime
+# (WSD decay 8k-10k) - NOT directly comparable to the 6k dashboards; compare WITHIN v20.
+ARMS = (
+    [dict(arm="default", seed=s, steps=10000, scale_mode="aurora", ns_kj=6) for s in (0, 1)]   # aurora_k1 ns_8
+    + [dict(arm="default", seed=s, steps=10000, scale_mode="aurora", ns_kj=8) for s in (0, 1)]  # aurora_k1 ns_10
+    + [dict(arm="default", seed=s, steps=10000, scale_mode="normuon") for s in (0, 1)]           # normuon (ns_8)
+    + [dict(arm="default", seed=s, steps=10000, scale_mode="polar") for s in (0, 1)]             # polar (ns_8)
+)
 
 
 def _tag(r):
