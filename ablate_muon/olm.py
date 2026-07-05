@@ -174,7 +174,7 @@ def run(cfg):
     else:
         hwd = 0.0 if c["cautious"] > 0 else c["wd"]                # cautious does manual masked decay
         nsc = _PE_COEFFS if c["coeffs"] == "pe" else _coeffs(c["ns_kj"])
-        ndt = torch.bfloat16 if c["ns_dtype"] == "bf16" else torch.float16
+        ndt = {"bf16": torch.bfloat16, "fp32": torch.float32}.get(c["ns_dtype"], torch.float16)
         mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=nsc, nesterov=c["nesterov"],
                    ns_dtype=ndt, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"])
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
