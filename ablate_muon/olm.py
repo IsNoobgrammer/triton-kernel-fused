@@ -81,7 +81,7 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
             scale_mode="aurora", aurora_k=1, ns_kj=6, coeffs="kj",      # DEFAULT = ns8 (6 KJ) aurora_k1
             #  coeffs: "kj" -> KJ*ns_kj + 2 pin;  "pe" -> Polar-Express PE-8 (8 iters)
-            ns_dtype="bf16", nesterov=True,                             # NS precision: bf16 default (v16: ==fp16, more portable); norms stay fp32
+            ns_dtype="bf16", nesterov=True, momentum=0.95,              # NS precision bf16 default (v16: ==fp16, more portable; norms stay fp32); muon heavy-ball momentum
             amp="bf16",                                                 # model precision: "bf16" autocast mixed precision (fp32 master weights, no GradScaler; modern GPUs) | "fp32" pure fp32 (T4: no bf16 tensor cores). For a T4 run set amp="fp32", ns_dtype="fp16".
             repulse=0.0, decor=0.0, grad_rep=0.0, xorth=0, niche=0.0,   # mechanism knobs (mech.py)
             scap=0.0, cautious=0.0, grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
@@ -116,6 +116,8 @@ def make_tag(c):
             t += "_nonest"
         if c.get("muon_lr", 1e-3) != 1e-3:
             t += f"_mlr{c['muon_lr']}"                            # Muon LR (adamw lr = separate 'lr')
+        if c.get("momentum", 0.95) != 0.95:
+            t += f"_mom{c['momentum']}"
     if c["mult"] != 4:
         t += f"_m{c['mult']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
@@ -181,7 +183,7 @@ def run(cfg):
         nsc = _PE_COEFFS if c["coeffs"] == "pe" else _coeffs(c["ns_kj"])
         ndt = {"bf16": torch.bfloat16, "fp32": torch.float32}.get(c["ns_dtype"], torch.float16)
         mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=nsc, nesterov=c["nesterov"],
-                   ns_dtype=ndt, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"])
+                   momentum=c["momentum"], ns_dtype=ndt, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"])
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
                 FusedMuon([q for q in hidden if q.ndim == 2], **mkw),
                 FusedMuon([q for q in hidden if q.ndim == 3], **mkw)]
@@ -284,7 +286,7 @@ def run(cfg):
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],
-                muon_lr=c["muon_lr"],
+                muon_lr=c["muon_lr"], momentum=c["momentum"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),
