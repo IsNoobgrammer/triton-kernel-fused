@@ -45,14 +45,21 @@ _PE_COEFFS = (
 # 10 NS iters vs PE-8's 8 (+25%).
 _DSV4_COEFFS = ((3.4445, -4.7750, 2.0315),) * 8 + ((2.0, -1.5, 0.5),) * 2
 
+# Per-arch default NS iteration dtype (single source of truth; FusedMuon exposes it as the
+# class attr DEFAULT_NS_DTYPE so sm120 can override it). sm75 = Turing/T4 -> fp16 (Turing has
+# fp16 tensor cores but NO bf16). The norm reduction is ALWAYS fp32 regardless (see newton_schulz).
+_NS_DTYPE = torch.float16
 
-def newton_schulz(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7):
+
+def newton_schulz(G, coeffs=_DSV4_COEFFS, ns_dtype=_NS_DTYPE, eps=1e-7):
     """Orthogonalize G (drive singular values -> 1) via Polar-Express Newton-Schulz (per-iteration coeffs).
 
     2D weights are unsqueezed to (1,A,B); 3D stacked experts (E,A,B) batch over E. Normalization is fp32
-    (an fp16 sum-of-squares of a ~unit 512^2 matrix overflows; fp32 is also strictly better than bf16's).
-    The iteration GEMMs run in `ns_dtype` — bf16 (baseline) or fp16 (T4 tensor cores; cuBLAS accumulates
-    in fp32). baddbmm folds each iteration's axpy into the GEMM (3 GEMMs/iter, 0 pointwise kernels).
+    (an fp16 sum-of-squares of a ~unit 512^2 matrix overflows; fp32 is also strictly better than bf16's) —
+    the norm is the one place low precision hurts (iteration stability needs the initial spectral norm
+    <= 1), so it stays fp32 regardless of ns_dtype. The iteration GEMMs run in `ns_dtype`: fp16 here
+    (sm75 = Turing/T4, fp16 tensor cores, no bf16; cuBLAS still accumulates in fp32) — sm120/Blackwell
+    overrides to bf16 (wider range, device-portable). baddbmm folds each iteration's axpy into the GEMM.
 
     NOTE (Round-4 T4): each baddbmm emits a cuBLAS bias DtoD memcpy (~11% of the step, DtoD count ~=
     baddbmm count). Replacing it with bmm + in-place axpy DOES kill the memcpy but trades it for two extra
@@ -82,7 +89,7 @@ def newton_schulz(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7):
 
 
 class FusedMuon(optim.Optimizer):
-    """Polar-Express Muon with foreach + baddbmm + configurable NS dtype (bf16 baseline / fp16 for T4).
+    """Polar-Express Muon with foreach + baddbmm + configurable NS dtype (fp16 on Turing/sm75; sm120 overrides to bf16).
 
     Only 2D and 3D params with a grad are stepped (3D experts orthogonalized per slice); route 1D params
     and conv kernels to AdamW upstream. `scale_mode` sets the POST-Newton-Schulz update scaling; it does
@@ -98,13 +105,17 @@ class FusedMuon(optim.Optimizer):
     normuon/aurora use the eager apply (not the CUDA-graph capture path).
     """
 
+    # Per-arch NS iteration dtype, overridable by subclasses (sm120 -> bf16). Single source of
+    # truth for the optimizer default; ns_dtype=None in __init__ resolves to this.
+    DEFAULT_NS_DTYPE = _NS_DTYPE
+
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, scale_mode=_scaling.DEFAULT_MODE,
+                 coeffs=_DSV4_COEFFS, ns_dtype=None, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
-        self.ns_dtype = ns_dtype
+        self.ns_dtype = ns_dtype if ns_dtype is not None else self.DEFAULT_NS_DTYPE
         self.scale_mode = _scaling.validate(scale_mode)
         self.aurora_k = _scaling.AURORA_K if aurora_k is None else aurora_k
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking

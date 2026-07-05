@@ -266,7 +266,7 @@ def _amalg_eager(X, coeffs):
 AMALG_COMPILE = _amalg_compiled is not None
 
 
-def newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7, force_eager=False):
+def newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7, force_eager=False):
     """Polar-Express Newton-Schulz with the two SYMMETRIC GEMMs done by the symmul kernel.
 
     Bit-for-bit the same algorithm as `kernels.sm75.muon.newton_schulz` (same PE coeffs, same

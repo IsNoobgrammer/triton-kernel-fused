@@ -58,6 +58,8 @@ class FusedMuon(_FusedMuon75):
     on a memory-constrained GPU). State dict / constructor are identical across all modes.
     """
 
+    DEFAULT_NS_DTYPE = torch.bfloat16   # Blackwell: native bf16 tensor cores (overrides sm75's fp16)
+
     def __init__(self, *args, use_symmul=True, use_gram=True, gram_restarts=None, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)

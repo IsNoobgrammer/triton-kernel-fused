@@ -137,7 +137,7 @@ def symmul2(S1, S2, out=None):
     return Y
 
 
-def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.float16, eps=1e-7,
+def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7,
                        gram_dtype=None, restart_at=GRAM_RESTART_AT, force_eager=False):
     """Polar-Express NS via the Gram recurrence: R <- C^2 R, Q <- C Q, X_out = Q X0.
 
@@ -204,7 +204,7 @@ class GramNewtonSchulz:
 
     def __init__(self, ns_coefficients=_DSV4_COEFFS,
                  gram_newton_schulz_reset_iterations=GRAM_RESTART_AT,
-                 ns_dtype=torch.float16, gram_dtype=None):
+                 ns_dtype=torch.bfloat16, gram_dtype=None):
         self.coeffs = tuple(tuple(float(v) for v in row) for row in ns_coefficients)
         self.resets = tuple(gram_newton_schulz_reset_iterations or ())
         if any(not 1 <= r < len(self.coeffs) for r in self.resets):
@@ -219,7 +219,7 @@ class GramNewtonSchulz:
 
 
 def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1e4, 1e6),
-                      ns_dtype=torch.float16, seed=0, verbose=True, bench=True):
+                      ns_dtype=torch.bfloat16, seed=0, verbose=True, bench=True):
     """Grid-search restart placement(s) for a coefficient set (GPU required).
 
     Scores every combination of `num_restarts` positions in [1, len(coeffs)-1] on
