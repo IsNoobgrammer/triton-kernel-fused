@@ -43,18 +43,15 @@ COMMON = dict(steps=6000, batch=768)
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
 # v16 wave (model stays FP32; ns_dtype = the Newton-Schulz precision, NOT the model dtype).
-# Part A - KJ ns_dtype x nesterov 2x2 factorial (all wd 0.1, aurora_k1, 8-iter KJ), 2 seeds =
-#   8 arms. Tests whether NS precision or nesterov move the needle + their interaction.
-# Part B - PE-8 NaN RESCUE: PE-8 NaN'd in fp16 NS (deterministic on s0). Does higher-precision
-#   NS fix it? bf16 (range) x2 seeds + fp32 (full precision) on s0 (the deterministic-NaN seed).
-#   bf16 fixes => range issue, PE-8 reopens w/ bf16 NS; fp32 also NaNs => coeffs fundamentally
-#   diverge on our matrices (PE-8 truly dead).
-ARMS = (
-    [dict(arm="default", seed=s, ns_dtype=dt, nesterov=nes)
-     for dt in ("fp16", "bf16") for nes in (True, False) for s in (0, 1)]        # A: 8
-    + [dict(arm="default", seed=s, coeffs="pe", ns_dtype="bf16") for s in (0, 1)]  # B: PE-8 bf16
-    + [dict(arm="default", seed=0, coeffs="pe", ns_dtype="fp32")]                  # B: PE-8 fp32 (NaN seed)
-)
+# KJ ns_dtype x nesterov 2x2 factorial (all wd 0.1, aurora_k1, 8-iter KJ), 2 seeds = 8 arms.
+# Tests whether NS precision (fp16/bf16) or nesterov move the needle + their interaction.
+# (PE-8 skipped - already dead, not worth re-benching.)
+ARMS = [
+    dict(arm="default", seed=s, ns_dtype=dt, nesterov=nes)
+    for dt in ("fp16", "bf16")
+    for nes in (True, False)
+    for s in (0, 1)
+]
 
 
 def _tag(r):
