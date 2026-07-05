@@ -73,21 +73,17 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 # v23 (ema): does the anneal lift the mean above 0.429 by un-capping s23/s12? 8 arms.
 # v28 wave: IS THE EMA DEAD WEIGHT? v25 revealed base aurora n=8 (0.432, d2 0.441) ~= xo (0.429,
 # d2 0.428) and BEATS aurora_ema (0.468) - the n=2 base estimate that made ema look good was
-# unlucky. So xo's win may be entirely xorth, not the ema. Test all three at n=8, SAME LAUNCH
+# unlucky. So xo's win may be entirely xorth, not the ema. Test both at n=8, SAME LAUNCH
 # (const-LR 10k, SEEDS8) so base-vs-ema-substrate is drift-clean:
 #   v28  = xorth 0.01 on BASE aurora (NO ema)      -> if == xo, drop the ema entirely
 #   v27  = xorth 0.01 on aurora_ema (= v24 repeat) -> same-launch anchor for v28 + run-to-run var vs v24
-#   v29  = aurora_ema_v2 (post-polar EMA, normuon-style; breaks orthogonality) -> completes the
-#          scale-mode family at n=8 (v22 tested it 2-seed, tied v1). Does post-EMA differ from
-#          pre-EMA (v1) or from plain base once noise-robust?
-# 3 configs x 8 = 24 arms. Key reads: v28 vs v27 (ema worth keeping?), v27 vs v24 (launch noise floor).
+# 2 configs x 8 = 16 arms. Key reads: v28 vs v27 (ema worth keeping?), v27 vs v24 (launch noise floor).
+# (post-EMA aurora_ema_v2 deferred - keep launch <=16 arms.)
 ARMS = (
     [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
           xorth=0.01) for s in SEEDS8]                                         # v28 base aurora + xorth (no ema)
     + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
             xorth=0.01) for s in SEEDS8]                                       # v27 ema + xorth (= v24 repeat)
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6)
-       for s in SEEDS8]                                                        # v29 post-EMA (normuon-style)
 )
 
 
