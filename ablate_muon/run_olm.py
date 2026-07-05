@@ -71,18 +71,23 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 # 0->0.1 over [0,1000], cosine decay 0.1->0 over [1000,6000], 0 after. Peak 0.1 (10x v24 const 0.01)
 # is safe BECAUSE it is off before deep seeds specialize. Compare per-seed vs v24 (const 0.01) and
 # v23 (ema): does the anneal lift the mean above 0.429 by un-capping s23/s12? 8 arms.
-# v27 wave (same launch as v26): RUN-TO-RUN VARIANCE probe - re-run the EXACT v24 config
-# (aurora_ema + xorth 0.01 constant, SEEDS8, const-LR 10k) a 2nd time. Same seed + same config,
-# different launch -> isolates bf16 launch non-determinism from seed variance. Per-seed |v27-v24|
-# = the launch-noise floor; any arm-to-arm delta smaller than it is not real. Settles how much of
-# our cross-launch caveat is actually costing us. 8 arms (identical tags to v24 by design).
+# v28 wave: IS THE EMA DEAD WEIGHT? v25 revealed base aurora n=8 (0.432, d2 0.441) ~= xo (0.429,
+# d2 0.428) and BEATS aurora_ema (0.468) - the n=2 base estimate that made ema look good was
+# unlucky. So xo's win may be entirely xorth, not the ema. Test all three at n=8, SAME LAUNCH
+# (const-LR 10k, SEEDS8) so base-vs-ema-substrate is drift-clean:
+#   v28  = xorth 0.01 on BASE aurora (NO ema)      -> if == xo, drop the ema entirely
+#   v27  = xorth 0.01 on aurora_ema (= v24 repeat) -> same-launch anchor for v28 + run-to-run var vs v24
+#   v29  = aurora_ema_v2 (post-polar EMA, normuon-style; breaks orthogonality) -> completes the
+#          scale-mode family at n=8 (v22 tested it 2-seed, tied v1). Does post-EMA differ from
+#          pre-EMA (v1) or from plain base once noise-robust?
+# 3 configs x 8 = 24 arms. Key reads: v28 vs v27 (ema worth keeping?), v27 vs v24 (launch noise floor).
 ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
-          xorth=0.1, xorth_sched="cos", xorth_warm=1000, xorth_decay_end=6000)
-     for s in SEEDS8]                                                          # v26 annealed xorth
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
+          xorth=0.01) for s in SEEDS8]                                         # v28 base aurora + xorth (no ema)
     + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
-            xorth=0.01)
-       for s in SEEDS8]                                                        # v27 = v24 repeat (run-to-run var)
+            xorth=0.01) for s in SEEDS8]                                       # v27 ema + xorth (= v24 repeat)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6)
+       for s in SEEDS8]                                                        # v29 post-EMA (normuon-style)
 )
 
 
