@@ -84,6 +84,8 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             ns_dtype="bf16", nesterov=True, momentum=0.95,              # NS precision bf16 default (v16: ==fp16, more portable; norms stay fp32); muon heavy-ball momentum
             amp="bf16",                                                 # model precision: "bf16" autocast mixed precision (fp32 master weights, no GradScaler; modern GPUs) | "fp32" pure fp32 (T4: no bf16 tensor cores). For a T4 run set amp="fp32", ns_dtype="fp16".
             repulse=0.0, decor=0.0, grad_rep=0.0, xorth=0, niche=0.0,   # mechanism knobs (mech.py)
+            xorth_sched=None, xorth_warm=1000, xorth_decay_end=6000,    # anneal xorth beta: None=const; "lin"/"cos"=ramp 0->peak by warm, decay peak->0 by decay_end
+
             scap=0.0, cautious=0.0, grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
 
@@ -221,7 +223,7 @@ def run(cfg):
         with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=amp_on):
             loss = F.cross_entropy(model(xb, pad_mask=(xb != PAD)), yb)  # load counts real tokens only
         loss.backward()                                              # bf16 forward, fp32 master weights, no GradScaler needed
-        mech.pre_step(c, all_params, expert_ws, mblocks, mstate)      # grad-space mechanisms
+        mech.pre_step(c, all_params, expert_ws, mblocks, mstate, step)  # grad-space mechanisms
         # WSD schedule (LM-standard), identical for AdamW and Muon: linear warmup ->
         # stable -> cosine decay to min_lr_frac over the final decay_frac of steps.
         if c["warmup"] and step <= c["warmup"]:

@@ -61,15 +61,21 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 #   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
 # v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
 # ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
-# v25 wave: 8-SEED CONTROLS for base aurora + normuon (SEEDS8, const-LR 10k) so the 3-way is fully
-# noise-robust: v23 aurora_ema ns8 (0.468+/-0.055, done) vs base aurora ns8 vs normuon ns10 - all
-# 8 seeds, same set, directly comparable. Settles whether aurora_ema's depth win over base aurora
-# and its tie w/ normuon hold at n=8. normuon = ns10 (the const-LR-viable one; ns8 stalls const-LR
-# per v21, no need to reconfirm at 8 seeds). 2 configs x 8 = 16 arms.
-ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in SEEDS8]     # base aurora ns8
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="normuon", ns_kj=8) for s in SEEDS8]   # normuon ns10
-)
+# v25 wave [DONE/pushed 887613a]: 8-SEED CONTROLS base aurora + normuon (SEEDS8, const-LR 10k).
+# v26 wave: ANNEALED XORTH on aurora_ema (SEEDS8, const-LR 10k) - tests the "keep-floor-drop-cap"
+# prediction from the v24 seed-wise debug. v24 finding: constant xorth 0.01 is a variance-reducer
+# (r=-0.90 vs ema depth on d2/d3/d4) - it LIFTS the stalled/late floor but CAPS the naturally-deep
+# seeds (s23 lost 0.21 d2, s12 lost 0.05) because late-phase decorrelation homogenizes specialization
+# that already formed. HYPOTHESIS: anneal beta strong-early/off-late -> keep the rescue (break the
+# symmetry that stalls) AND recover the ceiling (stop capping deep seeds). Schedule: linear ramp
+# 0->0.1 over [0,1000], cosine decay 0.1->0 over [1000,6000], 0 after. Peak 0.1 (10x v24 const 0.01)
+# is safe BECAUSE it is off before deep seeds specialize. Compare per-seed vs v24 (const 0.01) and
+# v23 (ema): does the anneal lift the mean above 0.429 by un-capping s23/s12? 8 arms.
+ARMS = [
+    dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
+         xorth=0.1, xorth_sched="cos", xorth_warm=1000, xorth_decay_end=6000)
+    for s in SEEDS8
+]
 
 
 def _tag(r):
@@ -106,6 +112,8 @@ def _tag(r):
             t += f"_{pre}{r[key]}"
     if r.get("xorth"):
         t += f"_xo{r['xorth']}"
+        if r.get("xorth_sched"):
+            t += f"{r['xorth_sched']}anneal"
     if r.get("mult", 4) != 4:
         t += f"_m{r['mult']}"
     if r.get("steps", 6000) != 6000:

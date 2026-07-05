@@ -8,20 +8,43 @@ creates once ({}) and threads through every step (holds EMA/slow/prev/power-iter
 the online harness uses. Verdicts on grok live in ideas_todo.md — re-tested here because
 grok was the wrong regime.)
 """
+import math
+
 import torch
 import torch.nn.functional as F
 
 
 @torch.no_grad()
-def pre_step(cfg, params, expert_ws, mblocks, state):
+def _xorth_beta(cfg, step):
+    """Effective xorth strength at `step`. Default = constant cfg['xorth']. If xorth_sched
+    is set ('lin'|'cos'), anneal: ramp 0->peak over [0, xorth_warm], then decay peak->0 over
+    [xorth_warm, xorth_decay_end], then 0. Tests 'break symmetry early, don't cap deep seeds late'."""
+    peak = cfg.get("xorth", 0)
+    sched = cfg.get("xorth_sched")
+    if not sched or not peak:
+        return peak
+    warm = cfg.get("xorth_warm", 1000)
+    dend = cfg.get("xorth_decay_end", 6000)
+    if step <= warm:
+        return peak * step / max(warm, 1)                        # linear ramp 0 -> peak
+    if step >= dend:
+        return 0.0
+    prog = (step - warm) / max(dend - warm, 1)                   # 0..1 across decay window
+    if sched == "cos":
+        return peak * 0.5 * (1 + math.cos(math.pi * prog))       # smooth peak -> 0
+    return peak * (1 - prog)                                     # linear peak -> 0
+
+
+def pre_step(cfg, params, expert_ws, mblocks, state, step=0):
     if cfg.get("decor", 0) > 0:                                   # subtract shared expert grad
         for w in expert_ws:
             w.grad -= cfg["decor"] * w.grad.mean(0, keepdim=True)
     if cfg.get("grad_rep", 0) > 0:                                # amplify each expert's deviation
         for w in expert_ws:
             w.grad += cfg["grad_rep"] * (w.grad - w.grad.mean(0, keepdim=True))
-    if cfg.get("xorth", 0) and expert_ws:                        # cross-expert decorrelate grads along E axis
-        beta = cfg["xorth"]                                       # strength: 0=off, 1=full whiten (old); keep LOW (~0.05)
+    beta = _xorth_beta(cfg, step)
+    if beta and expert_ws:                                       # cross-expert decorrelate grads along E axis
+        # beta: 0=off, 1=full whiten (old); keep LOW (~0.05) or anneal via xorth_sched
         Gs = [w.grad.reshape(w.shape[0], -1).float() for w in expert_ws]   # (E, D_i) per weight, D varies
         Cs = []                                                   # cross-expert Grams: all (E, E) -> stackable
         for G in Gs:
