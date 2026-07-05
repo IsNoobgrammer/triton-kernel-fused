@@ -50,13 +50,13 @@ COMMON = dict(steps=6000, batch=768)
 # baseline) so the whole curve is SAME-LAUNCH - sidesteps bf16 cross-launch non-determinism (v17).
 # muon_lr matched adamw lr (1e-3) by convention; Muon's controlled-magnitude update may want higher.
 # Rank on AUC + depth-2.
-# v19 wave: MOMENTUM SWEEP - Muon heavy-ball momentum {0.9, 0.95, 0.98} x2 seeds. Fine knob
-# (likely noise-limited like nesterov, but 0.9->0.98 is a real range - 0.98 = much longer grad
-# memory), swept for completeness. 0.95 = default, INCLUDED for same-launch anchor (bf16 non-
-# determinism). All else at adopted default (bf16-amp, bf16 NS, aurora_k1, 8-iter, wd 0.1, mlr 1e-3).
+# v19 wave: MOMENTUM SWEEP - Muon heavy-ball momentum {0.88, 0.9, 0.95, 0.98, 0.99} x2 seeds.
+# Fine knob (likely noise-limited like nesterov, but 0.88->0.99 spans ~8x->100x grad memory, so
+# the ends may separate). 0.95 = default, INCLUDED for same-launch anchor (bf16 non-determinism).
+# All else at adopted default (bf16-amp, bf16 NS, aurora_k1, 8-iter, wd 0.1, mlr 1e-3).
 ARMS = [
     dict(arm="default", seed=s, momentum=m)
-    for m in (0.9, 0.95, 0.98)
+    for m in (0.88, 0.9, 0.95, 0.98, 0.99)
     for s in (0, 1)
 ]
 
