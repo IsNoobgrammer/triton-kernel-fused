@@ -71,20 +71,31 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 # 0->0.1 over [0,1000], cosine decay 0.1->0 over [1000,6000], 0 after. Peak 0.1 (10x v24 const 0.01)
 # is safe BECAUSE it is off before deep seeds specialize. Compare per-seed vs v24 (const 0.01) and
 # v23 (ema): does the anneal lift the mean above 0.429 by un-capping s23/s12? 8 arms.
-# v28 wave: IS THE EMA DEAD WEIGHT? v25 revealed base aurora n=8 (0.432, d2 0.441) ~= xo (0.429,
-# d2 0.428) and BEATS aurora_ema (0.468) - the n=2 base estimate that made ema look good was
-# unlucky. So xo's win may be entirely xorth, not the ema. Test both at n=8, SAME LAUNCH
-# (const-LR 10k, SEEDS8) so base-vs-ema-substrate is drift-clean:
-#   v28  = xorth 0.01 on BASE aurora (NO ema)      -> if == xo, drop the ema entirely
-#   v27  = xorth 0.01 on aurora_ema (= v24 repeat) -> same-launch anchor for v28 + run-to-run var vs v24
-# 2 configs x 8 = 16 arms. Key reads: v28 vs v27 (ema worth keeping?), v27 vs v24 (launch noise floor).
-# (post-EMA aurora_ema_v2 deferred - keep launch <=16 arms.)
-ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
-          xorth=0.01) for s in SEEDS8]                                         # v28 base aurora + xorth (no ema)
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
-            xorth=0.01) for s in SEEDS8]                                       # v27 ema + xorth (= v24 repeat)
+# === TWO NEXT SWEEPS (Fable ideas, both testable on current low-ratio screen) ===
+# Both are 16 arms; run as SEPARATE launches. Set ARMS = ARMS_UNDERORTH or ARMS_SPECTRAL.
+#
+# v29 UNDER-ORTHOGONALIZATION (perf-per-flop via the DENOMINATOR): the coeff axis is dead for LOSS in the
+# MORE-iters direction; nobody tested FEWER. ns4 = 2 KJ (aggressive quintic) + 2 pin = 4 iters, HALF of
+# ns8's 8. Wide singular band; if it TIES ns8 on aggregate frac, that's a free ~50% cut of NS GEMMs.
+# Drift-clean parity: ns8 baseline + ns4 IN THE SAME LAUNCH, base aurora, wd0.1, SEEDS8. wd held fixed
+# (broad basin); a tie needs no retune (even better), a loss triggers a wd-retune follow-up. 2x8 = 16.
+ARMS_UNDERORTH = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in SEEDS8]   # ns8 baseline
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=2) for s in SEEDS8]  # ns4 = 2 KJ + 2 pin
 )
+#
+# v30 SPECTRAL WEIGHT DECAY (route accumulated per-row momentum energy into the DECAY, not the update):
+# stale rows (low energy) decayed harder, same TOTAL decay (mean-normalized). Works through wd - the one
+# knob that clears the noise floor. gamma=0 is standard base aurora (in-launch control + gives the row-
+# energy CoV gate for free via swd_cov); gamma=1.0 is the strong dose. If gamma1 != gamma0 on aggregate
+# SEEDS8 frac -> signal, refine; if flat (or swd_cov ~0) -> dead. base aurora ns8, wd0.1. 2x8 = 16.
+ARMS_SPECTRAL = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
+          spectral_wd=0.0) for s in SEEDS8]                                    # gamma 0 = standard wd control
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
+            spectral_wd=1.0) for s in SEEDS8]                                  # gamma 1 = strong redistribution
+)
+ARMS = ARMS_UNDERORTH                                                          # <- swap to ARMS_SPECTRAL for the 2nd launch
 
 
 def _tag(r):
@@ -110,6 +121,8 @@ def _tag(r):
             t += f"_mlr{r['muon_lr']}"
         if r.get("momentum", 0.95) != 0.95:
             t += f"_mom{r['momentum']}"
+        if r.get("spectral_wd", 0.0) > 0:
+            t += f"_swd{r['spectral_wd']}"
     if r.get("decay_frac", 0.2) == 0:
         t += "_constlr"
     if r.get("amp", "bf16") == "bf16":

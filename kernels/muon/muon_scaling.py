@@ -179,6 +179,29 @@ def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):
     return (Ohat * (C / fro).view(-1, 1, 1)).to(O.dtype)
 
 
+def spectral_wd_mult(u, e_ema, gamma, beta=0.99, eps=1e-12):
+    """Spectral weight decay: REDISTRIBUTE decoupled wd across rows by their accumulated momentum energy.
+
+    u     : (M, rows, cols) pre-orthogonalization momentum (the NS input).
+    e_ema : (M, rows) fp32 per-row energy EMA, MUTATED IN PLACE.
+    gamma : redistribution strength (0 = uniform = standard wd).
+    Returns (mult, cov):
+      mult : (M, rows) per-row multiplier on the decay, mean 1 per slice (so AVG decay == wd; only the
+             DISTRIBUTION changes). Low-energy (stale) rows -> mult > 1 (decayed harder); active < 1.
+      cov  : mean per-slice coefficient-of-variation of e_ema (the 5-min gate: if ~0, rows are uniform
+             and spectral wd is a no-op regardless of gamma).
+    """
+    e_now = u.float().pow(2).mean(dim=-1)                         # (M, rows) per-row energy this step
+    e_ema.mul_(beta).add_(e_now, alpha=1.0 - beta)               # EMA in place
+    mean = e_ema.mean(dim=-1, keepdim=True).clamp_min(eps)        # per-slice mean -> (M,1)
+    cov = (e_ema.std(dim=-1) / mean.squeeze(-1)).mean()          # gate diagnostic (scalar)
+    if gamma == 0:
+        return None, cov
+    s = (e_ema / mean).clamp_min(eps).pow(-gamma)                # low energy -> large multiplier
+    s = s / s.mean(dim=-1, keepdim=True).clamp_min(eps)          # renormalize: mean 1 per slice
+    return s.clamp(0.25, 4.0), cov
+
+
 def _selfcheck():                                                # pragma: no cover
     torch.manual_seed(0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"

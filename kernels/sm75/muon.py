@@ -111,13 +111,23 @@ class FusedMuon(optim.Optimizer):
 
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_DSV4_COEFFS, ns_dtype=None, scale_mode=_scaling.DEFAULT_MODE,
-                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None):
+                 ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
+                 spectral_wd=0.0, swd_beta=0.99):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype if ns_dtype is not None else self.DEFAULT_NS_DTYPE
         self.scale_mode = _scaling.validate(scale_mode)
         self.aurora_k = _scaling.AURORA_K if aurora_k is None else aurora_k
+        # SPECTRAL WEIGHT DECAY (idea: route accumulated per-row update energy into the DECAY, not the
+        # update). gamma=spectral_wd; 0 = standard uniform decoupled wd. gamma>0 REDISTRIBUTES the same
+        # total decay by row staleness: rows with LOW EMA'd momentum energy (stale, optimizer not
+        # maintaining them) get decayed HARDER; active rows lighter. Acts on W, sidesteps the polar
+        # entirely (no orthogonality break, no re-flatten). Mean-normalized so avg decay == wd (isolates
+        # redistribution). swd_beta = energy-EMA momentum. See kernels/muon/muon_scaling.spectral_wd_mult.
+        self.spectral_wd = float(spectral_wd)
+        self.swd_beta = float(swd_beta)
+        self._swd_cov = None                                          # last-step row-energy coeff-of-variation (gate diagnostic)
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
         # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
         # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
@@ -170,6 +180,8 @@ class FusedMuon(optim.Optimizer):
                 self.state[anchor]["muon_mom"] = torch.zeros((M, r, c), device=anchor.device, dtype=self.ns_dtype)
             if _scaling.needs_perrow_state(self.scale_mode) and "scale_v" not in self.state[anchor]:
                 self.state[anchor]["scale_v"] = _scaling.perrow_state(M, r, anchor.device)  # per-row EMA (normuon post / aurora_ema pre); round-trips in state_dict
+            if self.spectral_wd > 0 and "swd_e" not in self.state[anchor]:
+                self.state[anchor]["swd_e"] = torch.zeros((M, r), device=anchor.device)  # per-row momentum-energy EMA for spectral wd (fp32; round-trips)
             # aurora/per-row fold their scale into the update tensor, so the scalar is unused (1.0)
             scale = (_scaling.scalar_scale(self.scale_mode, r, c)
                      if self.scale_mode in _scaling.SCALAR_MODES else 1.0)
@@ -278,7 +290,8 @@ class FusedMuon(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self.use_graph and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)):
+        if (self.use_graph and self.spectral_wd == 0
+                and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode))):
             self._graph_step()                                    # captured graph supports scalar scales only
             return loss
 
@@ -295,7 +308,8 @@ class FusedMuon(optim.Optimizer):
             # momentum + Newton-Schulz run batched, and the update is scattered back. Mixed-precision
             # (AdamW-8bit norm): fp32 master weights, fp32 grads, fp16 momentum state + NS.
             plan = self._plan(group, params)
-            if wd != 0:
+            spectral = self.spectral_wd > 0 and wd != 0
+            if wd != 0 and not spectral:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
@@ -304,6 +318,7 @@ class FusedMuon(optim.Optimizer):
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
                 v_all = self.state[g["anchor"]].get("scale_v")       # (M,r) EMA state for per-row modes
+                e_all = self.state[g["anchor"]].get("swd_e") if spectral else None  # (M,r) energy EMA for spectral wd
                 alpha = -lr * g["scale"]                              # scalar modes fold the scale here
                 for members, start, crows in g["chunks"]:            # bounded row-chunks (memory cap)
                     mom_c = mom[start:start + crows]                  # view into the persistent buffer
@@ -313,6 +328,13 @@ class FusedMuon(optim.Optimizer):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
+                    if spectral:                                     # per-row decay from accumulated momentum energy (skips scalar decay above)
+                        s, cov = _scaling.spectral_wd_mult(u, e_all[start:start + crows], self.spectral_wd, self.swd_beta)
+                        self._swd_cov = float(cov)
+                        for p, o, n in members:                     # weight[row] *= (1 - lr*wd*s[row]); s mean 1 -> avg == wd
+                            m = (s[o:o + n] if s is not None else 1.0)
+                            pv = p.view(n, r, c)
+                            pv.mul_(1.0 - lr * wd * (m.unsqueeze(-1) if s is not None else 1.0))
                     if aurora:                                        # iterative prescale+re-orthogonalize (K polars)
                         out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
                     elif aurora_ema:                                  # aurora + normuon per-row EMA memory
