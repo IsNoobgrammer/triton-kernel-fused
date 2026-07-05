@@ -552,6 +552,22 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   (0.01-0.2) beats large; (b) fewer NS iters never worse (perf-per-flop); (c) PE-8 structurally
   unstable; (d) aurora_k1 > normuon/polar (scale axis, that one WAS robust). Fine rankings
   need many seeds; coarse verdicts hold.
+- [olm v16 DONE - ns_dtype x nesterov 2x2 factorial on RTX 6000, model FP32] final frac:
+  fp16+nest 0.553/0.580 | fp16+nonest 0.561/0.557 | bf16+nest 0.560/0.558 |
+  bf16+nonest 0.566/0.471. Cell means all in 0.519-0.567 (0.048 band); within-cell seed
+  spread up to 0.095 => WASH, both knobs below the seed-noise floor. SURVIVING TAKEAWAYS:
+  (a) bf16 NS == fp16 (no cost) -> bf16 is a safe, more device-PORTABLE default (kills the
+  fp16 T4-vs-RTX shift risk); (b) nesterov on/off doesn't matter, keep default on.
+  CLARIFICATION (user caught): OLM model is FP32 (no autocast anywhere - olm.py .to(dev), no
+  .half/.bfloat16); ns_dtype only sets the Newton-Schulz precision. So "PE-8 NaN" was in the
+  fp16 NS, NOT the model. ns_dtype now supports fp32 too (kept for future). No model-dtype
+  (AMP) knob exists - real-LM AMP transfer would need adding autocast (+GradScaler for fp16).
+- [olm BUDGET/NOISE decision] 3 axes now confirm fine knobs (wd-fine, iters, dtype/nesterov)
+  sit BELOW OLM resolution at 6000st/2-seeds. 10k steps would shrink endpoint spread (late
+  seeds finish emerging; still compute-bound at 10k) but is the WRONG tool for seed VARIANCE -
+  more SEEDS averages 1/N, more steps only removes 1 seed's mid-transition bias. STANDARD:
+  6000 steps + 3 seeds + AUC when resolution needed; 10k reserved for final winner confirm;
+  screen only COARSE knobs (lr) where 2 seeds suffice. Don't chase sub-noise deltas.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
