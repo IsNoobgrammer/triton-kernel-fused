@@ -61,12 +61,15 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 #   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
 # v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
 # ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
-# v24 wave: AURORA_EMA + XORTH 0.01 STACK - 8 seeds (SEEDS8), const-LR 10k. xorth (grad-space
-# cross-expert decorrelation, pre_step) is orthogonal to aurora_ema (scale mode), so they compose.
-# Does a low-beta xorth ADD to aurora_ema (deeper / more spec) or is it redundant once the EMA is
-# deepening composition? Directly comparable to v23 (aurora_ema ns8, same SEEDS8). ns8 default.
-ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6, xorth=0.01)
-        for s in SEEDS8]
+# v25 wave: 8-SEED CONTROLS for base aurora + normuon (SEEDS8, const-LR 10k) so the 3-way is fully
+# noise-robust: v23 aurora_ema ns8 (0.468+/-0.055, done) vs base aurora ns8 vs normuon ns10 - all
+# 8 seeds, same set, directly comparable. Settles whether aurora_ema's depth win over base aurora
+# and its tie w/ normuon hold at n=8. normuon = ns10 (the const-LR-viable one; ns8 stalls const-LR
+# per v21, no need to reconfirm at 8 seeds). 2 configs x 8 = 16 arms.
+ARMS = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in SEEDS8]     # base aurora ns8
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="normuon", ns_kj=8) for s in SEEDS8]   # normuon ns10
+)
 
 
 def _tag(r):
