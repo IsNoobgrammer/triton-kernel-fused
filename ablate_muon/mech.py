@@ -20,14 +20,20 @@ def pre_step(cfg, params, expert_ws, mblocks, state):
     if cfg.get("grad_rep", 0) > 0:                                # amplify each expert's deviation
         for w in expert_ws:
             w.grad += cfg["grad_rep"] * (w.grad - w.grad.mean(0, keepdim=True))
-    if cfg.get("xorth", 0):                                       # whiten expert grads along E axis
-        for w in expert_ws:
-            G = w.grad.reshape(w.shape[0], -1).float()
+    if cfg.get("xorth", 0) and expert_ws:                        # cross-expert decorrelate grads along E axis
+        beta = cfg["xorth"]                                       # strength: 0=off, 1=full whiten (old); keep LOW (~0.05)
+        Gs = [w.grad.reshape(w.shape[0], -1).float() for w in expert_ws]   # (E, D_i) per weight, D varies
+        Cs = []                                                   # cross-expert Grams: all (E, E) -> stackable
+        for G in Gs:
             C = G @ G.mT
-            C = C / C.diagonal().mean().clamp_min(1e-12)
-            ev, V = torch.linalg.eigh(C)
-            isq = V @ torch.diag(ev.clamp_min(1e-6).rsqrt()) @ V.mT
-            w.grad.copy_((isq @ G).reshape_as(w.grad).to(w.grad.dtype))
+            Cs.append(C / C.diagonal().mean().clamp_min(1e-12))   # normalize Gram (diag ~1)
+        Cb = torch.stack(Cs)                                      # (W, E, E)
+        ev, V = torch.linalg.eigh(Cb)                            # ONE batched eigh over all expert weights
+        isq = V @ torch.diag_embed(ev.clamp_min(1e-6).rsqrt()) @ V.mT     # (W, E, E) batched C^{-1/2}
+        eye = torch.eye(Cb.shape[-1], device=Cb.device, dtype=Cb.dtype)
+        T = (1 - beta) * eye + beta * isq                         # (W, E, E) DAMPED nudge per weight
+        for w, G, Ti in zip(expert_ws, Gs, T):
+            w.grad.copy_((Ti @ G).reshape_as(w.grad).to(w.grad.dtype))
     if cfg.get("niche", 0) > 0:                                   # fitness-sharing lr (inverse load)
         for b in mblocks:
             f = (b.moe.load + 1) / (b.moe.load.sum() + b.moe.E)

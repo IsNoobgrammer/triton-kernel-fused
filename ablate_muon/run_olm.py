@@ -57,10 +57,14 @@ COMMON = dict(steps=6000, batch=768)
 #   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
 # v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
 # ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
-# aurora (ref) + aurora_ema v1 already run - bench ONLY the new arm (v2), 2 seeds. Compare to the
-# already-have v1/aurora (cross-launch, so mind the ~0.05 bf16 drift).
-ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6)
-        for s in (0, 1)]
+# aurora (ref) + aurora_ema v1 already run - bench ONLY new arms. v2 (post-ema) + XORTH sweep
+# (cross-expert grad decorrelation, damped strength beta) on base aurora_k1 8-iter (all default),
+# const-LR 10k. Low beta so it nudges, not dominates. All 2 seeds. (cross-launch vs v1/aurora -
+# mind ~0.05 bf16 drift.)
+ARMS = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6) for s in (0, 1)]  # post-ema (v2)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, xorth=b) for b in (0.01, 0.05, 0.1) for s in (0, 1)]  # xorth sweep on base aurora
+)
 
 
 def _tag(r):
@@ -96,7 +100,7 @@ def _tag(r):
         if r.get(key):
             t += f"_{pre}{r[key]}"
     if r.get("xorth"):
-        t += "_xo"
+        t += f"_xo{r['xorth']}"
     if r.get("mult", 4) != 4:
         t += f"_m{r['mult']}"
     if r.get("steps", 6000) != 6000:

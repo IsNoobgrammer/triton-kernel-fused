@@ -126,7 +126,7 @@ def make_tag(c):
         if c.get(key):
             t += f"_{pre}{c[key]}"
     if c.get("xorth"):
-        t += "_xo"
+        t += f"_xo{c['xorth']}"
     if c["steps"] != 6000:
         t += f"_{c['steps']}st"
     if c.get("decay_frac", 0.2) == 0:
@@ -288,7 +288,7 @@ def run(cfg):
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],
-                muon_lr=c["muon_lr"], momentum=c["momentum"], decay_frac=c["decay_frac"],
+                muon_lr=c["muon_lr"], momentum=c["momentum"], decay_frac=c["decay_frac"], xorth=c["xorth"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),
