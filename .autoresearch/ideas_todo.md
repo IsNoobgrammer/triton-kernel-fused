@@ -662,6 +662,18 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     (consistent with its historical near-null; low beta mildly positive not harmful).
   VERDICT: aurora_ema (either placement) is the winner; xorth minor. 8-seed confirm (v23, SEEDS8)
   is the lock. If EMA holds -> real-LM candidate. NOTE both EMA + xorth are bimodal (seed lottery).
+- [olm v23 DONE - aurora_ema ns8 8-SEED confirm (SEEDS8); 2-seed teaser was OPTIMISTIC] frac per
+  seed: s23 0.401, s12 0.418, s69 0.455, s2026 0.455, s24 0.453, s28 0.462, s9 0.506, s2 0.593.
+  MEAN 0.468 +/- 0.055 (d2 mean 0.327, d3 0.152). Emergence: ~6/8 deep, 1 partial (s28), 1 TOTAL
+  STALL (s2, d2 0.023 - never composed). The 2-seed v21_5 estimate (0.432) was LUCKY (both seeds
+  emerged); true mean 0.468 is ~0.036 higher.
+  CORRECTED VERDICT: aurora_ema is a MODEST real improvement, not the slam-dunk 2 seeds implied.
+  vs base aurora (2-seed 0.480): still wins DEPTH robustly (d2 0.327 vs 0.297, d3 0.152 vs 0.093)
+  but frac margin shrinks to ~0.012 = WITHIN the +/-0.055 spread (wash on compression, real on
+  depth). vs normuon ns10 (0.462): ~TIED. Seed-lottery PERSISTS (~1/8 total stall) - EMA doesn't
+  cure the intrinsic emergence-timing tail. CAVEATS: base aurora + normuon refs are only 2-seed
+  (frac comparison not fully fair) - need base-aurora ns8 x SEEDS8 control. v24 (ema+xorth 0.01,
+  same SEEDS8) = paired stack test pending. Promotion to real-LM candidate = REAL but QUALIFIED.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
