@@ -42,15 +42,17 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
-# v15 wave: COEFF/ITER axis re-bench on RTX 6000 (device-match; T4 had the coeff curve, but
-# we found a hardware shift). ns_8 (8-iter, default ns_kj=6) at wd 0.1 IS the v13 wd0.1 run -
-# do NOT re-run it; anchor the plot to that. NEW device-matched arms = ns_6 / ns_10 / PE-8, all
-# wd 0.1 aurora_k1, 2 seeds. (Capture v14 low-side first - this replaces those arms.)
-ARMS = (
-    [dict(arm="default", seed=s, ns_kj=4) for s in (0, 1)]        # ns_6 = 6-iter (KJ*4+2pin)
-    + [dict(arm="default", seed=s, ns_kj=8) for s in (0, 1)]      # ns_10 = 10-iter (dsv4_10)
-    + [dict(arm="default", seed=s, coeffs="pe") for s in (0, 1)]  # PE-8 (Polar-Express)
-)
+# v16 wave: ns_dtype x nesterov 2x2 FACTORIAL on RTX 6000 (all wd 0.1, aurora_k1, 8-iter KJ).
+# dtype {fp16, bf16} x nesterov {True, False} x 2 seeds = 8 distinct arms. Supersets both OFAT
+# sweeps + gives the interaction; no duplicated baseline. fp16+nesterov=True IS the default
+# (== v13 wd0.1) but re-run here for a clean self-contained/paired factorial (user: device is
+# fast). bf16 = stability/portability check (should kill PE-style NaN + shrink device shift).
+ARMS = [
+    dict(arm="default", seed=s, ns_dtype=dt, nesterov=nes)
+    for dt in ("fp16", "bf16")
+    for nes in (True, False)
+    for s in (0, 1)
+]
 
 
 def _tag(r):
@@ -68,6 +70,10 @@ def _tag(r):
             t += "_pe8"
         elif r.get("ns_kj", 6) != 6:
             t += f"_it{r['ns_kj'] + 2}"                           # total NS iters
+        if r.get("ns_dtype", "fp16") != "fp16":
+            t += f"_{r['ns_dtype']}"
+        if not r.get("nesterov", True):
+            t += "_nonest"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
                      ("grokfast", "gf"), ("lookahead", "la")):
