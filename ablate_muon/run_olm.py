@@ -57,14 +57,13 @@ COMMON = dict(steps=6000, batch=768)
 #   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
 # v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
 # ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
-# aurora (ref) + aurora_ema v1 already run - bench ONLY new arms. v2 (post-ema) + XORTH sweep
-# (cross-expert grad decorrelation, damped strength beta) on base aurora_k1 8-iter (all default),
-# const-LR 10k. Low beta so it nudges, not dominates. All 2 seeds. (cross-launch vs v1/aurora -
-# mind ~0.05 bf16 drift.)
-ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6) for s in (0, 1)]  # post-ema (v2)
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, xorth=b) for b in (0.01, 0.05, 0.1) for s in (0, 1)]  # xorth sweep on base aurora
-)
+# v23 wave: AURORA_EMA ns8 CONFIRM - 8 seeds, const-LR 10k. v21_5 showed aurora_ema ns8 beats both
+# parents (frac 0.432, deepest d3/d4) but on 2 seeds w/ a seed-lottery (s1 emerged spectacularly).
+# 8 seeds kills that doubt: report mean +/- spread + how many of 8 emerge. If the mean holds near
+# ~0.43-0.45 and most seeds emerge, aurora_ema promotes to a real-LM candidate. Everything default
+# (aurora_ema, ns_kj=6, wd 0.1, mlr 1e-3, bf16-amp).
+ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6)
+        for s in range(8)]
 
 
 def _tag(r):
