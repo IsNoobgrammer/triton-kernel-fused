@@ -71,11 +71,19 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 # 0->0.1 over [0,1000], cosine decay 0.1->0 over [1000,6000], 0 after. Peak 0.1 (10x v24 const 0.01)
 # is safe BECAUSE it is off before deep seeds specialize. Compare per-seed vs v24 (const 0.01) and
 # v23 (ema): does the anneal lift the mean above 0.429 by un-capping s23/s12? 8 arms.
-ARMS = [
-    dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
-         xorth=0.1, xorth_sched="cos", xorth_warm=1000, xorth_decay_end=6000)
-    for s in SEEDS8
-]
+# v27 wave (same launch as v26): RUN-TO-RUN VARIANCE probe - re-run the EXACT v24 config
+# (aurora_ema + xorth 0.01 constant, SEEDS8, const-LR 10k) a 2nd time. Same seed + same config,
+# different launch -> isolates bf16 launch non-determinism from seed variance. Per-seed |v27-v24|
+# = the launch-noise floor; any arm-to-arm delta smaller than it is not real. Settles how much of
+# our cross-launch caveat is actually costing us. 8 arms (identical tags to v24 by design).
+ARMS = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
+          xorth=0.1, xorth_sched="cos", xorth_warm=1000, xorth_decay_end=6000)
+     for s in SEEDS8]                                                          # v26 annealed xorth
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6,
+            xorth=0.01)
+       for s in SEEDS8]                                                        # v27 = v24 repeat (run-to-run var)
+)
 
 
 def _tag(r):
