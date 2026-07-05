@@ -13,6 +13,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 COMMON = dict(steps=6000, batch=768)
 
+# CANONICAL 8-seed set for noise-robust sweeps - ALWAYS use these for any 8-seed run so results
+# are directly comparable across waves (same model inits + data streams). Do not change.
+SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
+
 # OLM wave 1: calibration + baselines. Default arch = dense first layer, MoE layers 2-4
 # (user call); depth 1-6 Zipf mix; 5% label noise -> CE floor 0.42 nats = frac 0.092,
 # matching LM's residual ~0.09 (the race is toward the floor, never to zero, like text).
@@ -63,7 +67,7 @@ COMMON = dict(steps=6000, batch=768)
 # ~0.43-0.45 and most seeds emerge, aurora_ema promotes to a real-LM candidate. Everything default
 # (aurora_ema, ns_kj=6, wd 0.1, mlr 1e-3, bf16-amp).
 ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6)
-        for s in range(8)]
+        for s in SEEDS8]
 
 
 def _tag(r):
