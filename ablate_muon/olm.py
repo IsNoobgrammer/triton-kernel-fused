@@ -114,6 +114,8 @@ def make_tag(c):
             t += f"_{c['ns_dtype']}"                              # e.g. _bf16
         if not c.get("nesterov", True):
             t += "_nonest"
+        if c.get("muon_lr", 1e-3) != 1e-3:
+            t += f"_mlr{c['muon_lr']}"                            # Muon LR (adamw lr = separate 'lr')
     if c["mult"] != 4:
         t += f"_m{c['mult']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
@@ -282,6 +284,7 @@ def run(cfg):
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],
+                muon_lr=c["muon_lr"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),

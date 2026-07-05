@@ -42,15 +42,17 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
-# v17 wave: AMP CALIBRATION - does bf16 mixed-precision TRAINING (model forward in bf16 autocast,
-# fp32 master weights, eval still fp32) match pure fp32? OLM was fp32-model its whole history, so
-# verify before adopting bf16-amp as default. amp {off=fp32, bf16} x 2 seeds; everything else at
-# the new default (bf16 NS, aurora_k1, 8-iter, wd 0.1). amp="off" (bf16 NS, fp32 model) should
-# track v13 wd0.1 (fp16 NS, fp32 model) since v16 showed bf16 NS == fp16. If amp=bf16 ~= off ->
-# adopt bf16-amp (faster, LM-realistic); if it shifts -> keep fp32 model.
+# v17 DONE: bf16 mixed-precision training ADOPTED (amp=bf16 0.558 == bf16-NS fp32 baseline 0.559,
+# no drift; caveat: bf16 not bit-repro run-to-run). bf16-amp is now the default.
+# v18 wave: MUON LR SWEEP - the coarse knob (should separate THROUGH seed noise, unlike the fine
+# knobs). Vary muon_lr {3e-4, 1e-3, 2e-3, 4e-3, 8e-3} x 2 seeds; adamw lr stays 1e-3, everything
+# else at the adopted default (bf16-amp, bf16 NS, aurora_k1, 8-iter, wd 0.1). 1e-3 INCLUDED (=
+# baseline) so the whole curve is SAME-LAUNCH - sidesteps bf16 cross-launch non-determinism (v17).
+# muon_lr matched adamw lr (1e-3) by convention; Muon's controlled-magnitude update may want higher.
+# Rank on AUC + depth-2.
 ARMS = [
-    dict(arm="default", seed=s, amp=a)
-    for a in ("fp32", "bf16")
+    dict(arm="default", seed=s, muon_lr=lr)
+    for lr in (3e-4, 1e-3, 2e-3, 4e-3, 8e-3)
     for s in (0, 1)
 ]
 
@@ -74,6 +76,8 @@ def _tag(r):
             t += f"_{r['ns_dtype']}"
         if not r.get("nesterov", True):
             t += "_nonest"
+        if r.get("muon_lr", 1e-3) != 1e-3:
+            t += f"_mlr{r['muon_lr']}"
     if r.get("amp", "bf16") == "bf16":
         t += "_bf16amp"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
