@@ -568,6 +568,18 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   more SEEDS averages 1/N, more steps only removes 1 seed's mid-transition bias. STANDARD:
   6000 steps + 3 seeds + AUC when resolution needed; 10k reserved for final winner confirm;
   screen only COARSE knobs (lr) where 2 seeds suffice. Don't chase sub-noise deltas.
+- [olm v17 DONE - bf16 MIXED-PRECISION TRAINING calibration; ADOPTED as default] amp=bf16
+  (model forward in torch.autocast(bf16), fp32 master weights, no GradScaler, eval fp32) vs
+  fp32 model. final frac: amp=bf16 0.553/0.562 (mean 0.558) vs amp=fp32 0.561/0.604 (0.582),
+  same launch; d2 0.16/0.15 vs 0.14/0.09. bf16-amp == or slightly better, inside noise, and
+  == the bf16-NS fp32 baseline (0.559). => bf16 mixed precision does NOT drift from fp32; ADOPT
+  (faster + LM-realistic, already the default). NS + model both bf16 now (norms stay fp32).
+  * REPRODUCIBILITY CAVEAT (real): amp=fp32 (bf16-NS + fp32 model) should be DETERMINISTICALLY
+    identical to v16's bf16-NS arm, but s0 matched (0.561 vs 0.560) while s1 did NOT (0.604 vs
+    0.558). bf16 GEMM algo selection is not bit-stable run-to-run; near a phase-transition cliff
+    that non-determinism tips the trajectory (s1 stuck this launch, emerged last). So bf16 adds
+    ~+/-0.05 run-to-run noise ON TOP of seed noise - expect it, don't expect bit-exact repro.
+    fp32 is the choice if exact reproduction is ever needed. Mitigation = AUC + multi-seed (already used).
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
