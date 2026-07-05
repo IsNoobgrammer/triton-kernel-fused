@@ -650,6 +650,18 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   aurora_EMA ns8. Plot: dashboard_v21_5 + depth_detail_v21_5. v2 (post-polar EMA) + xorth sweep
   still queued. This is the strongest combo result of the program - promote aurora_EMA to real-LM
   candidate if the seed-confirm holds.
+- [olm v22 REST DONE - EMA placement TIED (v1~=v2); xorth mild low-beta positive] const-LR 10k,
+  frac mean: aurora_ema v1 0.432 ~= aurora_ema_v2 0.434 (TIED) << base aurora 0.480. v2 = full
+  aurora THEN normuon post-hoc EMA (breaks orthogonality); v1 = EMA in prescale (keeps it). They
+  TIE -> the EMA MEMORY is the win, NOT the placement; breaking orthogonality (v2) doesn't hurt
+  once you have the per-row memory. (My "v1>v2 via orthogonality" prediction REFUTED.)
+  * XORTH sweep on base aurora (damped beta, batched eigh): frac mean 0.01=0.463, 0.05=0.464,
+    0.10=0.471 vs base 0.480. Mild positive over base, best at beta 0.01-0.05, FADES by 0.1
+    (dose-response as predicted - low beta sweet spot). But loses to aurora_ema (0.43) and is
+    within seed-lottery noise. xorth = minor decorrelation add-on, not a compression winner
+    (consistent with its historical near-null; low beta mildly positive not harmful).
+  VERDICT: aurora_ema (either placement) is the winner; xorth minor. 8-seed confirm (v23, SEEDS8)
+  is the lock. If EMA holds -> real-LM candidate. NOTE both EMA + xorth are bimodal (seed lottery).
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
