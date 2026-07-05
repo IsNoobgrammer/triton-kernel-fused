@@ -601,6 +601,23 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   memory ~ larger effective step, tips the transition. Keep 0.95; don't push high. Optimizer HP
   grid now complete: lr 1e-3 (coarse, real U-curve) + momentum 0.95 (shallow) are the two, both
   at their conventional defaults.
+- [olm v20 DONE - SCALE-MODE @ 10k STEPS; RANKING REVERSES, normuon WINS] final frac (mean) @10k:
+  normuon 0.413 < aurora ns10 0.450 ~ aurora ns8 0.453 < polar 0.517. OPPOSITE of 6k (v11:
+  aurora 0.493 won, normuon 0.555 lost). The longer budget FLIPPED it.
+  * WHY: normuon emerges LATER but DEEPER. normuon s0 second-half descent 0.509(6k)->0.381(10k),
+    reaches d2 0.721 / d3 0.303 / d4 0.151 (DEEPEST composition of the whole program), d1 still
+    0.946 (no sacrifice - got both). aurora s0 descends far less in the tail (0.577->0.515),
+    plateaus. => the 6k scale-mode screen was BIASED toward the fast-emerging mode (aurora);
+    long training reveals normuon's higher ceiling. Validates running 10k (user call).
+  * ns_8 == ns_10 EVEN AT 10k (0.453 vs 0.450) - iter count still noise-limited; ns_8 = cheaper pick.
+  * polar STILL WORST (0.517) - base muon weakest at any budget.
+  * CAVEAT: 2 seeds, normuon-aurora gap 0.04 ~ noise; AUC ties them (normuon's win is at the
+    endpoint via the late descent, AUC penalizes the slow early part). But trajectory mechanism
+    (later-but-deeper, d2 0.72) supports it.
+  IMPLICATION: normuon REOPENS as a long-budget / real-LM candidate - our "aurora_k1 wins"
+  verdict was BUDGET-DEPENDENT. Real LM trains long => confirm normuon vs aurora at real scale +
+  more seeds. Partially resolves Aurora-vs-NorMuon tension (budget-gated). dashboard_v20.png
+  (10k eval grid; the depth-2 late-overtake is the money shot). Plot now per-axis-steps capable.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
