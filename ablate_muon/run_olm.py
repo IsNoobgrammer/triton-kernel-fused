@@ -61,12 +61,11 @@ SEEDS8 = (23, 24, 12, 2, 9, 28, 69, 2026)
 #   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
 # v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
 # ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
-# v23 wave: AURORA_EMA ns8 CONFIRM - 8 seeds, const-LR 10k. v21_5 showed aurora_ema ns8 beats both
-# parents (frac 0.432, deepest d3/d4) but on 2 seeds w/ a seed-lottery (s1 emerged spectacularly).
-# 8 seeds kills that doubt: report mean +/- spread + how many of 8 emerge. If the mean holds near
-# ~0.43-0.45 and most seeds emerge, aurora_ema promotes to a real-LM candidate. Everything default
-# (aurora_ema, ns_kj=6, wd 0.1, mlr 1e-3, bf16-amp).
-ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6)
+# v24 wave: AURORA_EMA + XORTH 0.01 STACK - 8 seeds (SEEDS8), const-LR 10k. xorth (grad-space
+# cross-expert decorrelation, pre_step) is orthogonal to aurora_ema (scale mode), so they compose.
+# Does a low-beta xorth ADD to aurora_ema (deeper / more spec) or is it redundant once the EMA is
+# deepening composition? Directly comparable to v23 (aurora_ema ns8, same SEEDS8). ns8 default.
+ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6, xorth=0.01)
         for s in SEEDS8]
 
 
