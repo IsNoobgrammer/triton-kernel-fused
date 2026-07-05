@@ -129,6 +129,8 @@ def make_tag(c):
         t += "_xo"
     if c["steps"] != 6000:
         t += f"_{c['steps']}st"
+    if c.get("decay_frac", 0.2) == 0:
+        t += "_constlr"                                           # WSD decay disabled (warmup+stable only)
     if c.get("amp", "bf16") == "bf16":                            # model mixed-precision regime marker
         t += "_bf16amp"                                           # distinguishes from the fp32-model history
     return t
@@ -286,7 +288,7 @@ def run(cfg):
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],
-                muon_lr=c["muon_lr"], momentum=c["momentum"],
+                muon_lr=c["muon_lr"], momentum=c["momentum"], decay_frac=c["decay_frac"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),

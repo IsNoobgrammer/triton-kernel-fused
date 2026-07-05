@@ -50,16 +50,20 @@ COMMON = dict(steps=6000, batch=768)
 # baseline) so the whole curve is SAME-LAUNCH - sidesteps bf16 cross-launch non-determinism (v17).
 # muon_lr matched adamw lr (1e-3) by convention; Muon's controlled-magnitude update may want higher.
 # Rank on AUC + depth-2.
-# v20 wave: SCALE-MODE @ 10k STEPS - re-run the aurora/normuon/polar comparison at LONGER budget
-# so late seeds fully emerge (6k v11 was mid-transition noisy). aurora_k1 at BOTH ns_8 and ns_10
-# (does more NS fidelity help once converged?) vs normuon vs polar. 2 seeds each = 8 arms, all
-# steps=10000, adopted defaults (bf16-amp, bf16 NS, wd 0.1, mlr 1e-3). NOTE: 10k is its own regime
-# (WSD decay 8k-10k) - NOT directly comparable to the 6k dashboards; compare WITHIN v20.
+# v21 wave: CONSTANT-LR (no decay) @ 10k - is normuon a LATE EMERGER or DECAY-SPECIFIC? v20 showed
+# normuon's deep-depth surge locks to the decay onset (8k) both seeds, while aurora emerged at ~6k
+# in the stable phase. decay_frac=0 disables the cosine decay (warmup 500 kept - harmless - then
+# flat LR 1.0). If normuon STILL surges ~8k under constant LR -> intrinsic late emerger; if it
+# stays flat/low -> its v20 win was a decay artifact. aurora ns8 = control (should emerge ~6k
+# regardless). normuon at BOTH ns8 and ns10 - does more NS fidelity let it keep climbing / plateau
+# higher without the decay tail? Plus aurora ns12 (ns_kj=10, K1): a prior experiment found
+# 12-iter K1 ~= aurora K2 - does the extra NS fidelity change aurora's plateau under constant LR?
+# 2 seeds each = 8 arms, 10k, bf16-amp, wd 0.1, mlr 1e-3.
 ARMS = (
-    [dict(arm="default", seed=s, steps=10000, scale_mode="aurora", ns_kj=6) for s in (0, 1)]   # aurora_k1 ns_8
-    + [dict(arm="default", seed=s, steps=10000, scale_mode="aurora", ns_kj=8) for s in (0, 1)]  # aurora_k1 ns_10
-    + [dict(arm="default", seed=s, steps=10000, scale_mode="normuon") for s in (0, 1)]           # normuon (ns_8)
-    + [dict(arm="default", seed=s, steps=10000, scale_mode="polar") for s in (0, 1)]             # polar (ns_8)
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in (0, 1)]    # aurora ns8 (control)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=10) for s in (0, 1)]  # aurora ns12 K1 (~= k2)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="normuon", ns_kj=6) for s in (0, 1)]  # normuon ns8
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="normuon", ns_kj=8) for s in (0, 1)]  # normuon ns10
 )
 
 
@@ -86,6 +90,8 @@ def _tag(r):
             t += f"_mlr{r['muon_lr']}"
         if r.get("momentum", 0.95) != 0.95:
             t += f"_mom{r['momentum']}"
+    if r.get("decay_frac", 0.2) == 0:
+        t += "_constlr"
     if r.get("amp", "bf16") == "bf16":
         t += "_bf16amp"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
