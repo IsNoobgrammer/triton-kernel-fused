@@ -527,6 +527,31 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   exact value within noise; ranking 0.01 vs 0.1 vs 0.2 would need 4-6+ seeds (flat basin,
   likely not worth it). Emergence-timing noise caps wd resolution here. dashboard_wd.png =
   full 10-point device-matched curve.
+- [olm v15 DONE - COEFF/ITER re-bench on RTX 6000; T4 "8>6>10" did NOT reproduce]
+  Device-matched final frac (mean): 8-iter 0.526 ~= 6-iter 0.525 | 10-iter 0.549 |
+  PE-8 s1 0.467 (s0 NaN). 8-iter and 6-iter TIE; 10-iter marginally worse - all within seed
+  noise. The T4 clean ordering 8>6>10 was seed-dependent, same lesson as the wd axis: at
+  6000 steps / 2 seeds, iteration-count deltas are BELOW the emergence-timing noise floor.
+  Perf-per-flop take stands (fewer NS iters is never worse here) but "8 strictly beats 10"
+  is retracted as a clean claim.
+  * PE-8 NaN is SEED-DETERMINISTIC, not device-random [user question]: seed-0 NaNs on BOTH
+    T4 and RTX 6000; seed-1 trains on both. Cause is what the seed controls (init spectrum +
+    data), NOT hardware. PE minimax coeffs are aggressive - tuned to a specific [smin,smax];
+    when the input singular values fall outside it the degree-N polynomial AMPLIFIES instead
+    of contracting -> runaway over NS iters -> NaN in <1000 steps (eff collapses to 2.0).
+    seed-0's init lands in the overshoot regime, seed-1's doesn't (reproducible RNG lottery).
+    Device-independent because the overshoot is a LARGE runaway (orders of magnitude), so
+    fp16 T4-vs-RTX rounding (~1e-3) can't flip it - unlike the small frac SHIFT which it can.
+    KJ coeffs have a wider safe basin -> tolerate the same matrices. => PE-8 rejection is
+    STRUCTURAL not bad-luck; 50% NaN rate disqualifies regardless of s1's 0.467 (its best).
+    Also confirms our seeds fully control the run (device shift is pure fp16 accumulation).
+  dashboard_coeff.png rebuilt device-matched (8it/6it/10it/pe8; k2 -> scale axis).
+- [olm v14/v15 META] Both axes reconfirm: emergence-timing SEED NOISE is the resolution
+  ceiling on OLM at 6000st/2-seeds. Clean T4 orderings (wd peak 0.2; iters 8>6>10) were
+  seed artifacts that DON'T survive device-matched re-bench. What survives: (a) small wd
+  (0.01-0.2) beats large; (b) fewer NS iters never worse (perf-per-flop); (c) PE-8 structurally
+  unstable; (d) aurora_k1 > normuon/polar (scale axis, that one WAS robust). Fine rankings
+  need many seeds; coarse verdicts hold.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
