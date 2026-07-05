@@ -631,6 +631,25 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
   unlocks emergence) but does nothing for aurora. Both bimodal at 2 seeds (one emerges, one
   stalls) - emergence is seed-lottery under const-LR. Plot: v21 axis + depth_detail_v21 (const-
   LR overlay now flat). => normuon viable WITHOUT decay if given ns10; aurora robust at ns8.
+- [olm v22 PART - AURORA_EMA (best-of-both) WORKS; challenges the combo-null prior] New scale mode
+  aurora_ema (v1): prescale rows by their EMA 2nd-moment (normuon's per-row memory) BEFORE the
+  polar, then re-orthogonalize -> keeps orthogonality (aurora) + adds cross-step memory (normuon).
+  Per-row EMA = +0.2% mem (NOT Adam-like). const-LR 10k, final frac (mean)/d2/d3/d4:
+    aurora ns8 (base, same launch): 0.480 / 0.297 / 0.093 / 0.046
+    aurora_EMA ns8:                 0.432 / 0.405 / 0.213 / 0.114  = BEST frac, deepest d3/d4
+    aurora_EMA ns10:                0.473 / 0.347
+    normuon ns8 (v21):              0.496 / 0.294
+    normuon ns10 (v21 champ):       0.462 / 0.410 / 0.194 / 0.108
+  aurora_EMA ns8 BEATS base aurora on BOTH seeds SAME-LAUNCH (0.462/0.402 vs 0.511/0.449) and
+  reaches much deeper (d3 0.213 vs 0.093, d4 0.114 vs 0.046). It also MATCHES/BEATS the normuon
+  ns10 const-LR champ (better frac 0.432 vs 0.462, ~tied d2, deepest d3/d4 of ALL) - at ns8
+  (cheaper) with orthogonality intact. And aurora_EMA needs NO extra iters (ns8 0.432 < ns10
+  0.473), unlike normuon. => the combo landed ABOVE both parents - first time a combo beat the
+  champ-lesson prior. CAVEAT: 2 seeds, seed-lottery (ema s1 emerged spectacularly), and it's a
+  LATE emerger so AUC penalizes it (endpoint win, slow trajectory). CONFIRM: 3-4 seeds on
+  aurora_EMA ns8. Plot: dashboard_v21_5 + depth_detail_v21_5. v2 (post-polar EMA) + xorth sweep
+  still queued. This is the strongest combo result of the program - promote aurora_EMA to real-LM
+  candidate if the seed-confirm holds.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
