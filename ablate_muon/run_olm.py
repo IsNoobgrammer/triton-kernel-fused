@@ -57,11 +57,10 @@ COMMON = dict(steps=6000, batch=768)
 #   aurora_ema_v2    = full aurora, THEN normuon post-hoc EMA -> BREAKS orthogonality (normuon-faithful)
 # v1 vs v2 isolates whether the EMA belongs pre- or post-polar. Reference (v21 const-LR): aurora
 # ns8 d2 0.56; normuon ns10 d2 0.56/d3 0.33/d4 0.19 (champ). 2 seeds each = 6 arms.
-ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in (0, 1)]        # aurora (no EMA, reference)
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6) for s in (0, 1)]   # v1: EMA pre-polar
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6) for s in (0, 1)] # v2: EMA post-polar
-)
+# aurora (ref) + aurora_ema v1 already run - bench ONLY the new arm (v2), 2 seeds. Compare to the
+# already-have v1/aurora (cross-launch, so mind the ~0.05 bf16 drift).
+ARMS = [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema_v2", ns_kj=6)
+        for s in (0, 1)]
 
 
 def _tag(r):
