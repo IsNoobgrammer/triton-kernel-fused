@@ -593,6 +593,14 @@ Task difficulty is TUNABLE (depth mix / max depth / p) if wave 1 lands too easy/
     1000 at 4e-3/8e-3) -> degraded learning. Below 1e-3 (3e-4) = undertrained/slow.
   Verdict: keep muon_lr 1e-3 (robust); 2e-3 = risk/reward. dashboard_lr.png (U-curve, first
   real signal). LR is the frontier-defining knob; fine knobs were all sub-noise.
+- [olm v19 DONE - MOMENTUM SWEEP {0.88/0.9/0.95/0.98/0.99}; shallow, mostly noise, keep 0.95]
+  final frac (mean): 0.88 0.582 | 0.9 0.564 | 0.95 0.533 (BEST) | 0.98 0.567 | 0.99 0.591.
+  Fine knob, noise-dominated (within-config seed spread up to 0.15) BUT a weak real signal:
+  0.95 best mean, BOTH extremes worse (short memory 0.88 + long 0.98/0.99). High momentum shows
+  the SAME instability as high lr - mom0.98 s0 collapsed (d1->0.148), 0.99 s1 stuck - longer grad
+  memory ~ larger effective step, tips the transition. Keep 0.95; don't push high. Optimizer HP
+  grid now complete: lr 1e-3 (coarse, real U-curve) + momentum 0.95 (shallow) are the two, both
+  at their conventional defaults.
   MECHANISM (matches theory): all four saturate depth-1 (~0.946); they split on depth-2.
   polar (scalar scale, rows NOT uniform) = worst; normuon (uniform rows, breaks orthogonality)
   = mid; aurora_k1 (uniform rows AND re-orthogonalized) = best. BOTH uniformity and
