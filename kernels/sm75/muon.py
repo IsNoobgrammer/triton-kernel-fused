@@ -168,9 +168,8 @@ class FusedMuon(optim.Optimizer):
             anchor = ps[0]
             if "muon_mom" not in self.state[anchor]:                 # don't clobber a loaded checkpoint
                 self.state[anchor]["muon_mom"] = torch.zeros((M, r, c), device=anchor.device, dtype=self.ns_dtype)
-            perrow = _scaling.is_perrow(self.scale_mode)
-            if perrow and "scale_v" not in self.state[anchor]:       # per-row EMA state (round-trips in state_dict)
-                self.state[anchor]["scale_v"] = _scaling.perrow_state(M, r, anchor.device)
+            if _scaling.needs_perrow_state(self.scale_mode) and "scale_v" not in self.state[anchor]:
+                self.state[anchor]["scale_v"] = _scaling.perrow_state(M, r, anchor.device)  # per-row EMA (normuon post / aurora_ema pre); round-trips in state_dict
             # aurora/per-row fold their scale into the update tensor, so the scalar is unused (1.0)
             scale = (_scaling.scalar_scale(self.scale_mode, r, c)
                      if self.scale_mode in _scaling.SCALAR_MODES else 1.0)
@@ -300,6 +299,7 @@ class FusedMuon(optim.Optimizer):
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
+            aurora_ema = _scaling.is_aurora_ema(self.scale_mode)
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]             # (M,r,c) fp16, persistent
@@ -315,6 +315,8 @@ class FusedMuon(optim.Optimizer):
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
                     if aurora:                                        # iterative prescale+re-orthogonalize (K polars)
                         out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
+                    elif aurora_ema:                                  # EMA-prescale + re-orthogonalize (memory, stays orthogonal)
+                        out = _scaling.aurora_ema_update(u, self._polar, v_all[start:start + crows])
                     else:
                         out = newton_schulz(u, self.coeffs, self.ns_dtype)
                         if perrow:                                    # leverage-aware per-row rescale (scale folded into out)
@@ -322,7 +324,7 @@ class FusedMuon(optim.Optimizer):
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members],
-                                        alpha=(-lr if (perrow or aurora) else alpha))
+                                        alpha=(-lr if _scaling.folds_scale(self.scale_mode) else alpha))
 
         return loss
 
@@ -340,6 +342,8 @@ class DistributedMuon(FusedMuon):
 
     def __init__(self, params, *, process_group=None, **kwargs):
         super().__init__(params, **kwargs)
+        if _scaling.is_aurora_ema(self.scale_mode):                   # per-row EMA prescale not wired for the round-robin path
+            raise NotImplementedError("scale_mode 'aurora_ema' is only supported by FusedMuon, not DistributedMuon")
         self.pg = process_group
         self._owner = None                                            # owner[i] = rank that does param i
 

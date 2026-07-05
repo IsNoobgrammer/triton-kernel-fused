@@ -24,7 +24,8 @@ import torch
 SCALAR_MODES = ("polar",)
 PERROW_MODES = ("normuon",)
 AURORA_MODES = ("aurora",)
-ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES
+AURORA_EMA_MODES = ("aurora_ema",)                                    # aurora prescale + normuon's per-row EMA memory
+ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES + AURORA_EMA_MODES
 DEFAULT_MODE = "aurora"
 
 # Update RMS every mode targets (Moonlight convention; = DeepSeek-V4's sqrt(max(n,m))*gamma). For a
@@ -50,6 +51,20 @@ def is_perrow(mode):
 
 def is_aurora(mode):
     return mode in AURORA_MODES
+
+
+def is_aurora_ema(mode):
+    return mode in AURORA_EMA_MODES
+
+
+def needs_perrow_state(mode):
+    """Modes that keep a persistent per-row EMA buffer (normuon post-hoc; aurora_ema prescale)."""
+    return mode in PERROW_MODES or mode in AURORA_EMA_MODES
+
+
+def folds_scale(mode):
+    """Modes that bake the update scale into the tensor (caller applies -lr, not the scalar)."""
+    return mode in AURORA_MODES or mode in PERROW_MODES or mode in AURORA_EMA_MODES
 
 
 def validate(mode):
@@ -96,6 +111,30 @@ def aurora_update(M, polar_fn, gain=None, K=AURORA_K, beta=AURORA_BETA, eps=PERR
         r = X.norm(dim=-1).clamp_min(eps)                        # per-row L2 -> (B, rows)
         D = D.pow(beta) * r.pow(1.0 - beta)
         X = polar_fn((tgt * (X / D.unsqueeze(-1))).to(dt)).float()
+    return (gain * X).to(dt)
+
+
+def aurora_ema_update(M, polar_fn, v_ema, gain=None, beta2=PERROW_BETA2, eps=PERROW_EPS):
+    """Aurora WITH MEMORY = best-of-both attempt. Prescale rows by their EMA 2nd-moment
+    (normuon's per-row adaptivity) BEFORE the polar, then re-orthogonalize - so unlike normuon's
+    post-hoc rescale, the output STAYS orthogonal (aurora's strength) while gaining cross-step
+    per-row memory (normuon's strength). One polar solve (K=1).
+
+    M: (B, rows, cols) momenta. polar_fn: the arch's orthogonalizer. v_ema: (B, rows) fp32 EMA
+    buffer, MUTATED IN PLACE (persisted in optimizer state, +rows/(rows*cols) memory ~ normuon).
+    """
+    rows, cols = M.shape[-2], M.shape[-1]
+    if gain is None:
+        gain = RMS_TARGET * (max(rows, cols) ** 0.5)
+    tgt = (min(rows, cols) / rows) ** 0.5                        # sqrt(cols/rows) tall, 1 wide
+    dt = M.dtype
+    X = M.float()
+    fro = X.flatten(-2, -1).norm(dim=-1).clamp_min(eps)          # per-matrix Frobenius -> (B,)
+    X = X / fro.view(*fro.shape, 1, 1)
+    row_ms = X.mul(X).mean(dim=-1)                               # per-row mean-square -> (B, rows)
+    v_ema.mul_(beta2).add_(row_ms, alpha=1.0 - beta2)           # EMA in place (normuon's memory)
+    D = v_ema.sqrt().clamp_min(eps)                              # EMA-based row scale -> (B, rows)
+    X = polar_fn((tgt * (X / D.unsqueeze(-1))).to(dt)).float()  # re-orthogonalize (output stays orthogonal)
     return (gain * X).to(dt)
 
 

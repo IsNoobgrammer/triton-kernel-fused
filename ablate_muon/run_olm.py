@@ -50,20 +50,17 @@ COMMON = dict(steps=6000, batch=768)
 # baseline) so the whole curve is SAME-LAUNCH - sidesteps bf16 cross-launch non-determinism (v17).
 # muon_lr matched adamw lr (1e-3) by convention; Muon's controlled-magnitude update may want higher.
 # Rank on AUC + depth-2.
-# v21 wave: CONSTANT-LR (no decay) @ 10k - is normuon a LATE EMERGER or DECAY-SPECIFIC? v20 showed
-# normuon's deep-depth surge locks to the decay onset (8k) both seeds, while aurora emerged at ~6k
-# in the stable phase. decay_frac=0 disables the cosine decay (warmup 500 kept - harmless - then
-# flat LR 1.0). If normuon STILL surges ~8k under constant LR -> intrinsic late emerger; if it
-# stays flat/low -> its v20 win was a decay artifact. aurora ns8 = control (should emerge ~6k
-# regardless). normuon at BOTH ns8 and ns10 - does more NS fidelity let it keep climbing / plateau
-# higher without the decay tail? Plus aurora ns12 (ns_kj=10, K1): a prior experiment found
-# 12-iter K1 ~= aurora K2 - does the extra NS fidelity change aurora's plateau under constant LR?
-# 2 seeds each = 8 arms, 10k, bf16-amp, wd 0.1, mlr 1e-3.
+# v22 wave: AURORA-EMA (best-of-both) @ CONST-LR 10k. New scale mode: aurora's row-PRESCALE but
+# using normuon's per-row EMA 2nd-moment (memory) instead of the instantaneous row norm, then
+# re-orthogonalize -> keeps orthogonality (aurora's deep ceiling) + adds cross-step per-row memory
+# (normuon's breadth). Does the EMA help aurora? Compare aurora_ema {ns8, ns10} vs aurora ns8
+# (same-launch reference, dodges bf16 cross-launch drift). Reference points from v21 (const-LR):
+# aurora ns8 emerged intrinsically (d2 0.56); normuon ns10 best (d2 0.56/d3 0.33/d4 0.19).
+# 2 seeds each = 6 arms, const-LR 10k, bf16-amp, wd 0.1, mlr 1e-3.
 ARMS = (
-    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in (0, 1)]    # aurora ns8 (control)
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=10) for s in (0, 1)]  # aurora ns12 K1 (~= k2)
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="normuon", ns_kj=6) for s in (0, 1)]  # normuon ns8
-    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="normuon", ns_kj=8) for s in (0, 1)]  # normuon ns10
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=6) for s in (0, 1)]   # aurora_ema ns8
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora_ema", ns_kj=8) for s in (0, 1)]  # aurora_ema ns10
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6) for s in (0, 1)]      # aurora ns8 (reference)
 )
 
 
