@@ -82,6 +82,7 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             scale_mode="aurora", aurora_k=1, ns_kj=6, coeffs="kj",      # DEFAULT = ns8 (6 KJ) aurora_k1
             #  coeffs: "kj" -> KJ*ns_kj + 2 pin;  "pe" -> Polar-Express PE-8 (8 iters)
             ns_dtype="bf16", nesterov=True,                             # NS precision: bf16 default (v16: ==fp16, more portable); norms stay fp32
+            amp="bf16",                                                 # model precision: "bf16" autocast mixed precision (fp32 master weights, no GradScaler; modern GPUs) | "fp32" pure fp32 (T4: no bf16 tensor cores). For a T4 run set amp="fp32", ns_dtype="fp16".
             repulse=0.0, decor=0.0, grad_rep=0.0, xorth=0, niche=0.0,   # mechanism knobs (mech.py)
             scap=0.0, cautious=0.0, grokfast=0.0, gf_alpha=0.98, lookahead=0, la_beta=0.5,
             depth_mix=(0.45, 0.25, 0.15, 0.08, 0.045, 0.025))
@@ -124,6 +125,8 @@ def make_tag(c):
         t += "_xo"
     if c["steps"] != 6000:
         t += f"_{c['steps']}st"
+    if c.get("amp", "bf16") == "bf16":                            # model mixed-precision regime marker
+        t += "_bf16amp"                                           # distinguishes from the fp32-model history
     return t
 
 
@@ -193,6 +196,7 @@ def run(cfg):
     g = torch.Generator(device=dev).manual_seed(c["seed"] + 7)
     mix = torch.tensor(c["depth_mix"], device=dev)
     E = c["experts"]
+    amp_on = c.get("amp", "bf16") == "bf16"                           # bf16 autocast for the model forward (train only; eval stays fp32)
     best, curve = 0.0, []
     for step in range(1, c["steps"] + 1):
         deps = torch.multinomial(mix, c["batch"], replacement=True, generator=g)
@@ -208,8 +212,9 @@ def run(cfg):
         if c["noise"] > 0:                                            # same noise in the stream
             flip = torch.rand(len(yb), device=dev, generator=g) < c["noise"]
             yb[flip] = torch.randint(0, P, (int(flip.sum()),), device=dev, generator=g)
-        loss = F.cross_entropy(model(xb, pad_mask=(xb != PAD)), yb)   # load counts real tokens only
-        loss.backward()
+        with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=amp_on):
+            loss = F.cross_entropy(model(xb, pad_mask=(xb != PAD)), yb)  # load counts real tokens only
+        loss.backward()                                              # bf16 forward, fp32 master weights, no GradScaler needed
         mech.pre_step(c, all_params, expert_ws, mblocks, mstate)      # grad-space mechanisms
         # WSD schedule (LM-standard), identical for AdamW and Muon: linear warmup ->
         # stable -> cosine decay to min_lr_frac over the final decay_frac of steps.
@@ -276,7 +281,7 @@ def run(cfg):
                   + f" | eff/{E} {' '.join(f'{e:.1f}' for e in eff)}", flush=True)
     return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
-                coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"],
+                coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),

@@ -42,14 +42,15 @@ COMMON = dict(steps=6000, batch=768)
 # check). Fix the established winners (aurora_k1, 8-iter KJ) and vary ONLY muon wd. 2 seeds
 # each, rank on AUC (noise-robust). wd=0.1 NOT re-run (known: s0 0.535 / s1 0.451 = anchor).
 # Optimum likely BELOW 0.1 since 2.0 is already dead -> probe 0.01/0.03/0.05 + one above (0.2).
-# v16 wave (model stays FP32; ns_dtype = the Newton-Schulz precision, NOT the model dtype).
-# KJ ns_dtype x nesterov 2x2 factorial (all wd 0.1, aurora_k1, 8-iter KJ), 2 seeds = 8 arms.
-# Tests whether NS precision (fp16/bf16) or nesterov move the needle + their interaction.
-# (PE-8 skipped - already dead, not worth re-benching.)
+# v17 wave: AMP CALIBRATION - does bf16 mixed-precision TRAINING (model forward in bf16 autocast,
+# fp32 master weights, eval still fp32) match pure fp32? OLM was fp32-model its whole history, so
+# verify before adopting bf16-amp as default. amp {off=fp32, bf16} x 2 seeds; everything else at
+# the new default (bf16 NS, aurora_k1, 8-iter, wd 0.1). amp="off" (bf16 NS, fp32 model) should
+# track v13 wd0.1 (fp16 NS, fp32 model) since v16 showed bf16 NS == fp16. If amp=bf16 ~= off ->
+# adopt bf16-amp (faster, LM-realistic); if it shifts -> keep fp32 model.
 ARMS = [
-    dict(arm="default", seed=s, ns_dtype=dt, nesterov=nes)
-    for dt in ("fp16", "bf16")
-    for nes in (True, False)
+    dict(arm="default", seed=s, amp=a)
+    for a in ("fp32", "bf16")
     for s in (0, 1)
 ]
 
@@ -73,6 +74,8 @@ def _tag(r):
             t += f"_{r['ns_dtype']}"
         if not r.get("nesterov", True):
             t += "_nonest"
+    if r.get("amp", "bf16") == "bf16":
+        t += "_bf16amp"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
                      ("niche", "ni"), ("scap", "sc"), ("cautious", "cw"),
                      ("grokfast", "gf"), ("lookahead", "la")):
