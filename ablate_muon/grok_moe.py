@@ -68,14 +68,26 @@ def build_data(p, frac, op_mix, device):
 
 
 class MoE(nn.Module):
-    """Dense-compute MoE (tiny scale): all experts on all tokens, top-k combine."""
+    """Dense-compute MoE (tiny scale): all experts on all tokens, top-k combine.
 
-    def __init__(self, d, E=8, top_k=2, mult=4):
+    ffn: "mlp" = Linear->GELU->Linear (hidden = mult*d, 2 matrices);
+         "swiglu" = SiLU-gated GLU (3 matrices), hidden PARAM-MATCHED to the mlp: 3*d*h == 2*d*(mult*d)
+         => h = 2*mult*d/3, so an mlp<->swiglu swap is capacity-neutral (isolates the activation)."""
+
+    def __init__(self, d, E=8, top_k=2, mult=4, ffn="mlp"):
         super().__init__()
-        self.E, self.top_k = E, top_k
+        self.E, self.top_k, self.ffn = E, top_k, ffn
         self.router = nn.Linear(d, E, bias=False)
-        self.w1 = nn.Parameter(torch.randn(E, d, mult * d) * (d ** -0.5))
-        self.w2 = nn.Parameter(torch.randn(E, mult * d, d) * ((mult * d) ** -0.5))
+        if ffn == "swiglu":
+            h = (2 * mult * d) // 3                               # param-matched hidden
+            self.wg = nn.Parameter(torch.randn(E, d, h) * (d ** -0.5))   # gate proj
+            self.wu = nn.Parameter(torch.randn(E, d, h) * (d ** -0.5))   # up proj
+            self.wd = nn.Parameter(torch.randn(E, h, d) * (h ** -0.5))   # down proj
+            self.expert_ws = [self.wg, self.wu, self.wd]          # (E,in,out) tensors -> Muon + mech hooks
+        else:
+            self.w1 = nn.Parameter(torch.randn(E, d, mult * d) * (d ** -0.5))
+            self.w2 = nn.Parameter(torch.randn(E, mult * d, d) * ((mult * d) ** -0.5))
+            self.expert_ws = [self.w1, self.w2]
         self.register_buffer("bias", torch.zeros(E))
         self.register_buffer("load", torch.zeros(E))
 
@@ -89,8 +101,13 @@ class MoE(nn.Module):
             li = idx if real is None else idx[real]
             if li.numel():
                 self.load += torch.bincount(li.flatten(), minlength=self.E).float()
-        h = torch.einsum("nd,edh->neh", x, self.w1)
-        h = torch.einsum("neh,ehd->ned", F.gelu(h), self.w2)
+        if self.ffn == "swiglu":
+            g = torch.einsum("nd,edh->neh", x, self.wg)
+            u = torch.einsum("nd,edh->neh", x, self.wu)
+            h = torch.einsum("neh,ehd->ned", F.silu(g) * u, self.wd)
+        else:
+            h = torch.einsum("nd,edh->neh", x, self.w1)
+            h = torch.einsum("neh,ehd->ned", F.gelu(h), self.w2)
         hk = h.gather(1, idx.unsqueeze(-1).expand(-1, -1, h.shape[-1]).long())
         self._last_top1 = idx[:, 0]                               # grok-harness compat
         self._last_idx, self._last_w = idx, w                     # (N,k) top-k experts + combine wts
@@ -103,14 +120,30 @@ class MoE(nn.Module):
         self.load.zero_()
 
 
+class SwiGLU(nn.Module):
+    """Dense SwiGLU FFN, param-matched to a Linear->GELU->Linear MLP of hidden mult*d."""
+    def __init__(self, d, mult=4):
+        super().__init__()
+        hid = (2 * mult * d) // 3
+        self.wg, self.wu = nn.Linear(d, hid, bias=False), nn.Linear(d, hid, bias=False)
+        self.wd = nn.Linear(hid, d, bias=False)
+
+    def forward(self, x):
+        return self.wd(F.silu(self.wg(x)) * self.wu(x))
+
+
 class Block(nn.Module):
-    def __init__(self, d, h, E, top_k, dense=False, mult=4):
+    def __init__(self, d, h, E, top_k, dense=False, mult=4, ffn="mlp"):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
         self.attn = nn.MultiheadAttention(d, h, batch_first=True)
-        self.moe = None if dense else MoE(d, E, top_k, mult)
-        self.mlp = (nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
-                    if dense else None)
+        self.moe = None if dense else MoE(d, E, top_k, mult, ffn=ffn)
+        if not dense:
+            self.mlp = None
+        elif ffn == "swiglu":
+            self.mlp = SwiGLU(d, mult)
+        else:
+            self.mlp = nn.Sequential(nn.Linear(d, mult * d), nn.GELU(), nn.Linear(mult * d, d))
 
     def forward(self, x, mask, real=None):
         hh = self.ln1(x)
@@ -125,11 +158,11 @@ class Block(nn.Module):
 
 class GrokMoENet(nn.Module):
     def __init__(self, vocab, d=128, layers=3, heads=4, E=8, top_k=2, seq=4, dense_layers=(),
-                 mult=4):
+                 mult=4, ffn="mlp"):
         super().__init__()
         self.tok = nn.Embedding(vocab, d)
         self.pos = nn.Embedding(seq, d)
-        self.blocks = nn.ModuleList(Block(d, heads, E, top_k, dense=(i in dense_layers), mult=mult)
+        self.blocks = nn.ModuleList(Block(d, heads, E, top_k, dense=(i in dense_layers), mult=mult, ffn=ffn)
                                     for i in range(layers))
         self.lnf = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab, bias=False)

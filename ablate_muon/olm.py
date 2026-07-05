@@ -79,6 +79,7 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             dense_first=1, bias_every=10, bias_factor=0.01, mult=4, nval=4096,
             eval_every=250, max_depth=6, noise=0.05, div_deep=0,
             warmup=500, decay_frac=0.2, min_lr_frac=0.1,               # WSD, same for both opts
+            ffn="mlp",                                                 # expert/dense FFN: "mlp" (GELU) | "swiglu" (param-matched SiLU-gated)
             scale_mode="aurora", aurora_k=1, ns_kj=6, coeffs="kj",      # DEFAULT = ns8 (6 KJ) aurora_k1
             spectral_wd=0.0, swd_beta=0.99,                             # spectral weight decay: redistribute wd by per-row momentum-energy staleness (0=standard)
             #  coeffs: "kj" -> KJ*ns_kj + 2 pin;  "pe" -> Polar-Express PE-8 (8 iters)
@@ -102,6 +103,8 @@ def make_tag(c):
     t = f"olm_{c['arm']}_s{c['seed']}_wd{c['wd'] if c['arm'] != 'adamw' else c['adamw_wd']}"
     if c["dense_first"]:
         t += f"_df{c['dense_first']}"
+    if c.get("ffn", "mlp") != "mlp":
+        t += f"_{c['ffn']}"
     if c.get("warmup", 500) != 500:
         t += f"_wu{c['warmup']}"
     if c["arm"] == "default":
@@ -174,7 +177,7 @@ def run(cfg):
 
     model = GrokMoENet(VOCAB, c["d"], c["layers"], c["heads"], c["experts"], c["top_k"],
                        seq=maxseq, dense_layers=tuple(range(c["dense_first"])),
-                       mult=c["mult"]).to(dev)
+                       mult=c["mult"], ffn=c["ffn"]).to(dev)
     mblocks = [b for b in model.blocks if b.moe is not None]
     n_par = sum(q.numel() for q in model.parameters())
 
@@ -196,7 +199,7 @@ def run(cfg):
                 FusedMuon([q for q in hidden if q.ndim == 2], **mkw),
                 FusedMuon([q for q in hidden if q.ndim == 3], **mkw)]
     all_params = list(model.parameters())
-    expert_ws = ([b.moe.w1 for b in mblocks] + [b.moe.w2 for b in mblocks])
+    expert_ws = [w for b in mblocks for w in b.moe.expert_ws]      # (E,in,out) tensors (mlp: w1,w2 | swiglu: wg,wu,wd)
     mstate = {}                                                    # per-run mechanism buffers
     tag = make_tag(c)
     lnP = math.log(P)
@@ -292,7 +295,7 @@ def run(cfg):
                   + f" | spec {' '.join(f'{s:.2f}' for s in spec)}"
                   + f" | eff/{E} {' '.join(f'{e:.1f}' for e in eff)}", flush=True)
     swd_cov = next((o._swd_cov for o in opts if getattr(o, "_swd_cov", None) is not None), None)
-    return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"],
+    return dict(arm=c["arm"], seed=c["seed"], wd=c["wd"], adamw_wd=c["adamw_wd"], ffn=c["ffn"],
                 spectral_wd=c["spectral_wd"], swd_cov=(round(swd_cov, 4) if swd_cov else None),
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],

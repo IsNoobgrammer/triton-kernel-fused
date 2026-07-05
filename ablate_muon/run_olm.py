@@ -95,13 +95,26 @@ ARMS_SPECTRAL = (
     + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
             spectral_wd=1.0) for s in SEEDS8]                                  # gamma 1 = strong redistribution
 )
-ARMS = ARMS_UNDERORTH                                                          # <- swap to ARMS_SPECTRAL for the 2nd launch
+#
+# v31 SWIGLU vs GELU-MLP (architecture axis - may clear the noise floor where optimizer knobs can't):
+# param-matched swap (swiglu hidden = 2*mult*d/3, so 3 matrices == 2 mlp matrices) -> isolates the
+# ACTIVATION, not capacity. mlp baseline + swiglu, SAME LAUNCH, base aurora wd0.1 SEEDS8 const-LR.
+# Reads how much perf the GELU-MLP was leaving on the table (aggregate frac + d2/d3/d4). 2x8 = 16.
+ARMS_SWIGLU = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
+          ffn="mlp") for s in SEEDS8]                                          # GELU-MLP baseline
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
+            ffn="swiglu") for s in SEEDS8]                                     # param-matched SwiGLU
+)
+ARMS = ARMS_SWIGLU                                                             # <- ARMS_UNDERORTH / ARMS_SPECTRAL for the other launches
 
 
 def _tag(r):
     t = f"olm_{r['arm']}_s{r['seed']}_wd{r['wd'] if r['arm'] != 'adamw' else r['adamw_wd']}"
     if r.get("dense_first"):
         t += f"_df{r['dense_first']}"
+    if r.get("ffn", "mlp") != "mlp":
+        t += f"_{r['ffn']}"
     if r.get("warmup", 500) != 500:
         t += f"_wu{r['warmup']}"
     if r["arm"] == "default":
