@@ -112,7 +112,7 @@ class FusedMuon(optim.Optimizer):
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_DSV4_COEFFS, ns_dtype=None, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
-                 spectral_wd=0.0, swd_beta=0.99):
+                 spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.coeffs = coeffs
@@ -128,6 +128,10 @@ class FusedMuon(optim.Optimizer):
         self.spectral_wd = float(spectral_wd)
         self.swd_beta = float(swd_beta)
         self._swd_cov = None                                          # last-step row-energy coeff-of-variation (gate diagnostic)
+        # AFTER-NS cross-expert decorrelation (post-polar xorth): damped E x E whitening of the
+        # ORTHOGONALIZED update, per expert-stack (n>1). Cleaner gram than pre-NS grad xorth (uniform
+        # spectrum) but breaks per-expert orthogonality. 0 = off. See muon_scaling.xorth_whiten.
+        self.xorth_post = float(xorth_post)
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
         # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
         # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
@@ -290,7 +294,7 @@ class FusedMuon(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if (self.use_graph and self.spectral_wd == 0
+        if (self.use_graph and self.spectral_wd == 0 and self.xorth_post == 0
                 and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode))):
             self._graph_step()                                    # captured graph supports scalar scales only
             return loss
@@ -347,6 +351,10 @@ class FusedMuon(optim.Optimizer):
                         out = newton_schulz(u, self.coeffs, self.ns_dtype)
                         if perrow:                                    # leverage-aware per-row rescale (scale folded into out)
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
+                    if self.xorth_post > 0:                            # AFTER-NS cross-expert whiten, per expert-stack (n>1)
+                        for p, o, n in members:
+                            if n > 1:
+                                out[o:o + n] = _scaling.xorth_whiten(out[o:o + n], self.xorth_post)
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members],

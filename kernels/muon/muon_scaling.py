@@ -179,6 +179,25 @@ def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):
     return (Ohat * (C / fro).view(-1, 1, 1)).to(O.dtype)
 
 
+def xorth_whiten(O, beta, eps=1e-6):
+    """AFTER-NS cross-expert decorrelation: damped E x E whitening of the ORTHOGONALIZED update.
+
+    O    : (E, rows, cols) - the E experts' post-NS updates for one weight (E stacked matrices).
+    beta : strength (0 = off, 1 = full whiten). Damped: T = (1-beta) I + beta * C^{-1/2}.
+    Decorrelates the CLEAN uniform-spectrum updates (well-conditioned gram) instead of the noisy
+    raw gradient (pre-NS). Cost: mixing experts by T breaks each expert's individual orthogonality
+    (the post-polar trade, cf. normuon). Returns T @ O along the E axis, same shape/dtype as O.
+    """
+    E = O.shape[0]
+    G = O.reshape(E, -1).float()                                  # (E, D) flatten rows*cols
+    C = G @ G.mT                                                  # (E, E) cross-expert gram
+    C = C / C.diagonal().mean().clamp_min(1e-12)                  # normalize (diag ~1)
+    ev, V = torch.linalg.eigh(C)
+    isq = V @ torch.diag_embed(ev.clamp_min(1e-6).rsqrt()) @ V.mT # C^{-1/2}
+    T = (1 - beta) * torch.eye(E, device=O.device, dtype=C.dtype) + beta * isq
+    return (T @ G).reshape_as(O).to(O.dtype)
+
+
 def spectral_wd_mult(u, e_ema, gamma, beta=0.99, eps=1e-12):
     """Spectral weight decay: REDISTRIBUTE decoupled wd across rows by their accumulated momentum energy.
 

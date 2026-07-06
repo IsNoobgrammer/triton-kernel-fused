@@ -82,6 +82,7 @@ _DEF = dict(arm="default", seed=0, steps=6000, batch=768, d=128, layers=4, heads
             ffn="mlp",                                                 # expert/dense FFN: "mlp" (GELU) | "swiglu" (param-matched SiLU-gated)
             scale_mode="aurora", aurora_k=1, ns_kj=6, coeffs="kj",      # DEFAULT = ns8 (6 KJ) aurora_k1
             spectral_wd=0.0, swd_beta=0.99,                             # spectral weight decay: redistribute wd by per-row momentum-energy staleness (0=standard)
+            xorth_post=0.0,                                             # after-NS cross-expert whiten (post-polar xorth); pre-NS grad xorth stays the 'xorth' knob (mech.py)
             #  coeffs: "kj" -> KJ*ns_kj + 2 pin;  "pe" -> Polar-Express PE-8 (8 iters)
             ns_dtype="bf16", nesterov=True, momentum=0.95,              # NS precision bf16 default (v16: ==fp16, more portable; norms stay fp32); muon heavy-ball momentum
             amp="bf16",                                                 # model precision: "bf16" autocast mixed precision (fp32 master weights, no GradScaler; modern GPUs) | "fp32" pure fp32 (T4: no bf16 tensor cores). For a T4 run set amp="fp32", ns_dtype="fp16".
@@ -126,6 +127,8 @@ def make_tag(c):
             t += f"_mom{c['momentum']}"
         if c.get("spectral_wd", 0.0) > 0:
             t += f"_swd{c['spectral_wd']}"                        # spectral weight decay (gamma)
+        if c.get("xorth_post", 0.0) > 0:
+            t += f"_xop{c['xorth_post']}"                         # after-NS cross-expert whiten
     if c["mult"] != 4:
         t += f"_m{c['mult']}"
     for key, pre in (("repulse", "rep"), ("decor", "dec"), ("grad_rep", "gr"),
@@ -194,7 +197,7 @@ def run(cfg):
         ndt = {"bf16": torch.bfloat16, "fp32": torch.float32}.get(c["ns_dtype"], torch.float16)
         mkw = dict(lr=c["muon_lr"], weight_decay=hwd, coeffs=nsc, nesterov=c["nesterov"],
                    momentum=c["momentum"], ns_dtype=ndt, scale_mode=c["scale_mode"], aurora_k=c["aurora_k"],
-                   spectral_wd=c["spectral_wd"], swd_beta=c["swd_beta"])
+                   spectral_wd=c["spectral_wd"], swd_beta=c["swd_beta"], xorth_post=c["xorth_post"])
         opts = [torch.optim.AdamW(rest, lr=c["lr"], weight_decay=c["adamw_wd"], betas=(0.9, 0.98)),
                 FusedMuon([q for q in hidden if q.ndim == 2], **mkw),
                 FusedMuon([q for q in hidden if q.ndim == 3], **mkw)]
@@ -299,7 +302,8 @@ def run(cfg):
                 spectral_wd=c["spectral_wd"], swd_cov=(round(swd_cov, 4) if swd_cov else None),
                 scale_mode=c["scale_mode"], aurora_k=c["aurora_k"], ns_kj=c["ns_kj"],
                 coeffs=c["coeffs"], ns_dtype=c["ns_dtype"], nesterov=c["nesterov"], amp=c["amp"],
-                muon_lr=c["muon_lr"], momentum=c["momentum"], decay_frac=c["decay_frac"], xorth=c["xorth"],
+                muon_lr=c["muon_lr"], momentum=c["momentum"], decay_frac=c["decay_frac"],
+                xorth=c["xorth"], xorth_post=c["xorth_post"],
                 dense_first=c["dense_first"], warmup=c["warmup"], noise=c["noise"], max_depth=maxd,
                 mult=c["mult"], experts=E, steps=c["steps"], loss=round(vloss, 4),
                 gap=round(vloss - floor, 4), frac=round(vloss / lnP, 4),

@@ -134,7 +134,22 @@ ARMS_SWIGLU_XO = (
     + [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora",
             ns_kj=6, xorth=0.005) for s in SEEDS8]                            # SwiGLU + xorth 0.005 (gentle)
 )
-ARMS = ARMS_SWIGLU_XO                                                          # <- other ARMS_* sets available above for later launches
+#
+# v34 EMA+XORTH, BEFORE-vs-AFTER NS (user: likes ema; test the combo AND xorth placement): xorth on the
+# raw gradient (pre-NS, noisy gram, stays orthogonal) vs on the orthogonalized update (post-NS, clean
+# uniform-spectrum gram, breaks orthogonality). Both arms carry aurora_ema (the combo the user wants) so
+# the A/B ISOLATES placement, drift-clean. beta 0.005. If post-NS beats pre-NS -> the clean-substrate
+# principle wins again (build it out); if pre wins -> orthogonality matters more than gram conditioning.
+#   pre  = aurora_ema + xorth 0.005 (grad-space, mech.py)
+#   post = aurora_ema + xorth_post 0.005 (after-NS, kernel)
+# ffn=swiglu, SEEDS8 const-LR. 2x8 = 16.
+ARMS_SWIGLU_EMAXO = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora_ema",
+          ns_kj=6, xorth=0.005) for s in SEEDS8]                              # ema + xorth PRE-NS (grad)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora_ema",
+            ns_kj=6, xorth_post=0.005) for s in SEEDS8]                       # ema + xorth POST-NS (after orthogonalize)
+)
+ARMS = ARMS_SWIGLU_EMAXO                                                       # <- other ARMS_* sets available above for later launches
 
 
 def _tag(r):
@@ -177,6 +192,8 @@ def _tag(r):
         t += f"_xo{r['xorth']}"
         if r.get("xorth_sched"):
             t += f"{r['xorth_sched']}anneal"
+    if r.get("xorth_post"):
+        t += f"_xop{r['xorth_post']}"
     if r.get("mult", 4) != 4:
         t += f"_m{r['mult']}"
     if r.get("steps", 6000) != 6000:
