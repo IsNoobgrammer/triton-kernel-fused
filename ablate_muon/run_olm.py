@@ -119,7 +119,22 @@ ARMS_SWIGLU_MECH = (
     + [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora",
             ns_kj=6, xorth=0.01) for s in SEEDS8]                             # SwiGLU + base aurora + xorth
 )
-ARMS = ARMS_SWIGLU_MECH                                                        # <- ARMS_UNDERORTH / ARMS_SPECTRAL / ARMS_SWIGLU for other launches
+#
+# v33 XORTH ON SWIGLU - DRIFT-CLEAN CONFIRM: v32 gave a tantalizing but confounded hint that xorth
+# lifts SwiGLU's DEEP depth (d2/d3/d4 all up vs base) - the first mechanism to poke the depth axis,
+# matching the gate-conditioning hypothesis. But v32 was CROSS-LAUNCH, xorth was n=6 (s2/s2026 missing),
+# and the matched-6 excluded base's two DEEPEST seeds -> biased. This settles it: SwiGLU base + SwiGLU
+# +xorth in the SAME LAUNCH, full SEEDS8, no missing seeds. beta=0.005 (gentler than v32's 0.01 -
+# low-beta wins on the xorth dose-response, and softer decorrelation should be safer on the gate).
+# If xorth's d2/d3/d4 edge survives drift-clean at n=8 -> hypothesis confirmed (-> build SwiGLU-native
+# wg/wu decorrelation). ema DROPPED (v32: 2nd confirm it's a dead variance-damper). 2x8 = 16.
+ARMS_SWIGLU_XO = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora",
+          ns_kj=6) for s in SEEDS8]                                            # SwiGLU base aurora (in-launch anchor)
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora",
+            ns_kj=6, xorth=0.005) for s in SEEDS8]                            # SwiGLU + xorth 0.005 (gentle)
+)
+ARMS = ARMS_SWIGLU_XO                                                          # <- other ARMS_* sets available above for later launches
 
 
 def _tag(r):
