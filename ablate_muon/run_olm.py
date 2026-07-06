@@ -106,7 +106,20 @@ ARMS_SWIGLU = (
     + [dict(arm="default", seed=s, steps=10000, decay_frac=0, scale_mode="aurora", ns_kj=6,
             ffn="swiglu") for s in SEEDS8]                                     # param-matched SwiGLU
 )
-ARMS = ARMS_SWIGLU                                                             # <- ARMS_UNDERORTH / ARMS_SPECTRAL for the other launches
+#
+# v32 EMA / XORTH ON SWIGLU (do the update mechanisms grip better on a gated substrate?): hypothesis
+# is SwiGLU's gate SiLU(wg.x)*(wu.x) makes update CONDITIONING matter more (wg/wu must stay
+# well-separated or the gate collapses), so ema/xorth - both NULL on GELU-MLP - might finally clear
+# the floor here. PRIOR = still null (sub-floor effect x sub-floor substrate); needs a gate-specific
+# interaction to show. ffn=swiglu, SEEDS8 const-LR. Baseline = the just-run SwiGLU base aurora (0.450,
+# CROSS-LAUNCH -> only trust a gap > ~0.03). 2x8 = 16.
+ARMS_SWIGLU_MECH = (
+    [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora_ema",
+          ns_kj=6) for s in SEEDS8]                                            # SwiGLU + aurora_ema
+    + [dict(arm="default", seed=s, steps=10000, decay_frac=0, ffn="swiglu", scale_mode="aurora",
+            ns_kj=6, xorth=0.01) for s in SEEDS8]                             # SwiGLU + base aurora + xorth
+)
+ARMS = ARMS_SWIGLU_MECH                                                        # <- ARMS_UNDERORTH / ARMS_SPECTRAL / ARMS_SWIGLU for other launches
 
 
 def _tag(r):
