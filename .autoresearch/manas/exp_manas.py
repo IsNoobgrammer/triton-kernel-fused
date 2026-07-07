@@ -30,7 +30,7 @@ class ExpManas(ManasOptimizer):
     measurement says the paper's purity requirement is not where the gain comes from."""
 
     def __init__(self, params, ref_mode="theta", norm_mode="global", sign=-1.0,
-                 trust=None, probe_src="buffer", **kw):
+                 trust=None, probe_src="buffer", comp=None, **kw):
         assert kw.get("probe_rank") is None, "ExpManas is full-d only"
         super().__init__(params, **kw)
         assert ref_mode in ("theta", "ema") and norm_mode in ("global", "permat")
@@ -38,7 +38,34 @@ class ExpManas(ManasOptimizer):
         self.ref_mode, self.norm_mode = ref_mode, norm_mode
         self.sign, self.trust = float(sign), (None if trust is None else float(trust))
         self.probe_src = probe_src
+        # comp [user's update-history idea]: keep a rho-decayed buffer u of the APPLIED
+        # updates (post-polar Muon steps) and add kappa * gamma * u/||u|| to the probe
+        # offset — the probe then knows how much of its direction the weights have already
+        # realized. kappa < 0 = back off by realized travel; kappa > 0 = extend along it.
+        # Differs from momdir (inert): u is post-NS and CORRECTS d instead of replacing it.
+        self.comp = None if comp is None else float(comp)
         self._motion_ema = None                                  # EMA of ||theta step motion||
+
+    def _u_of(self, p):
+        st = self.state[p]
+        if "exp_u" not in st:
+            st["exp_u"] = torch.zeros_like(p, dtype=torch.float32)
+        return st["exp_u"]
+
+    def _offsets(self):
+        """Dense probe offsets per param (cached-apply path: ema and/or comp active)."""
+        ps = self._probe_params()
+        offs = {p: ManasOptimizer._d_of(self, p).clone() for p in ps}
+        if self.ref_mode == "ema":
+            for p in ps:
+                offs[p] += self._ema_ref(p) - p.detach().float()
+        if self.comp is not None:
+            un = torch.linalg.vector_norm(torch.stack(
+                [torch.linalg.vector_norm(self._u_of(p)) for p in ps])).clamp_min(1e-12)
+            k = self.comp * self.probe_gamma / un
+            for p in ps:
+                offs[p] += k * self._u_of(p)
+        return {p: offs[p].to(p.dtype) for p in ps}
 
     # ---- probe_src 'muonmom': offset from the batched muon_mom buffers, no d state ----
     def _mom_views(self):
@@ -88,28 +115,33 @@ class ExpManas(ManasOptimizer):
                     st[key] = offs[p]
                 p.add_(st[key], alpha=sign)
             return
-        if self.ref_mode == "ema":                               # offsets change between apply
-            ps = self._probe_params()                            # and remove only via p itself;
-            key = "exp_shift"                                    # cache the applied offset so
-            for p in ps:                                         # remove is bit-exact
+        if self.ref_mode == "ema" or self.comp is not None:      # offsets depend on p / u;
+            ps = self._probe_params()                            # cache the applied offset so
+            key = "exp_shift"                                    # remove is bit-exact
+            offs = self._offsets() if sign > 0 else None
+            for p in ps:
                 st = self.state[p]
                 if sign > 0:
-                    st[key] = self._d_of(p).to(p.dtype)
+                    st[key] = offs[p]
                 p.add_(st[key], alpha=sign)
             return
         super()._shift(sign)
 
     @torch.no_grad()
     def step(self, closure=None):
-        if self.trust is not None or self.ref_mode == "ema":
+        track = self.trust is not None or self.ref_mode == "ema" or self.comp is not None
+        if track:
             before = [p.detach().clone() for p in self._probe_params()]
         loss = super().step(closure)                             # Muon step + _update_probe
         ps = self._probe_params()
-        if self.trust is not None or self.ref_mode == "ema":
+        if track:
             motion = torch.linalg.vector_norm(torch.stack(
                 [torch.linalg.vector_norm((p - b).float()) for p, b in zip(ps, before)]))
             m = self._motion_ema
             self._motion_ema = motion if m is None else 0.95 * m + 0.05 * motion
+        if self.comp is not None:                                # decayed applied-update buffer
+            for p, b in zip(ps, before):
+                self._u_of(p).mul_(self.probe_rho).add_((p.detach() - b).float())
         if self.ref_mode == "ema":                               # theta_bar tracks theta at rho
             for p in ps:
                 self._ema_ref(p).lerp_(p.detach().float(), 1.0 - self.probe_rho)

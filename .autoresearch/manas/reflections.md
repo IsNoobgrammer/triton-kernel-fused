@@ -86,3 +86,13 @@ at every batch size tested (32: rho .995; 128: rho .98; 512: rho .90). rho docum
 memory-in-samples, not a free knob. Gamma remains the geometry-coupled dose. Implication
 for BiBo/pretraining: derive rho from tokens-per-step (expect rho << 0.9 at LM batch
 sizes), sweep only gamma.
+
+## Wave 10 (runs 24-25) - user update-history idea, verdict
+comp+1 (extend probe along rho-decayed realized updates): frontier-equal-or-hair-better
+than champion (held-out +0.0266 vs +0.0255, overlapping), peak-acc neutral after its
+opt-seed 5/5 died at the gate (SECOND best_acc winner's curse - that axis needs more
+held-out seeds than 3 to resolve 0.01-class effects; treat any 5/5 opt best_acc as noise
+until gated). Cost: +1x weights fp32 (u buffer) - so r8 champion keeps the title on
+cost-adjusted quality. Mechanism note: back-off sign (user's original guess) neutral,
+extend sign carries whatever effect exists - direction of realized travel adds lookahead
+depth, not double-counting correction. Worth a low-rank-u revisit at LM scale.

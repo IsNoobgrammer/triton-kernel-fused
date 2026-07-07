@@ -25,3 +25,5 @@ for kw in (dict(ref_mode="ema"), dict(norm_mode="permat"), dict(sign=1.0),
     dn = torch.linalg.vector_norm(opt._full_d(m.weight)).item()
     print(f"{kw}: ok, ||d|| {dn:.5f}")
 print("smoke ok")
+
+print('comp smoke:')
