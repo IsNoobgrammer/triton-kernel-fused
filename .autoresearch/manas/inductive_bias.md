@@ -50,6 +50,19 @@ TRUE requirements, each pinned by an inert ablation:
   on when each gets one vote — a data-consensus direction, not a magnitude-weighted
   momentum. (SUPPORTED — this is the interpretation that fits all ablations)
 
+Why EQUAL votes, not agreement-weighted (design rationale, MEASURED + reasoned): Manas is
+a swarm-consensus method whose "swarm" is its own past steps — consensus over data shards,
+harvested from the trajectory at zero parallel cost (the PSO lens). The natural PSO import,
+weighting votes by agreement with the emerging consensus (social reinforcement), TIED equal
+votes at both champion and 1.4x gamma (wave 12) — so it is a lens, not a lever. The reason
+equal-weight is correct-in-principle, not just simpler: in a common-minimum method the
+SURVIVING cross-batch DISAGREEMENT is signal, not noise (it is the landscape spread the
+method exists to average over); down-weighting it would erase the structure we are chasing.
+Denoising is already handled by two stacked, free, lossless-for-signal filters — the
+temporal rho-average (over ~window samples) and the rank-8 spatial projection — so a third
+(agreement) denoiser is redundant and eats real signal. Note the temporal average is the
+larger denoiser: agreement-weighting tied even on FULL-d, where low-rank is not in play.
+
 Working model: **consensus-direction lookahead**. Manas evaluates the landscape slightly
 ahead along the variance-reduced direction the data has been pulling, and the returned
 gradient carries curvature information about that consensus locus into Muon. The
