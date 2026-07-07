@@ -34,8 +34,19 @@ Setting the knobs at a new scale (measured scaling laws, .autoresearch/manas/):
     optimum was 80x the old default, so re-sweep the dose per model scale; the curve was
     smooth with a broad plateau and no instability up to 2x the optimum.
 
+Optional U BUFFER (comp != None): a second rho-decayed memory of the APPLIED updates,
+added to the probe offset as  comp * gamma * u/||u||_global  — the probe then also looks
+along the optimizer's realized travel. comp is continuous in units of gamma; comp=+1
+(extend) validated best on the toy (frontier tie with the no-u champion; back-off signs
+neutral; dose turns by +2). At probe_rank=r, u lives in d's SAME rank-r basis (state = one
+extra (r,n) Cu per matrix, ~zero marginal memory; re-projected on basis refresh) — this
+shared-basis compression is held-out validated (+0.0235, tie with full fp32 u's +0.0266).
+u did not SEPARATE from no-u on the toy (batches too homogeneous for update-history
+information); it is expected to matter on heterogeneous large-batch data — LM A/B decides.
+
 Usage (training loop):
-    opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)
+    opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
+    opt = ManasOptimizer(params, ..., comp=1.0)                              # + rank-8 u buffer
     with opt.probe():          # forward/backward run at theta + d
         loss = model(x).loss
         loss.backward()
@@ -76,7 +87,7 @@ NS8_COEFFS = (_KJ,) * 6 + (_PIN,) * 2          # exp_kappa 'ns8': compressed KJ 
 
 class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
-                 probe_rank=None, probe_refresh=200, coeffs=NS8_COEFFS,
+                 probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
@@ -88,6 +99,8 @@ class ManasOptimizer(FusedMuon):
         # size-adaptive per matrix). The per-param resolved rank is clamped to [1, min(m,n)].
         self.probe_rank = None if probe_rank is None else probe_rank
         self.probe_refresh = int(probe_refresh)
+        # comp: u-buffer strength in units of gamma (None = off). +1 validated on the toy.
+        self.comp = None if comp is None else float(comp)
         self._probe_on = False
         self._probe_updates = 0
 
@@ -126,6 +139,19 @@ class ManasOptimizer(FusedMuon):
         q, c = self._lowrank_qc(p)
         return q @ c
 
+    def _u_of(self, p):
+        """Dense u (applied-update memory) for one param. Low-rank mode shares d's basis:
+        u = Q @ Cu — one extra (r,n) buffer, re-projected on basis refresh like C."""
+        st = self.state[p]
+        if self.probe_rank is None:
+            if "manas_u" not in st:
+                st["manas_u"] = torch.zeros_like(p, dtype=torch.float32)
+            return st["manas_u"]
+        q, _c = self._lowrank_qc(p)
+        if "manas_cu" not in st:
+            st["manas_cu"] = torch.zeros_like(st["manas_c"])
+        return q @ st["manas_cu"]
+
     # ---------------- probe application ----------------
     @contextmanager
     def probe(self):
@@ -138,6 +164,18 @@ class ManasOptimizer(FusedMuon):
 
     def _shift(self, sign):
         ps = self._probe_params()
+        if self.comp is not None:
+            # offset = d + comp*gamma*u/||u||; cache the applied tensor -> bit-exact remove
+            if sign > 0:
+                us = {p: self._u_of(p) for p in ps}
+                un = torch.linalg.vector_norm(torch.stack(
+                    [torch.linalg.vector_norm(us[p]) for p in ps])).clamp_min(1e-12)
+                k = self.comp * self.probe_gamma / un
+                for p in ps:
+                    self.state[p]["manas_shift"] = (self._d_of(p) + k * us[p]).to(p.dtype)
+            for p in ps:
+                p.add_(self.state[p]["manas_shift"], alpha=sign)
+            return
         if self.probe_rank is None and all(p.dtype == torch.float32 for p in ps):
             # fused fast path (fp32 masters, full-d): ONE foreach over all params
             if sign > 0:
@@ -167,8 +205,28 @@ class ManasOptimizer(FusedMuon):
     def step(self, closure=None):
         if self._probe_on:
             raise RuntimeError("remove_probe() (or exit the probe() context) before step()")
+        if self.comp is not None:                # u tracks the APPLIED update: snapshot theta,
+            ps = self._probe_params()            # and (low-rank) the basis if a refresh will
+            before = [p.detach().clone() for p in ps]        # fire inside _update_probe
+            fire = (self.probe_rank is not None
+                    and self._probe_updates % max(self.probe_refresh, 1) == 0)
+            q_old = [self._lowrank_qc(p)[0].clone() if fire else None for p in ps]
         loss = super().step(closure)             # fused aurora-K1 Muon on the probe-point grads
         self._update_probe()
+        if self.comp is not None:
+            for p, b, qo in zip(ps, before, q_old):
+                delta = (p.detach() - b).float()
+                if self.probe_rank is None:
+                    self._u_of(p).mul_(self.probe_rho).add_(delta)
+                    continue
+                q, _c = self._lowrank_qc(p)
+                st = self.state[p]
+                if "manas_cu" not in st:
+                    st["manas_cu"] = torch.zeros_like(st["manas_c"])
+                cu = st["manas_cu"]
+                if qo is not None:               # basis refreshed: carry u into the new basis
+                    cu.copy_((q.mT @ qo) @ cu)
+                cu.mul_(self.probe_rho).add_(q.mT @ delta)
         return loss
 
     @torch.no_grad()

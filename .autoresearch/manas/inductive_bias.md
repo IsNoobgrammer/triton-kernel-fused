@@ -119,8 +119,13 @@ model copy plus K inner optimizer steps per accumulation window.
 1. Estimate N_mem on a short pilot (or default to memory-in-tokens ~ a few thousand
    sequences); derive rho from tokens-per-step. Expect rho << 0.9 at real batch sizes.
 2. Sweep ONLY gamma (3-4 short runs); everything else has a law or a validated default.
-3. rank-8 low-rank d; refresh 200; fp16 d is an untested-but-likely-fine footprint win.
-4. Defer u buffer until the large-batch retest; if it separates, low-rank it.
+3. rank-8 low-rank d is now the SHIPPED DEFAULT (probe_rank=8); refresh 200; fp16 d is an
+   untested-but-likely-fine footprint win.
+4. u buffer is SHIPPED as an optional knob (comp; default off, comp=+1 when on; shares
+   d's r8 basis at ~zero marginal memory). Toy: free passenger (tie, no separation).
+   LM A/B (champion no-u vs comp=1) decides; fractional kappa sweep {0.2..1} belongs there,
+   not on the toy (0.2-steps are inside the noise floor). If it separates, it's already
+   low-rank and ready.
 5. Onset gating (start the probe mid-training) is the user's remaining untested
    intuition; the LR-schedule interaction (C11) is the vehicle to test it.
 6. Grad accumulation: apply the probe per OPTIMIZER step (accumulate at theta+d with d

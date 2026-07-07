@@ -143,7 +143,7 @@ Caveat: the observation is 3-seed eyeballing; first quantify (spike rate per arm
 paired seeds, plus directly measure loss(theta+d) - loss(theta) per step), then guard only
 if real (trust-ratio cap on ||d||, or skip probe-update when the probe loss blows out).
 
-### B5. Full-mode memory = +1x weights fp32 — kills the footprint pitch — P3 — OPEN
+### B5. Full-mode memory = +1x weights fp32 — kills the footprint pitch — P3 — FIXED(ship: probe_rank=8 is now the DEFAULT; d + optional u both live in the shared r8 basis ~1% each; full-d/full-u remain available but non-default. Held-out validated +0.0235-0.0255, bit-parity shipped-vs-sandbox.)
 manas_d is one fp32 model-shaped buffer per matrix: same as Adam's exp_avg, ON TOP of
 Muon's fp16 momentum. "Muon memory footprint" claims require low-rank to actually work
 (B1-B3) or an fp16/bf16 d (probably fine — d is bounded by construction; try it).
