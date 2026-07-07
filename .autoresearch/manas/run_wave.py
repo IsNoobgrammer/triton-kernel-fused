@@ -78,10 +78,12 @@ class Trainer:
     """Muon(+probe) on 2D mats, AdamW on the rest. gamma=0 => base Muon (probe inert)."""
 
     def __init__(self, model, gamma=0.0, rho=0.85, rank=None, refresh=200, sign=-1.0,
-                 outer="muon", ref=None, norm=None, trust=None, src=None, comp=None):
+                 outer="muon", ref=None, norm=None, trust=None, src=None, comp=None,
+                 alr=None, awd=None):
         mats, rest = E.split_params(model)
         if outer == "adamw":
-            self.opt = torch.optim.AdamW(mats + rest, lr=E.LR, weight_decay=E.WD)
+            self.opt = torch.optim.AdamW(mats + rest, lr=alr or E.LR,
+                                         weight_decay=E.WD if awd is None else awd)
             self.aux = None
             self.probe = None
         elif ref or norm or src or trust is not None or comp is not None or sign != -1.0:
