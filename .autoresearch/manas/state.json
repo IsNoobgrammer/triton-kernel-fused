@@ -1,0 +1,14 @@
+{
+  "objective": "paired delta vs base Muon, MNIST-1D heterogeneous protocol, eval_manas.py frozen run-0; co-primary frontier + best_ood_acc (amended wave 3, user sign-off)",
+  "status": "STOPPED - target met (run 22)",
+  "baseline": {"best_ood_acc_mean_opt": 0.4412, "min_train_mean_opt": 0.0877},
+  "best_arm": "manas gamma:0.08 rho:0.98 rank:8 refresh:200",
+  "best_held_out": {"delta_frontier": 0.0255, "sem": 0.0016, "best_acc": -0.0013},
+  "runner_up": "manas gamma:0.08 rho:0.98 full-d (held-out +0.0245 frontier, +0.0073 best_acc)",
+  "run_number": 22,
+  "promotions": [9, 12, 15, 17, 19, 22],
+  "engine_keep_rate": {"improvement": "6/13", "novel": "0/4", "diagnosis": "n/a (3 decisive verdicts: A2, A7, C7)"},
+  "mechanism_verdict": "trajectory-level lookahead along variance-reduced momentum-free normalized-grad direction; Nexus alignment-force theory refuted by measurement (see round_report.md)",
+  "open_issues": ["A1(USER, reframed)", "A3", "A5", "A6", "A8", "B3", "B5-B10", "C8", "C9", "C10-C12", "D2(Muon+Nexus arm)"],
+  "notes": "Round closed. Report: .autoresearch/manas/round_report.md. Next: BiBo-scale test with gamma re-sweep; grokking second testbed (C9); lr-tuned AdamW baseline (C8) before public claims."
+}

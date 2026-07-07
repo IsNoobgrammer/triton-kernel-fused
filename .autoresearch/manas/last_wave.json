@@ -1,0 +1,28 @@
+{
+ "manas_g80_r8_slow": {
+  "per_seed": {
+   "5": {
+    "delta_frontier": 0.02870058501309952,
+    "delta_best_acc": -0.009999990463256836,
+    "delta_final_train": -0.012576279540856689,
+    "delta_final_ce": 0.12399840354919434
+   },
+   "6": {
+    "delta_frontier": 0.023915525262642245,
+    "delta_best_acc": 0.004999995231628418,
+    "delta_final_train": 0.00898658360044162,
+    "delta_final_ce": 0.31032848358154297
+   },
+   "7": {
+    "delta_frontier": 0.02379776552922287,
+    "delta_best_acc": 0.0009999871253967285,
+    "delta_final_train": -0.0007699256141980443,
+    "delta_final_ce": 0.4475281238555908
+   }
+  },
+  "delta_frontier_mean": 0.02547129193498821,
+  "noise_sem": 0.0016150043526212713,
+  "delta_best_acc_mean": -0.0013333360354105632,
+  "delta_final_train_mean": -0.0014532071848710377
+ }
+}

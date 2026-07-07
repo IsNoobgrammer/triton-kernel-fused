@@ -1,0 +1,72 @@
+
+## Wave 0 (runs 0-1)
+Primary frontier metric is flat for every arm at gamma 1.5e-3 (all |delta| < 0.001 ~ sem).
+Either the probe does nothing at this gamma, or the frontier metric averages over the OOD-acc
+plateau and is insensitive. rho=0.94 improved BEST OOD acc on 5/5 paired seeds (+0.012,
+~3.5 sigma) - long memory beat short memory (rho0/rho05 ~ +0.004, rho085 +0.0006). This is
+the OPPOSITE of the staleness prediction (A1/A2). Do not metric-shop: best_acc stays a
+slice/secondary; verify rho094 on held-out before any belief. Next: held-out rho094; extend
+rho to 0.97; gamma dose at rho094 (primary may need bigger gamma to move).
+
+## Wave 1 (run 2)
+rho094's 5/5 best_acc signal did NOT survive held-out (+0.0013 vs +0.0122): winner's curse,
+caught by the gate. Everything remains inside noise on the primary. The real gap: we have no
+POSITIVE CONTROL - if AdamW+Nexus(clone) itself cannot move this testbed, no Manas variant
+result here means anything. Wave 2 = Nexus clone (K=4, faithful Alg-3) vs accum-AdamW base,
+plus gamma 1e-2 escalation to bracket the probe's active range. If Nexus-clone is also flat
+-> testbed insensitive -> pivot to grokking two-source testbed (C9). Slice archive entry for
+rho094 downgraded (held-out fail).
+
+## Wave 2 (runs 3-4)
+Positive control verdict: the testbed CAN detect the Nexus mechanism, but on best_ood_acc
+(clone: 5/5 seeds, +0.0136) and training speed (-0.087 min-train), NOT on the frozen
+frontier metric (clone scores NEGATIVE there, 2.8 sigma). Frontier-at-matched-loss fails
+its own positive control -> flag to user for metric amendment; do not silently switch.
+Manas gamma escalation: frontier delta rises monotonically with gamma, g1e-2 first 2-sigma
+arm. Two live threads: (a) is g1e-2 real on held-out; (b) at active gamma, does rho matter
+(A2 re-test, g10_rho0 arm)? If rho0 == rho094 at g1e-2, memory is irrelevant and the win is
+extragradient; if rho094 > rho0, common-minima memory earns its keep.
+
+## Wave 3 partial (run 5) - FIRST PROMOTION
+g10_rho094 held-out: frontier +0.0032 +/- 0.0008, matching opt seeds exactly. Champion
+promoted. C13 resolution via user free-hand: co-primary metrics (frontier for the Manas
+axis, best_ood_acc for the Nexus-clone axis); a future superior-optimizer claim wants BOTH
+positive. Remaining wave-3 arms (g20 dose, g10_rho0 attribution) still running. Next:
+exp_manas sandbox (ref_mode EMA for A1, per-matrix norm B10, sign flip A10, motion trust
+A4) tested against BOTH base and the new champion.
+
+## Wave 3 complete (runs 6-7) - ATTRIBUTION LANDED
+rho=0 at gamma 1e-2: NOTHING (-0.0008 +/- 0.0005). rho=0.94 same gamma: +0.0032 held-out
+4 sigma. Memory is the mechanism, extragradient alone is inert -> A2 closed in favor of the
+common-minima story. Gamma dose still rising at 2e-2 (+0.0045 opt). Open: where does the
+dose curve turn (stability edge)? Does rho want to go higher still (0.98 arm in wave 4)?
+Do any exp_manas mechanism variants (ema-ref, permat, sign+, trust) beat the plain champion?
+A7 mechanism measurement chained after wave 4 on the GPU.
+
+## Wave 4 (runs 9-11) - MECHANISM REFRAME
+g20_rho094 promoted (held-out 2.2 sigma). Sign flip inert -> descent-specific. exp_ema
+rejected (slows training 2.3x - lagged outer gradient; its frontier "win" is a range
+artifact; lesson: ANY variant that changes training speed makes the frontier metric
+treacherous - always check train_parity slice first). A7 inversion: clean alignment-force
+injection (rho=0) is useless; noisy long-memory probe wins -> the gain is NOT the paper's
+mechanism. Working hypothesis: variance-reduced trajectory lookahead. If exp_momdir
+(probe along Muon momentum, zero extra memory) matches the champion, Manas collapses to a
+2-line Muon patch with no probe state at all - the strongest possible engineering outcome.
+
+## Wave 5 (runs 12-14)
+g10_rho098 promoted (held-out +0.0077, both co-primaries positive). momdir DEAD at both
+doses -> the mechanism needs the momentum-free normalized-grad EMA specifically, not just
+any smoothed direction; window length (rho 0.98 ~ 50 steps) beats momentum beta window.
+Purity story partially back. Meta-pattern across 5 waves: EVERY winning move so far has
+been "more smoothing of the probe direction" (rho up) or "bigger probe" (gamma up), and
+every mechanism-swap variant (ema-ref, sign, momdir) died -> the shipped probe rule is
+architecturally right at toy scale; the knobs were just set an order of magnitude too
+timid (defaults gamma 1e-3 rho 0.85 vs champion gamma 1e-2+ rho 0.98).
+
+## Wave 8 (runs 19-20) - DOSE CURVE CLOSED
+g80_rho098 promoted at held-out +0.0245 (largest, cleanest result of the round). Curve
+turns after g120; optimum plateau gamma 0.08-0.12, rho 0.98. Both original default knobs
+were order(s) of magnitude too small. No instability anywhere on the curve (parity/min-train
+clean up to g160 - B4 spikes never materialized at high gamma under the fixed protocol).
+Remaining: low-rank at champion config (wave 9, incl. refresh 16 vs 200 A/B for B2), then
+consolidation: manas.py defaults + docstring reposition, final comparison table, commit.
