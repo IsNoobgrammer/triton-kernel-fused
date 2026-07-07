@@ -1,116 +1,28 @@
 {
- "manas_g80_rho098": {
+ "shampoo_lr6e2": {
   "per_seed": {
-   "0": {
-    "delta_frontier": 0.013187636554445763,
-    "delta_best_acc": 0.01199999451637268,
-    "delta_final_train": -0.025918466349442795,
-    "delta_final_ce": -0.4092295169830322
+   "5": {
+    "delta_frontier": -0.016443133889137807,
+    "delta_best_acc": -0.006999999284744263,
+    "delta_final_train": -0.025962645808855697,
+    "delta_final_ce": -0.3732428550720215
    },
-   "1": {
-    "delta_frontier": 0.01675690562981969,
-    "delta_best_acc": 0.001999974250793457,
-    "delta_final_train": -0.012023862451314926,
-    "delta_final_ce": -0.1710977554321289
+   "6": {
+    "delta_frontier": -0.007875736135614719,
+    "delta_best_acc": 0.015000015497207642,
+    "delta_final_train": -0.010834017147620514,
+    "delta_final_ce": 0.24590253829956055
    },
-   "2": {
-    "delta_frontier": 0.028301959810654052,
-    "delta_best_acc": -0.0020000040531158447,
-    "delta_final_train": -0.02010175647834936,
-    "delta_final_ce": 0.3445868492126465
-   },
-   "3": {
-    "delta_frontier": 0.00531069575476586,
-    "delta_best_acc": 0.009000003337860107,
-    "delta_final_train": -0.019600123167037964,
-    "delta_final_ce": -0.384321928024292
-   },
-   "4": {
-    "delta_frontier": 0.01582651199270105,
-    "delta_best_acc": 0.0,
-    "delta_final_train": -0.022515200078487396,
-    "delta_final_ce": 0.5024383068084717
+   "7": {
+    "delta_frontier": -0.015697514457972354,
+    "delta_best_acc": 0.018999993801116943,
+    "delta_final_train": -0.03260452797015508,
+    "delta_final_ce": -1.177748680114746
    }
   },
-  "delta_frontier_mean": 0.015876741948477283,
-  "noise_sem": 0.0037015933735678012,
-  "delta_best_acc_mean": 0.00419999361038208,
-  "delta_final_train_mean": -0.020031881704926487
- },
- "exp_agree_g80": {
-  "per_seed": {
-   "0": {
-    "delta_frontier": 0.015929218109661282,
-    "delta_best_acc": 0.0029999911785125732,
-    "delta_final_train": -0.012283739944299057,
-    "delta_final_ce": -0.7958571910858154
-   },
-   "1": {
-    "delta_frontier": 0.014364489869203521,
-    "delta_best_acc": 0.01299998164176941,
-    "delta_final_train": 0.008709548662106187,
-    "delta_final_ce": -0.7481598854064941
-   },
-   "2": {
-    "delta_frontier": 0.01903133330488803,
-    "delta_best_acc": 0.009000003337860107,
-    "delta_final_train": -0.011805325746536255,
-    "delta_final_ce": 0.7152197360992432
-   },
-   "3": {
-    "delta_frontier": 0.008146049548827701,
-    "delta_best_acc": -0.0020000040531158447,
-    "delta_final_train": -0.0035094531873861995,
-    "delta_final_ce": 0.16172313690185547
-   },
-   "4": {
-    "delta_frontier": 0.01341849281085288,
-    "delta_best_acc": 0.0029999911785125732,
-    "delta_final_train": -0.01389728734890619,
-    "delta_final_ce": -0.36310338973999023
-   }
-  },
-  "delta_frontier_mean": 0.014177916728686683,
-  "noise_sem": 0.0017835030822562353,
-  "delta_best_acc_mean": 0.005199992656707763,
-  "delta_final_train_mean": -0.006557251513004303
- },
- "exp_agree_g120": {
-  "per_seed": {
-   "0": {
-    "delta_frontier": 0.015229089475666932,
-    "delta_best_acc": 0.018000006675720215,
-    "delta_final_train": -0.023291168113549546,
-    "delta_final_ce": -0.9299964904785156
-   },
-   "1": {
-    "delta_frontier": 0.012873698761427719,
-    "delta_best_acc": 0.007999986410140991,
-    "delta_final_train": -0.01568014547228813,
-    "delta_final_ce": -0.43352341651916504
-   },
-   "2": {
-    "delta_frontier": 0.018464944334057994,
-    "delta_best_acc": 0.02000001072883606,
-    "delta_final_train": -0.0035297051072120667,
-    "delta_final_ce": 1.6162059307098389
-   },
-   "3": {
-    "delta_frontier": 0.003211595105829847,
-    "delta_best_acc": 0.0020000040531158447,
-    "delta_final_train": -0.018735215067863464,
-    "delta_final_ce": -0.3126189708709717
-   },
-   "4": {
-    "delta_frontier": 0.012338045255389679,
-    "delta_best_acc": -0.0040000081062316895,
-    "delta_final_train": -0.017993214229742677,
-    "delta_final_ce": 0.18493199348449707
-   }
-  },
-  "delta_frontier_mean": 0.012423474586474435,
-  "noise_sem": 0.002544008207157248,
-  "delta_best_acc_mean": 0.008799999952316284,
-  "delta_final_train_mean": -0.01584588959813118
+  "delta_frontier_mean": -0.01333879482757496,
+  "noise_sem": 0.0027399966415967637,
+  "delta_best_acc_mean": 0.009000003337860107,
+  "delta_final_train_mean": -0.0231337303088771
  }
 }

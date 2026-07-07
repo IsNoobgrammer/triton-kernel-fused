@@ -304,11 +304,12 @@
     <tbody>
       <tr class="row-hi"><td>Manas &middot; rank-8 (default)</td><td class="num"><span class="pos">+0.026</span></td><td class="num">~1.01&times;</td></tr>
       <tr><td>Muon (baseline)</td><td class="num">&mdash;</td><td class="num">1&times;</td></tr>
-      <tr><td>Adam + Nexus</td><td class="num"><span class="neg">&minus;0.030</span></td><td class="num">~4&times;</td></tr>
+      <tr><td>Shampoo (tuned, 2nd-order)</td><td class="num"><span class="neg">&minus;0.013</span></td><td class="num">~3&times;</td></tr>
       <tr><td>Adam (tuned)</td><td class="num"><span class="neg">&minus;0.024</span></td><td class="num">~2&times;</td></tr>
+      <tr><td>Adam + Nexus</td><td class="num"><span class="neg">&minus;0.030</span></td><td class="num">~4&times;</td></tr>
     </tbody>
   </table></div>
-  <p style="font-size:.9rem;color:var(--dim);font-family:var(--mono);line-height:1.6">Memory is optimizer state relative to Muon. On this task, orthogonalization alone puts Muon well clear of the whole Adam family &mdash; even tuned, even with the common-minimum method attached &mdash; and Manas adds a further, separately-earned margin on top at almost no cost.</p>
+  <p style="font-size:.9rem;color:var(--dim);font-family:var(--mono);line-height:1.6">Memory is optimizer state relative to Muon. On this task, orthogonalization puts Muon clear of the whole comparison &mdash; including <b>Shampoo</b>, the heavyweight second-order method that builds an explicit curvature preconditioner. Shampoo, Adam and Nexus all reach lower training loss or a higher accuracy <em>peak</em> (real optimization strength) but generalize worse at <em>matched</em> training loss &mdash; curvature helps the descent, not the same-loss/better-model property. Manas is the only method that improves that property, and it does so at ~1% extra memory versus Shampoo's ~3&times; plus the eigendecompositions it needs just to stay stable.</p>
   <div class="callout"><span class="eyebrow">Where this stands</span><p style="margin:0">This is a controlled small-scale result, honestly gated &mdash; not yet a large language-model claim. The two things that settle it at scale are already set up: derive &rho; from batch size using the memory law, tune only &gamma;, and A/B the optional <strong>u</strong> memory where the data is varied enough for it to matter. That run is the next step.</p></div>
 </div></div></section>
 

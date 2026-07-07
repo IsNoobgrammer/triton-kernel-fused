@@ -23,6 +23,65 @@ LOGS = os.path.join(HERE, "logs")
 os.makedirs(LOGS, exist_ok=True)
 
 
+class ShampooOpt:
+    """Faithful small-scale Shampoo: per-matrix Kronecker preconditioner L^(-1/4) M R^(-1/4)
+    with L=EMA(G Gt), R=EMA(Gt G), momentum M, inverse-roots refreshed every `every` steps
+    (eigh, fp32). Second-order baseline for the ablation [C17]."""
+
+    def __init__(self, params, lr, wd, beta1=0.9, beta2=0.95, eps=1e-6, every=5):
+        self.params = [p for p in params if p.ndim == 2]
+        self.lr, self.wd, self.b1, self.b2, self.eps, self.every = lr, wd, beta1, beta2, eps, every
+        self.t = 0
+        self.state = {}
+
+    def _root(self, A, power):
+        A = 0.5 * (A + A.mT)                                  # symmetrize (kill fp asymmetry)
+        n = A.shape[0]
+        ridge = self.eps * A.diagonal().mean().clamp_min(1e-12)
+        I = torch.eye(n, device=A.device)
+        for bump in (1.0, 1e2, 1e4):                          # escalate ridge until eigh converges
+            try:
+                w, U = torch.linalg.eigh(A + ridge * bump * I)
+                return (U * w.clamp_min(self.eps).pow(power)) @ U.mT
+            except Exception:
+                continue
+        return I                                             # give up this refresh -> identity
+
+    @torch.no_grad()
+    def step(self):
+        self.t += 1
+        for p in self.params:
+            if p.grad is None:
+                continue
+            g = torch.nan_to_num(p.grad.float(), 0.0, 0.0, 0.0)
+            st = self.state.setdefault(id(p), {})
+            if "L" not in st:
+                m, n = g.shape
+                st["L"] = torch.eye(m, device=g.device) * self.eps
+                st["R"] = torch.eye(n, device=g.device) * self.eps
+                st["m"] = torch.zeros_like(g)
+                st["Li"] = torch.eye(m, device=g.device)     # identity fallback until first refresh
+                st["Ri"] = torch.eye(n, device=g.device)
+            st["L"].mul_(self.b2).add_(g @ g.mT, alpha=1 - self.b2)
+            st["R"].mul_(self.b2).add_(g.mT @ g, alpha=1 - self.b2)
+            st["m"].mul_(self.b1).add_(g)
+            if self.t % self.every == 1:
+                st["Li"] = self._root(st["L"], -0.25)
+                st["Ri"] = self._root(st["R"], -0.25)
+            upd = st["Li"] @ st["m"] @ st["Ri"]
+            if not torch.isfinite(upd).all():                # skip a bad step, don't poison weights
+                continue
+            g_norm = st["m"].norm()                           # norm-grafting onto momentum (the
+            upd = upd * (g_norm / upd.norm().clamp_min(1e-12))  # standard Shampoo stability fix)
+            if self.wd:
+                p.mul_(1 - self.lr * self.wd)
+            p.add_(upd.to(p.dtype), alpha=-self.lr)
+
+    def zero_grad(self, set_to_none=True):
+        for p in self.params:
+            p.grad = None
+
+
 class AccumAdamWTrainer:
     """AdamW with K-step gradient accumulation — the paper's baseline arm [C7]."""
 
@@ -85,6 +144,10 @@ class Trainer:
             self.opt = torch.optim.AdamW(mats + rest, lr=alr or E.LR,
                                          weight_decay=E.WD if awd is None else awd)
             self.aux = None
+            self.probe = None
+        elif outer == "shampoo":
+            self.opt = ShampooOpt(mats, lr=alr or E.LR, wd=E.WD if awd is None else awd)
+            self.aux = torch.optim.AdamW(rest, lr=E.LR, weight_decay=E.WD)
             self.probe = None
         elif ref or norm or src or vote or trust is not None or comp is not None or sign != -1.0:
             self.opt = ExpManas(mats, lr=E.LR, probe_gamma=gamma, probe_rho=rho,

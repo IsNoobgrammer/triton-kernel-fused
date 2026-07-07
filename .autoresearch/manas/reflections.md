@@ -114,3 +114,12 @@ So PSO is the right NAME for the mechanism, not a lever that improves it here. E
 Lens kept for the writeup; vote gating closed. Larger unexplored PSO door = a gbest-style
 attractor (pull toward best-consensus point seen) - u-buffer is a crude half-step to it;
 full version is a bigger design, deferred pending user + the LM run.
+
+## Wave 13 (run 29) - Shampoo ablation (friend request)
+Grafted Kronecker Shampoo, tuned lr, on the frozen protocol: matched-loss frontier -0.0133
+held-out (loses to Muon), small peak-acc edge +0.009, trains FASTER (real curvature). Same
+family signature as Adam/Nexus: better optimization, worse same-loss generalization.
+Operationally it needed eigh ridge-escalation + momentum norm-grafting just to not diverge -
+fragility Muon/Manas never touch. Final board (held-out frontier vs Muon): Manas r8 +0.0255
+> Muon 0 > Shampoo -0.013 > Adam(tuned) -0.024 > Adam+Nexus -0.030. Manas is the only
+positive. C17 closed.

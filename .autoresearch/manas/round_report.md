@@ -25,11 +25,16 @@ scale-sensitive knob; re-sweep per model scale.
 | AdamW + Nexus clone (K=4)             | -0.030    | -0.022       | +0.126    |
 | Muon + Manas full-d (g.08, rho.98)    | +0.0245 H | +0.0073 H    | -0.018    |
 | Muon + Manas rank-8 (g.08, rho.98)    | +0.0255 H | -0.0013 H    | -0.002    |
+| Shampoo (grafted, tuned lr 6e-2)      | -0.0133 H | +0.0090 H    | -0.023    |
 
-H = held-out. Ordering: Muon+Manas > Muon >> AdamW+Nexus > AdamW. Muon supplies ~10x the
-probe's increment over the AdamW family; Manas adds a separately-attributed increment on
-top. Nexus clone DOES work on its own base (vs accum-AdamW: +0.0136 peak acc, 5/5 seeds,
-faster training) — the positive control that validated the testbed.
+H = held-out. Ordering on the matched-loss frontier axis: Muon+Manas > Muon > Shampoo >
+AdamW(tuned) > AdamW+Nexus. Manas is the ONLY arm positive vs Muon on that axis. Shampoo,
+AdamW, and Nexus all reach lower training loss and/or a higher OOD peak (real optimization
+strength) but generalize worse at MATCHED train loss — the second-order/curvature family
+improves optimization, not the same-loss/better-model property Manas targets. Nexus clone
+DOES beat its own AdamW base (+0.0136 peak, 5/5) — the positive control that validated the
+testbed. Shampoo needed eigh ridge-escalation + momentum norm-grafting to train stably at
+all; Muon/Manas need no such numerical scaffolding.
 
 ## Mechanism verdict (the science)
 
