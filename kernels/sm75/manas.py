@@ -23,8 +23,16 @@ DIRECTION, never hands Muon magnitude structure to flatten (the paper's reported
 
 Validated (MNIST-1D heterogeneous-sources protocol, paired seeds, held-out gated):
 gamma 8e-2 / rho 0.98 full-d gives OOD-acc-at-matched-train-loss +0.0245 (5 sigma) and
-positive peak-OOD-acc vs base Muon, training slightly faster; dose optimum gamma 0.08-0.12,
-rho saturates at 0.98. gamma is the scale-sensitive knob — re-sweep it per task/model scale.
+positive peak-OOD-acc vs base Muon, training slightly faster; dose optimum gamma 0.08-0.12.
+
+Setting the knobs at a new scale (measured scaling laws, .autoresearch/manas/):
+  rho — NOT free: it holds MEMORY IN SAMPLES. rho* ~= 1 - batch_size/N_mem with N_mem a
+    task constant (~6k samples on the reference task; invariant across BS 32-512, where
+    the rho optimum moved 0.995 -> 0.90 exactly as the law predicts). Bigger batches want
+    SHORTER windows; re-derive rho from batch size, don't copy it.
+  gamma — couples to weight-space geometry (LR / weight norms / curvature): the toy
+    optimum was 80x the old default, so re-sweep the dose per model scale; the curve was
+    smooth with a broad plateau and no instability up to 2x the optimum.
 
 Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)

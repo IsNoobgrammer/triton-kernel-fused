@@ -70,3 +70,19 @@ were order(s) of magnitude too small. No instability anywhere on the curve (pari
 clean up to g160 - B4 spikes never materialized at high gamma under the fixed protocol).
 Remaining: low-rank at champion config (wave 9, incl. refresh 16 vs 200 A/B for B2), then
 consolidation: manas.py defaults + docstring reposition, final comparison table, commit.
+
+## User hypothesis (C14): rho is the batch/noise-coupled knob, gamma the geometry knob
+User theory: rho-window x batch ~ const (memory in TOKENS is the invariant) - long memory
+for small/noisy batches (our toy), short memory for big-batch pretraining. Gamma = the
+curvature-signal magnitude; couples to weight-space geometry (LR/weight norms), so its
+dimensionless form (fraction of step motion - trust-ratio) should transfer, raw value
+re-swept per scale. Diagnostic bs_rho.py launched: BS {32, 512} x rho {.90, .98, .995} at
+gamma .08, paired within BS. Prediction: rho* decreases with BS. If confirmed, ship a
+"tokens-of-memory" parameterization (user-facing knob = effective samples, rho derived).
+
+## Post-round (run 23) - C14 CONFIRMED
+User's rho-batch law holds with a tight invariant: effective window x batch ~= 5-6k samples
+at every batch size tested (32: rho .995; 128: rho .98; 512: rho .90). rho documented as
+memory-in-samples, not a free knob. Gamma remains the geometry-coupled dose. Implication
+for BiBo/pretraining: derive rho from tokens-per-step (expect rho << 0.9 at LM batch
+sizes), sweep only gamma.
