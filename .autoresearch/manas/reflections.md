@@ -104,3 +104,13 @@ evidence yet for the smoothing/denoising story: the mechanism lives in a tiny su
 u still separates from nothing at toy scale; its real test is heterogeneous large-batch
 (LM). Production candidate lineup frozen: (a) champion r8-no-u; (b) exp_lrdu r8-d+r8-u
 comp+1 - identical cost class, LM decides.
+
+## Wave 12 (run 28) - PSO lens, honest tie
+User framing: Manas = PSO whose swarm is past steps (consensus over data shards, harvested
+from the trajectory, zero parallel cost). Tested the one falsifiable import - agreement-
+weighted (social-reinforcement) votes: TIE with equal-vote at champion and 1.4x gamma.
+So PSO is the right NAME for the mechanism, not a lever that improves it here. Equal-vote
+(plain recency-decayed average) is as good as self-sharpening consensus at toy scale.
+Lens kept for the writeup; vote gating closed. Larger unexplored PSO door = a gbest-style
+attractor (pull toward best-consensus point seen) - u-buffer is a crude half-step to it;
+full version is a bigger design, deferred pending user + the LM run.

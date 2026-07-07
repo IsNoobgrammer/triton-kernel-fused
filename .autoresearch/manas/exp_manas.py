@@ -29,8 +29,12 @@ class ExpManas(ManasOptimizer):
     probe memory (kills B5 by construction) and deliberately momentum-IMPURE — the A7
     measurement says the paper's purity requirement is not where the gain comes from."""
 
+    # vote [PSO import]: "equal" (shipped, every past batch one vote) | "agree" (social
+    # reinforcement — weight each new gradient's vote by its agreement with the emerging
+    # consensus d: w = clamp(0.5 + 0.5*cos(g, d), 0.15, 1). Self-sharpening swarm; the one
+    # PSO ingredient plain recency-decay averaging lacks. Full-d test path only.
     def __init__(self, params, ref_mode="theta", norm_mode="global", sign=-1.0,
-                 trust=None, probe_src="buffer", comp=None, **kw):
+                 trust=None, probe_src="buffer", comp=None, vote="equal", **kw):
         # low-rank d is inherited from the parent; only trust/ema/permat/sign paths
         # still require full-d (they touch _full_d / raw grads directly)
         if kw.get("probe_rank") is not None:
@@ -42,6 +46,11 @@ class ExpManas(ManasOptimizer):
         self.ref_mode, self.norm_mode = ref_mode, norm_mode
         self.sign, self.trust = float(sign), (None if trust is None else float(trust))
         self.probe_src = probe_src
+        assert vote in ("equal", "agree")
+        self.vote = vote
+        if vote == "agree":
+            assert kw.get("probe_rank") is None and norm_mode == "global" and sign == -1.0, \
+                "vote='agree' is full-d / global / descent only (mechanism test path)"
         # comp [user's update-history idea]: keep a rho-decayed buffer u of the APPLIED
         # updates (post-polar Muon steps) and add kappa * gamma * u/||u|| to the probe
         # offset — the probe then knows how much of its direction the weights have already
@@ -188,6 +197,28 @@ class ExpManas(ManasOptimizer):
     @torch.no_grad()
     def _update_probe(self):
         if self.probe_src == "muonmom":                          # no probe state to update
+            return
+        if self.vote == "agree":                                 # PSO social-reinforcement votes
+            ps = [p for p in self._probe_params() if p.grad is not None]
+            if not ps or self.probe_gamma == 0.0:
+                return
+            gn = torch.linalg.vector_norm(torch.stack(
+                [torch.linalg.vector_norm(p.grad, dtype=torch.float32) for p in ps]))
+            inv = self.probe_gamma / gn
+            inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
+            for p in ps:
+                d = self._full_d(p)
+                g32 = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).float()
+                # agreement of this batch with the consensus so far (per matrix)
+                dn = torch.linalg.vector_norm(d)
+                if dn > 0:
+                    cos = torch.dot(g32.flatten(), d.flatten()) / (
+                        torch.linalg.vector_norm(g32) * dn + 1e-12)
+                    # descent probe subtracts g, so a vote AGREES with d when cos < 0
+                    w = torch.clamp(0.5 - 0.5 * cos, 0.15, 1.0)
+                else:
+                    w = 1.0
+                d.mul_(self.probe_rho).addcmul_(g32, inv * w, value=-1.0)
             return
         if self.norm_mode == "global" and self.sign == -1.0:
             return super()._update_probe()

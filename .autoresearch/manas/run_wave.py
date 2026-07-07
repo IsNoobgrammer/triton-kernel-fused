@@ -79,19 +79,19 @@ class Trainer:
 
     def __init__(self, model, gamma=0.0, rho=0.85, rank=None, refresh=200, sign=-1.0,
                  outer="muon", ref=None, norm=None, trust=None, src=None, comp=None,
-                 alr=None, awd=None):
+                 vote=None, alr=None, awd=None):
         mats, rest = E.split_params(model)
         if outer == "adamw":
             self.opt = torch.optim.AdamW(mats + rest, lr=alr or E.LR,
                                          weight_decay=E.WD if awd is None else awd)
             self.aux = None
             self.probe = None
-        elif ref or norm or src or trust is not None or comp is not None or sign != -1.0:
+        elif ref or norm or src or vote or trust is not None or comp is not None or sign != -1.0:
             self.opt = ExpManas(mats, lr=E.LR, probe_gamma=gamma, probe_rho=rho,
                                 probe_rank=rank, probe_refresh=refresh,
                                 weight_decay=E.WD, ref_mode=ref or "theta",
                                 norm_mode=norm or "global", sign=sign, trust=trust,
-                                probe_src=src or "buffer", comp=comp)
+                                probe_src=src or "buffer", comp=comp, vote=vote or "equal")
             self.aux = torch.optim.AdamW(rest, lr=E.LR, weight_decay=E.WD)
             self.probe = self.opt.probe if gamma != 0 else None
         else:
@@ -125,7 +125,7 @@ def parse_arm(spec):
     cfg = {}
     for kv in filter(None, kvs.split(",")):
         k, _, v = kv.partition(":")
-        cfg[k] = v if k in ("outer", "ref", "norm", "src") else (None if v == "None" else float(v))
+        cfg[k] = v if k in ("outer", "ref", "norm", "src", "vote") else (None if v == "None" else float(v))
     if "rank" in cfg and cfg["rank"] and cfg["rank"] > 1:
         cfg["rank"] = int(cfg["rank"])
     if "refresh" in cfg:
