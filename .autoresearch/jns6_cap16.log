@@ -1,0 +1,17 @@
+  start 0: floor 0.7135 ceil 0.8352 feasible=True
+  start 1: floor nan ceil nan feasible=False
+  start 2: floor nan ceil nan feasible=False
+  start 3: floor nan ceil nan feasible=False
+  start 4: floor nan ceil nan feasible=False
+  start 5: floor nan ceil nan feasible=False
+  start 6: floor nan ceil nan feasible=False
+  start 7: floor nan ceil nan feasible=False
+  start 8: floor nan ceil nan feasible=False
+  start 9: floor nan ceil nan feasible=False
+  start 10: floor nan ceil nan feasible=False
+  start 11: floor nan ceil nan feasible=False
+  start 12: floor nan ceil nan feasible=False
+  start 13: floor nan ceil nan feasible=False
+  start 14: floor nan ceil nan feasible=False
+  start 15: floor nan ceil nan feasible=False
+BEST floor 0.7135 ceil 0.8352 (l0=0.002, 6 steps, cap 1.6)

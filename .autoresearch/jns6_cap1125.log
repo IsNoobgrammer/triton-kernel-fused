@@ -1,0 +1,9 @@
+  start 0: floor 0.6682 ceil 0.8917 feasible=True
+  start 1: floor nan ceil nan feasible=False
+  start 2: floor nan ceil nan feasible=False
+  start 3: floor nan ceil nan feasible=False
+  start 4: floor nan ceil nan feasible=False
+  start 5: floor nan ceil nan feasible=False
+  start 6: floor nan ceil nan feasible=False
+  start 7: floor nan ceil nan feasible=False
+  start 8: floor nan ceil nan feasible=False

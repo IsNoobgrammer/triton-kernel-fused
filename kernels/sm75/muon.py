@@ -112,8 +112,16 @@ class FusedMuon(optim.Optimizer):
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
                  coeffs=_DSV4_COEFFS, ns_dtype=None, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
-                 spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
+                 spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0, xorth_backend="ns",
+                 xorth_ns_iters=18, xorth_ema=0.95, xorth_gate_ref=0.3):
+        # xorth_post is a GROUP-level option (like lr/wd): the constructor value is only the default;
+        # pass param groups to scope whitening to the params whose leading dim IS an expert axis:
+        #   FusedMuon([{"params": expert_stacks, "xorth_post": 0.01},
+        #              {"params": everything_else}], ...)            # xorth off elsewhere
+        # This makes experts-only whitening EXPLICIT — the old implicit rule ("any 3D param") would
+        # silently whiten across the leading dim of e.g. (H,d,d) stacked attention heads.
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay,
+                        xorth_post=float(xorth_post))
         super().__init__(params, defaults)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype if ns_dtype is not None else self.DEFAULT_NS_DTYPE
@@ -131,7 +139,17 @@ class FusedMuon(optim.Optimizer):
         # AFTER-NS cross-expert decorrelation (post-polar xorth): damped E x E whitening of the
         # ORTHOGONALIZED update, per expert-stack (n>1). Cleaner gram than pre-NS grad xorth (uniform
         # spectrum) but breaks per-expert orthogonality. 0 = off. See muon_scaling.xorth_whiten.
-        self.xorth_post = float(xorth_post)
+        if xorth_backend not in ("ns", "eigh"):
+            raise ValueError(f"xorth_backend must be 'ns' or 'eigh', got {xorth_backend!r}")
+        self.xorth_backend = xorth_backend
+        self.xorth_ns_iters = int(xorth_ns_iters)
+        # EMA'd + gated whitening (the 'ns' backend default): whiten against a PERSISTENT (E,E)
+        # EMA gram (init identity — xorth is a no-op until cross-expert correlation accumulates)
+        # with per-stack strength gated on the EMA's off-diagonal RMS. xorth_ema=0 -> instantaneous
+        # gram; xorth_gate_ref<=0 -> gate off (always full xorth_post). State: E^2 fp32 per stack
+        # (~5KB on BiBo — nothing next to the (M,rows) row-EMA's ~0.2%).
+        self.xorth_ema = float(xorth_ema)
+        self.xorth_gate_ref = float(xorth_gate_ref)
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
         # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
         # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
@@ -155,6 +173,39 @@ class FusedMuon(optim.Optimizer):
 
     def _scale(self, p):
         return _scaling.scalar_scale(self.scale_mode, p.shape[-2], p.shape[-1])
+
+    def _whiten_chunk(self, out, members, r, c, beta_max):
+        """Cross-expert whiten every expert stack (n>1) in one chunk, batched per expert-count.
+        STREAMING (per chunk, not per group): the fp32 staging is bounded by ns_batch_elems, so
+        memory scales to 256-expert/80-layer stacks. Backend 'ns' (default) = EMA'd + GATED
+        Denman–Beavers whitening (persistent (E,E) gram state per param, identity-init; pure bmm,
+        no cuSOLVER, any E); 'eigh' = the legacy exact instantaneous path (per-matrix cuSOLVER
+        serialization above E=32 — reproduction only)."""
+        byn = defaultdict(list)
+        for p, o, n in members:
+            if n > 1:
+                byn[n].append((p, o))
+        for n, po in byn.items():
+            sel = torch.stack([out[o:o + n].reshape(n, -1) for _p, o in po]).float()   # (S, E, D)
+            if self.xorth_backend == "eigh":
+                wht = _scaling.xorth_whiten_batch(sel, beta_max)
+            else:
+                cema = torch.stack([self._xorth_state(p, n) for p, _o in po])          # (S, E, E)
+                wht = _scaling.xorth_whiten_gated(sel, cema, beta_max,
+                                                  rho=self.xorth_ema, gate_ref=self.xorth_gate_ref,
+                                                  iters=self.xorth_ns_iters)
+                for i, (p, _o) in enumerate(po):                   # persist the mutated EMA grams
+                    self.state[p]["xorth_cema"].copy_(cema[i])
+            for i, (_p, o) in enumerate(po):
+                out[o:o + n] = wht[i].view(n, r, c).to(out.dtype)
+
+    def _xorth_state(self, p, n):
+        """(E,E) fp32 EMA gram for one expert stack — identity init ('assume decorrelated'), keyed
+        by the param so it round-trips through state_dict like the momentum buffer."""
+        st = self.state[p]
+        if "xorth_cema" not in st:
+            st["xorth_cema"] = torch.eye(n, device=p.device, dtype=torch.float32)
+        return st["xorth_cema"]
 
     def _polar(self, u):
         """The raw orthogonalizer aurora iterates on (overridden on sm120 to gram/symmul)."""
@@ -294,7 +345,8 @@ class FusedMuon(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if (self.use_graph and self.spectral_wd == 0 and self.xorth_post == 0
+        if (self.use_graph and self.spectral_wd == 0
+                and not any(g.get("xorth_post", 0) > 0 for g in self.param_groups)
                 and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode))):
             self._graph_step()                                    # captured graph supports scalar scales only
             return loss
@@ -305,6 +357,8 @@ class FusedMuon(optim.Optimizer):
                 continue
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
                                           group["weight_decay"], group["nesterov"])
+            xp = group["xorth_post"]                              # group-scoped: whiten ONLY the groups
+                                                                  # whose leading dim is an expert axis
 
             # BATCHED-STATE, SAME-SHAPE: momentum is ONE (M,r,c) fp16 buffer per shape group (the lever
             # compile can't reach — it runs NS per param). Grads are gathered directly into the batched
@@ -324,6 +378,7 @@ class FusedMuon(optim.Optimizer):
                 v_all = self.state[g["anchor"]].get("scale_v")       # (M,r) EMA state for per-row modes
                 e_all = self.state[g["anchor"]].get("swd_e") if spectral else None  # (M,r) energy EMA for spectral wd
                 alpha = -lr * g["scale"]                              # scalar modes fold the scale here
+                sc_alpha = -lr if _scaling.folds_scale(self.scale_mode) else alpha
                 for members, start, crows in g["chunks"]:            # bounded row-chunks (memory cap)
                     mom_c = mom[start:start + crows]                  # view into the persistent buffer
                     gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
@@ -351,14 +406,12 @@ class FusedMuon(optim.Optimizer):
                         out = newton_schulz(u, self.coeffs, self.ns_dtype)
                         if perrow:                                    # leverage-aware per-row rescale (scale folded into out)
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
-                    if self.xorth_post > 0:                            # AFTER-NS cross-expert whiten, per expert-stack (n>1)
-                        for p, o, n in members:
-                            if n > 1:
-                                out[o:o + n] = _scaling.xorth_whiten(out[o:o + n], self.xorth_post)
+                    if xp > 0:                                        # AFTER-NS cross-expert whiten
+                        self._whiten_chunk(out, members, r, c, xp)
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members],
-                                        alpha=(-lr if _scaling.folds_scale(self.scale_mode) else alpha))
+                                        alpha=sc_alpha)
 
         return loss
 

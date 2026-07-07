@@ -1,0 +1,32 @@
+<frozen runpy>:128: RuntimeWarning: 'kernels.sm120.newton_schulz_gram' found in sys.modules after import of package 'kernels.sm120', but prior to execution of 'kernels.sm120.newton_schulz_gram'; this may result in unpredictable behaviour
+GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition
+
+(2048 x 8192)  r=4.0
+  champion (cuBLAS)       4.88 ms  vs-champ 0.00e+00  vs-truth 7.69e-04  sv[min/mean/max] 1.000/1.000/1.001
+  symmul NS               3.96 ms  vs-champ 8.28e-04  vs-truth 7.61e-04  sv[min/mean/max] 1.000/1.000/1.001
+  gram NS (default)       2.50 ms  vs-champ 1.34e-03  vs-truth 1.18e-03  sv[min/mean/max] 0.998/1.000/1.002
+  gram NS no-restart      1.92 ms  vs-champ 3.12e-03  vs-truth 3.06e-03  sv[min/mean/max] 0.995/1.001/1.006
+  gram NS fp32-gram       3.80 ms  vs-champ 1.31e-03  vs-truth 1.09e-03  sv[min/mean/max] 0.998/1.000/1.002
+
+(2048 x 4096)  r=2.0
+  champion (cuBLAS)       3.04 ms  vs-champ 0.00e+00  vs-truth 1.43e-03  sv[min/mean/max] 1.000/1.000/1.001
+  symmul NS               2.37 ms  vs-champ 1.69e-03  vs-truth 1.43e-03  sv[min/mean/max] 1.000/1.000/1.001
+  gram NS (default)       2.02 ms  vs-champ 1.86e-03  vs-truth 1.29e-03  sv[min/mean/max] 0.998/1.000/1.002
+  gram NS no-restart      1.73 ms  vs-champ 4.58e-03  vs-truth 4.38e-03  sv[min/mean/max] 0.993/1.001/1.008
+  gram NS fp32-gram       3.30 ms  vs-champ 1.82e-03  vs-truth 1.19e-03  sv[min/mean/max] 0.998/1.000/1.002
+
+(2048 x 2048)  r=1.0
+  champion (cuBLAS)       1.98 ms  vs-champ 0.00e+00  vs-truth 1.39e-02  sv[min/mean/max] 0.461/1.000/1.002
+  symmul NS               1.49 ms  vs-champ 0.00e+00  vs-truth 1.39e-02  sv[min/mean/max] 0.461/1.000/1.002
+  gram NS (default)       1.48 ms  vs-champ 0.00e+00  vs-truth 1.39e-02  sv[min/mean/max] 0.461/1.000/1.002
+  gram NS no-restart      1.49 ms  vs-champ 0.00e+00  vs-truth 1.39e-02  sv[min/mean/max] 0.461/1.000/1.002
+  gram NS fp32-gram       1.48 ms  vs-champ 0.00e+00  vs-truth 1.39e-02  sv[min/mean/max] 0.461/1.000/1.002
+
+(3072 x 8192)  r=2.7
+  champion (cuBLAS)      10.57 ms  vs-champ 0.00e+00  vs-truth 1.52e-03  sv[min/mean/max] 0.999/1.000/1.001
+  symmul NS               8.17 ms  vs-champ 1.85e-03  vs-truth 1.44e-03  sv[min/mean/max] 1.000/1.001/1.001
+  gram NS (default)       5.70 ms  vs-champ 1.92e-03  vs-truth 1.15e-03  sv[min/mean/max] 0.998/1.001/1.002
+  gram NS no-restart      4.51 ms  vs-champ 3.85e-03  vs-truth 3.55e-03  sv[min/mean/max] 0.993/1.001/1.008
+  gram NS fp32-gram       9.61 ms  vs-champ 1.77e-03  vs-truth 1.11e-03  sv[min/mean/max] 0.998/1.000/1.001
+
+

@@ -1,0 +1,450 @@
+[transformers] The new embeddings will be initialized from a multivariate normal distribution that has old embeddings' mean and covariance. As described in this article: https://nlp.stanford.edu/~johnhew/vocab-expansion.html. To disable this, use `mean_resizing=False`
+/usr/local/lib/python3.13/site-packages/torch/autograd/graph.py:882: UserWarning: Flash Attention defaults to a non-deterministic algorithm. To explicitly enable determinism call torch.use_deterministic_algorithms(True, warn_only=False). (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/attention_backward.cu:124.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[exp_kappa] arm=default | fused CE + fused MoE + KappaMuon active
+[bench] ============================================================
+[bench] BiBo Benchmark — BIBO
+[bench] ============================================================
+[bench]   Device: cuda:0 (world_size=1)
+[bench]   Batch: 16 x 1 accum
+[bench]   Steps: 3000
+[bench]   Optimizer: muon_adamw
+[bench]   Scheduler: whd (WSD: 5% warmup → 60% hold → 35% cosine decay to 0)
+[bench]   Precision: AMP bfloat16 (fp32 master weights)
+[bench]   Muon NS coeffs: Polar-Express
+[bench]   Deterministic: ON (seed=42, strict=False) — identical config => identical curve
+[bench] ============================================================
+[bench] Loading dataset...
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+  Loading tokenizer: fhai50032/QTK-81K
+[bench] Tokenizer vocab: 81920, safe: 81920
+[bench] Building bibo model...
+  Resized embeddings: 81000 -> 81920
+[bench] Params: 137.95M total, 71.89M active
+[bench] MoE layers: 8, Dense: 2
+  Optimizer: Muon+AdamW(fused) [KappaMuon[default]] [Turbo-NS 5it]
+
+[bench] Starting training from step 0...
+[bench] 1148889 train, 60467 val samples
+  step      1/3000 (  0.0%) | loss=11.4213 | lr=2.00e-06 | tok=16.38K | tps=7819 | mfu=5.2%/gpu | mem=7.5G | 2.096s | grad=18.1084 | ETA=1.7h
+  step     10/3000 (  0.3%) | loss=11.3475 | lr=2.00e-05 | tok=163.84K | tps=91099 | mfu=60.4%/gpu | mem=9.4G | 0.140s | grad=13.7544 | ETA=7.0m
+    [perf] 1 stall(s) this window (max step 0.49s) — likely recompile/launch-bound
+  step     20/3000 (  0.7%) | loss=11.1425 | lr=4.00e-05 | tok=327.68K | tps=117702 | mfu=78.1%/gpu | mem=9.4G | 0.139s | grad=7.1854 | ETA=6.9m
+  step     30/3000 (  1.0%) | loss=10.7882 | lr=6.00e-05 | tok=491.52K | tps=117950 | mfu=78.3%/gpu | mem=9.4G | 0.141s | grad=7.1392 | ETA=7.0m
+  step     40/3000 (  1.3%) | loss=10.3531 | lr=8.00e-05 | tok=655.36K | tps=115244 | mfu=76.5%/gpu | mem=9.4G | 0.170s | grad=4.2639 | ETA=8.4m
+  step     50/3000 (  1.7%) | loss=9.6738 | lr=1.00e-04 | tok=819.20K | tps=92378 | mfu=61.3%/gpu | mem=9.3G | 0.248s | grad=4.8769 | ETA=12.2m
+  step     60/3000 (  2.0%) | loss=8.9289 | lr=1.20e-04 | tok=983.04K | tps=39605 | mfu=26.3%/gpu | mem=9.0G | 0.141s | grad=4.6476 | ETA=6.9m
+    [perf] 3 stall(s) this window (max step 1.06s) — likely recompile/launch-bound
+  step     70/3000 (  2.3%) | loss=8.2142 | lr=1.40e-04 | tok=1.15M | tps=57597 | mfu=38.2%/gpu | mem=8.7G | 0.144s | grad=3.6743 | ETA=7.0m
+    [perf] 1 stall(s) this window (max step 0.72s) — likely recompile/launch-bound
+  step     80/3000 (  2.7%) | loss=7.8414 | lr=1.60e-04 | tok=1.31M | tps=55250 | mfu=36.7%/gpu | mem=8.7G | 0.475s | grad=2.4116 | ETA=23.1m
+    [perf] 3 stall(s) this window (max step 1.03s) — likely recompile/launch-bound
+  step     90/3000 (  3.0%) | loss=7.6448 | lr=1.80e-04 | tok=1.47M | tps=121506 | mfu=80.6%/gpu | mem=8.7G | 0.135s | grad=1.9049 | ETA=6.5m
+  step    100/3000 (  3.3%) | loss=7.5872 | lr=2.00e-04 | tok=1.64M | tps=122080 | mfu=81.0%/gpu | mem=8.8G | 0.135s | grad=1.8784 | ETA=6.5m
+  step    110/3000 (  3.7%) | loss=7.4115 | lr=2.20e-04 | tok=1.80M | tps=121968 | mfu=80.9%/gpu | mem=8.9G | 0.137s | grad=1.7812 | ETA=6.6m
+  step    120/3000 (  4.0%) | loss=6.9722 | lr=2.40e-04 | tok=1.97M | tps=119840 | mfu=79.5%/gpu | mem=9.0G | 0.136s | grad=1.8919 | ETA=6.5m
+  step    130/3000 (  4.3%) | loss=7.1139 | lr=2.60e-04 | tok=2.13M | tps=120185 | mfu=79.7%/gpu | mem=9.0G | 0.135s | grad=1.4870 | ETA=6.4m
+  step    140/3000 (  4.7%) | loss=6.8271 | lr=2.80e-04 | tok=2.29M | tps=118164 | mfu=78.4%/gpu | mem=9.1G | 0.141s | grad=1.5152 | ETA=6.7m
+  step    150/3000 (  5.0%) | loss=6.7623 | lr=3.00e-04 | tok=2.46M | tps=119322 | mfu=79.2%/gpu | mem=9.2G | 0.137s | grad=1.3761 | ETA=6.5m
+  step    160/3000 (  5.3%) | loss=6.7324 | lr=3.00e-04 | tok=2.62M | tps=120027 | mfu=79.6%/gpu | mem=9.2G | 0.135s | grad=1.5844 | ETA=6.4m
+  step    170/3000 (  5.7%) | loss=6.6912 | lr=3.00e-04 | tok=2.79M | tps=119751 | mfu=79.5%/gpu | mem=9.3G | 0.136s | grad=1.0373 | ETA=6.4m
+  step    180/3000 (  6.0%) | loss=6.4295 | lr=3.00e-04 | tok=2.95M | tps=119536 | mfu=79.3%/gpu | mem=9.3G | 0.140s | grad=1.0181 | ETA=6.6m
+  step    190/3000 (  6.3%) | loss=6.6115 | lr=3.00e-04 | tok=3.11M | tps=119960 | mfu=79.6%/gpu | mem=9.3G | 0.140s | grad=1.1757 | ETA=6.5m
+  step    200/3000 (  6.7%) | loss=6.4996 | lr=3.00e-04 | tok=3.28M | tps=116533 | mfu=77.3%/gpu | mem=9.3G | 0.175s | grad=1.1100 | ETA=8.2m
+  step    210/3000 (  7.0%) | loss=6.2472 | lr=3.00e-04 | tok=3.44M | tps=120146 | mfu=79.7%/gpu | mem=9.3G | 0.137s | grad=1.1761 | ETA=6.4m
+  step    220/3000 (  7.3%) | loss=6.4553 | lr=3.00e-04 | tok=3.60M | tps=119675 | mfu=79.4%/gpu | mem=9.4G | 0.137s | grad=1.1328 | ETA=6.3m
+  step    230/3000 (  7.7%) | loss=6.2531 | lr=3.00e-04 | tok=3.77M | tps=119368 | mfu=79.2%/gpu | mem=9.5G | 0.138s | grad=0.9709 | ETA=6.4m
+  step    240/3000 (  8.0%) | loss=6.0560 | lr=3.00e-04 | tok=3.93M | tps=118113 | mfu=78.4%/gpu | mem=9.6G | 0.140s | grad=0.9236 | ETA=6.5m
+  step    250/3000 (  8.3%) | loss=5.9562 | lr=3.00e-04 | tok=4.10M | tps=118029 | mfu=78.3%/gpu | mem=9.6G | 0.142s | grad=1.0110 | ETA=6.5m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=6.1496 ppl=468.55 bpb=1.4104
+    [LONG-RANGE] L1024 loss=6.1796 bpb=1.3804  L2048 loss=8.1085 bpb=1.4891  | degr×=1.079
+  step    260/3000 (  8.7%) | loss=5.9664 | lr=3.00e-04 | tok=4.26M | tps=116051 | mfu=77.0%/gpu | mem=9.5G | 0.138s | grad=1.0859 | ETA=6.3m
+  step    270/3000 (  9.0%) | loss=6.0779 | lr=3.00e-04 | tok=4.42M | tps=116115 | mfu=77.0%/gpu | mem=9.5G | 0.139s | grad=0.9599 | ETA=6.3m
+  step    280/3000 (  9.3%) | loss=6.1017 | lr=3.00e-04 | tok=4.59M | tps=116951 | mfu=77.6%/gpu | mem=9.5G | 0.138s | grad=0.9535 | ETA=6.3m
+  step    290/3000 (  9.7%) | loss=5.7369 | lr=3.00e-04 | tok=4.75M | tps=118115 | mfu=78.4%/gpu | mem=9.6G | 0.145s | grad=1.0102 | ETA=6.5m
+  step    300/3000 ( 10.0%) | loss=6.0940 | lr=3.00e-04 | tok=4.92M | tps=116326 | mfu=77.2%/gpu | mem=9.6G | 0.145s | grad=1.0434 | ETA=6.5m
+  step    310/3000 ( 10.3%) | loss=5.9616 | lr=3.00e-04 | tok=5.08M | tps=116759 | mfu=77.5%/gpu | mem=9.5G | 0.139s | grad=1.0731 | ETA=6.3m
+  step    320/3000 ( 10.7%) | loss=5.8159 | lr=3.00e-04 | tok=5.24M | tps=116157 | mfu=77.1%/gpu | mem=9.5G | 0.141s | grad=0.9592 | ETA=6.3m
+  step    330/3000 ( 11.0%) | loss=6.0407 | lr=3.00e-04 | tok=5.41M | tps=116264 | mfu=77.1%/gpu | mem=9.5G | 0.143s | grad=0.9506 | ETA=6.3m
+  step    340/3000 ( 11.3%) | loss=5.9046 | lr=3.00e-04 | tok=5.57M | tps=116543 | mfu=77.3%/gpu | mem=9.5G | 0.142s | grad=1.5107 | ETA=6.3m
+  step    350/3000 ( 11.7%) | loss=5.8476 | lr=3.00e-04 | tok=5.73M | tps=115789 | mfu=76.8%/gpu | mem=9.5G | 0.142s | grad=0.9137 | ETA=6.3m
+  step    360/3000 ( 12.0%) | loss=5.6849 | lr=3.00e-04 | tok=5.90M | tps=115562 | mfu=76.7%/gpu | mem=9.5G | 0.143s | grad=1.1773 | ETA=6.3m
+  step    370/3000 ( 12.3%) | loss=5.5922 | lr=3.00e-04 | tok=6.06M | tps=117805 | mfu=78.2%/gpu | mem=9.5G | 0.138s | grad=0.9711 | ETA=6.0m
+  step    380/3000 ( 12.7%) | loss=5.4126 | lr=3.00e-04 | tok=6.23M | tps=117441 | mfu=77.9%/gpu | mem=9.5G | 0.138s | grad=1.0019 | ETA=6.0m
+  step    390/3000 ( 13.0%) | loss=6.0630 | lr=3.00e-04 | tok=6.39M | tps=116041 | mfu=77.0%/gpu | mem=9.4G | 0.144s | grad=1.0216 | ETA=6.3m
+  step    400/3000 ( 13.3%) | loss=5.9813 | lr=3.00e-04 | tok=6.55M | tps=116341 | mfu=77.2%/gpu | mem=9.5G | 0.141s | grad=1.1341 | ETA=6.1m
+  step    410/3000 ( 13.7%) | loss=5.7507 | lr=3.00e-04 | tok=6.72M | tps=116199 | mfu=77.1%/gpu | mem=9.4G | 0.138s | grad=0.9281 | ETA=5.9m
+  step    420/3000 ( 14.0%) | loss=5.7573 | lr=3.00e-04 | tok=6.88M | tps=117904 | mfu=78.2%/gpu | mem=9.4G | 0.138s | grad=3.7765 | ETA=5.9m
+  step    430/3000 ( 14.3%) | loss=5.3962 | lr=3.00e-04 | tok=7.05M | tps=115122 | mfu=76.4%/gpu | mem=9.4G | 0.144s | grad=0.9759 | ETA=6.2m
+  step    440/3000 ( 14.7%) | loss=6.1244 | lr=3.00e-04 | tok=7.21M | tps=116792 | mfu=77.5%/gpu | mem=9.4G | 0.138s | grad=1.2393 | ETA=5.9m
+  step    450/3000 ( 15.0%) | loss=5.8637 | lr=3.00e-04 | tok=7.37M | tps=115166 | mfu=76.4%/gpu | mem=9.4G | 0.141s | grad=1.3472 | ETA=6.0m
+  step    460/3000 ( 15.3%) | loss=5.4405 | lr=3.00e-04 | tok=7.54M | tps=117348 | mfu=77.9%/gpu | mem=9.4G | 0.141s | grad=0.9140 | ETA=6.0m
+  step    470/3000 ( 15.7%) | loss=5.1895 | lr=3.00e-04 | tok=7.70M | tps=118665 | mfu=78.7%/gpu | mem=9.4G | 0.137s | grad=1.0303 | ETA=5.8m
+  step    480/3000 ( 16.0%) | loss=5.9914 | lr=3.00e-04 | tok=7.86M | tps=118269 | mfu=78.5%/gpu | mem=9.4G | 0.138s | grad=1.0954 | ETA=5.8m
+  step    490/3000 ( 16.3%) | loss=5.5714 | lr=3.00e-04 | tok=8.03M | tps=118855 | mfu=78.9%/gpu | mem=9.4G | 0.137s | grad=0.9218 | ETA=5.7m
+  step    500/3000 ( 16.7%) | loss=5.8438 | lr=3.00e-04 | tok=8.19M | tps=119747 | mfu=79.5%/gpu | mem=9.4G | 0.137s | grad=1.0364 | ETA=5.7m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=5.4947 ppl=243.40 bpb=1.2602
+    [LONG-RANGE] L1024 loss=5.5297 bpb=1.2353  L2048 loss=7.5867 bpb=1.3933  | degr×=1.128
+  step    510/3000 ( 17.0%) | loss=6.0154 | lr=3.00e-04 | tok=8.36M | tps=113651 | mfu=75.4%/gpu | mem=9.4G | 0.147s | grad=1.5341 | ETA=6.1m
+  step    520/3000 ( 17.3%) | loss=5.4223 | lr=3.00e-04 | tok=8.52M | tps=118070 | mfu=78.3%/gpu | mem=9.3G | 0.138s | grad=0.9954 | ETA=5.7m
+  step    530/3000 ( 17.7%) | loss=5.6062 | lr=3.00e-04 | tok=8.68M | tps=117457 | mfu=77.9%/gpu | mem=9.4G | 0.138s | grad=1.0020 | ETA=5.7m
+  step    540/3000 ( 18.0%) | loss=5.2302 | lr=3.00e-04 | tok=8.85M | tps=117585 | mfu=78.0%/gpu | mem=9.2G | 0.143s | grad=1.1691 | ETA=5.9m
+  step    550/3000 ( 18.3%) | loss=5.6769 | lr=3.00e-04 | tok=9.01M | tps=116450 | mfu=77.3%/gpu | mem=9.2G | 0.142s | grad=1.0680 | ETA=5.8m
+  step    560/3000 ( 18.7%) | loss=5.6797 | lr=3.00e-04 | tok=9.18M | tps=117690 | mfu=78.1%/gpu | mem=9.2G | 0.140s | grad=0.9836 | ETA=5.7m
+  step    570/3000 ( 19.0%) | loss=5.3150 | lr=3.00e-04 | tok=9.34M | tps=116023 | mfu=77.0%/gpu | mem=9.3G | 0.145s | grad=1.0646 | ETA=5.9m
+  step    580/3000 ( 19.3%) | loss=5.2665 | lr=3.00e-04 | tok=9.50M | tps=117433 | mfu=77.9%/gpu | mem=9.2G | 0.139s | grad=1.0004 | ETA=5.6m
+  step    590/3000 ( 19.7%) | loss=5.3735 | lr=3.00e-04 | tok=9.67M | tps=118552 | mfu=78.7%/gpu | mem=9.2G | 0.138s | grad=1.1666 | ETA=5.6m
+  step    600/3000 ( 20.0%) | loss=5.1356 | lr=3.00e-04 | tok=9.83M | tps=117068 | mfu=77.7%/gpu | mem=9.3G | 0.140s | grad=1.0143 | ETA=5.6m
+  step    610/3000 ( 20.3%) | loss=5.0447 | lr=3.00e-04 | tok=9.99M | tps=117912 | mfu=78.2%/gpu | mem=9.2G | 0.137s | grad=1.2590 | ETA=5.4m
+  step    620/3000 ( 20.7%) | loss=5.0253 | lr=3.00e-04 | tok=10.16M | tps=118792 | mfu=78.8%/gpu | mem=9.3G | 0.137s | grad=1.0935 | ETA=5.4m
+  step    630/3000 ( 21.0%) | loss=5.3360 | lr=3.00e-04 | tok=10.32M | tps=118687 | mfu=78.8%/gpu | mem=9.2G | 0.139s | grad=1.0336 | ETA=5.5m
+  step    640/3000 ( 21.3%) | loss=5.5540 | lr=3.00e-04 | tok=10.49M | tps=118223 | mfu=78.4%/gpu | mem=9.3G | 0.137s | grad=1.1750 | ETA=5.4m
+  step    650/3000 ( 21.7%) | loss=5.2823 | lr=3.00e-04 | tok=10.65M | tps=119377 | mfu=79.2%/gpu | mem=9.3G | 0.137s | grad=1.1280 | ETA=5.4m
+  step    660/3000 ( 22.0%) | loss=5.3800 | lr=3.00e-04 | tok=10.81M | tps=117282 | mfu=77.8%/gpu | mem=9.3G | 0.138s | grad=1.1060 | ETA=5.4m
+  step    670/3000 ( 22.3%) | loss=5.1730 | lr=3.00e-04 | tok=10.98M | tps=116471 | mfu=77.3%/gpu | mem=9.3G | 0.143s | grad=1.1004 | ETA=5.6m
+  step    680/3000 ( 22.7%) | loss=5.3447 | lr=3.00e-04 | tok=11.14M | tps=118578 | mfu=78.7%/gpu | mem=9.3G | 0.137s | grad=1.0990 | ETA=5.3m
+  step    690/3000 ( 23.0%) | loss=4.9530 | lr=3.00e-04 | tok=11.30M | tps=117873 | mfu=78.2%/gpu | mem=9.3G | 0.138s | grad=1.1624 | ETA=5.3m
+  step    700/3000 ( 23.3%) | loss=5.1882 | lr=3.00e-04 | tok=11.47M | tps=117928 | mfu=78.3%/gpu | mem=9.4G | 0.143s | grad=1.0658 | ETA=5.5m
+  step    710/3000 ( 23.7%) | loss=4.9855 | lr=3.00e-04 | tok=11.63M | tps=115975 | mfu=77.0%/gpu | mem=9.4G | 0.138s | grad=1.1405 | ETA=5.3m
+  step    720/3000 ( 24.0%) | loss=5.0355 | lr=3.00e-04 | tok=11.80M | tps=113459 | mfu=75.3%/gpu | mem=9.3G | 0.164s | grad=1.0380 | ETA=6.2m
+  step    730/3000 ( 24.3%) | loss=5.0567 | lr=3.00e-04 | tok=11.96M | tps=115703 | mfu=76.8%/gpu | mem=9.3G | 0.138s | grad=1.1938 | ETA=5.2m
+  step    740/3000 ( 24.7%) | loss=5.4159 | lr=3.00e-04 | tok=12.12M | tps=117499 | mfu=78.0%/gpu | mem=9.4G | 0.138s | grad=1.0490 | ETA=5.2m
+  step    750/3000 ( 25.0%) | loss=5.0520 | lr=3.00e-04 | tok=12.29M | tps=116930 | mfu=77.6%/gpu | mem=9.4G | 0.138s | grad=1.0542 | ETA=5.2m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=5.1353 ppl=169.92 bpb=1.1778
+    [LONG-RANGE] L1024 loss=5.1826 bpb=1.1577  L2048 loss=7.1277 bpb=1.3090  | degr×=1.131
+  step    760/3000 ( 25.3%) | loss=5.1206 | lr=3.00e-04 | tok=12.45M | tps=116969 | mfu=77.6%/gpu | mem=9.3G | 0.137s | grad=1.1856 | ETA=5.1m
+  step    770/3000 ( 25.7%) | loss=5.1284 | lr=3.00e-04 | tok=12.62M | tps=116155 | mfu=77.1%/gpu | mem=9.3G | 0.147s | grad=1.0423 | ETA=5.5m
+  step    780/3000 ( 26.0%) | loss=5.3456 | lr=3.00e-04 | tok=12.78M | tps=117651 | mfu=78.1%/gpu | mem=9.4G | 0.139s | grad=0.9779 | ETA=5.1m
+  step    790/3000 ( 26.3%) | loss=5.2796 | lr=3.00e-04 | tok=12.94M | tps=118931 | mfu=78.9%/gpu | mem=9.3G | 0.138s | grad=1.1952 | ETA=5.1m
+  step    800/3000 ( 26.7%) | loss=5.2486 | lr=3.00e-04 | tok=13.11M | tps=116561 | mfu=77.3%/gpu | mem=9.3G | 0.140s | grad=1.2564 | ETA=5.1m
+  step    810/3000 ( 27.0%) | loss=4.8740 | lr=3.00e-04 | tok=13.27M | tps=116102 | mfu=77.0%/gpu | mem=9.4G | 0.139s | grad=1.1068 | ETA=5.1m
+  step    820/3000 ( 27.3%) | loss=5.3017 | lr=3.00e-04 | tok=13.43M | tps=116271 | mfu=77.2%/gpu | mem=9.3G | 0.137s | grad=1.1194 | ETA=5.0m
+  step    830/3000 ( 27.7%) | loss=5.2254 | lr=3.00e-04 | tok=13.60M | tps=117144 | mfu=77.7%/gpu | mem=9.3G | 0.141s | grad=1.1808 | ETA=5.1m
+  step    840/3000 ( 28.0%) | loss=4.9686 | lr=3.00e-04 | tok=13.76M | tps=117506 | mfu=78.0%/gpu | mem=9.3G | 0.138s | grad=1.1204 | ETA=5.0m
+  step    850/3000 ( 28.3%) | loss=4.9084 | lr=3.00e-04 | tok=13.93M | tps=117217 | mfu=77.8%/gpu | mem=9.4G | 0.137s | grad=1.1861 | ETA=4.9m
+  step    860/3000 ( 28.7%) | loss=5.1311 | lr=3.00e-04 | tok=14.09M | tps=115871 | mfu=76.9%/gpu | mem=9.4G | 0.143s | grad=1.1041 | ETA=5.1m
+  step    870/3000 ( 29.0%) | loss=4.9642 | lr=3.00e-04 | tok=14.25M | tps=115972 | mfu=77.0%/gpu | mem=9.4G | 0.140s | grad=1.1002 | ETA=5.0m
+  step    880/3000 ( 29.3%) | loss=5.1673 | lr=3.00e-04 | tok=14.42M | tps=115731 | mfu=76.8%/gpu | mem=9.3G | 0.141s | grad=2.2117 | ETA=5.0m
+  step    890/3000 ( 29.7%) | loss=5.1802 | lr=3.00e-04 | tok=14.58M | tps=117268 | mfu=77.8%/gpu | mem=9.3G | 0.141s | grad=1.2303 | ETA=5.0m
+  step    900/3000 ( 30.0%) | loss=4.9294 | lr=3.00e-04 | tok=14.75M | tps=115708 | mfu=76.8%/gpu | mem=9.3G | 0.139s | grad=1.0243 | ETA=4.9m
+  step    910/3000 ( 30.3%) | loss=5.3425 | lr=3.00e-04 | tok=14.91M | tps=117870 | mfu=78.2%/gpu | mem=9.3G | 0.141s | grad=1.0788 | ETA=4.9m
+  step    920/3000 ( 30.7%) | loss=4.8873 | lr=3.00e-04 | tok=15.07M | tps=117210 | mfu=77.8%/gpu | mem=9.3G | 0.136s | grad=1.1541 | ETA=4.7m
+  step    930/3000 ( 31.0%) | loss=5.1193 | lr=3.00e-04 | tok=15.24M | tps=118779 | mfu=78.8%/gpu | mem=9.3G | 0.138s | grad=1.1268 | ETA=4.7m
+  step    940/3000 ( 31.3%) | loss=5.0154 | lr=3.00e-04 | tok=15.40M | tps=117179 | mfu=77.8%/gpu | mem=9.3G | 0.137s | grad=1.0622 | ETA=4.7m
+  step    950/3000 ( 31.7%) | loss=5.0673 | lr=3.00e-04 | tok=15.56M | tps=117572 | mfu=78.0%/gpu | mem=9.4G | 0.138s | grad=1.1798 | ETA=4.7m
+  step    960/3000 ( 32.0%) | loss=4.6355 | lr=3.00e-04 | tok=15.73M | tps=118027 | mfu=78.3%/gpu | mem=9.4G | 0.138s | grad=1.2467 | ETA=4.7m
+  step    970/3000 ( 32.3%) | loss=4.7307 | lr=3.00e-04 | tok=15.89M | tps=115146 | mfu=76.4%/gpu | mem=9.4G | 0.141s | grad=1.2119 | ETA=4.8m
+  step    980/3000 ( 32.7%) | loss=4.9862 | lr=3.00e-04 | tok=16.06M | tps=117595 | mfu=78.0%/gpu | mem=9.3G | 0.141s | grad=1.0863 | ETA=4.7m
+  step    990/3000 ( 33.0%) | loss=4.8888 | lr=3.00e-04 | tok=16.22M | tps=117363 | mfu=77.9%/gpu | mem=9.3G | 0.142s | grad=1.2936 | ETA=4.8m
+  step   1000/3000 ( 33.3%) | loss=5.2790 | lr=3.00e-04 | tok=16.38M | tps=119151 | mfu=79.1%/gpu | mem=9.4G | 0.137s | grad=1.3077 | ETA=4.6m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=4.9041 ppl=134.84 bpb=1.1247
+    [LONG-RANGE] L1024 loss=4.9571 bpb=1.1074  L2048 loss=6.4943 bpb=1.1927  | degr×=1.077
+  step   1010/3000 ( 33.7%) | loss=4.6941 | lr=3.00e-04 | tok=16.55M | tps=118916 | mfu=78.9%/gpu | mem=9.3G | 0.137s | grad=1.2400 | ETA=4.6m
+  step   1020/3000 ( 34.0%) | loss=4.8153 | lr=3.00e-04 | tok=16.71M | tps=117313 | mfu=77.8%/gpu | mem=9.3G | 0.138s | grad=1.3499 | ETA=4.6m
+  step   1030/3000 ( 34.3%) | loss=4.9218 | lr=3.00e-04 | tok=16.88M | tps=118001 | mfu=78.3%/gpu | mem=9.3G | 0.146s | grad=1.2618 | ETA=4.8m
+  step   1040/3000 ( 34.7%) | loss=4.6419 | lr=3.00e-04 | tok=17.04M | tps=116520 | mfu=77.3%/gpu | mem=9.3G | 0.138s | grad=1.2391 | ETA=4.5m
+  step   1050/3000 ( 35.0%) | loss=4.5476 | lr=3.00e-04 | tok=17.20M | tps=117392 | mfu=77.9%/gpu | mem=9.3G | 0.138s | grad=1.2061 | ETA=4.5m
+  step   1060/3000 ( 35.3%) | loss=4.7894 | lr=3.00e-04 | tok=17.37M | tps=117681 | mfu=78.1%/gpu | mem=9.3G | 0.141s | grad=1.2774 | ETA=4.5m
+  step   1070/3000 ( 35.7%) | loss=4.9919 | lr=3.00e-04 | tok=17.53M | tps=119172 | mfu=79.1%/gpu | mem=9.3G | 0.138s | grad=1.3222 | ETA=4.4m
+  step   1080/3000 ( 36.0%) | loss=4.8227 | lr=3.00e-04 | tok=17.69M | tps=118506 | mfu=78.6%/gpu | mem=9.3G | 0.138s | grad=1.2059 | ETA=4.4m
+  step   1090/3000 ( 36.3%) | loss=4.9154 | lr=3.00e-04 | tok=17.86M | tps=118314 | mfu=78.5%/gpu | mem=9.3G | 0.138s | grad=1.3177 | ETA=4.4m
+  step   1100/3000 ( 36.7%) | loss=4.9810 | lr=3.00e-04 | tok=18.02M | tps=116955 | mfu=77.6%/gpu | mem=9.3G | 0.137s | grad=1.2824 | ETA=4.3m
+  step   1110/3000 ( 37.0%) | loss=4.9146 | lr=3.00e-04 | tok=18.19M | tps=118361 | mfu=78.5%/gpu | mem=9.3G | 0.138s | grad=1.1190 | ETA=4.3m
+  step   1120/3000 ( 37.3%) | loss=4.8627 | lr=3.00e-04 | tok=18.35M | tps=117767 | mfu=78.1%/gpu | mem=9.3G | 0.137s | grad=1.1427 | ETA=4.3m
+  step   1130/3000 ( 37.7%) | loss=5.1189 | lr=3.00e-04 | tok=18.51M | tps=118141 | mfu=78.4%/gpu | mem=9.3G | 0.138s | grad=1.2111 | ETA=4.3m
+  step   1140/3000 ( 38.0%) | loss=4.7072 | lr=3.00e-04 | tok=18.68M | tps=114562 | mfu=76.0%/gpu | mem=9.3G | 0.141s | grad=1.1200 | ETA=4.4m
+  step   1150/3000 ( 38.3%) | loss=4.9118 | lr=3.00e-04 | tok=18.84M | tps=116283 | mfu=77.2%/gpu | mem=9.3G | 0.141s | grad=1.5274 | ETA=4.4m
+  step   1160/3000 ( 38.7%) | loss=4.8029 | lr=3.00e-04 | tok=19.01M | tps=116247 | mfu=77.1%/gpu | mem=9.3G | 0.143s | grad=1.2738 | ETA=4.4m
+  step   1170/3000 ( 39.0%) | loss=4.5671 | lr=3.00e-04 | tok=19.17M | tps=117186 | mfu=77.8%/gpu | mem=9.3G | 0.145s | grad=1.1689 | ETA=4.4m
+  step   1180/3000 ( 39.3%) | loss=4.9949 | lr=3.00e-04 | tok=19.33M | tps=115895 | mfu=76.9%/gpu | mem=9.3G | 0.137s | grad=1.2016 | ETA=4.2m
+  step   1190/3000 ( 39.7%) | loss=4.5728 | lr=3.00e-04 | tok=19.50M | tps=116516 | mfu=77.3%/gpu | mem=9.4G | 0.137s | grad=1.2210 | ETA=4.1m
+  step   1200/3000 ( 40.0%) | loss=5.0939 | lr=3.00e-04 | tok=19.66M | tps=116556 | mfu=77.3%/gpu | mem=9.3G | 0.146s | grad=1.0732 | ETA=4.4m
+  step   1210/3000 ( 40.3%) | loss=4.6628 | lr=3.00e-04 | tok=19.82M | tps=116084 | mfu=77.0%/gpu | mem=9.3G | 0.140s | grad=1.6082 | ETA=4.2m
+  step   1220/3000 ( 40.7%) | loss=4.4510 | lr=3.00e-04 | tok=19.99M | tps=116977 | mfu=77.6%/gpu | mem=9.3G | 0.139s | grad=1.3982 | ETA=4.1m
+  step   1230/3000 ( 41.0%) | loss=4.4868 | lr=3.00e-04 | tok=20.15M | tps=115517 | mfu=76.7%/gpu | mem=9.3G | 0.141s | grad=1.1256 | ETA=4.1m
+  step   1240/3000 ( 41.3%) | loss=4.7704 | lr=3.00e-04 | tok=20.32M | tps=116638 | mfu=77.4%/gpu | mem=9.3G | 0.140s | grad=1.1872 | ETA=4.1m
+  step   1250/3000 ( 41.7%) | loss=4.7199 | lr=3.00e-04 | tok=20.48M | tps=117180 | mfu=77.8%/gpu | mem=9.3G | 0.142s | grad=1.2845 | ETA=4.1m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=4.7088 ppl=110.92 bpb=1.0800
+    [LONG-RANGE] L1024 loss=4.7762 bpb=1.0669  L2048 loss=6.1267 bpb=1.1252  | degr×=1.055
+    Checkpoint saved at step 1250 (model-only)
+  step   1260/3000 ( 42.0%) | loss=4.6832 | lr=3.00e-04 | tok=20.64M | tps=114467 | mfu=76.0%/gpu | mem=9.3G | 0.144s | grad=1.2383 | ETA=4.2m
+  step   1270/3000 ( 42.3%) | loss=4.6629 | lr=3.00e-04 | tok=20.81M | tps=117482 | mfu=78.0%/gpu | mem=9.3G | 0.137s | grad=1.2079 | ETA=4.0m
+  step   1280/3000 ( 42.7%) | loss=4.7666 | lr=3.00e-04 | tok=20.97M | tps=117199 | mfu=77.8%/gpu | mem=9.3G | 0.138s | grad=1.1917 | ETA=4.0m
+  step   1290/3000 ( 43.0%) | loss=4.8217 | lr=3.00e-04 | tok=21.14M | tps=115514 | mfu=76.7%/gpu | mem=9.3G | 0.139s | grad=1.2073 | ETA=4.0m
+  step   1300/3000 ( 43.3%) | loss=4.9432 | lr=3.00e-04 | tok=21.30M | tps=118162 | mfu=78.4%/gpu | mem=9.3G | 0.138s | grad=1.2743 | ETA=3.9m
+  step   1310/3000 ( 43.7%) | loss=4.7741 | lr=3.00e-04 | tok=21.46M | tps=117742 | mfu=78.1%/gpu | mem=9.3G | 0.137s | grad=1.3450 | ETA=3.9m
+  step   1320/3000 ( 44.0%) | loss=5.0679 | lr=3.00e-04 | tok=21.63M | tps=117740 | mfu=78.1%/gpu | mem=9.3G | 0.138s | grad=1.2192 | ETA=3.9m
+  step   1330/3000 ( 44.3%) | loss=4.8539 | lr=3.00e-04 | tok=21.79M | tps=116744 | mfu=77.5%/gpu | mem=9.3G | 0.143s | grad=1.2420 | ETA=4.0m
+  step   1340/3000 ( 44.7%) | loss=4.4875 | lr=3.00e-04 | tok=21.95M | tps=115882 | mfu=76.9%/gpu | mem=9.3G | 0.145s | grad=1.4927 | ETA=4.0m
+  step   1350/3000 ( 45.0%) | loss=4.7084 | lr=3.00e-04 | tok=22.12M | tps=116657 | mfu=77.4%/gpu | mem=9.3G | 0.141s | grad=1.2540 | ETA=3.9m
+  step   1360/3000 ( 45.3%) | loss=5.2235 | lr=3.00e-04 | tok=22.28M | tps=118505 | mfu=78.6%/gpu | mem=9.3G | 0.141s | grad=1.2614 | ETA=3.8m
+  step   1370/3000 ( 45.7%) | loss=4.5314 | lr=3.00e-04 | tok=22.45M | tps=115387 | mfu=76.6%/gpu | mem=9.4G | 0.139s | grad=1.4569 | ETA=3.8m
+  step   1380/3000 ( 46.0%) | loss=4.8093 | lr=3.00e-04 | tok=22.61M | tps=117158 | mfu=77.7%/gpu | mem=9.3G | 0.138s | grad=1.1833 | ETA=3.7m
+  step   1390/3000 ( 46.3%) | loss=4.6669 | lr=3.00e-04 | tok=22.77M | tps=113816 | mfu=75.5%/gpu | mem=9.3G | 0.140s | grad=1.3932 | ETA=3.8m
+  step   1400/3000 ( 46.7%) | loss=4.3983 | lr=3.00e-04 | tok=22.94M | tps=113786 | mfu=75.5%/gpu | mem=9.3G | 0.145s | grad=1.2674 | ETA=3.9m
+  step   1410/3000 ( 47.0%) | loss=4.5025 | lr=3.00e-04 | tok=23.10M | tps=116662 | mfu=77.4%/gpu | mem=9.3G | 0.138s | grad=1.2833 | ETA=3.6m
+  step   1420/3000 ( 47.3%) | loss=4.7804 | lr=3.00e-04 | tok=23.27M | tps=118299 | mfu=78.5%/gpu | mem=9.3G | 0.137s | grad=1.4893 | ETA=3.6m
+  step   1430/3000 ( 47.7%) | loss=4.6190 | lr=3.00e-04 | tok=23.43M | tps=118041 | mfu=78.3%/gpu | mem=9.4G | 0.137s | grad=1.2960 | ETA=3.6m
+  step   1440/3000 ( 48.0%) | loss=4.3288 | lr=3.00e-04 | tok=23.59M | tps=117517 | mfu=78.0%/gpu | mem=9.3G | 0.138s | grad=1.3307 | ETA=3.6m
+  step   1450/3000 ( 48.3%) | loss=4.2592 | lr=3.00e-04 | tok=23.76M | tps=116855 | mfu=77.5%/gpu | mem=9.3G | 0.138s | grad=1.2586 | ETA=3.6m
+  step   1460/3000 ( 48.7%) | loss=4.6923 | lr=3.00e-04 | tok=23.92M | tps=115165 | mfu=76.4%/gpu | mem=9.4G | 0.143s | grad=1.3547 | ETA=3.7m
+  step   1470/3000 ( 49.0%) | loss=4.8737 | lr=3.00e-04 | tok=24.08M | tps=116618 | mfu=77.4%/gpu | mem=9.4G | 0.144s | grad=1.3424 | ETA=3.7m
+  step   1480/3000 ( 49.3%) | loss=4.8769 | lr=3.00e-04 | tok=24.25M | tps=113051 | mfu=75.0%/gpu | mem=9.3G | 0.140s | grad=1.3607 | ETA=3.6m
+  step   1490/3000 ( 49.7%) | loss=4.7873 | lr=3.00e-04 | tok=24.41M | tps=116448 | mfu=77.3%/gpu | mem=9.3G | 0.138s | grad=2.1313 | ETA=3.5m
+  step   1500/3000 ( 50.0%) | loss=4.0685 | lr=3.00e-04 | tok=24.58M | tps=119339 | mfu=79.2%/gpu | mem=9.3G | 0.137s | grad=1.3869 | ETA=3.4m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=4.4802 ppl=88.25 bpb=1.0275
+    [LONG-RANGE] L1024 loss=4.5447 bpb=1.0152  L2048 loss=5.9677 bpb=1.0960  | degr×=1.080
+  step   1510/3000 ( 50.3%) | loss=4.7127 | lr=3.00e-04 | tok=24.74M | tps=116689 | mfu=77.4%/gpu | mem=9.3G | 0.141s | grad=1.3164 | ETA=3.5m
+  step   1520/3000 ( 50.7%) | loss=4.4308 | lr=3.00e-04 | tok=24.90M | tps=115605 | mfu=76.7%/gpu | mem=9.4G | 0.138s | grad=1.3154 | ETA=3.4m
+  step   1530/3000 ( 51.0%) | loss=4.3162 | lr=3.00e-04 | tok=25.07M | tps=118161 | mfu=78.4%/gpu | mem=9.4G | 0.139s | grad=1.2299 | ETA=3.4m
+  step   1540/3000 ( 51.3%) | loss=4.6757 | lr=3.00e-04 | tok=25.23M | tps=118998 | mfu=79.0%/gpu | mem=9.4G | 0.139s | grad=1.3434 | ETA=3.4m
+  step   1550/3000 ( 51.7%) | loss=4.4070 | lr=3.00e-04 | tok=25.40M | tps=117622 | mfu=78.0%/gpu | mem=9.3G | 0.137s | grad=1.3727 | ETA=3.3m
+  step   1560/3000 ( 52.0%) | loss=4.5482 | lr=3.00e-04 | tok=25.56M | tps=116922 | mfu=77.6%/gpu | mem=9.3G | 0.142s | grad=1.3157 | ETA=3.4m
+  step   1570/3000 ( 52.3%) | loss=4.2895 | lr=3.00e-04 | tok=25.72M | tps=116815 | mfu=77.5%/gpu | mem=9.3G | 0.141s | grad=1.4849 | ETA=3.4m
+  step   1580/3000 ( 52.7%) | loss=4.4528 | lr=3.00e-04 | tok=25.89M | tps=116786 | mfu=77.5%/gpu | mem=9.3G | 0.138s | grad=1.2893 | ETA=3.3m
+  step   1590/3000 ( 53.0%) | loss=4.7527 | lr=3.00e-04 | tok=26.05M | tps=116505 | mfu=77.3%/gpu | mem=9.3G | 0.140s | grad=1.3205 | ETA=3.3m
+  step   1600/3000 ( 53.3%) | loss=4.2857 | lr=3.00e-04 | tok=26.21M | tps=116854 | mfu=77.5%/gpu | mem=9.3G | 0.140s | grad=1.5241 | ETA=3.3m
+  step   1610/3000 ( 53.7%) | loss=4.3470 | lr=3.00e-04 | tok=26.38M | tps=117157 | mfu=77.7%/gpu | mem=9.4G | 0.140s | grad=1.4856 | ETA=3.2m
+  step   1620/3000 ( 54.0%) | loss=4.2372 | lr=3.00e-04 | tok=26.54M | tps=116016 | mfu=77.0%/gpu | mem=9.3G | 0.139s | grad=2.0673 | ETA=3.2m
+  step   1630/3000 ( 54.3%) | loss=4.7355 | lr=3.00e-04 | tok=26.71M | tps=116327 | mfu=77.2%/gpu | mem=9.4G | 0.139s | grad=1.3946 | ETA=3.2m
+  step   1640/3000 ( 54.7%) | loss=4.2439 | lr=3.00e-04 | tok=26.87M | tps=116493 | mfu=77.3%/gpu | mem=9.4G | 0.137s | grad=1.3520 | ETA=3.1m
+  step   1650/3000 ( 55.0%) | loss=4.2049 | lr=3.00e-04 | tok=27.03M | tps=119080 | mfu=79.0%/gpu | mem=9.4G | 0.140s | grad=1.3415 | ETA=3.2m
+  step   1660/3000 ( 55.3%) | loss=4.3310 | lr=3.00e-04 | tok=27.20M | tps=118002 | mfu=78.3%/gpu | mem=9.3G | 0.137s | grad=1.3326 | ETA=3.1m
+  step   1670/3000 ( 55.7%) | loss=4.7491 | lr=3.00e-04 | tok=27.36M | tps=117171 | mfu=77.7%/gpu | mem=9.4G | 0.137s | grad=1.4209 | ETA=3.0m
+  step   1680/3000 ( 56.0%) | loss=4.4851 | lr=3.00e-04 | tok=27.53M | tps=118693 | mfu=78.8%/gpu | mem=9.4G | 0.144s | grad=1.4673 | ETA=3.2m
+  step   1690/3000 ( 56.3%) | loss=4.5342 | lr=3.00e-04 | tok=27.69M | tps=114825 | mfu=76.2%/gpu | mem=9.3G | 0.143s | grad=1.1973 | ETA=3.1m
+  step   1700/3000 ( 56.7%) | loss=4.1168 | lr=3.00e-04 | tok=27.85M | tps=116375 | mfu=77.2%/gpu | mem=9.3G | 0.139s | grad=1.3420 | ETA=3.0m
+  step   1710/3000 ( 57.0%) | loss=4.9580 | lr=3.00e-04 | tok=28.02M | tps=115060 | mfu=76.3%/gpu | mem=9.3G | 0.147s | grad=1.3348 | ETA=3.2m
+  step   1720/3000 ( 57.3%) | loss=4.2992 | lr=3.00e-04 | tok=28.18M | tps=116805 | mfu=77.5%/gpu | mem=9.3G | 0.143s | grad=1.2963 | ETA=3.0m
+  step   1730/3000 ( 57.7%) | loss=4.0479 | lr=3.00e-04 | tok=28.34M | tps=117317 | mfu=77.8%/gpu | mem=9.4G | 0.137s | grad=1.2300 | ETA=2.9m
+  step   1740/3000 ( 58.0%) | loss=4.3850 | lr=3.00e-04 | tok=28.51M | tps=117193 | mfu=77.8%/gpu | mem=9.4G | 0.144s | grad=1.4601 | ETA=3.0m
+  step   1750/3000 ( 58.3%) | loss=4.2844 | lr=3.00e-04 | tok=28.67M | tps=116089 | mfu=77.0%/gpu | mem=9.4G | 0.145s | grad=1.3678 | ETA=3.0m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=4.3080 ppl=74.29 bpb=0.9880
+    [LONG-RANGE] L1024 loss=4.3748 bpb=0.9773  L2048 loss=5.8779 bpb=1.0795  | degr×=1.105
+  step   1760/3000 ( 58.7%) | loss=4.3057 | lr=3.00e-04 | tok=28.84M | tps=116488 | mfu=77.3%/gpu | mem=9.4G | 0.137s | grad=1.5031 | ETA=2.8m
+  step   1770/3000 ( 59.0%) | loss=4.5246 | lr=3.00e-04 | tok=29.00M | tps=116319 | mfu=77.2%/gpu | mem=9.3G | 0.144s | grad=1.6248 | ETA=2.9m
+  step   1780/3000 ( 59.3%) | loss=4.2659 | lr=3.00e-04 | tok=29.16M | tps=118672 | mfu=78.7%/gpu | mem=9.4G | 0.141s | grad=1.2168 | ETA=2.9m
+  step   1790/3000 ( 59.7%) | loss=4.2986 | lr=3.00e-04 | tok=29.33M | tps=118781 | mfu=78.8%/gpu | mem=9.3G | 0.138s | grad=1.2804 | ETA=2.8m
+  step   1800/3000 ( 60.0%) | loss=4.3106 | lr=3.00e-04 | tok=29.49M | tps=115505 | mfu=76.6%/gpu | mem=9.4G | 0.141s | grad=1.4928 | ETA=2.8m
+  step   1810/3000 ( 60.3%) | loss=4.4076 | lr=3.00e-04 | tok=29.66M | tps=116858 | mfu=77.5%/gpu | mem=9.4G | 0.147s | grad=1.3643 | ETA=2.9m
+  step   1820/3000 ( 60.7%) | loss=4.2171 | lr=3.00e-04 | tok=29.82M | tps=115396 | mfu=76.6%/gpu | mem=9.3G | 0.141s | grad=1.3142 | ETA=2.8m
+  step   1830/3000 ( 61.0%) | loss=4.2017 | lr=3.00e-04 | tok=29.98M | tps=116963 | mfu=77.6%/gpu | mem=9.4G | 0.140s | grad=1.2814 | ETA=2.7m
+  step   1840/3000 ( 61.3%) | loss=4.2382 | lr=3.00e-04 | tok=30.15M | tps=117339 | mfu=77.9%/gpu | mem=9.4G | 0.137s | grad=1.4396 | ETA=2.7m
+  step   1850/3000 ( 61.7%) | loss=4.3792 | lr=3.00e-04 | tok=30.31M | tps=117721 | mfu=78.1%/gpu | mem=9.3G | 0.143s | grad=1.2677 | ETA=2.7m
+  step   1860/3000 ( 62.0%) | loss=4.4198 | lr=3.00e-04 | tok=30.47M | tps=117145 | mfu=77.7%/gpu | mem=9.3G | 0.139s | grad=1.1912 | ETA=2.6m
+  step   1870/3000 ( 62.3%) | loss=4.5832 | lr=3.00e-04 | tok=30.64M | tps=117420 | mfu=77.9%/gpu | mem=9.4G | 0.137s | grad=1.2081 | ETA=2.6m
+  step   1880/3000 ( 62.7%) | loss=4.2139 | lr=3.00e-04 | tok=30.80M | tps=118732 | mfu=78.8%/gpu | mem=9.4G | 0.141s | grad=1.2728 | ETA=2.6m
+  step   1890/3000 ( 63.0%) | loss=4.3593 | lr=3.00e-04 | tok=30.97M | tps=119283 | mfu=79.2%/gpu | mem=9.3G | 0.137s | grad=1.7504 | ETA=2.5m
+  step   1900/3000 ( 63.3%) | loss=4.2803 | lr=3.00e-04 | tok=31.13M | tps=116922 | mfu=77.6%/gpu | mem=9.3G | 0.144s | grad=1.3798 | ETA=2.6m
+  step   1910/3000 ( 63.7%) | loss=4.5224 | lr=3.00e-04 | tok=31.29M | tps=113932 | mfu=75.6%/gpu | mem=9.3G | 0.141s | grad=1.2760 | ETA=2.6m
+  step   1920/3000 ( 64.0%) | loss=4.2570 | lr=3.00e-04 | tok=31.46M | tps=116161 | mfu=77.1%/gpu | mem=9.4G | 0.146s | grad=1.3923 | ETA=2.6m
+  step   1930/3000 ( 64.3%) | loss=4.4716 | lr=3.00e-04 | tok=31.62M | tps=116213 | mfu=77.1%/gpu | mem=9.4G | 0.139s | grad=1.3901 | ETA=2.5m
+  step   1940/3000 ( 64.7%) | loss=4.2559 | lr=3.00e-04 | tok=31.78M | tps=117137 | mfu=77.7%/gpu | mem=9.3G | 0.138s | grad=1.4583 | ETA=2.4m
+  step   1950/3000 ( 65.0%) | loss=4.3698 | lr=3.00e-04 | tok=31.95M | tps=117238 | mfu=77.8%/gpu | mem=9.4G | 0.146s | grad=1.2762 | ETA=2.6m
+  step   1960/3000 ( 65.3%) | loss=4.2758 | lr=3.00e-04 | tok=32.11M | tps=117733 | mfu=78.1%/gpu | mem=9.4G | 0.137s | grad=1.3369 | ETA=2.4m
+  step   1970/3000 ( 65.7%) | loss=4.1918 | lr=3.00e-04 | tok=32.28M | tps=118108 | mfu=78.4%/gpu | mem=9.3G | 0.143s | grad=1.3604 | ETA=2.5m
+  step   1980/3000 ( 66.0%) | loss=4.5148 | lr=2.99e-04 | tok=32.44M | tps=116313 | mfu=77.2%/gpu | mem=9.3G | 0.141s | grad=1.4665 | ETA=2.4m
+  step   1990/3000 ( 66.3%) | loss=4.3684 | lr=2.99e-04 | tok=32.60M | tps=117645 | mfu=78.1%/gpu | mem=9.3G | 0.137s | grad=1.5877 | ETA=2.3m
+  step   2000/3000 ( 66.7%) | loss=4.2256 | lr=2.98e-04 | tok=32.77M | tps=117490 | mfu=78.0%/gpu | mem=9.3G | 0.137s | grad=1.4046 | ETA=2.3m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=4.1920 ppl=66.16 bpb=0.9614
+    [LONG-RANGE] L1024 loss=4.2638 bpb=0.9525  L2048 loss=5.5288 bpb=1.0154  | degr×=1.066
+  step   2010/3000 ( 67.0%) | loss=3.7854 | lr=2.98e-04 | tok=32.93M | tps=116474 | mfu=77.3%/gpu | mem=9.4G | 0.138s | grad=1.3370 | ETA=2.3m
+  step   2020/3000 ( 67.3%) | loss=3.8415 | lr=2.97e-04 | tok=33.10M | tps=117057 | mfu=77.7%/gpu | mem=9.4G | 0.138s | grad=1.3891 | ETA=2.3m
+  step   2030/3000 ( 67.7%) | loss=4.1485 | lr=2.96e-04 | tok=33.26M | tps=117869 | mfu=78.2%/gpu | mem=9.4G | 0.137s | grad=1.3413 | ETA=2.2m
+  step   2040/3000 ( 68.0%) | loss=4.4472 | lr=2.95e-04 | tok=33.42M | tps=118207 | mfu=78.4%/gpu | mem=9.4G | 0.138s | grad=1.3004 | ETA=2.2m
+  step   2050/3000 ( 68.3%) | loss=4.3708 | lr=2.93e-04 | tok=33.59M | tps=116176 | mfu=77.1%/gpu | mem=9.3G | 0.140s | grad=1.3275 | ETA=2.2m
+  step   2060/3000 ( 68.7%) | loss=3.6747 | lr=2.92e-04 | tok=33.75M | tps=117482 | mfu=78.0%/gpu | mem=9.3G | 0.138s | grad=1.2849 | ETA=2.2m
+  step   2070/3000 ( 69.0%) | loss=4.0721 | lr=2.90e-04 | tok=33.91M | tps=115466 | mfu=76.6%/gpu | mem=9.4G | 0.141s | grad=1.2822 | ETA=2.2m
+  step   2080/3000 ( 69.3%) | loss=4.1750 | lr=2.89e-04 | tok=34.08M | tps=116433 | mfu=77.3%/gpu | mem=9.4G | 0.144s | grad=1.3624 | ETA=2.2m
+  step   2090/3000 ( 69.7%) | loss=4.2825 | lr=2.87e-04 | tok=34.24M | tps=116419 | mfu=77.3%/gpu | mem=9.3G | 0.143s | grad=1.6426 | ETA=2.2m
+  step   2100/3000 ( 70.0%) | loss=4.0408 | lr=2.85e-04 | tok=34.41M | tps=115971 | mfu=77.0%/gpu | mem=9.3G | 0.138s | grad=1.3121 | ETA=2.1m
+  step   2110/3000 ( 70.3%) | loss=4.2986 | lr=2.83e-04 | tok=34.57M | tps=118597 | mfu=78.7%/gpu | mem=9.3G | 0.140s | grad=1.3287 | ETA=2.1m
+  step   2120/3000 ( 70.7%) | loss=3.9558 | lr=2.81e-04 | tok=34.73M | tps=116973 | mfu=77.6%/gpu | mem=9.3G | 0.141s | grad=1.2559 | ETA=2.1m
+  step   2130/3000 ( 71.0%) | loss=3.7539 | lr=2.79e-04 | tok=34.90M | tps=116939 | mfu=77.6%/gpu | mem=9.4G | 0.140s | grad=1.3131 | ETA=2.0m
+  step   2140/3000 ( 71.3%) | loss=4.0445 | lr=2.76e-04 | tok=35.06M | tps=116287 | mfu=77.2%/gpu | mem=9.3G | 0.140s | grad=1.3179 | ETA=2.0m
+  step   2150/3000 ( 71.7%) | loss=4.2330 | lr=2.74e-04 | tok=35.23M | tps=115593 | mfu=76.7%/gpu | mem=9.4G | 0.141s | grad=1.3736 | ETA=2.0m
+  step   2160/3000 ( 72.0%) | loss=4.4001 | lr=2.71e-04 | tok=35.39M | tps=115439 | mfu=76.6%/gpu | mem=9.3G | 0.138s | grad=1.2870 | ETA=1.9m
+  step   2170/3000 ( 72.3%) | loss=4.2267 | lr=2.69e-04 | tok=35.55M | tps=115593 | mfu=76.7%/gpu | mem=9.3G | 0.150s | grad=1.3388 | ETA=2.1m
+  step   2180/3000 ( 72.7%) | loss=4.3541 | lr=2.66e-04 | tok=35.72M | tps=115116 | mfu=76.4%/gpu | mem=9.4G | 0.154s | grad=1.5242 | ETA=2.1m
+  step   2190/3000 ( 73.0%) | loss=4.0219 | lr=2.63e-04 | tok=35.88M | tps=115495 | mfu=76.6%/gpu | mem=9.4G | 0.141s | grad=1.3220 | ETA=1.9m
+  step   2200/3000 ( 73.3%) | loss=4.0823 | lr=2.60e-04 | tok=36.04M | tps=118170 | mfu=78.4%/gpu | mem=9.3G | 0.137s | grad=1.2497 | ETA=1.8m
+  step   2210/3000 ( 73.7%) | loss=4.2797 | lr=2.57e-04 | tok=36.21M | tps=117548 | mfu=78.0%/gpu | mem=9.3G | 0.137s | grad=1.4639 | ETA=1.8m
+  step   2220/3000 ( 74.0%) | loss=4.1087 | lr=2.54e-04 | tok=36.37M | tps=117422 | mfu=77.9%/gpu | mem=9.4G | 0.139s | grad=1.4236 | ETA=1.8m
+  step   2230/3000 ( 74.3%) | loss=4.2395 | lr=2.50e-04 | tok=36.54M | tps=116316 | mfu=77.2%/gpu | mem=9.3G | 0.148s | grad=1.2830 | ETA=1.9m
+  step   2240/3000 ( 74.7%) | loss=4.1806 | lr=2.47e-04 | tok=36.70M | tps=118712 | mfu=78.8%/gpu | mem=9.3G | 0.143s | grad=1.3456 | ETA=1.8m
+  step   2250/3000 ( 75.0%) | loss=4.1877 | lr=2.44e-04 | tok=36.86M | tps=114826 | mfu=76.2%/gpu | mem=9.4G | 0.154s | grad=1.2983 | ETA=1.9m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=4.0908 ppl=59.79 bpb=0.9382
+    [LONG-RANGE] L1024 loss=4.1591 bpb=0.9291  L2048 loss=5.5532 bpb=1.0199  | degr×=1.098
+  step   2260/3000 ( 75.3%) | loss=3.9508 | lr=2.40e-04 | tok=37.03M | tps=117681 | mfu=78.1%/gpu | mem=9.3G | 0.139s | grad=1.3956 | ETA=1.7m
+  step   2270/3000 ( 75.7%) | loss=4.2928 | lr=2.36e-04 | tok=37.19M | tps=117190 | mfu=77.8%/gpu | mem=9.3G | 0.144s | grad=1.3161 | ETA=1.8m
+  step   2280/3000 ( 76.0%) | loss=3.8894 | lr=2.33e-04 | tok=37.36M | tps=116677 | mfu=77.4%/gpu | mem=9.3G | 0.145s | grad=1.3317 | ETA=1.7m
+  step   2290/3000 ( 76.3%) | loss=3.6699 | lr=2.29e-04 | tok=37.52M | tps=116407 | mfu=77.2%/gpu | mem=9.4G | 0.142s | grad=1.3197 | ETA=1.7m
+  step   2300/3000 ( 76.7%) | loss=3.9831 | lr=2.25e-04 | tok=37.68M | tps=117543 | mfu=78.0%/gpu | mem=9.4G | 0.138s | grad=1.3135 | ETA=1.6m
+  step   2310/3000 ( 77.0%) | loss=3.6242 | lr=2.21e-04 | tok=37.85M | tps=117670 | mfu=78.1%/gpu | mem=9.3G | 0.141s | grad=1.2475 | ETA=1.6m
+  step   2320/3000 ( 77.3%) | loss=4.4079 | lr=2.17e-04 | tok=38.01M | tps=116102 | mfu=77.0%/gpu | mem=9.3G | 0.141s | grad=1.2556 | ETA=1.6m
+  step   2330/3000 ( 77.7%) | loss=4.2284 | lr=2.13e-04 | tok=38.17M | tps=115702 | mfu=76.8%/gpu | mem=9.4G | 0.140s | grad=1.3962 | ETA=1.6m
+  step   2340/3000 ( 78.0%) | loss=4.2826 | lr=2.09e-04 | tok=38.34M | tps=117566 | mfu=78.0%/gpu | mem=9.4G | 0.138s | grad=1.4086 | ETA=1.5m
+  step   2350/3000 ( 78.3%) | loss=4.2892 | lr=2.05e-04 | tok=38.50M | tps=117217 | mfu=77.8%/gpu | mem=9.3G | 0.141s | grad=1.3241 | ETA=1.5m
+  step   2360/3000 ( 78.7%) | loss=4.0564 | lr=2.01e-04 | tok=38.67M | tps=117554 | mfu=78.0%/gpu | mem=9.4G | 0.141s | grad=1.3838 | ETA=1.5m
+  step   2370/3000 ( 79.0%) | loss=3.9231 | lr=1.96e-04 | tok=38.83M | tps=117838 | mfu=78.2%/gpu | mem=9.4G | 0.144s | grad=1.2617 | ETA=1.5m
+  step   2380/3000 ( 79.3%) | loss=4.4416 | lr=1.92e-04 | tok=38.99M | tps=116765 | mfu=77.5%/gpu | mem=9.4G | 0.138s | grad=1.5354 | ETA=1.4m
+  step   2390/3000 ( 79.7%) | loss=4.0666 | lr=1.88e-04 | tok=39.16M | tps=117232 | mfu=77.8%/gpu | mem=9.4G | 0.138s | grad=1.4901 | ETA=1.4m
+  step   2400/3000 ( 80.0%) | loss=4.2558 | lr=1.83e-04 | tok=39.32M | tps=117201 | mfu=77.8%/gpu | mem=9.4G | 0.139s | grad=1.2119 | ETA=1.4m
+  step   2410/3000 ( 80.3%) | loss=3.8550 | lr=1.79e-04 | tok=39.49M | tps=116676 | mfu=77.4%/gpu | mem=9.3G | 0.141s | grad=1.4844 | ETA=1.4m
+  step   2420/3000 ( 80.7%) | loss=3.9260 | lr=1.75e-04 | tok=39.65M | tps=117548 | mfu=78.0%/gpu | mem=9.3G | 0.139s | grad=1.2591 | ETA=1.3m
+  step   2430/3000 ( 81.0%) | loss=4.0503 | lr=1.70e-04 | tok=39.81M | tps=115507 | mfu=76.6%/gpu | mem=9.4G | 0.146s | grad=1.2987 | ETA=1.4m
+  step   2440/3000 ( 81.3%) | loss=4.0238 | lr=1.66e-04 | tok=39.98M | tps=116611 | mfu=77.4%/gpu | mem=9.4G | 0.139s | grad=1.3758 | ETA=1.3m
+  step   2450/3000 ( 81.7%) | loss=3.9895 | lr=1.61e-04 | tok=40.14M | tps=117005 | mfu=77.6%/gpu | mem=9.4G | 0.140s | grad=1.2046 | ETA=1.3m
+  step   2460/3000 ( 82.0%) | loss=3.9767 | lr=1.57e-04 | tok=40.30M | tps=116747 | mfu=77.5%/gpu | mem=9.3G | 0.143s | grad=1.2439 | ETA=1.3m
+  step   2470/3000 ( 82.3%) | loss=3.8888 | lr=1.52e-04 | tok=40.47M | tps=115630 | mfu=76.7%/gpu | mem=9.4G | 0.144s | grad=1.2169 | ETA=1.3m
+  step   2480/3000 ( 82.7%) | loss=3.8673 | lr=1.48e-04 | tok=40.63M | tps=116245 | mfu=77.1%/gpu | mem=9.3G | 0.144s | grad=1.3023 | ETA=1.2m
+  step   2490/3000 ( 83.0%) | loss=3.6885 | lr=1.43e-04 | tok=40.80M | tps=115863 | mfu=76.9%/gpu | mem=9.3G | 0.138s | grad=1.2936 | ETA=1.2m
+  step   2500/3000 ( 83.3%) | loss=4.1559 | lr=1.39e-04 | tok=40.96M | tps=117559 | mfu=78.0%/gpu | mem=9.3G | 0.138s | grad=1.2872 | ETA=1.1m
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=3.9907 ppl=54.09 bpb=0.9153
+    [LONG-RANGE] L1024 loss=4.0598 bpb=0.9069  L2048 loss=5.5740 bpb=1.0237  | degr×=1.129
+    Checkpoint saved at step 2500 (model-only)
+  step   2510/3000 ( 83.7%) | loss=3.8746 | lr=1.34e-04 | tok=41.12M | tps=114982 | mfu=76.3%/gpu | mem=9.4G | 0.142s | grad=1.2131 | ETA=1.2m
+  step   2520/3000 ( 84.0%) | loss=4.1669 | lr=1.30e-04 | tok=41.29M | tps=116898 | mfu=77.6%/gpu | mem=9.3G | 0.138s | grad=1.3111 | ETA=1.1m
+  step   2530/3000 ( 84.3%) | loss=3.8429 | lr=1.25e-04 | tok=41.45M | tps=116457 | mfu=77.3%/gpu | mem=9.4G | 0.138s | grad=1.2155 | ETA=1.1m
+  step   2540/3000 ( 84.7%) | loss=3.9152 | lr=1.21e-04 | tok=41.62M | tps=114185 | mfu=75.8%/gpu | mem=9.4G | 0.144s | grad=1.3325 | ETA=1.1m
+  step   2550/3000 ( 85.0%) | loss=3.8949 | lr=1.17e-04 | tok=41.78M | tps=115814 | mfu=76.8%/gpu | mem=9.3G | 0.143s | grad=1.3887 | ETA=1.1m
+  step   2560/3000 ( 85.3%) | loss=3.9693 | lr=1.12e-04 | tok=41.94M | tps=114321 | mfu=75.9%/gpu | mem=9.3G | 0.144s | grad=1.3850 | ETA=1.1m
+  step   2570/3000 ( 85.7%) | loss=3.6294 | lr=1.08e-04 | tok=42.11M | tps=116669 | mfu=77.4%/gpu | mem=9.3G | 0.138s | grad=1.3368 | ETA=59.5s
+  step   2580/3000 ( 86.0%) | loss=4.0426 | lr=1.04e-04 | tok=42.27M | tps=115754 | mfu=76.8%/gpu | mem=9.3G | 0.141s | grad=1.2617 | ETA=59.1s
+  step   2590/3000 ( 86.3%) | loss=4.2328 | lr=9.94e-05 | tok=42.43M | tps=115332 | mfu=76.5%/gpu | mem=9.4G | 0.140s | grad=1.1758 | ETA=57.6s
+  step   2600/3000 ( 86.7%) | loss=3.7619 | lr=9.52e-05 | tok=42.60M | tps=116297 | mfu=77.2%/gpu | mem=9.3G | 0.143s | grad=1.2984 | ETA=57.0s
+  step   2610/3000 ( 87.0%) | loss=4.0428 | lr=9.10e-05 | tok=42.76M | tps=116217 | mfu=77.1%/gpu | mem=9.4G | 0.138s | grad=1.1662 | ETA=53.8s
+  step   2620/3000 ( 87.3%) | loss=4.1006 | lr=8.69e-05 | tok=42.93M | tps=115983 | mfu=77.0%/gpu | mem=9.4G | 0.141s | grad=1.2874 | ETA=53.5s
+  step   2630/3000 ( 87.7%) | loss=3.7816 | lr=8.29e-05 | tok=43.09M | tps=115599 | mfu=76.7%/gpu | mem=9.4G | 0.143s | grad=1.1745 | ETA=53.0s
+  step   2640/3000 ( 88.0%) | loss=3.8195 | lr=7.89e-05 | tok=43.25M | tps=115347 | mfu=76.5%/gpu | mem=9.3G | 0.139s | grad=1.2216 | ETA=50.1s
+  step   2650/3000 ( 88.3%) | loss=4.0099 | lr=7.50e-05 | tok=43.42M | tps=116677 | mfu=77.4%/gpu | mem=9.3G | 0.139s | grad=1.2985 | ETA=48.7s
+  step   2660/3000 ( 88.7%) | loss=4.0636 | lr=7.11e-05 | tok=43.58M | tps=116526 | mfu=77.3%/gpu | mem=9.4G | 0.140s | grad=1.2006 | ETA=47.7s
+  step   2670/3000 ( 89.0%) | loss=4.0070 | lr=6.74e-05 | tok=43.75M | tps=117635 | mfu=78.1%/gpu | mem=9.4G | 0.138s | grad=1.2629 | ETA=45.5s
+  step   2680/3000 ( 89.3%) | loss=3.8275 | lr=6.37e-05 | tok=43.91M | tps=117424 | mfu=77.9%/gpu | mem=9.4G | 0.145s | grad=1.3951 | ETA=46.4s
+  step   2690/3000 ( 89.7%) | loss=4.2452 | lr=6.00e-05 | tok=44.07M | tps=117317 | mfu=77.8%/gpu | mem=9.4G | 0.137s | grad=1.3284 | ETA=42.4s
+  step   2700/3000 ( 90.0%) | loss=4.0155 | lr=5.65e-05 | tok=44.24M | tps=111016 | mfu=73.7%/gpu | mem=9.4G | 0.141s | grad=1.2576 | ETA=42.3s
+  step   2710/3000 ( 90.3%) | loss=3.6986 | lr=5.30e-05 | tok=44.40M | tps=114939 | mfu=76.3%/gpu | mem=9.3G | 0.145s | grad=1.2207 | ETA=42.0s
+  step   2720/3000 ( 90.7%) | loss=4.2919 | lr=4.96e-05 | tok=44.56M | tps=117308 | mfu=77.8%/gpu | mem=9.3G | 0.140s | grad=1.2750 | ETA=39.2s
+  step   2730/3000 ( 91.0%) | loss=3.9054 | lr=4.63e-05 | tok=44.73M | tps=117852 | mfu=78.2%/gpu | mem=9.3G | 0.139s | grad=1.2794 | ETA=37.5s
+  step   2740/3000 ( 91.3%) | loss=4.2499 | lr=4.31e-05 | tok=44.89M | tps=116239 | mfu=77.1%/gpu | mem=9.4G | 0.144s | grad=1.2241 | ETA=37.4s
+  step   2750/3000 ( 91.7%) | loss=4.4084 | lr=4.00e-05 | tok=45.06M | tps=116166 | mfu=77.1%/gpu | mem=9.4G | 0.137s | grad=1.2966 | ETA=34.2s
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=3.9210 ppl=50.45 bpb=0.8993
+    [LONG-RANGE] L1024 loss=3.9902 bpb=0.8914  L2048 loss=5.5454 bpb=1.0184  | degr×=1.143
+  step   2760/3000 ( 92.0%) | loss=3.9243 | lr=3.70e-05 | tok=45.22M | tps=116969 | mfu=77.6%/gpu | mem=9.4G | 0.142s | grad=1.1769 | ETA=34.0s
+  step   2770/3000 ( 92.3%) | loss=3.8469 | lr=3.41e-05 | tok=45.38M | tps=115049 | mfu=76.3%/gpu | mem=9.3G | 0.143s | grad=1.2225 | ETA=32.9s
+  step   2780/3000 ( 92.7%) | loss=3.8635 | lr=3.13e-05 | tok=45.55M | tps=116913 | mfu=77.6%/gpu | mem=9.4G | 0.138s | grad=1.1702 | ETA=30.4s
+  step   2790/3000 ( 93.0%) | loss=4.2867 | lr=2.86e-05 | tok=45.71M | tps=115031 | mfu=76.3%/gpu | mem=9.4G | 0.139s | grad=1.1854 | ETA=29.2s
+  step   2800/3000 ( 93.3%) | loss=4.2461 | lr=2.61e-05 | tok=45.88M | tps=115608 | mfu=76.7%/gpu | mem=9.3G | 0.142s | grad=1.2845 | ETA=28.5s
+  step   2810/3000 ( 93.7%) | loss=4.0967 | lr=2.36e-05 | tok=46.04M | tps=113675 | mfu=75.4%/gpu | mem=9.3G | 0.145s | grad=1.2053 | ETA=27.5s
+  step   2820/3000 ( 94.0%) | loss=4.2112 | lr=2.12e-05 | tok=46.20M | tps=117186 | mfu=77.8%/gpu | mem=9.3G | 0.144s | grad=1.2625 | ETA=25.9s
+  step   2830/3000 ( 94.3%) | loss=3.7262 | lr=1.90e-05 | tok=46.37M | tps=116365 | mfu=77.2%/gpu | mem=9.4G | 0.138s | grad=1.2241 | ETA=23.5s
+  step   2840/3000 ( 94.7%) | loss=3.8950 | lr=1.69e-05 | tok=46.53M | tps=118313 | mfu=78.5%/gpu | mem=9.4G | 0.139s | grad=1.3008 | ETA=22.3s
+  step   2850/3000 ( 95.0%) | loss=3.7724 | lr=1.49e-05 | tok=46.69M | tps=116719 | mfu=77.5%/gpu | mem=9.3G | 0.137s | grad=1.3162 | ETA=20.6s
+  step   2860/3000 ( 95.3%) | loss=4.1358 | lr=1.30e-05 | tok=46.86M | tps=118973 | mfu=78.9%/gpu | mem=9.3G | 0.138s | grad=1.2994 | ETA=19.3s
+  step   2870/3000 ( 95.7%) | loss=3.6819 | lr=1.12e-05 | tok=47.02M | tps=114580 | mfu=76.0%/gpu | mem=9.3G | 0.154s | grad=1.2715 | ETA=20.0s
+  step   2880/3000 ( 96.0%) | loss=4.0839 | lr=9.56e-06 | tok=47.19M | tps=117824 | mfu=78.2%/gpu | mem=9.3G | 0.141s | grad=1.2090 | ETA=16.9s
+  step   2890/3000 ( 96.3%) | loss=3.9440 | lr=8.05e-06 | tok=47.35M | tps=116701 | mfu=77.4%/gpu | mem=9.3G | 0.137s | grad=1.2446 | ETA=15.1s
+  step   2900/3000 ( 96.7%) | loss=3.5637 | lr=6.66e-06 | tok=47.51M | tps=118169 | mfu=78.4%/gpu | mem=9.4G | 0.137s | grad=1.2328 | ETA=13.7s
+  step   2910/3000 ( 97.0%) | loss=4.0964 | lr=5.41e-06 | tok=47.68M | tps=118017 | mfu=78.3%/gpu | mem=9.4G | 0.138s | grad=1.2834 | ETA=12.4s
+  step   2920/3000 ( 97.3%) | loss=4.1311 | lr=4.28e-06 | tok=47.84M | tps=117615 | mfu=78.0%/gpu | mem=9.3G | 0.144s | grad=1.1695 | ETA=11.5s
+  step   2930/3000 ( 97.7%) | loss=4.0614 | lr=3.28e-06 | tok=48.01M | tps=117414 | mfu=77.9%/gpu | mem=9.4G | 0.144s | grad=1.3035 | ETA=10.1s
+  step   2940/3000 ( 98.0%) | loss=3.9593 | lr=2.41e-06 | tok=48.17M | tps=117363 | mfu=77.9%/gpu | mem=9.3G | 0.138s | grad=1.1781 | ETA=8.3s
+  step   2950/3000 ( 98.3%) | loss=4.3345 | lr=1.68e-06 | tok=48.33M | tps=115831 | mfu=76.9%/gpu | mem=9.4G | 0.139s | grad=1.1722 | ETA=6.9s
+  step   2960/3000 ( 98.7%) | loss=3.8757 | lr=1.07e-06 | tok=48.50M | tps=117366 | mfu=77.9%/gpu | mem=9.4G | 0.139s | grad=1.2222 | ETA=5.5s
+  step   2970/3000 ( 99.0%) | loss=3.7254 | lr=6.04e-07 | tok=48.66M | tps=116816 | mfu=77.5%/gpu | mem=9.4G | 0.138s | grad=1.1953 | ETA=4.2s
+  step   2980/3000 ( 99.3%) | loss=3.8265 | lr=2.68e-07 | tok=48.82M | tps=118840 | mfu=78.9%/gpu | mem=9.3G | 0.142s | grad=1.2941 | ETA=2.8s
+  step   2990/3000 ( 99.7%) | loss=3.9254 | lr=6.71e-08 | tok=48.99M | tps=114641 | mfu=76.1%/gpu | mem=9.4G | 0.138s | grad=1.2268 | ETA=1.4s
+  step   3000/3000 (100.0%) | loss=3.8940 | lr=0.00e+00 | tok=49.15M | tps=118458 | mfu=78.6%/gpu | mem=9.3G | 0.138s | grad=1.1266 | ETA=0.0s
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+    [VAL] loss=3.9028 ppl=49.54 bpb=0.8951
+    [LONG-RANGE] L1024 loss=3.9713 bpb=0.8871  L2048 loss=5.5242 bpb=1.0145  | degr×=1.144
+
+[bench] ============================================================
+[bench] Training Complete! (3000 steps, 1 epochs)
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 1024
+Loading dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
+  Raw dataset size: 1209356
+  Train: 1148889, Val: 60467, Seq len: 2048
+[bench] Final val loss: 3.9028
+[bench] Final perplexity: 49.54
+[bench] Final bits-per-byte: 0.8951
+[bench] Length-extrap bpb: L1024=0.8959  L2048=1.0158  | degradation×=1.134
+[bench] ============================================================
+    Checkpoint saved at step 3000 (model-only)
+
+

@@ -194,9 +194,17 @@ gw*sc 166MB + cast 83MB — all avoidable, none of it the budget.**
 - Pushed `ce_probe` (3d5e330): (a) _grad_logits tile sweep on scratch (in-place kernel can't
   autotune in prod — Liger NaN trap), 7 configs; (b) dense tl.dot best-of-5-configs vs cuBLAS at
   GEMM2/GEMM3 shapes -> prints h + required skip. h<=2 GO / ~3 marginal / >=6 dead on Turing.
-- AWAIT: `python bench.py ce_probe` on T4 (no --compile needed). If (a) finds >10% -> hard-code
-  tiles (~3% total win). If (b) says GO -> open the sparse-GEMM round; else grad sparsity =
-  sm120/Ampere+ lever only (CCE targets those arches natively).
+- **T4 PROBE VERDICT (2026-07-04):**
+  (a) tile sweep: **BM8/BV1024/w4 = 1.889ms/213GB/s vs prod BM32/BV256/w4 = 2.368ms/170GB/s
+  (-20% on the kernel, ~-6.7ms/step ~ 3.5% total).** Wide contiguous-V tiles win the
+  bandwidth-bound pass. Hard-coded in cross_entropy.py (LOCAL, uncommitted — new user policy:
+  discuss before commit/push). Confirm with `bench.py --compile ce` after push.
+  (b) **tl.dot handicap h = 43-46x (best of 5 configs). Sparsity needs skip > 98% to break
+  even -> grad sparsity is DEAD on sm75, definitively.** This fully explains CCE's 0.08x —
+  it wasn't CCE's config, it's tl.dot-vs-cuBLAS on Turing at these shapes (far worse than the
+  ledger's generic "2.5-3x": K=81000 / K=1242 reduction shapes are pathological for tl.dot on
+  64KB-SRAM sm75). Grad sparsity stays a **sm120/Ampere+ lever** (CCE's native target).
+- **Policy change (user, 2026-07-04): no auto commit/push — discuss changes first.**
 
 ## Round 3b (XSA beats inductor) — 2026-06-28
 - XSA was 0.86x fwd+bwd vs compiled (README "fallback only"). Diagnosed: the kernel launched

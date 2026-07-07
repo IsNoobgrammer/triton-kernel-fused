@@ -103,6 +103,13 @@ def aurora_update(M, polar_fn, gain=None, K=AURORA_K, beta=AURORA_BETA, eps=PERR
         gain = RMS_TARGET * (max(rows, cols) ** 0.5)
     tgt = (min(rows, cols) / rows) ** 0.5                        # sqrt(cols/rows) tall, 1 wide
     dt = M.dtype
+    if K == 1 and beta == 0.0:
+        # FUSED fast path (the default config): the per-matrix Frobenius normalize CANCELS —
+        # tgt·(X/D) = tgt·(M/fro)/(rn/fro) = tgt·M/rn — so the polar input is ONE row-multiplier
+        # on raw M (fp32-accumulated row norms, no fp32 copy of M, no fro pass, one transient).
+        rn = torch.linalg.vector_norm(M, dim=-1, dtype=torch.float32).clamp_min(eps)   # (B, rows)
+        X = polar_fn((M * (tgt / rn).unsqueeze(-1)).to(dt))
+        return (X * gain).to(dt)
     X = M.float()
     fro = X.flatten(-2, -1).norm(dim=-1).clamp_min(eps)          # per-matrix Frobenius -> (B,)
     X = X / fro.view(*fro.shape, 1, 1)
@@ -128,14 +135,17 @@ def aurora_ema_update(M, polar_fn, v_ema, gain=None, beta2=PERROW_BETA2, eps=PER
         gain = RMS_TARGET * (max(rows, cols) ** 0.5)
     tgt = (min(rows, cols) / rows) ** 0.5                        # sqrt(cols/rows) tall, 1 wide
     dt = M.dtype
-    X = M.float()
-    fro = X.flatten(-2, -1).norm(dim=-1).clamp_min(eps)          # per-matrix Frobenius -> (B,)
-    X = X / fro.view(*fro.shape, 1, 1)
-    row_ms = X.mul(X).mean(dim=-1)                               # per-row mean-square -> (B, rows)
-    v_ema.mul_(beta2).add_(row_ms, alpha=1.0 - beta2)           # EMA in place (normuon's memory)
-    D = v_ema.sqrt().clamp_min(eps)                              # EMA-based row scale -> (B, rows)
-    X = polar_fn((tgt * (X / D.unsqueeze(-1))).to(dt)).float()  # re-orthogonalize (output stays orthogonal)
-    return (gain * X).to(dt)
+    # FUSED (Jul 7 2026): all stats come from fp32-accumulated row norms of raw M — no fp32 copy.
+    # fro = ||rn|| (norm-of-row-norms == Frobenius); row_ms of X=M/fro is (rn/fro)^2/cols. The fro
+    # normalize does NOT cancel here (the EMA accumulates the NORMALIZED stats across steps —
+    # semantics preserved bit-for-fp-noise), but it folds into the single prescale multiplier.
+    rn = torch.linalg.vector_norm(M, dim=-1, dtype=torch.float32)          # (B, rows)
+    fro = torch.linalg.vector_norm(rn, dim=-1).clamp_min(eps)              # (B,) per-matrix Frobenius
+    row_ms = (rn / fro.unsqueeze(-1)).square() / cols                      # per-row mean-square of X
+    v_ema.mul_(beta2).add_(row_ms, alpha=1.0 - beta2)                      # EMA in place (normuon's memory)
+    D = v_ema.sqrt().clamp_min(eps)                                        # EMA-based row scale -> (B, rows)
+    X = polar_fn((M * (tgt / (fro.unsqueeze(-1) * D)).unsqueeze(-1)).to(dt))  # one prescale multiplier
+    return (X * gain).to(dt)
 
 
 def aurora_ema_v2_update(M, polar_fn, v_ema, gain=None, K=AURORA_K, beta2=PERROW_BETA2, eps=PERROW_EPS):
@@ -166,17 +176,108 @@ def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):
     Returns the tensor T (same shape/dtype as O) to add as `weight -= lr * T` — i.e. lr is folded
     OUT (the caller applies `-lr`), the RMS_TARGET and Frobenius factors are folded IN. Frobenius
     norm is per-slice (each stacked matrix scaled by its own ||Ohat||).
+
+    FUSED form (Jul 7 2026): the row stats come from a single fp32-accumulating vector_norm (no
+    fp32 copy of O), the row normalize / per-slice Frobenius / RMS gain collapse algebraically into
+    ONE per-row multiplier (||Ohat_r|| = rn_r·inv_r, so fro is computable from the (M,rows) stats
+    without materializing Ohat), and O is touched once. 3 full fp32 (M,r,c) transients -> 1.
     """
     if mode not in PERROW_MODES:
         raise ValueError(f"{mode!r} is not a per-row scale_mode")
     rows, cols = O.shape[-2], O.shape[-1]
-    Of = O.float()
-    row_sq = Of.mul(Of).mean(dim=-1)                              # mean_cols(O*O) -> (M, rows)
-    v.mul_(beta2).add_(row_sq, alpha=1.0 - beta2)                 # EMA in place
-    Ohat = Of / v.sqrt().add(eps).unsqueeze(-1)                   # per-row RMS normalize -> (M, rows, cols)
-    fro = Ohat.flatten(-2).norm(dim=-1).clamp_min(1e-12)          # per-slice Frobenius -> (M,)
-    C = RMS_TARGET * (rows * cols) ** 0.5                         # ||T||_F -> 0.2*sqrt(m*n) => RMS 0.2
-    return (Ohat * (C / fro).view(-1, 1, 1)).to(O.dtype)
+    rn = torch.linalg.vector_norm(O, dim=-1, dtype=torch.float32)  # (M, rows) fp32-accumulated row norms
+    v.mul_(beta2).add_(rn.square() / cols, alpha=1.0 - beta2)      # EMA of mean_cols(O*O), in place
+    inv = 1.0 / (v.sqrt() + eps)                                   # per-row normalizer
+    fro = torch.linalg.vector_norm(rn * inv, dim=-1).clamp_min(1e-12)  # ||Ohat||_F per slice, from stats
+    C = RMS_TARGET * (rows * cols) ** 0.5                          # ||T||_F -> 0.2*sqrt(m*n) => RMS 0.2
+    mult = inv * (C / fro).unsqueeze(-1)                           # (M, rows) combined multiplier
+    return (O * mult.unsqueeze(-1)).to(O.dtype)                    # one pass over O
+
+
+def xorth_whiten_batch(G, beta, eps=1e-6):
+    """Batched cross-expert whitening core: G (S, E, D) fp32 — S independent expert-stacks, each an
+    (E, D) flattened update block. One bmm gram + ONE batched eigh + one bmm for ALL stacks (the
+    per-stack Python loop with S separate eigh calls was the xorth overhead). Returns T @ G, fp32."""
+    C = G @ G.mT                                                  # (S, E, E) cross-expert grams
+    C = C / C.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12).view(-1, 1, 1)
+    ev, V = torch.linalg.eigh(C)                                  # batched — one call for all S stacks
+    isq = V @ torch.diag_embed(ev.clamp_min(eps).rsqrt()) @ V.mT  # C^{-1/2}
+    T = beta * isq
+    T.diagonal(dim1=-2, dim2=-1).add_(1.0 - beta)                 # (1-beta)·I + beta·C^{-1/2}, no eye alloc
+    return T @ G
+
+
+def xorth_whiten_ns(G, beta, iters=18, ridge=1e-3):
+    """E-SCALABLE whitening core: C^{-1/2} via coupled Denman–Beavers Newton iteration — pure batched
+    bmm, NO cuSOLVER eigh (which serializes per matrix for E>32 and host-syncs; at E=256 x 160 stacks
+    that's hundreds of ms — this is ~45 tiny bmm launches total, fully async, any E).
+
+    G (S, E, D) fp32. Ridge (C + ridge·I, diag-normalized C) replaces the eigh path's eigenvalue
+    clamp: it BOUNDS the amplification of near-null expert directions at ~1/sqrt(ridge) (~31x at
+    1e-3) where the clamp allowed ~1000x — safer, and it guarantees DB convergence. Scaling by the
+    Gershgorin row-sum bound keeps the iteration's spectrum in (0, 1]; `iters` (default 18) covers
+    the worst case (all-correlated stack at E=256: smallest normalized ev ~ ridge/E, DB grows small
+    evs ~2.25x/iter). Under-converged tail directions get LESS than full rsqrt — a soft extra
+    damping, benign for the beta-damped T = (1-beta)I + beta·C^{-1/2}.
+    """
+    C = G @ G.mT                                                  # (S, E, E) cross-expert grams
+    C = C / C.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12).view(-1, 1, 1)
+    isq = _db_isq(C, iters, ridge)
+    T = beta * isq
+    T.diagonal(dim1=-2, dim2=-1).add_(1.0 - beta)
+    return T @ G
+
+
+def _db_isq(C, iters, ridge):
+    """C^{-1/2} of (S,E,E) PSD grams via coupled Denman–Beavers (pure bmm — see xorth_whiten_ns).
+    Ridge added here; Gershgorin row-sum bound keeps the iteration spectrum in (0, 1]."""
+    Cw = C.clone()
+    Cw.diagonal(dim1=-2, dim2=-1).add_(ridge)
+    s = Cw.abs().sum(-1).amax(-1).clamp_min(1e-12).view(-1, 1, 1)  # Gershgorin: s >= lambda_max
+    E = Cw.shape[-1]
+    I = torch.eye(E, device=Cw.device, dtype=Cw.dtype).expand_as(Cw)
+    Y = Cw / s
+    Z = I
+    for _ in range(iters):                                        # Y -> Y0^{1/2}, Z -> Y0^{-1/2}
+        Mk = 1.5 * I - 0.5 * (Z @ Y)
+        Y = Y @ Mk
+        Z = Mk @ Z
+    return Z / s.sqrt()                                           # C^{-1/2} = (C/s)^{-1/2} / sqrt(s)
+
+
+def xorth_whiten_gated(G, cema, beta_max, rho=0.95, gate_ref=0.3, iters=18, ridge=1e-3):
+    """EMA'd + GATED cross-expert whitening — decorrelate only PERSISTENT correlation, only when
+    there is evidence of it, and only a little.
+
+    Two fixes over the instantaneous whiten (both aimed at 'small decorrelation, when needed'):
+      1. EMA GRAM: a one-step gram's off-diagonals are dominated by that batch's token mix, so
+         whitening against it injects batch noise. The whitening target here is `cema` — an fp32
+         (S,E,E) EMA of the normalized grams, MUTATED IN PLACE (persisted per param, E^2 floats
+         per stack ~ nothing next to the (M,rows) row-EMA). Init at IDENTITY = 'assume
+         decorrelated until proven otherwise'.
+      2. GATE: beta_t = beta_max * clamp(offdiag_RMS(cema)/gate_ref, 0, 1) per stack, GPU-resident
+         (no host sync). offdiag RMS of a unit-diag gram ~ the mean |correlation|; below gate_ref
+         the whitening ramps proportionally, at 0 correlation T == I exactly (xorth does nothing).
+         gate_ref<=0 disables the gate (always beta_max); rho=0 makes the gram instantaneous.
+
+    G (S,E,D) fp32 post-NS updates. Returns T @ G with T = (1-beta_t)I + beta_t*cema^{-1/2}.
+    """
+    E = G.shape[1]
+    C = G @ G.mT
+    C = C / C.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12).view(-1, 1, 1)
+    cema.mul_(rho).add_(C, alpha=1.0 - rho)
+    off = cema.clone()
+    off.diagonal(dim1=-2, dim2=-1).zero_()
+    corr = off.square().sum(dim=(-2, -1)).div(max(E * E - E, 1)).sqrt()   # RMS over off-diag entries
+    if gate_ref > 0:
+        gate = (corr / gate_ref).clamp(0.0, 1.0)
+    else:
+        gate = torch.ones_like(corr)
+    beta = beta_max * gate                                        # (S,) per-stack strength
+    isq = _db_isq(cema, iters, ridge)
+    T = beta.view(-1, 1, 1) * isq
+    T.diagonal(dim1=-2, dim2=-1).add_((1.0 - beta).unsqueeze(-1))
+    return T @ G
 
 
 def xorth_whiten(O, beta, eps=1e-6):
@@ -187,15 +288,10 @@ def xorth_whiten(O, beta, eps=1e-6):
     Decorrelates the CLEAN uniform-spectrum updates (well-conditioned gram) instead of the noisy
     raw gradient (pre-NS). Cost: mixing experts by T breaks each expert's individual orthogonality
     (the post-polar trade, cf. normuon). Returns T @ O along the E axis, same shape/dtype as O.
-    """
+    Single-stack wrapper over xorth_whiten_batch (FusedMuon batches all stacks per chunk)."""
     E = O.shape[0]
-    G = O.reshape(E, -1).float()                                  # (E, D) flatten rows*cols
-    C = G @ G.mT                                                  # (E, E) cross-expert gram
-    C = C / C.diagonal().mean().clamp_min(1e-12)                  # normalize (diag ~1)
-    ev, V = torch.linalg.eigh(C)
-    isq = V @ torch.diag_embed(ev.clamp_min(1e-6).rsqrt()) @ V.mT # C^{-1/2}
-    T = (1 - beta) * torch.eye(E, device=O.device, dtype=C.dtype) + beta * isq
-    return (T @ G).reshape_as(O).to(O.dtype)
+    G = O.reshape(E, -1).float().unsqueeze(0)                     # (1, E, D)
+    return xorth_whiten_batch(G, beta, eps)[0].reshape_as(O).to(O.dtype)
 
 
 def spectral_wd_mult(u, e_ema, gamma, beta=0.99, eps=1e-12):

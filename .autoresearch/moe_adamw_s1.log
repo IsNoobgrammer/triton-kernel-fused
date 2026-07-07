@@ -1,0 +1,2 @@
+[grokmoe] arm=adamw seed=1 frac=0.45 E=8 topk=2 repulse=0.0 wd=2.0 params=3.38M train=16892 heldout=20647 opmix=(0.4, 0.3, 0.2, 0.1)
+[grokmoe] step   200 loss 4.0559 acc 0.0132 add=0.005 sub=0.008 mul=0.023 div=0.017 | MI 0.00 0.00 0.45 | minload 0.001

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "marimo-pair": {
+      "source": "marimo-team/marimo-pair",
+      "sourceType": "github",
+      "skillPath": "skills/marimo-pair/SKILL.md",
+      "computedHash": "87e8a947faba33f1b4e259d7cca4c4a66cb14cb651df58c28a2c854a0f98f044"
+    },
+    "retro-marimo-pair": {
+      "source": "marimo-team/marimo-pair",
+      "sourceType": "github",
+      "skillPath": "skills/retro-marimo-pair/SKILL.md",
+      "computedHash": "62310fea7ac3b86960dbf14430b060d7f99b3f58a0e698723aa03885623a1ea8"
+    }
+  }
+}

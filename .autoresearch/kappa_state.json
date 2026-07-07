@@ -1,0 +1,18 @@
+{
+  "objective": "min geomean kappa r=1 decay=2 (fp16) per NS-iter budget",
+  "round": "kappa-pareto",
+  "status": "DONE - target met run 5 (held-out + 10-seed paired)",
+  "run_number": 5,
+  "champion": {
+    "name": "sperm05_KJ10pin2",
+    "pipeline": "rownorm -> +0.05*spectral*signed-perm -> NS[KJ x10, pin x2] (12 iters, fp16)",
+    "holdout": {"B12": 1.001, "B11": 1.064, "B10_variant": 1.62},
+    "paired_10seed": {"B12_max": 1.0, "B10_max": 6.0}
+  },
+  "pareto_opt_seeds": {"B8": 17.95, "B9": 5.26, "B10": 1.696, "B11": 1.012, "B12": 1.001},
+  "refuted": ["sink2 prescale (worse than rownorm)", "gaussian dither (330 vs 35)",
+              "polar splits at low budget (196 vs 2.6 at B12)",
+              "coeff solver beyond KJ (net quintic lift capped ~3x/iter, KJ ~= optimal)"],
+  "pending": "T4/VM training verdict before repo adoption — dither injects eps=5% orthogonal noise into null directions",
+  "stop": {"target": "kappa<=3 @ B<=12 held-out", "met": true, "max_runs": 25}
+}

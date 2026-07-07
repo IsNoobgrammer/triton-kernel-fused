@@ -33,9 +33,10 @@ __all__ = ["fused_router", "router_bias_update", "FusedConvRouterCuDNN",
 
 @triton.jit
 def _conv_router_fwd_kernel(X, W, Bias, Idx, Wt, Logit, S, sxb, sxs, sxh, swe, swh, swk,
-                            sln, sle, HAS_BIAS: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
-                            TOPK: tl.constexpr, H: tl.constexpr, BLOCK_S: tl.constexpr,
-                            BLOCK_E: tl.constexpr, BLOCK_D: tl.constexpr):
+                            sln, sle, scale, HAS_BIAS: tl.constexpr, NORM: tl.constexpr,
+                            E: tl.constexpr, K: tl.constexpr,
+                            TOPK: tl.constexpr, TOPK_P2: tl.constexpr, H: tl.constexpr,
+                            BLOCK_S: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_D: tl.constexpr):
     b = tl.program_id(0)
     st = tl.program_id(1)
     offs_s = st * BLOCK_S + tl.arange(0, BLOCK_S)          # output positions
@@ -59,20 +60,29 @@ def _conv_router_fwd_kernel(X, W, Bias, Idx, Wt, Logit, S, sxb, sxs, sxh, swe, s
     n = b * S + offs_s
     tl.store(Logit + n[:, None] * sln + offs_e[None, :] * sle,
              acc.to(Logit.dtype.element_ty), mask=mask_s[:, None] & mask_e[None, :])
-    # fused epilogue: sigmoid + selection-bias + top-k argmax + unbiased gather
+    # fused epilogue: sigmoid + selection-bias + top-k argmax + unbiased gather + norm_topk + scaling
+    # (same in-register fold as sm75 _router_epilogue_fwd_kernel — kills the _TopkNormalize round-trip)
     scores = 1.0 / (1.0 + tl.exp(-acc))
     sel = scores
     if HAS_BIAS:
         bb = tl.load(Bias + offs_e, mask=mask_e, other=0.0).to(tl.float32)
         sel = sel + bb[None, :]
     sel = tl.where(mask_e[None, :], sel, -1e30)
+    offs_k = tl.arange(0, TOPK_P2)
+    wmat = tl.zeros((BLOCK_S, TOPK_P2), dtype=tl.float32)
     for kk in tl.static_range(TOPK):
         am = tl.argmax(sel, axis=1)
         onehot = offs_e[None, :] == am[:, None]
         w_kk = tl.sum(tl.where(onehot, scores, 0.0), axis=1)
         tl.store(Idx + n * TOPK + kk, am.to(tl.int64), mask=mask_s)
-        tl.store(Wt + n * TOPK + kk, w_kk, mask=mask_s)
+        wmat = tl.where(offs_k[None, :] == kk, w_kk[:, None], wmat)
         sel = tl.where(onehot, -1e30, sel)
+    if NORM:                                               # MiMo/DeepSeek-V3 top-k sum-to-1 (+1e-20)
+        t = tl.sum(wmat, axis=1) + 1e-20
+        wmat = wmat / t[:, None]
+    wmat = wmat * scale
+    tl.store(Wt + n[:, None] * TOPK + offs_k[None, :], wmat,
+             mask=mask_s[:, None] & (offs_k < TOPK)[None, :])
 
 
 @triton.jit
@@ -139,7 +149,7 @@ class FusedConvRouterFused(torch.autograd.Function):
     (idx (B*S,k) long, weights (B*S,k) fp32 UNBIASED, counts (E,) int32); only `weights` differentiable."""
 
     @staticmethod
-    def forward(ctx, x, weight, bias, top_k, num_experts):
+    def forward(ctx, x, weight, bias, top_k, num_experts, norm_topk=True, scale=1.0):
         B, S, H = x.shape
         E, _, K = weight.shape
         x = x.contiguous()
@@ -155,12 +165,15 @@ class FusedConvRouterFused(torch.autograd.Function):
         _conv_router_fwd_kernel[grid](
             x, weight, bias if bias is not None else x, idx, wt, logits, S,
             x.stride(0), x.stride(1), x.stride(2), weight.stride(0), weight.stride(1), weight.stride(2),
-            logits.stride(0), logits.stride(1), HAS_BIAS=bias is not None,
-            E=E, K=K, TOPK=top_k, H=H, BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D,
+            logits.stride(0), logits.stride(1), float(scale), HAS_BIAS=bias is not None,
+            NORM=bool(norm_topk and top_k > 1),
+            E=E, K=K, TOPK=top_k, TOPK_P2=max(1, triton.next_power_of_2(top_k)), H=H,
+            BLOCK_S=BLOCK_S, BLOCK_E=BLOCK_E, BLOCK_D=BLOCK_D,
             num_stages=1, num_warps=4)
         counts = _count_experts(idx, num_experts)
         ctx.save_for_backward(x, weight, logits, idx)
         ctx.dims = (B, S, H, E, K, top_k)
+        ctx.norm, ctx.scale = bool(norm_topk and top_k > 1), float(scale)
         ctx.mark_non_differentiable(idx, counts)
         return idx, wt, counts
 
@@ -178,6 +191,7 @@ class FusedConvRouterFused(torch.autograd.Function):
             logits, idx, gw_in, grad_logits, N,
             logits.stride(0), logits.stride(1), idx.stride(0), idx.stride(1),
             gw_in.stride(0), gw_in.stride(1), grad_logits.stride(0), grad_logits.stride(1),
+            ctx.scale, NORM=ctx.norm,
             E=E, TOPK=top_k, BLOCK_N=BLOCK_N_EP, BLOCK_E=BLOCK_E)
 
         grad_x = torch.empty(B, S, H, device=x.device, dtype=x.dtype)
@@ -205,18 +219,18 @@ class FusedConvRouterFused(torch.autograd.Function):
             E=E, H=H, BLOCK_E=BLOCK_E, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, K=K,
             num_stages=2, num_warps=4)
         grad_w = grad_w_acc.to(weight.dtype)
-        return grad_x, grad_w, None, None, None
+        return grad_x, grad_w, None, None, None, None, None
 
 
 def fused_router(x, conv_weight, bias, top_k, num_experts,
                  norm_topk_prob=True, routed_scaling_factor=1.0, return_counts=False):
-    """sm120 conv router (fused Triton conv). Same API/semantics as sm75.fused_router; conv is Triton."""
+    """sm120 conv router (fused Triton conv). Same API/semantics as sm75.fused_router; conv is Triton.
+    norm_topk/scaling folded IN-EPILOGUE (Jul 7 2026): fwd normalizes in-register inside the conv
+    kernel; bwd rides the shared sm75 epilogue-bwd Jacobian. Supersedes the _TopkNormalize round-trip
+    (kept below as reference — it was the measured 1.45->1.86x step this fold completes)."""
     B, S, _ = x.shape
-    idx, w, counts = FusedConvRouterFused.apply(x, conv_weight, bias, top_k, num_experts)
-    if top_k > 1 and norm_topk_prob:
-        w = _topk_normalize(w, routed_scaling_factor)       # fused norm+scale (one kernel each way)
-    else:
-        w = w * routed_scaling_factor
+    idx, w, counts = FusedConvRouterFused.apply(x, conv_weight, bias, top_k, num_experts,
+                                                norm_topk_prob, routed_scaling_factor)
     idx = idx.view(B, S, top_k)
     w = w.view(B, S, top_k)
     return (idx, w, counts) if return_counts else (idx, w)

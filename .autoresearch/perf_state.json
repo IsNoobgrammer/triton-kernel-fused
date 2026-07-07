@@ -1,0 +1,61 @@
+{
+  "round": "perf-per-flop",
+  "objective": "pareto(val_loss@600 screen -> val_loss@2000 confirm, tps)",
+  "baseline": {
+    "arm": "default",
+    "loss2000": 3.8923,
+    "tps": 155097,
+    "loss600": 5.0617,
+    "wall600_s": 252
+  },
+  "noise_sigma_2000": 0.0016,
+  "noise_sigma_600": 0.0021,
+  "best": {
+    "arm": "default (incumbent kept)",
+    "recommended": "ns8 pending one 121M A/B; muon hidden-wd sweep = top untested LM knob",
+    "lm_specialist_candidate": "normuon"
+  },
+  "run_number": 2,
+  "plateau_counter": 0,
+  "vm_runs_used_short": 6,
+  "vm_runs_used_confirm": 2,
+  "vm_budget_short": 14,
+  "vm_budget_confirm": 3,
+  "screen600": {
+    "base1": {
+      "loss": 5.0617,
+      "tps": 155097
+    },
+    "base2": {
+      "loss": 5.0638,
+      "tps": 155683
+    },
+    "ns6": {
+      "loss": 5.0684,
+      "tps": 162022
+    },
+    "ns8": {
+      "loss": 5.0622,
+      "tps": 158104
+    },
+    "normuon": {
+      "loss": 5.0453,
+      "tps": 156371
+    }
+  },
+  "in_flight": "none",
+  "lessons": "cap parallel grok jobs at ~8-10 (23-way contention = 20x slowdown, launch-bound tiny kernels); LM eval closed by user (grok screen primary); gram rejected at 137M shapes; normuon LM lead real+growing at kill (-0.026@1200)",
+  "tried_ideas": [
+    "ns6",
+    "ns8",
+    "normuon",
+    "gram",
+    "mmx6-greedy(dropped)",
+    "sinkhorn-precond(refuted L0)",
+    "polar-warmstart(refuted math)",
+    "dither(prior)",
+    "cap-balloon(prior)"
+  ],
+  "stop_conditions": "see perf_scope.md",
+  "round_status": "DONE (closed 2026-07-04 09:23; LM finale PENDING - sandbox died)"
+}
