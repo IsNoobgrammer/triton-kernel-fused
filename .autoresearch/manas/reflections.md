@@ -96,3 +96,11 @@ until gated). Cost: +1x weights fp32 (u buffer) - so r8 champion keeps the title
 cost-adjusted quality. Mechanism note: back-off sign (user's original guess) neutral,
 extend sign carries whatever effect exists - direction of realized travel adds lookahead
 depth, not double-counting correction. Worth a low-rank-u revisit at LM scale.
+
+## Wave 11 (run 27) - all-low-rank validated
+Low-rank u through d's shared r8 basis fully replicates champion-class frontier (+0.0235
+held-out). Both memories compress to ~1% each with nothing measurable lost - strongest
+evidence yet for the smoothing/denoising story: the mechanism lives in a tiny subspace.
+u still separates from nothing at toy scale; its real test is heterogeneous large-batch
+(LM). Production candidate lineup frozen: (a) champion r8-no-u; (b) exp_lrdu r8-d+r8-u
+comp+1 - identical cost class, LM decides.

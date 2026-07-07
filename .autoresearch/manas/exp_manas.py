@@ -31,7 +31,11 @@ class ExpManas(ManasOptimizer):
 
     def __init__(self, params, ref_mode="theta", norm_mode="global", sign=-1.0,
                  trust=None, probe_src="buffer", comp=None, **kw):
-        assert kw.get("probe_rank") is None, "ExpManas is full-d only"
+        # low-rank d is inherited from the parent; only trust/ema/permat/sign paths
+        # still require full-d (they touch _full_d / raw grads directly)
+        if kw.get("probe_rank") is not None:
+            assert trust is None and ref_mode == "theta" and norm_mode == "global" \
+                and sign == -1.0, "low-rank ExpManas supports comp/muonmom variants only"
         super().__init__(params, **kw)
         assert ref_mode in ("theta", "ema") and norm_mode in ("global", "permat")
         assert probe_src in ("buffer", "muonmom")
@@ -47,10 +51,18 @@ class ExpManas(ManasOptimizer):
         self._motion_ema = None                                  # EMA of ||theta step motion||
 
     def _u_of(self, p):
+        """Dense u for one param. Low-rank mode: u = Q @ Cu in d's SAME rank-r basis —
+        zero extra basis state; the smoothing thesis says the lossy projection keeps the
+        signal (this is exactly the test). Cu re-projected on basis refresh like C."""
         st = self.state[p]
-        if "exp_u" not in st:
-            st["exp_u"] = torch.zeros_like(p, dtype=torch.float32)
-        return st["exp_u"]
+        if self.probe_rank is None:
+            if "exp_u" not in st:
+                st["exp_u"] = torch.zeros_like(p, dtype=torch.float32)
+            return st["exp_u"]
+        q, _c = self._lowrank_qc(p)
+        if "exp_cu" not in st:
+            st["exp_cu"] = torch.zeros_like(st["manas_c"])
+        return q @ st["exp_cu"]
 
     def _offsets(self):
         """Dense probe offsets per param (cached-apply path: ema and/or comp active)."""
@@ -60,11 +72,12 @@ class ExpManas(ManasOptimizer):
             for p in ps:
                 offs[p] += self._ema_ref(p) - p.detach().float()
         if self.comp is not None:
+            us = {p: self._u_of(p) for p in ps}
             un = torch.linalg.vector_norm(torch.stack(
-                [torch.linalg.vector_norm(self._u_of(p)) for p in ps])).clamp_min(1e-12)
+                [torch.linalg.vector_norm(us[p]) for p in ps])).clamp_min(1e-12)
             k = self.comp * self.probe_gamma / un
             for p in ps:
-                offs[p] += k * self._u_of(p)
+                offs[p] += k * us[p]
         return {p: offs[p].to(p.dtype) for p in ps}
 
     # ---- probe_src 'muonmom': offset from the batched muon_mom buffers, no d state ----
@@ -132,6 +145,12 @@ class ExpManas(ManasOptimizer):
         track = self.trust is not None or self.ref_mode == "ema" or self.comp is not None
         if track:
             before = [p.detach().clone() for p in self._probe_params()]
+        if self.comp is not None and self.probe_rank is not None:
+            # parent refreshes Q IN-PLACE inside _update_probe; predict the fire (same
+            # condition it uses, pre-increment) and snapshot the old basis for Cu re-projection
+            fire = self._probe_updates % max(self.probe_refresh, 1) == 0
+            self._q_before = [self._lowrank_qc(p)[0].clone() if fire else None
+                              for p in self._probe_params()]
         loss = super().step(closure)                             # Muon step + _update_probe
         ps = self._probe_params()
         if track:
@@ -140,8 +159,19 @@ class ExpManas(ManasOptimizer):
             m = self._motion_ema
             self._motion_ema = motion if m is None else 0.95 * m + 0.05 * motion
         if self.comp is not None:                                # decayed applied-update buffer
-            for p, b in zip(ps, before):
-                self._u_of(p).mul_(self.probe_rho).add_((p.detach() - b).float())
+            if self.probe_rank is None:
+                for p, b in zip(ps, before):
+                    self._u_of(p).mul_(self.probe_rho).add_((p.detach() - b).float())
+            else:
+                for p, b, qo in zip(ps, before, self._q_before):
+                    q, _c = self._lowrank_qc(p)
+                    st = self.state[p]
+                    if "exp_cu" not in st:
+                        st["exp_cu"] = torch.zeros_like(st["manas_c"])
+                    cu = st["exp_cu"]
+                    if qo is not None:                           # basis refreshed this step
+                        cu.copy_((q.mT @ qo) @ cu)
+                    cu.mul_(self.probe_rho).add_(q.mT @ (p.detach() - b).float())
         if self.ref_mode == "ema":                               # theta_bar tracks theta at rho
             for p in ps:
                 self._ema_ref(p).lerp_(p.detach().float(), 1.0 - self.probe_rho)

@@ -88,6 +88,7 @@ class Trainer:
             self.probe = None
         elif ref or norm or src or trust is not None or comp is not None or sign != -1.0:
             self.opt = ExpManas(mats, lr=E.LR, probe_gamma=gamma, probe_rho=rho,
+                                probe_rank=rank, probe_refresh=refresh,
                                 weight_decay=E.WD, ref_mode=ref or "theta",
                                 norm_mode=norm or "global", sign=sign, trust=trust,
                                 probe_src=src or "buffer", comp=comp)
