@@ -123,3 +123,41 @@ Operationally it needed eigh ridge-escalation + momentum norm-grafting just to n
 fragility Muon/Manas never touch. Final board (held-out frontier vs Muon): Manas r8 +0.0255
 > Muon 0 > Shampoo -0.013 > Adam(tuned) -0.024 > Adam+Nexus -0.030. Manas is the only
 positive. C17 closed.
+
+## Task #1 (divergence hunt) - hetero_dose CONTROL verdict: NEGATIVE
+Seed-floor control (Muon<->Muon same-data-diff-init vs Muon<->Manas same-init-data):
+excess divergence ~0 at alpha 0-0.25 (-0.4%, +0.1%, within noise). The monotone raw
+functional-divergence rise (14->23%) is DATA SENSITIVITY, not Manas mechanism - two Muons
+diverge as much as Muon-vs-Manas. On heterogeneous MNIST-1D, Manas is functionally
+indistinguishable from Muon beyond seed noise. Loss-balance signal was also noise (earlier).
+So: the +0.0255 matched-loss OOD win is real (gated) but does NOT manifest as a visible
+functional/trajectory difference here - the effect is too small to SEE on this task, only to
+measure statistically. Weight-distance metric was uninformative (symmetry-dominated, ~110%
+at all alpha). Remaining divergence candidates: grokking (train_grok.py) same-loss/diff-
+generalization; large-batch u-buffer separation (running). If those also null, the honest
+conclusion is Manas's difference from Muon is real-but-small at toy scale and only a
+LM-scale run could make it visible.
+
+## Task #1 - U-buffer under heterogeneity: NO SEPARATION
+hetero_u.py (Manas+u comp=1 vs Manas no-u, rank-8, 5 paired seeds, alpha grid): delta acc
+~0 at every alpha (+0.23,-0.12,+0.16,-0.09,+0.09%, all within noise), no dose-response.
+The "heterogeneity is where u earns its keep" hypothesis is NOT confirmed at toy scale -
+u remains a free passenger. Faint ungated hint: spread(+u) < spread(no-u) at 4/5 alphas
+(weak balance aid), not chased. u's value, if any, needs LM scale / large heterogeneous
+batches. Keep u OFF by default (shipped); revisit only at BiBo scale.
+
+## Task #1 CLOSE - grokking verdict (8 seeds) + overall
+Heterogeneous grok (add+mul, 8 seeds, 6000 steps): grok_step Manas-Muon = -143 +/-61 steps
+(6/7 grokked-seeds earlier, ~2.3 sigma) - Manas groks slightly earlier UNDER heterogeneity.
+Best-acc difference WASHED OUT at 8 seeds (+0.02 at 3 seeds -> ~0 at 8; was 2-seed luck).
+Single-op grok (homogeneous): Manas == Muon (766 vs 800, tie). The homogeneous-vs-hetero
+contrast is the cleanest mechanism demonstration: no difference without disagreement, small
+edge with it.
+
+TASK #1 VERDICT: Manas's difference from Muon is REAL but SMALL at toy scale, everywhere.
+4 testbeds: functional-divergence=noise-floor; u-buffer=no-sep; single-op-grok=identical;
+hetero-grok=~3% earlier (2 sigma), acc wash. Direction always consistent (Manas >= Muon,
+earlier grok under heterogeneity) - matches the gated +0.0255 OOD win - but never DRAMATIC.
+No visibly-different-at-toy-scale regime exists; effect needs LM scale to become a visible
+gap. Honest close. Lesson reaffirmed: 3-seed excitement (earlier AND +2% acc) did not
+survive 8-seed gating - always gate before believing.
