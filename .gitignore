@@ -6,3 +6,4 @@ __pycache__/
 docs/node_modules/
 docs/dist/
 docs/.astro/
+.autoresearch/manas/data/
