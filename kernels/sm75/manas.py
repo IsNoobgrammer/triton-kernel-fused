@@ -47,10 +47,19 @@ information); it is expected to matter on heterogeneous large-batch data — LM 
 Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
     opt = ManasOptimizer(params, ..., comp=1.0)                              # + rank-8 u buffer
+    opt = ManasOptimizer(params, ..., rgd_tau=3.0)                           # + RGD-weighted votes
     with opt.probe():          # forward/backward run at theta + d
         loss = model(x).loss
         loss.backward()
-    opt.step(); opt.zero_grad()
+    opt.step(); opt.zero_grad()                  # rgd_tau set: opt.step(probe_loss=loss.detach())
+
+RGD vote weighting (rgd_tau, default off): weights each batch's probe vote by the KL-DRO
+factor e^{min(loss,tau)/(tau+1)} (arXiv 2306.09222), EMA-normalized so only batch-RELATIVE
+surprise tilts the consensus — hard batches vote more, the tau clip caps outliers, and the
+weight is clamped to [0.25, 4] (||d|| stays bounded). Probe direction only; the training
+loss and base Muon update are untouched. NOTE: the weight acts on the per-STEP batch-mean
+loss, so its spread — and the whole effect — shrinks ~1/sqrt(batch tokens); at ~8M-token
+batches it degrades gracefully to the validated equal-vote probe (w -> 1), never past it.
 
 Probe memory, two modes:
   probe_rank=None (full)   : one model-shaped fp32 buffer `manas_d` per 2D/3D param.
@@ -88,7 +97,8 @@ NS8_COEFFS = (_KJ,) * 6 + (_PIN,) * 2          # exp_kappa 'ns8': compressed KJ 
 class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
-                 scale_mode="aurora", aurora_k=1, probe_warmup_steps=0, **kw):
+                 scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
+                 rgd_tau=None, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         if not (0.0 <= probe_rho < 1.0):
@@ -108,6 +118,17 @@ class ManasOptimizer(FusedMuon):
         # pure Muon until warmup passes, then the lookahead engages). 0 = active from step 1.
         self.probe_warmup_steps = int(probe_warmup_steps)
         self._manas_step = 0
+        # RGD VOTE WEIGHTING (arXiv 2306.09222, KL-DRO): rgd_tau=None (default) = the validated
+        # equal-vote probe. Set tau > 0 to weight each batch's probe VOTE by w = e^{min(loss,tau)/(tau+1)}
+        # (the paper's g(l) with its gamma = 1/(tau+1)), normalized by a running EMA of w so the
+        # secular loss decline (11 -> 2 over a run) cancels and only batch-relative surprise tilts the
+        # consensus. Hard/surprising batches vote more; the tau clip caps an outlier's vote. This
+        # weights the probe DIRECTION only — the training loss and the base Muon update are untouched.
+        # w is clamped to [0.25, 4] so ||d|| <= 4*gamma/(1-rho) stays bounded. Pass the batch loss via
+        # step(probe_loss=loss) (tensor, no host sync needed — or float).
+        self.rgd_tau = None if rgd_tau is None else float(rgd_tau)
+        self._probe_loss = None
+        self._rgd_wema = None      # smoothing state, attr-only: lost on resume -> one-EMA-window re-anchor, harmless
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -207,9 +228,12 @@ class ManasOptimizer(FusedMuon):
 
     # ---------------- step ----------------
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure=None, probe_loss=None):
         if self._probe_on:
             raise RuntimeError("remove_probe() (or exit the probe() context) before step()")
+        if self.rgd_tau is not None and probe_loss is None:
+            raise RuntimeError("rgd_tau is set: pass the batch loss via step(probe_loss=loss)")
+        self._probe_loss = probe_loss            # consumed by _update_probe (RGD vote weight)
         self._manas_step += 1                    # drives the probe warmup gate (see _update_probe)
         if self.comp is not None:                # u tracks the APPLIED update: snapshot theta,
             ps = self._probe_params()            # and (low-rank) the basis if a refresh will
@@ -248,6 +272,16 @@ class ManasOptimizer(FusedMuon):
         inv = self.probe_gamma / gn
         # sync-free guard: zero/inf/nan gradient norm -> inv = 0 -> this step only DECAYS d
         inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
+        if self.rgd_tau is not None:             # RGD vote weight (see __init__); all tensor ops, sync-free
+            lt = torch.as_tensor(self._probe_loss, dtype=torch.float32, device=gn.device)
+            w_raw = torch.exp(lt.clamp(max=self.rgd_tau) / (self.rgd_tau + 1.0))
+            w_raw = torch.where(torch.isfinite(w_raw), w_raw,
+                                self._rgd_wema if self._rgd_wema is not None else torch.ones_like(w_raw))
+            if self._rgd_wema is None:           # init at the first observed weight -> w starts ~1, no bias
+                self._rgd_wema = w_raw.clone()
+            self._rgd_wema.mul_(0.98).add_(w_raw, alpha=0.02)
+            inv = inv * (w_raw / self._rgd_wema).clamp(0.25, 4.0)
+        self._probe_loss = None                  # single-use: a stale loss never weights a later vote
         # refresh fires on the FIRST update too (C is still zero -> re-projection lossless), so the
         # basis aligns with real gradients immediately instead of projecting through the random init
         refresh = (self.probe_rank is not None
@@ -276,3 +310,36 @@ class ManasOptimizer(FusedMuon):
                 q.copy_(q_new)
             c.mul_(self.probe_rho)
             c.addcmul_(q.mT @ gf, inv, value=-1.0)                   # project increment into basis
+
+
+if __name__ == "__main__":                                           # pragma: no cover
+    # Self-check for the RGD vote weighting (probe math only; no NS/CUDA needed).
+    torch.manual_seed(0)
+    def mk(tau):
+        p = torch.nn.Parameter(torch.randn(32, 16))
+        opt = ManasOptimizer([p], probe_rank=None, rgd_tau=tau)
+        return p, opt
+    # 1) constant loss -> w == 1 exactly -> identical d to the equal-vote probe
+    (p0, o0), (p1, o1) = mk(None), mk(3.0)
+    for _ in range(5):
+        g = torch.randn(32, 16)
+        for p, o, kw in ((p0, o0, {}), (p1, o1, {"probe_loss": 2.0})):
+            p.grad = g.clone(); o._manas_step += 1; o._probe_loss = kw.get("probe_loss"); o._update_probe()
+    assert torch.allclose(o0._full_d(p0), o1._full_d(p1), atol=1e-6), "constant loss must reproduce equal votes"
+    # 2) a high-loss batch votes more than a low-loss one (same gradient)
+    (p2, o2), g = mk(3.0)[0:2], torch.randn(32, 16)
+    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = 2.0; o2._update_probe()
+    base = o2._full_d(p2).norm().item()
+    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = 4.0; o2._update_probe()
+    hi = (o2._full_d(p2).norm().item() - 0.98 * base)      # this vote's contribution
+    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = 0.5; o2._update_probe()
+    # 3) nonfinite loss cannot poison d
+    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = float("nan"); o2._update_probe()
+    assert torch.isfinite(o2._full_d(p2)).all(), "nan loss must not poison d"
+    # 4) missing loss with rgd on fails loud
+    try:
+        o2.step(); raise AssertionError("step() without probe_loss must raise when rgd_tau is set")
+    except RuntimeError:
+        pass
+    assert hi > 0, "high-loss vote must contribute"
+    print("manas rgd self-check PASS")
