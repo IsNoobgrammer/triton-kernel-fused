@@ -126,7 +126,7 @@ class ManasOptimizer(FusedMuon):
         # weights the probe DIRECTION only — the training loss and the base Muon update are untouched.
         # w is clamped to [0.25, 4] so ||d|| <= 4*gamma/(1-rho) stays bounded. Pass the batch loss via
         # step(probe_loss=loss) (tensor, no host sync needed — or float).
-        self.rgd_tau = None if rgd_tau is None else float(rgd_tau)
+        self.rgd_tau = float(rgd_tau) if rgd_tau else None   # None/0/False = off (equal votes)
         self._probe_loss = None
         self._rgd_wema = None      # smoothing state, attr-only: lost on resume -> one-EMA-window re-anchor, harmless
 
