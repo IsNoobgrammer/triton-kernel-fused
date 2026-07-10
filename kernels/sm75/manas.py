@@ -88,7 +88,7 @@ NS8_COEFFS = (_KJ,) * 6 + (_PIN,) * 2          # exp_kappa 'ns8': compressed KJ 
 class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
-                 scale_mode="aurora", aurora_k=1, **kw):
+                 scale_mode="aurora", aurora_k=1, probe_warmup_steps=0, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         if not (0.0 <= probe_rho < 1.0):
@@ -103,6 +103,11 @@ class ManasOptimizer(FusedMuon):
         self.comp = None if comp is None else float(comp)
         self._probe_on = False
         self._probe_updates = 0
+        # WARMUP: skip probe-buffer (d) accumulation for the first probe_warmup_steps step()s so the
+        # long-memory d isn't poisoned by early noisy gradients (d stays 0 -> probe is a no-op ->
+        # pure Muon until warmup passes, then the lookahead engages). 0 = active from step 1.
+        self.probe_warmup_steps = int(probe_warmup_steps)
+        self._manas_step = 0
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -205,6 +210,7 @@ class ManasOptimizer(FusedMuon):
     def step(self, closure=None):
         if self._probe_on:
             raise RuntimeError("remove_probe() (or exit the probe() context) before step()")
+        self._manas_step += 1                    # drives the probe warmup gate (see _update_probe)
         if self.comp is not None:                # u tracks the APPLIED update: snapshot theta,
             ps = self._probe_params()            # and (low-rank) the basis if a refresh will
             before = [p.detach().clone() for p in ps]        # fire inside _update_probe
@@ -233,6 +239,8 @@ class ManasOptimizer(FusedMuon):
     def _update_probe(self):
         ps = [p for p in self._probe_params() if p.grad is not None]
         if not ps or self.probe_gamma == 0.0:
+            return
+        if self._manas_step <= self.probe_warmup_steps:   # warmup: leave d at 0 (pure Muon)
             return
         # global L2 of the (2D/3D) gradient vector, fp32-accumulated; tiny (len(ps),) stack
         gn = torch.linalg.vector_norm(
