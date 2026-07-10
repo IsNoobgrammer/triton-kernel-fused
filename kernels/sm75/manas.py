@@ -34,20 +34,17 @@ Setting the knobs at a new scale (measured scaling laws, .autoresearch/manas/):
     optimum was 80x the old default, so re-sweep the dose per model scale; the curve was
     smooth with a broad plateau and no instability up to 2x the optimum.
 
-Optional U BUFFER (comp != None): a second rho-decayed memory of the APPLIED updates,
-added to the probe offset as  comp * gamma * u/||u||_global  — the probe then also looks
-along the optimizer's realized travel. comp is continuous in units of gamma; comp=+1
-(extend) validated best on the toy (frontier tie with the no-u champion; back-off signs
-neutral; dose turns by +2). At probe_rank=r, u lives in d's SAME rank-r basis (state = one
-extra (r,n) Cu per matrix, ~zero marginal memory; re-projected on basis refresh) — this
-shared-basis compression is held-out validated (+0.0235, tie with full fp32 u's +0.0266).
-u did not SEPARATE from no-u on the toy (batches too homogeneous for update-history
-information); it is expected to matter on heterogeneous large-batch data — LM A/B decides.
+U BUFFER: DEPRECATED AND REMOVED (2026-07-11). The applied-update memory failed to separate
+from no-u at BOTH scales it was hypothesized to help: toy (tie within noise) and the BiBo
+137M comp {0.5, 1, 2} sweep (spread 0.0035, non-monotone = jitter), while costing ~1.2% tps
+plus a full param clone per step and a dense per-param shift cache. Working explanation:
+u ~= the post-polar momentum direction, and momentum-direction probing is a measured inert
+control. comp= is accepted but IGNORED (DeprecationWarning); code lives in git <= e85af8b.
 
 Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
-    opt = ManasOptimizer(params, ..., comp=1.0)                              # + rank-8 u buffer
-    opt = ManasOptimizer(params, ..., rgd_tau=3.0)                           # + RGD-weighted votes
+    opt = ManasOptimizer(params, ..., rgd_tau=3.0)                           # + RGD (loss) vote weights
+    opt = ManasOptimizer(params, ..., cos_beta=0.5)                          # + cos(g,d) vote weights
     with opt.probe():          # forward/backward run at theta + d
         loss = model(x).loss
         loss.backward()
@@ -81,6 +78,7 @@ Safety, all sync-free (no .item()/host branch):
     into the weights is — as with any optimizer — the grad scaler's job to skip (bench/train.py's
     fp16 GradScaler does); Manas does not second-guess it.
 """
+import warnings
 from contextlib import contextmanager
 
 import torch
@@ -98,7 +96,7 @@ class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
-                 rgd_tau=None, probe_norm="global", **kw):
+                 rgd_tau=None, probe_norm="global", cos_beta=0.0, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         if not (0.0 <= probe_rho < 1.0):
@@ -109,8 +107,20 @@ class ManasOptimizer(FusedMuon):
         # size-adaptive per matrix). The per-param resolved rank is clamped to [1, min(m,n)].
         self.probe_rank = None if probe_rank is None else probe_rank
         self.probe_refresh = int(probe_refresh)
-        # comp: u-buffer strength in units of gamma (None = off). +1 validated on the toy.
-        self.comp = None if comp is None else float(comp)
+        # comp / U BUFFER: DEPRECATED 2026-07-11, ignored. The u buffer (rho-decayed memory of
+        # APPLIED updates added to the probe offset) failed to separate from no-u TWICE: toy
+        # (homogeneous-batch tie, +0.0235 vs +0.0266 within noise) AND the BiBo 137M comp sweep
+        # {0.5, 1, 2} at rho.88/g.06 (spread 0.0035, NON-monotone = jitter) — while costing ~1.2%
+        # tps plus a full param clone per step and a dense manas_shift cache in state. Suspected
+        # mechanism: u ~= the momentum direction post-polar, and momentum-direction probing is a
+        # measured inert control (Nesterov already covers it). Code removed; see git history
+        # (<= e85af8b) to resurrect for a long-horizon heterogeneous test.
+        if comp is not None:
+            warnings.warn("ManasOptimizer(comp=...) is deprecated and IGNORED (u buffer removed: "
+                          "no effect at toy or BiBo scale, ~1.2% tps + clone/shift memory cost; "
+                          "see manas.py comment / git history <= e85af8b)", DeprecationWarning,
+                          stacklevel=2)
+        self.comp = None
         self._probe_on = False
         self._probe_updates = 0
         # WARMUP: skip probe-buffer (d) accumulation for the first probe_warmup_steps step()s so the
@@ -138,6 +148,17 @@ class ManasOptimizer(FusedMuon):
         if probe_norm not in ("global", "perparam"):
             raise ValueError(f"probe_norm must be 'global' or 'perparam', got {probe_norm!r}")
         self.probe_norm = probe_norm
+        # cos(g, d) VOTE WEIGHTING (geometry-surprise; 0 = off, the validated equal vote). Each
+        # matrix's vote is scaled by w = 1 + cos_beta * agree, where agree = cos of THIS batch's
+        # gradient with the accumulated consensus GRADIENT direction (-d, since d stores -grads).
+        # cos_beta > 0: confirming batches vote more (sharpen; risk = rich-get-richer lock-in).
+        # cos_beta < 0: disagreeing batches vote more (novelty; risk = re-amplifying the noise
+        # the averaging removed). Use |cos_beta| <= 1; w is clamped to [0, 2] regardless, so
+        # ||d|| <= 2*gamma/(1-rho) stays bounded. Per-matrix, sync-free, ~one dot product each.
+        # Unlike rgd_tau (batch-MEAN-loss surprise, washes out ~1/sqrt(batch tokens)), the
+        # geometry signal does not concentrate away at large batch. First steps (d = 0) and
+        # nonfinite grads weight neutrally (w = 1).
+        self.cos_beta = float(cos_beta)
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -174,19 +195,6 @@ class ManasOptimizer(FusedMuon):
         q, c = self._lowrank_qc(p)
         return q @ c
 
-    def _u_of(self, p):
-        """Dense u (applied-update memory) for one param. Low-rank mode shares d's basis:
-        u = Q @ Cu — one extra (r,n) buffer, re-projected on basis refresh like C."""
-        st = self.state[p]
-        if self.probe_rank is None:
-            if "manas_u" not in st:
-                st["manas_u"] = torch.zeros_like(p, dtype=torch.float32)
-            return st["manas_u"]
-        q, _c = self._lowrank_qc(p)
-        if "manas_cu" not in st:
-            st["manas_cu"] = torch.zeros_like(st["manas_c"])
-        return q @ st["manas_cu"]
-
     # ---------------- probe application ----------------
     @contextmanager
     def probe(self):
@@ -199,18 +207,6 @@ class ManasOptimizer(FusedMuon):
 
     def _shift(self, sign):
         ps = self._probe_params()
-        if self.comp is not None:
-            # offset = d + comp*gamma*u/||u||; cache the applied tensor -> bit-exact remove
-            if sign > 0:
-                us = {p: self._u_of(p) for p in ps}
-                un = torch.linalg.vector_norm(torch.stack(
-                    [torch.linalg.vector_norm(us[p]) for p in ps])).clamp_min(1e-12)
-                k = self.comp * self.probe_gamma / un
-                for p in ps:
-                    self.state[p]["manas_shift"] = (self._d_of(p) + k * us[p]).to(p.dtype)
-            for p in ps:
-                p.add_(self.state[p]["manas_shift"], alpha=sign)
-            return
         if self.probe_rank is None and all(p.dtype == torch.float32 for p in ps):
             # fused fast path (fp32 masters, full-d): ONE foreach over all params
             if sign > 0:
@@ -244,28 +240,8 @@ class ManasOptimizer(FusedMuon):
             raise RuntimeError("rgd_tau is set: pass the batch loss via step(probe_loss=loss)")
         self._probe_loss = probe_loss            # consumed by _update_probe (RGD vote weight)
         self._manas_step += 1                    # drives the probe warmup gate (see _update_probe)
-        if self.comp is not None:                # u tracks the APPLIED update: snapshot theta,
-            ps = self._probe_params()            # and (low-rank) the basis if a refresh will
-            before = [p.detach().clone() for p in ps]        # fire inside _update_probe
-            fire = (self.probe_rank is not None
-                    and self._probe_updates % max(self.probe_refresh, 1) == 0)
-            q_old = [self._lowrank_qc(p)[0].clone() if fire else None for p in ps]
         loss = super().step(closure)             # fused aurora-K1 Muon on the probe-point grads
         self._update_probe()
-        if self.comp is not None:
-            for p, b, qo in zip(ps, before, q_old):
-                delta = (p.detach() - b).float()
-                if self.probe_rank is None:
-                    self._u_of(p).mul_(self.probe_rho).add_(delta)
-                    continue
-                q, _c = self._lowrank_qc(p)
-                st = self.state[p]
-                if "manas_cu" not in st:
-                    st["manas_cu"] = torch.zeros_like(st["manas_c"])
-                cu = st["manas_cu"]
-                if qo is not None:               # basis refreshed: carry u into the new basis
-                    cu.copy_((q.mT @ qo) @ cu)
-                cu.mul_(self.probe_rho).add_(q.mT @ delta)
         return loss
 
     @torch.no_grad()
@@ -303,12 +279,22 @@ class ManasOptimizer(FusedMuon):
         # nan_to_num: with a nonfinite gn, inv is already 0, but inf*0 = NaN elementwise — sanitize
         # the OPERAND so the (zero-scaled) increment is 0, not NaN. gn itself sees the raw grads
         # (an inf entry MUST zero inv). Only bites on bad steps; a fresh tensor either way.
+        def _cos_w(dot, dnorm, i):
+            """Vote weight 1 + beta*agree from <g, d> (agree = -cos: d stores NEGATED grads).
+            d=0 (first steps) or nonfinite -> exactly 1 (neutral). Clamped [0, 2]."""
+            agree = -dot / (dnorm * pn[i]).clamp_min(1e-12)
+            w = 1.0 + self.cos_beta * agree
+            return torch.where(torch.isfinite(w), w, torch.ones_like(w)).clamp(0.0, 2.0)
+
         if self.probe_rank is None:
             ds = [self._full_d(p) for p in ps]
-            torch._foreach_mul_(ds, self.probe_rho)                  # ONE fused decay sweep
+            torch._foreach_mul_(ds, self.probe_rho)                  # ONE fused decay sweep (direction unchanged)
             for i, (p, d) in enumerate(zip(ps, ds)):
                 g32 = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
-                d.addcmul_(g32, inv if inv.ndim == 0 else inv[i], value=-1.0)   # d -= (gamma/||g||) * g
+                iv = inv if inv.ndim == 0 else inv[i]
+                if self.cos_beta != 0.0:
+                    iv = iv * _cos_w((d * g32).sum(), torch.linalg.vector_norm(d), i)
+                d.addcmul_(g32, iv, value=-1.0)                      # d -= w * (gamma/||g||) * g
             return
         for i, p in enumerate(ps):
             q, c = self._lowrank_qc(p)
@@ -322,7 +308,12 @@ class ManasOptimizer(FusedMuon):
                 c.copy_((q_new.mT @ q) @ c)
                 q.copy_(q_new)
             c.mul_(self.probe_rho)
-            c.addcmul_(q.mT @ gf, inv if inv.ndim == 0 else inv[i], value=-1.0)  # project increment into basis
+            proj = q.mT @ gf                                         # (.., r, n) rank-space increment
+            iv = inv if inv.ndim == 0 else inv[i]
+            if self.cos_beta != 0.0:
+                # rank-space cosine: <q@c, g> = sum(c * (q^T g)), ||q@c||_F = ||c||_F (q orthonormal)
+                iv = iv * _cos_w((c * proj).sum(), torch.linalg.vector_norm(c), i)
+            c.addcmul_(proj, iv, value=-1.0)                         # project increment into basis
 
 
 if __name__ == "__main__":                                           # pragma: no cover
@@ -370,4 +361,26 @@ if __name__ == "__main__":                                           # pragma: n
     pa.grad = torch.full((32, 16), float("nan")); pb.grad = torch.randn(32, 16)
     o._manas_step += 1; o._update_probe()
     assert o._full_d(pa).norm() == 0 and o._full_d(pb).norm() > 0, "nan matrix must not veto healthy votes"
-    print("manas rgd+perparam self-check PASS")
+    # 7) cos_beta: first vote (d=0) is neutral -> identical to cos_beta=0; then a confirming
+    #    gradient votes MORE at beta>0 and LESS at beta<0 (agree sign accounts for d = -sum g)
+    g1, g2 = torch.randn(32, 16), None
+    outs = {}
+    for beta in (0.0, 0.9, -0.9):
+        p = torch.nn.Parameter(torch.randn(32, 16))
+        o = ManasOptimizer([p], probe_rank=None, cos_beta=beta)
+        p.grad = g1.clone(); o._manas_step += 1; o._update_probe()   # d=0 -> w=1 for every beta
+        if g2 is None:
+            g2 = g1 + 0.1 * torch.randn(32, 16)                     # strongly agreeing second batch
+        d_before = o._full_d(p).clone()
+        p.grad = g2.clone(); o._manas_step += 1; o._update_probe()
+        outs[beta] = (d_before, (o._full_d(p) - 0.98 * d_before))   # second-vote contribution (rho=0.98 default)
+    assert torch.allclose(outs[0.0][0], outs[0.9][0], atol=1e-7), "d=0 first vote must be neutral"
+    n0, npos, nneg = (outs[b][1].norm().item() for b in (0.0, 0.9, -0.9))
+    assert npos > n0 > nneg, f"agreeing vote: beta>0 must amplify, beta<0 damp ({npos:.4f} vs {n0:.4f} vs {nneg:.4f})"
+    # 8) comp= is deprecated: warns and is ignored
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        o = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], comp=1.0)
+    assert o.comp is None and any(issubclass(w.category, DeprecationWarning) for w in caught), \
+        "comp must warn DeprecationWarning and be ignored"
+    print("manas rgd+perparam+cos self-check PASS")
