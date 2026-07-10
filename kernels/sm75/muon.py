@@ -347,7 +347,8 @@ class FusedMuon(optim.Optimizer):
 
         if (self.use_graph and self.spectral_wd == 0
                 and not any(g.get("xorth_post", 0) > 0 for g in self.param_groups)
-                and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode))):
+                and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)
+                         or _scaling.is_aurora_ema(self.scale_mode))):
             self._graph_step()                                    # captured graph supports scalar scales only
             return loss
 

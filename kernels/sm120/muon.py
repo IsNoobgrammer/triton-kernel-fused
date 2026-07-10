@@ -83,9 +83,12 @@ class FusedMuon(_FusedMuon75):
 
     @torch.no_grad()
     def step(self, closure=None):
-        # per-row / aurora modes always take the eager symmul/gram apply below (not the captured graph)
-        _eager_mode = _scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)
-        if not self.use_symmul or (self.use_graph and not _eager_mode):
+        # per-row / aurora / aurora_ema modes always take the eager symmul/gram apply below (not the graph)
+        _eager_mode = (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)
+                       or _scaling.is_aurora_ema(self.scale_mode))
+        # features the fast loop below doesn't implement -> the sm75 step (correct, cuBLAS NS)
+        _sm75_only = self.spectral_wd > 0
+        if not self.use_symmul or _sm75_only or (self.use_graph and not _eager_mode):
             return super().step(closure)                  # pure-cuBLAS champion (or the graph path)
         loss = None
         if closure is not None:
@@ -102,6 +105,8 @@ class FusedMuon(_FusedMuon75):
                 torch._foreach_mul_(params, 1.0 - lr * wd)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
+            aurora_ema = _scaling.is_aurora_ema(self.scale_mode)
+            xp = group["xorth_post"]                      # group-scoped cross-expert whiten (see sm75)
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]
@@ -116,13 +121,21 @@ class FusedMuon(_FusedMuon75):
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
                     if aurora:                            # iterative prescale + re-orthogonalize (K gram/symmul solves)
                         out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
+                    elif aurora_ema:                      # aurora + normuon per-row EMA memory (v1 pre-polar / v2 post)
+                        v_c = v_all[start:start + crows]
+                        if self.scale_mode == "aurora_ema_v2":
+                            out = _scaling.aurora_ema_v2_update(u, self._polar, v_c, K=self.aurora_k)
+                        else:
+                            out = _scaling.aurora_ema_update(u, self._polar, v_c)
                     else:
                         out = self._ns(u)                 # gram NS (default) or symmul NS
                         if perrow:                        # leverage-aware per-row rescale (scale folded into out)
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
+                    if xp > 0:                            # AFTER-NS cross-expert whiten (inherited from sm75)
+                        self._whiten_chunk(out, members, r, c, xp)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members],
-                                        alpha=(-lr if (perrow or aurora) else alpha))
+                                        alpha=(-lr if (perrow or aurora or aurora_ema) else alpha))
         return loss
 
     def _compute(self, work, decay):
