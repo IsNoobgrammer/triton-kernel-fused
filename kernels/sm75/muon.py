@@ -113,7 +113,8 @@ class FusedMuon(optim.Optimizer):
                  coeffs=_DSV4_COEFFS, ns_dtype=None, scale_mode=_scaling.DEFAULT_MODE,
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
                  spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0, xorth_backend="ns",
-                 xorth_ns_iters=18, xorth_ema=0.95, xorth_gate_ref=0.3):
+                 xorth_ns_iters=18, xorth_ema=0.95, xorth_gate_ref=0.3,
+                 xorth_warmup_steps=0, xorth_where="post"):
         # xorth_post is a GROUP-level option (like lr/wd): the constructor value is only the default;
         # pass param groups to scope whitening to the params whose leading dim IS an expert axis:
         #   FusedMuon([{"params": expert_stacks, "xorth_post": 0.01},
@@ -150,6 +151,16 @@ class FusedMuon(optim.Optimizer):
         # (~5KB on BiBo — nothing next to the (M,rows) row-EMA's ~0.2%).
         self.xorth_ema = float(xorth_ema)
         self.xorth_gate_ref = float(xorth_gate_ref)
+        # xorth WARMUP + PLACEMENT. xorth is gated OFF until the optimizer has taken more than
+        # xorth_warmup_steps steps (0 = active from step 1) — let experts differentiate before
+        # decorrelating them. xorth_where: "post" (default) whitens the orthogonalized update AFTER
+        # Newton-Schulz; "pre" whitens the momentum BEFORE NS (NS then orthogonalizes decorrelated
+        # input). _xorth_step counts step() calls (see the increment in step()).
+        self.xorth_warmup_steps = int(xorth_warmup_steps)
+        if xorth_where not in ("pre", "post"):
+            raise ValueError(f"xorth_where must be 'pre' or 'post', got {xorth_where!r}")
+        self.xorth_where = xorth_where
+        self._xorth_step = 0
         # Cap rows*r*c per batched Newton-Schulz call: batches the many small 2D params while row-chunking
         # the big expert stacks so the per-step transient stays BELOW the baseline's peak (a hard eval
         # gate). Bigger caps run bigger GEMMs (faster: 64M hits 1.16x/1.10x) but blow past baseline mem
@@ -344,6 +355,7 @@ class FusedMuon(optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        self._xorth_step += 1                                 # once per step() (drives the xorth warmup gate)
 
         if (self.use_graph and self.spectral_wd == 0
                 and not any(g.get("xorth_post", 0) > 0 for g in self.param_groups)
@@ -360,6 +372,7 @@ class FusedMuon(optim.Optimizer):
                                           group["weight_decay"], group["nesterov"])
             xp = group["xorth_post"]                              # group-scoped: whiten ONLY the groups
                                                                   # whose leading dim is an expert axis
+            do_xorth = xp > 0 and self._xorth_step > self.xorth_warmup_steps   # warmup gate
 
             # BATCHED-STATE, SAME-SHAPE: momentum is ONE (M,r,c) fp16 buffer per shape group (the lever
             # compile can't reach — it runs NS per param). Grads are gathered directly into the batched
@@ -388,6 +401,10 @@ class FusedMuon(optim.Optimizer):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)                   # buf = momentum*buf + grad
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c   # reuse gbuf as NS input
+                    if do_xorth and self.xorth_where == "pre":       # PRE-NS: decorrelate the momentum, then orthogonalize
+                        if not nesterov:                             # u aliases the persistent momentum -> don't corrupt it
+                            u = u.clone()
+                        self._whiten_chunk(u, members, r, c, xp)
                     if spectral:                                     # per-row decay from accumulated momentum energy (skips scalar decay above)
                         s, cov = _scaling.spectral_wd_mult(u, e_all[start:start + crows], self.spectral_wd, self.swd_beta)
                         self._swd_cov = float(cov)
@@ -407,7 +424,7 @@ class FusedMuon(optim.Optimizer):
                         out = newton_schulz(u, self.coeffs, self.ns_dtype)
                         if perrow:                                    # leverage-aware per-row rescale (scale folded into out)
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
-                    if xp > 0:                                        # AFTER-NS cross-expert whiten
+                    if do_xorth and self.xorth_where == "post":       # POST-NS: whiten the orthogonalized update
                         self._whiten_chunk(out, members, r, c, xp)
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
                     torch._foreach_add_([p for p, _, _ in members],

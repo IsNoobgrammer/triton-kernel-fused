@@ -94,6 +94,7 @@ class FusedMuon(_FusedMuon75):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        self._xorth_step += 1                         # eager path owns the increment (super() path counts in sm75)
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
             if not params:
@@ -107,6 +108,7 @@ class FusedMuon(_FusedMuon75):
             aurora = _scaling.is_aurora(self.scale_mode)
             aurora_ema = _scaling.is_aurora_ema(self.scale_mode)
             xp = group["xorth_post"]                      # group-scoped cross-expert whiten (see sm75)
+            do_xorth = xp > 0 and self._xorth_step > self.xorth_warmup_steps   # warmup gate
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]
@@ -119,6 +121,10 @@ class FusedMuon(_FusedMuon75):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
+                    if do_xorth and self.xorth_where == "pre":   # PRE-NS: decorrelate momentum, then orthogonalize
+                        if not nesterov:                         # u aliases persistent momentum -> don't corrupt it
+                            u = u.clone()
+                        self._whiten_chunk(u, members, r, c, xp)
                     if aurora:                            # iterative prescale + re-orthogonalize (K gram/symmul solves)
                         out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
                     elif aurora_ema:                      # aurora + normuon per-row EMA memory (v1 pre-polar / v2 post)
@@ -131,7 +137,7 @@ class FusedMuon(_FusedMuon75):
                         out = self._ns(u)                 # gram NS (default) or symmul NS
                         if perrow:                        # leverage-aware per-row rescale (scale folded into out)
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
-                    if xp > 0:                            # AFTER-NS cross-expert whiten (inherited from sm75)
+                    if do_xorth and self.xorth_where == "post":   # POST-NS: whiten the orthogonalized update
                         self._whiten_chunk(out, members, r, c, xp)
                     torch._foreach_add_([p for p, _, _ in members],
                                         [out[o:o + n].reshape(p.shape) for p, o, n in members],
