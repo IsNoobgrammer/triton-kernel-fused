@@ -98,7 +98,7 @@ class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
-                 rgd_tau=None, **kw):
+                 rgd_tau=None, probe_norm="global", **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         if not (0.0 <= probe_rho < 1.0):
@@ -129,6 +129,15 @@ class ManasOptimizer(FusedMuon):
         self.rgd_tau = float(rgd_tau) if rgd_tau else None   # None/0/False = off (equal votes)
         self._probe_loss = None
         self._rgd_wema = None      # smoothing state, attr-only: lost on resume -> one-EMA-window re-anchor, harmless
+        # probe_norm: 'global' (validated default) = one gamma/||g||_all scalar — a matrix's share of
+        # each vote follows its share of the GLOBAL gradient norm, which couples gamma to model
+        # width/depth (suspected source of the 80x toy->BiBo gamma shift). 'perparam' = normalize each
+        # matrix's vote by ITS OWN grad norm — every matrix gets an equal-size gamma vote per step
+        # (muP-flavored; candidate fix for gamma transfer across scales). 3D expert stacks normalize
+        # at the TENSOR level (whole stack), not per slice.
+        if probe_norm not in ("global", "perparam"):
+            raise ValueError(f"probe_norm must be 'global' or 'perparam', got {probe_norm!r}")
+        self.probe_norm = probe_norm
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -266,11 +275,15 @@ class ManasOptimizer(FusedMuon):
             return
         if self._manas_step <= self.probe_warmup_steps:   # warmup: leave d at 0 (pure Muon)
             return
-        # global L2 of the (2D/3D) gradient vector, fp32-accumulated; tiny (len(ps),) stack
-        gn = torch.linalg.vector_norm(
-            torch.stack([torch.linalg.vector_norm(p.grad, dtype=torch.float32) for p in ps]))
+        # per-param L2 norms, fp32-accumulated; tiny (len(ps),) stack
+        pn = torch.stack([torch.linalg.vector_norm(p.grad, dtype=torch.float32) for p in ps])
+        if self.probe_norm == "perparam":
+            gn = pn                                       # (len(ps),) — each matrix votes gamma on its own
+        else:
+            gn = torch.linalg.vector_norm(pn)             # scalar — one global vote split by norm share
         inv = self.probe_gamma / gn
-        # sync-free guard: zero/inf/nan gradient norm -> inv = 0 -> this step only DECAYS d
+        # sync-free guard: zero/inf/nan gradient norm -> inv = 0 -> this step only DECAYS d.
+        # perparam: elementwise, so one dead/overflowed matrix skips only ITS vote, not everyone's.
         inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
         if self.rgd_tau is not None:             # RGD vote weight (see __init__); all tensor ops, sync-free
             lt = torch.as_tensor(self._probe_loss, dtype=torch.float32, device=gn.device)
@@ -293,11 +306,11 @@ class ManasOptimizer(FusedMuon):
         if self.probe_rank is None:
             ds = [self._full_d(p) for p in ps]
             torch._foreach_mul_(ds, self.probe_rho)                  # ONE fused decay sweep
-            for p, d in zip(ps, ds):
+            for i, (p, d) in enumerate(zip(ps, ds)):
                 g32 = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
-                d.addcmul_(g32, inv, value=-1.0)                     # d -= (gamma/||g||) * g
+                d.addcmul_(g32, inv if inv.ndim == 0 else inv[i], value=-1.0)   # d -= (gamma/||g||) * g
             return
-        for p in ps:
+        for i, p in enumerate(ps):
             q, c = self._lowrank_qc(p)
             gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
             if refresh:
@@ -309,7 +322,7 @@ class ManasOptimizer(FusedMuon):
                 c.copy_((q_new.mT @ q) @ c)
                 q.copy_(q_new)
             c.mul_(self.probe_rho)
-            c.addcmul_(q.mT @ gf, inv, value=-1.0)                   # project increment into basis
+            c.addcmul_(q.mT @ gf, inv if inv.ndim == 0 else inv[i], value=-1.0)  # project increment into basis
 
 
 if __name__ == "__main__":                                           # pragma: no cover
@@ -342,4 +355,19 @@ if __name__ == "__main__":                                           # pragma: n
     except RuntimeError:
         pass
     assert hi > 0, "high-loss vote must contribute"
-    print("manas rgd self-check PASS")
+    # 5) perparam norm: equal-size votes regardless of per-matrix grad scale (global: share-weighted)
+    for mode, expect_equal in (("perparam", True), ("global", False)):
+        pa, pb = torch.nn.Parameter(torch.randn(32, 16)), torch.nn.Parameter(torch.randn(32, 16))
+        o = ManasOptimizer([pa, pb], probe_rank=None, probe_norm=mode)
+        pa.grad = torch.randn(32, 16); pb.grad = 100.0 * torch.randn(32, 16)   # 100x scale gap
+        o._manas_step += 1; o._update_probe()
+        na, nb = o._full_d(pa).norm().item(), o._full_d(pb).norm().item()
+        equal = abs(na - nb) / max(na, nb) < 0.05
+        assert equal == expect_equal, f"{mode}: vote norms {na:.4f} vs {nb:.4f}"
+    # 6) perparam guard is per-matrix: a nan grad zeroes only its own vote
+    pa, pb = torch.nn.Parameter(torch.randn(32, 16)), torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([pa, pb], probe_rank=None, probe_norm="perparam")
+    pa.grad = torch.full((32, 16), float("nan")); pb.grad = torch.randn(32, 16)
+    o._manas_step += 1; o._update_probe()
+    assert o._full_d(pa).norm() == 0 and o._full_d(pb).norm() > 0, "nan matrix must not veto healthy votes"
+    print("manas rgd+perparam self-check PASS")
