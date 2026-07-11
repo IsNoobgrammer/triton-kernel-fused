@@ -45,6 +45,15 @@ Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
     opt = ManasOptimizer(params, ..., rgd_tau=3.0)                           # + RGD (loss) vote weights
     opt = ManasOptimizer(params, ..., cos_beta=0.5)                          # + cos(g,d) vote weights
+    opt = ManasOptimizer(params, ..., micro_vote=True)                       # per-micro-batch votes
+    opt = ManasOptimizer(params, ..., micro_vote=True, nexus_gamma=0.03)     # + common-basin walker
+
+Micro-vote loop (gradient accumulation; vote() is a no-op when micro_vote=False):
+    for micro in range(accum):
+        with opt.probe():
+            (loss / accum).backward()
+        opt.vote()
+    opt.step(); opt.zero_grad()
     with opt.probe():          # forward/backward run at theta + d
         loss = model(x).loss
         loss.backward()
@@ -96,7 +105,8 @@ class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
-                 rgd_tau=None, probe_norm="global", cos_beta=0.0, **kw):
+                 rgd_tau=None, probe_norm="global", cos_beta=0.0,
+                 micro_vote=False, nexus_gamma=0.0, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         if not (0.0 <= probe_rho < 1.0):
@@ -159,6 +169,31 @@ class ManasOptimizer(FusedMuon):
         # geometry signal does not concentrate away at large batch. First steps (d = 0) and
         # nonfinite grads weight neutrally (w = 1).
         self.cos_beta = float(cos_beta)
+        # MICRO-BATCH VOTING (micro_vote=True): with gradient accumulation, d gets one vote per
+        # MICRO-batch (call opt.vote() after each backward, OUTSIDE the probe context) instead of
+        # one per optimizer step from the accumulated mean. The votes are recovered as rank-space
+        # DELTAS of the accumulating p.grad (prev-projection diff — no model-sized snapshot), so
+        # this is low-rank-only. Point: the rho-batch law then binds to the MICRO batch size —
+        # rho stays useful at any global batch (step-voting degenerates to extragradient once
+        # effective batch ~ N_mem samples). Votes are normalized by their rank-space norm (the
+        # in-subspace component; rank-1-sufficiency says that's where the signal lives).
+        #
+        # NEXUS WALKER (nexus_gamma > 0, requires micro_vote): a SECOND rank-space offset s,
+        # zeroed each step, accumulating each micro's normalized direction UNdecayed; micro i
+        # probes at theta + d + s_{i-1}. The accumulated grad sum then carries the Taylor
+        # cross-terms g_j^T H g_i = the gradient of pairwise cosine similarity across micros
+        # (Nexus, arXiv 2604.09258, common-minima objective) — WITHOUT the paper's inner model:
+        # the probe shift IS the inner walk. Base Muon consumes mean-grad + alignment force.
+        # Walker ceiling = nexus_gamma * (micros per step); keep it in the reach band (~0.2-0.5).
+        self.micro_vote = bool(micro_vote)
+        self.nexus_gamma = float(nexus_gamma)
+        if self.micro_vote and self.probe_rank is None:
+            raise ValueError("micro_vote=True requires a low-rank probe (probe_rank is None)")
+        if self.micro_vote and (self.rgd_tau is not None or self.cos_beta != 0.0):
+            raise NotImplementedError("micro_vote does not compose with rgd_tau/cos_beta yet")
+        if self.nexus_gamma and not self.micro_vote:
+            raise ValueError("nexus_gamma requires micro_vote=True")
+        self._votes_cast = 0
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -189,11 +224,23 @@ class ManasOptimizer(FusedMuon):
         return st["manas_q"], st["manas_c"]
 
     def _d_of(self, p):
-        """Dense probe offset for one param (view for full mode, materialized for low-rank)."""
+        """Dense probe offset for one param (view for full mode, materialized for low-rank).
+        With the nexus walker, the offset is q @ (c + cs): consensus + intra-step alignment walk."""
         if self.probe_rank is None:
             return self._full_d(p)
         q, c = self._lowrank_qc(p)
-        return q @ c
+        cs = self.state[p].get("manas_cs") if self.nexus_gamma else None
+        return q @ (c + cs) if cs is not None else q @ c
+
+    def _micro_state(self, p):
+        """(prev_proj, cs) rank-space buffers for micro voting; zero-init, reset each step."""
+        st = self.state[p]
+        _q, c = self._lowrank_qc(p)
+        if "manas_prev_proj" not in st:
+            st["manas_prev_proj"] = torch.zeros_like(c)
+        if self.nexus_gamma and "manas_cs" not in st:
+            st["manas_cs"] = torch.zeros_like(c)
+        return st["manas_prev_proj"], st.get("manas_cs")
 
     # ---------------- probe application ----------------
     @contextmanager
@@ -231,6 +278,54 @@ class ManasOptimizer(FusedMuon):
         self._shift(-1)                          # deterministic recompute -> exact inverse of apply
         self._probe_on = False
 
+    # ---------------- micro voting ----------------
+    @torch.no_grad()
+    def vote(self):
+        """Cast one micro-batch vote (micro_vote mode; no-op otherwise, so loops can be
+        mode-agnostic). Call AFTER each micro-batch's backward, OUTSIDE the probe context:
+
+            with opt.probe():
+                (loss / accum).backward()
+            opt.vote()
+
+        Reads each param's rank-space projection of the ACCUMULATING p.grad and diffs it
+        against the previous call — the delta IS this micro-batch's gradient, in basis, with
+        no model-sized snapshot. Votes d (rho-decayed consensus) and, if nexus_gamma, the
+        undecayed intra-step walker cs. A missed vote() degrades gracefully (the next delta
+        just spans two micros); voting inside the probe context raises (d would desync the
+        exact probe remove)."""
+        if not self.micro_vote:
+            return
+        if self._probe_on:
+            raise RuntimeError("vote() must be called outside the probe() context")
+        if self._manas_step < self.probe_warmup_steps:   # warmup: probe stays a no-op
+            return
+        ps = [p for p in self._probe_params() if p.grad is not None]
+        if not ps or self.probe_gamma == 0.0:
+            return
+        self._votes_cast += 1
+        deltas, norms = [], []
+        for p in ps:
+            q, _c = self._lowrank_qc(p)
+            prev, _cs = self._micro_state(p)
+            gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
+            proj = q.mT @ gf                              # projection of the accumulated sum
+            deltas.append(proj - prev)
+            prev.copy_(proj)
+            norms.append(torch.linalg.vector_norm(deltas[-1]))
+        pn = torch.stack(norms)
+        gn = pn if self.probe_norm == "perparam" else torch.linalg.vector_norm(pn)
+        inv = self.probe_gamma / gn
+        inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
+        nxs = (self.nexus_gamma / self.probe_gamma) if self.nexus_gamma else 0.0
+        for i, p in enumerate(ps):
+            _c = self.state[p]["manas_c"]
+            iv = inv if inv.ndim == 0 else inv[i]
+            _c.mul_(self.probe_rho).addcmul_(deltas[i], iv, value=-1.0)   # consensus vote
+            if nxs:
+                _prev, cs = self._micro_state(p)
+                cs.addcmul_(deltas[i], iv * nxs, value=-1.0)              # walker: undecayed, in-step
+
     # ---------------- step ----------------
     @torch.no_grad()
     def step(self, closure=None, probe_loss=None):
@@ -241,8 +336,42 @@ class ManasOptimizer(FusedMuon):
         self._probe_loss = probe_loss            # consumed by _update_probe (RGD vote weight)
         self._manas_step += 1                    # drives the probe warmup gate (see _update_probe)
         loss = super().step(closure)             # fused aurora-K1 Muon on the probe-point grads
-        self._update_probe()
+        if self.micro_vote:
+            self._finish_micro_step()
+        else:
+            self._update_probe()
         return loss
+
+    @torch.no_grad()
+    def _finish_micro_step(self):
+        """Step-boundary bookkeeping for micro_vote mode: basis refresh (needs the FULL
+        accumulated grad, so it can only fire here — a mid-step refresh would desync prev_proj
+        and the walker), then reset the per-step buffers. Zero votes cast -> fall back to the
+        step-vote so the probe never silently dies (warned once)."""
+        if self._votes_cast == 0:
+            if not getattr(self, "_warned_no_votes", False):
+                warnings.warn("micro_vote=True but no vote() was cast this step; falling back "
+                              "to step-voting (call opt.vote() after each micro-batch backward)")
+                self._warned_no_votes = True
+            self._update_probe()
+        else:
+            refresh = self._probe_updates % max(self.probe_refresh, 1) == 0
+            self._probe_updates += 1
+            for p in self._probe_params():
+                if refresh and p.grad is not None:
+                    q, c = self._lowrank_qc(p)
+                    gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
+                    r = q.shape[-1]
+                    omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
+                    q_new = torch.linalg.qr(gf @ omega)[0]
+                    c.copy_((q_new.mT @ q) @ c)
+                    q.copy_(q_new)
+                st = self.state[p]
+                if "manas_prev_proj" in st:
+                    st["manas_prev_proj"].zero_()     # p.grad restarts from zero next step
+                if "manas_cs" in st:
+                    st["manas_cs"].zero_()            # the walker never crosses a step boundary
+        self._votes_cast = 0
 
     @torch.no_grad()
     def _update_probe(self):
@@ -383,4 +512,30 @@ if __name__ == "__main__":                                           # pragma: n
         o = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], comp=1.0)
     assert o.comp is None and any(issubclass(w.category, DeprecationWarning) for w in caught), \
         "comp must warn DeprecationWarning and be ignored"
-    print("manas rgd+perparam+cos self-check PASS")
+    # 9) micro voting: deltas of the accumulating grad, walker accumulates in-step, resets at boundary
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, nexus_gamma=0.04)
+    p.grad = torch.randn(32, 16); o.vote()
+    p.grad = p.grad + torch.randn(32, 16); o.vote()            # accumulation continues
+    assert o._votes_cast == 2
+    q, c = o._lowrank_qc(p); cs = o.state[p]["manas_cs"]
+    assert c.norm() > 0 and cs.norm() > 0, "both consensus and walker must receive votes"
+    assert torch.allclose(o._d_of(p), q @ (c + cs)), "offset must include the walker"
+    c_before = c.clone()
+    o.vote()                                                    # grad unchanged -> delta 0 -> decay only
+    assert torch.allclose(c, 0.98 * c_before, atol=1e-7), "zero delta must only decay the consensus"
+    o._finish_micro_step()
+    assert cs.norm() == 0 and o.state[p]["manas_prev_proj"].norm() == 0 and o._votes_cast == 0, \
+        "walker and prev-projection must reset at the step boundary"
+    try:
+        o.apply_probe(); o.vote(); raise AssertionError("vote() inside probe must raise")
+    except RuntimeError:
+        o.remove_probe()
+    for bad in (dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1),
+                dict(micro_vote=True, rgd_tau=3.0)):
+        try:
+            ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], **bad)
+            raise AssertionError(f"constructor must reject {bad}")
+        except (ValueError, NotImplementedError):
+            pass
+    print("manas rgd+perparam+cos+microvote self-check PASS")
