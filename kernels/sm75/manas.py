@@ -58,6 +58,10 @@ Usage (training loop):
     opt = ManasOptimizer(params, ..., micro_vote=True,                       # TWO-CLOCK decay:
                          probe_rho=1.0, probe_rho_step=0.9)                  # equal votes in-step,
                                                                              # memory in STEPS
+    opt = ManasOptimizer(params, ..., micro_vote=True, probe_rho=1.0,        # + FRESH-BLOCK boost:
+                         probe_rho_step=0.9, probe_gamma=0.02,               # this step's votes at
+                         probe_gamma_intra=0.06)                             # gamma_intra, folded to
+                                                                             # history at gamma/vote
 
     with opt.probe():          # forward/backward run at theta + d
         loss = model(x).loss
@@ -110,23 +114,33 @@ class ManasOptimizer(FusedMuon):
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
-                 micro_vote=False, nexus_gamma=0.0, probe_rho_step=None, **kw):
+                 micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
+                 probe_gamma_intra=None, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
-        # TWO-CLOCK DECAY (probe_rho_step, micro_vote only): probe_rho becomes the WITHIN-step
-        # per-vote decay (1.0 = all micro-batch votes weighted equally — micro order is arbitrary,
-        # so recency inside a step is pure ordering noise at high accum) and probe_rho_step decays
-        # the whole accumulated c once per optimizer step. A vote s steps ago, j votes back within
-        # its step, weighs rho_step^s * rho^j — memory is fixed IN STEPS regardless of accum count.
-        # Votes are additionally scaled by 1/(last step's vote count), so gamma is a PER-STEP
-        # budget and reach = gamma/(1-rho_step) is batch-invariant (first step: k unknown, uses 1 —
-        # one-step overshoot transient). None = the validated per-vote clock (rho decays per vote).
+        # TWO-CLOCK / FRESH-BLOCK MODE (probe_rho_step, micro_vote only): probe_rho_step is the
+        # ONLY decay — memory in STEPS, invariant to accum count. Within a step, votes accumulate
+        # UNDECAYED (probe_rho pinned 1.0 in spirit — micro order is arbitrary, in-step recency is
+        # ordering noise) into a FRESH BLOCK manas_cnow at per-vote weight probe_gamma_intra; the
+        # probe offset during the step is q @ (history + fresh block). At the step boundary the
+        # block is FOLDED into history at probe_gamma per vote (history = rho_step*history +
+        # (gamma/gamma_intra)*block), so a vote is loud while fresh and quieter as memory.
+        # gamma_intra defaults to gamma (= plain two-clock, no fresh boost).
+        # GAMMA IS PER-VOTE here (no per-step split): measured invariant across ga — the b32
+        # two-rho grid winners were 0.02/vote at ga1 AND 0.1/step = 0.025/vote at ga4.
+        # None = the validated per-vote rho clock (rho decays per vote, gamma per vote).
         self.probe_rho_step = None if probe_rho_step is None else float(probe_rho_step)
         if self.probe_rho_step is not None:
             if not micro_vote:
                 raise ValueError("probe_rho_step requires micro_vote=True")
             if not (0.0 < self.probe_rho_step < 1.0):
                 raise ValueError(f"probe_rho_step must be in (0, 1), got {probe_rho_step}")
+        if probe_gamma_intra is not None and self.probe_rho_step is None:
+            raise ValueError("probe_gamma_intra requires probe_rho_step (fresh-block mode)")
+        self.probe_gamma_intra = (float(probe_gamma_intra) if probe_gamma_intra is not None
+                                  else float(probe_gamma))
+        if self.probe_gamma_intra <= 0 and float(probe_gamma) > 0:
+            raise ValueError(f"probe_gamma_intra must be > 0, got {probe_gamma_intra}")
         rho_hi = 1.0 if self.probe_rho_step is not None else 1.0 - 1e-12
         if not (0.0 <= probe_rho <= rho_hi):
             raise ValueError(f"probe_rho must be in [0, 1) (or [0, 1] with probe_rho_step), "
@@ -202,7 +216,6 @@ class ManasOptimizer(FusedMuon):
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
-        self._votes_last = 1        # last step's vote count (two-clock gamma normalization)
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -232,14 +245,27 @@ class ManasOptimizer(FusedMuon):
             st["manas_c"] = torch.zeros(*lead, r, n, device=p.device, dtype=torch.float32)
         return st["manas_q"], st["manas_c"]
 
+    def _cnow(self, p):
+        """Fresh-block rank-space buffer (this step's votes at gamma_intra); zeroed at fold."""
+        st = self.state[p]
+        if "manas_cnow" not in st:
+            _q, c = self._lowrank_qc(p)
+            st["manas_cnow"] = torch.zeros_like(c)
+        return st["manas_cnow"]
+
     def _d_of(self, p):
         """Dense probe offset for one param (view for full mode, materialized for low-rank).
-        With the nexus walker, the offset is q @ (c + cs): consensus + intra-step alignment walk."""
+        Low-rank: q @ (history + fresh block if two-clock + walker cs if nexus)."""
         if self.probe_rank is None:
             return self._full_d(p)
         q, c = self._lowrank_qc(p)
+        total = c
+        if self.probe_rho_step is not None and "manas_cnow" in self.state[p]:
+            total = total + self.state[p]["manas_cnow"]
         cs = self.state[p].get("manas_cs") if self.nexus_gamma else None
-        return q @ (c + cs) if cs is not None else q @ c
+        if cs is not None:
+            total = total + cs
+        return q @ total
 
     def _micro_state(self, p):
         """(prev_proj, cs) rank-space buffers for micro voting; zero-init, reset each step."""
@@ -326,11 +352,12 @@ class ManasOptimizer(FusedMuon):
         gn = pn if self.probe_norm == "perparam" else torch.linalg.vector_norm(pn)
         inv = self.probe_gamma / gn
         inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
-        if self.probe_rho_step is not None:
-            inv = inv / max(self._votes_last, 1)   # gamma = per-STEP budget, split across votes
+        fresh = self.probe_rho_step is not None
+        if fresh:
+            inv = inv * (self.probe_gamma_intra / self.probe_gamma)   # per-vote intra weight
         nxs = (self.nexus_gamma / self.probe_gamma) if self.nexus_gamma else 0.0
         for i, p in enumerate(ps):
-            _c = self.state[p]["manas_c"]
+            _c = self._cnow(p) if fresh else self.state[p]["manas_c"]   # fresh block vs history
             iv = inv if inv.ndim == 0 else inv[i]
             _c.mul_(self.probe_rho).addcmul_(deltas[i], iv, value=-1.0)   # consensus vote
             if nxs:
@@ -363,10 +390,23 @@ class ManasOptimizer(FusedMuon):
                               "to step-voting (call opt.vote() after each micro-batch backward)")
                 self._warned_no_votes = True
             self._update_probe()
+            if self.probe_rho_step is not None:       # keep bounded even with probe_rho=1.0
+                for p in self._probe_params():
+                    if "manas_c" in self.state[p]:
+                        self.state[p]["manas_c"].mul_(self.probe_rho_step)
         else:
             refresh = self._probe_updates % max(self.probe_refresh, 1) == 0
             self._probe_updates += 1
+            fold = (self.probe_gamma / self.probe_gamma_intra
+                    if self.probe_rho_step is not None and self.probe_gamma_intra > 0 else 0.0)
             for p in self._probe_params():
+                stf = self.state[p]
+                if self.probe_rho_step is not None and "manas_c" in stf:
+                    c = stf["manas_c"]
+                    c.mul_(self.probe_rho_step)              # history ages one step
+                    if "manas_cnow" in stf:                  # fold fresh block in at gamma/vote
+                        c.add_(stf["manas_cnow"], alpha=fold)   # (BEFORE refresh: same basis)
+                        stf["manas_cnow"].zero_()
                 if refresh and p.grad is not None:
                     q, c = self._lowrank_qc(p)
                     gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
@@ -380,12 +420,6 @@ class ManasOptimizer(FusedMuon):
                     st["manas_prev_proj"].zero_()     # p.grad restarts from zero next step
                 if "manas_cs" in st:
                     st["manas_cs"].zero_()            # the walker never crosses a step boundary
-            self._votes_last = self._votes_cast       # gamma split for next step's votes
-        if self.probe_rho_step is not None:           # step clock: whole block ages one step
-            for p in self._probe_params():
-                st = self.state[p]
-                if "manas_c" in st:
-                    st["manas_c"].mul_(self.probe_rho_step)
         self._votes_cast = 0
 
     @torch.no_grad()
@@ -482,22 +516,33 @@ if __name__ == "__main__":                                           # pragma: n
         o.apply_probe(); o.vote(); raise AssertionError("vote() inside probe must raise")
     except RuntimeError:
         o.remove_probe()
-    # 10) two-clock decay: equal votes within a step (rho=1), boundary decay rho_step,
-    #     gamma split by last step's vote count
+    # 10) fresh-block two-clock: votes land in cnow at gamma_intra (per-vote, undecayed with
+    #     rho=1), d includes the block, boundary folds it into history at gamma/gamma_intra
+    #     then history decays by rho_step each later boundary
     p = torch.nn.Parameter(torch.randn(32, 16))
-    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0, probe_rho_step=0.9)
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
+                       probe_rho_step=0.9, probe_gamma=0.08, probe_gamma_intra=0.16)
     p.grad = torch.randn(32, 16); o.vote()
+    c, cn = o.state[p]["manas_c"], o.state[p]["manas_cnow"]
+    assert c.norm() == 0 and abs(cn.norm().item() - 0.16) < 1e-5, \
+        "first vote must carry gamma_intra into the fresh block, history untouched"
     p.grad = p.grad + torch.randn(32, 16); o.vote()
-    c = o.state[p]["manas_c"]; c_end = c.clone()
+    q, _ = o._lowrank_qc(p)
+    assert torch.allclose(o._d_of(p), q @ (c + cn)), "probe offset must include the fresh block"
+    cn_end = cn.clone()
     o._probe_updates = 1                                        # dodge the boundary basis refresh
     o._finish_micro_step()
-    assert torch.allclose(c, 0.9 * c_end, atol=1e-7), "boundary must decay the whole block by rho_step"
-    assert o._votes_last == 2, "vote count must carry to the next step's gamma split"
-    p.grad = torch.randn(32, 16); o.vote()                      # next step: gamma/2 per vote
-    inc = (c - 0.9 * c_end).norm().item()
-    assert abs(inc - o.probe_gamma / 2) < 1e-5, f"vote must carry gamma/k_last, got {inc}"
+    assert cn.norm() == 0 and torch.allclose(c, 0.5 * cn_end, atol=1e-7), \
+        "boundary must fold the block at gamma/gamma_intra and zero it"
+    c_hist = c.clone()
+    p.grad = torch.randn(32, 16); o.vote()                      # next step, then boundary again
+    cn2 = cn.clone()
+    o._finish_micro_step()
+    assert torch.allclose(c, 0.9 * c_hist + 0.5 * cn2, atol=1e-7), \
+        "second boundary: history decays rho_step, new block folds at gamma/gamma_intra"
     for bad in (dict(probe_rho=1.0),                            # rho=1 needs the step clock
                 dict(probe_rho_step=0.9),                       # step clock needs micro_vote
+                dict(probe_gamma_intra=0.1),                    # intra needs the step clock
                 dict(probe_rank=4, micro_vote=True, probe_rho_step=1.0),
                 dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1)):
         try:
