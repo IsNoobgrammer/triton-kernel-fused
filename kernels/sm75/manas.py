@@ -140,10 +140,10 @@ class ManasOptimizer(FusedMuon):
             raise ValueError("probe_gamma_intra requires probe_rho_step (fresh-block mode)")
         # gamma_intra: probe-time dose of the CURRENT step's raw block (see mode comment above);
         # fully independent of gamma, 0 legal (pure-history probing: fresh votes enter the
-        # consensus at the boundary but never steer a live probe).
-        self.probe_gamma_intra = (float(probe_gamma_intra) if probe_gamma_intra is not None
-                                  else float(probe_gamma))
-        if self.probe_gamma_intra < 0:
+        # consensus at the boundary but never steer a live probe). UNSET -> TRACKS gamma live
+        # (schedule gamma and the fresh dose follows); set explicitly -> independent dial.
+        self._probe_gamma_intra = None if probe_gamma_intra is None else float(probe_gamma_intra)
+        if self._probe_gamma_intra is not None and self._probe_gamma_intra < 0:
             raise ValueError(f"probe_gamma_intra must be >= 0, got {probe_gamma_intra}")
         rho_hi = 1.0 if self.probe_rho_step is not None else 1.0 - 1e-12
         if not (0.0 <= probe_rho <= rho_hi):
@@ -220,6 +220,15 @@ class ManasOptimizer(FusedMuon):
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
+
+    @property
+    def probe_gamma_intra(self):
+        """Fresh-block probe dose. Unset -> tracks probe_gamma live; explicit -> independent."""
+        return self.probe_gamma if self._probe_gamma_intra is None else self._probe_gamma_intra
+
+    @probe_gamma_intra.setter
+    def probe_gamma_intra(self, v):
+        self._probe_gamma_intra = None if v is None else float(v)
 
     # ---------------- probe state ----------------
     def _probe_params(self):
