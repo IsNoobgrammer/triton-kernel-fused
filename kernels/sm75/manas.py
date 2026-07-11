@@ -55,6 +55,9 @@ Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
     opt = ManasOptimizer(params, ..., micro_vote=True)                       # per-micro-batch votes
     opt = ManasOptimizer(params, ..., micro_vote=True, nexus_gamma=0.03)     # + common-basin walker
+    opt = ManasOptimizer(params, ..., micro_vote=True,                       # TWO-CLOCK decay:
+                         probe_rho=1.0, probe_rho_step=0.9)                  # equal votes in-step,
+                                                                             # memory in STEPS
 
     with opt.probe():          # forward/backward run at theta + d
         loss = model(x).loss
@@ -107,11 +110,27 @@ class ManasOptimizer(FusedMuon):
                  probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
-                 micro_vote=False, nexus_gamma=0.0, **kw):
+                 micro_vote=False, nexus_gamma=0.0, probe_rho_step=None, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
-        if not (0.0 <= probe_rho < 1.0):
-            raise ValueError(f"probe_rho must be in [0, 1), got {probe_rho}")
+        # TWO-CLOCK DECAY (probe_rho_step, micro_vote only): probe_rho becomes the WITHIN-step
+        # per-vote decay (1.0 = all micro-batch votes weighted equally — micro order is arbitrary,
+        # so recency inside a step is pure ordering noise at high accum) and probe_rho_step decays
+        # the whole accumulated c once per optimizer step. A vote s steps ago, j votes back within
+        # its step, weighs rho_step^s * rho^j — memory is fixed IN STEPS regardless of accum count.
+        # Votes are additionally scaled by 1/(last step's vote count), so gamma is a PER-STEP
+        # budget and reach = gamma/(1-rho_step) is batch-invariant (first step: k unknown, uses 1 —
+        # one-step overshoot transient). None = the validated per-vote clock (rho decays per vote).
+        self.probe_rho_step = None if probe_rho_step is None else float(probe_rho_step)
+        if self.probe_rho_step is not None:
+            if not micro_vote:
+                raise ValueError("probe_rho_step requires micro_vote=True")
+            if not (0.0 < self.probe_rho_step < 1.0):
+                raise ValueError(f"probe_rho_step must be in (0, 1), got {probe_rho_step}")
+        rho_hi = 1.0 if self.probe_rho_step is not None else 1.0 - 1e-12
+        if not (0.0 <= probe_rho <= rho_hi):
+            raise ValueError(f"probe_rho must be in [0, 1) (or [0, 1] with probe_rho_step), "
+                             f"got {probe_rho}")
         self.probe_gamma = float(probe_gamma)
         self.probe_rho = float(probe_rho)
         # probe_rank: None (full-d) | int (fixed rank) | float in (0,1) (fraction of min(m,n),
@@ -183,6 +202,7 @@ class ManasOptimizer(FusedMuon):
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
+        self._votes_last = 1        # last step's vote count (two-clock gamma normalization)
 
     # ---------------- probe state ----------------
     def _probe_params(self):
@@ -306,6 +326,8 @@ class ManasOptimizer(FusedMuon):
         gn = pn if self.probe_norm == "perparam" else torch.linalg.vector_norm(pn)
         inv = self.probe_gamma / gn
         inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
+        if self.probe_rho_step is not None:
+            inv = inv / max(self._votes_last, 1)   # gamma = per-STEP budget, split across votes
         nxs = (self.nexus_gamma / self.probe_gamma) if self.nexus_gamma else 0.0
         for i, p in enumerate(ps):
             _c = self.state[p]["manas_c"]
@@ -358,6 +380,12 @@ class ManasOptimizer(FusedMuon):
                     st["manas_prev_proj"].zero_()     # p.grad restarts from zero next step
                 if "manas_cs" in st:
                     st["manas_cs"].zero_()            # the walker never crosses a step boundary
+            self._votes_last = self._votes_cast       # gamma split for next step's votes
+        if self.probe_rho_step is not None:           # step clock: whole block ages one step
+            for p in self._probe_params():
+                st = self.state[p]
+                if "manas_c" in st:
+                    st["manas_c"].mul_(self.probe_rho_step)
         self._votes_cast = 0
 
     @torch.no_grad()
@@ -454,7 +482,24 @@ if __name__ == "__main__":                                           # pragma: n
         o.apply_probe(); o.vote(); raise AssertionError("vote() inside probe must raise")
     except RuntimeError:
         o.remove_probe()
-    for bad in (dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1)):
+    # 10) two-clock decay: equal votes within a step (rho=1), boundary decay rho_step,
+    #     gamma split by last step's vote count
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0, probe_rho_step=0.9)
+    p.grad = torch.randn(32, 16); o.vote()
+    p.grad = p.grad + torch.randn(32, 16); o.vote()
+    c = o.state[p]["manas_c"]; c_end = c.clone()
+    o._probe_updates = 1                                        # dodge the boundary basis refresh
+    o._finish_micro_step()
+    assert torch.allclose(c, 0.9 * c_end, atol=1e-7), "boundary must decay the whole block by rho_step"
+    assert o._votes_last == 2, "vote count must carry to the next step's gamma split"
+    p.grad = torch.randn(32, 16); o.vote()                      # next step: gamma/2 per vote
+    inc = (c - 0.9 * c_end).norm().item()
+    assert abs(inc - o.probe_gamma / 2) < 1e-5, f"vote must carry gamma/k_last, got {inc}"
+    for bad in (dict(probe_rho=1.0),                            # rho=1 needs the step clock
+                dict(probe_rho_step=0.9),                       # step clock needs micro_vote
+                dict(probe_rank=4, micro_vote=True, probe_rho_step=1.0),
+                dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1)):
         try:
             ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], **bad)
             raise AssertionError(f"constructor must reject {bad}")
