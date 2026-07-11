@@ -137,10 +137,14 @@ class ManasOptimizer(FusedMuon):
                 raise ValueError(f"probe_rho_step must be in (0, 1), got {probe_rho_step}")
         if probe_gamma_intra is not None and self.probe_rho_step is None:
             raise ValueError("probe_gamma_intra requires probe_rho_step (fresh-block mode)")
+        # The fresh block is stored RAW (unit votes, coefficient 1): gamma_intra scales it only
+        # at PROBE time, gamma only at FOLD time. The two doses are fully independent - no ratio
+        # arithmetic couples them - and gamma_intra=0 is legal (pure-history probing: fresh votes
+        # enter the consensus at the boundary but never steer a live probe).
         self.probe_gamma_intra = (float(probe_gamma_intra) if probe_gamma_intra is not None
                                   else float(probe_gamma))
-        if self.probe_gamma_intra <= 0 and float(probe_gamma) > 0:
-            raise ValueError(f"probe_gamma_intra must be > 0, got {probe_gamma_intra}")
+        if self.probe_gamma_intra < 0:
+            raise ValueError(f"probe_gamma_intra must be >= 0, got {probe_gamma_intra}")
         rho_hi = 1.0 if self.probe_rho_step is not None else 1.0 - 1e-12
         if not (0.0 <= probe_rho <= rho_hi):
             raise ValueError(f"probe_rho must be in [0, 1) (or [0, 1] with probe_rho_step), "
@@ -246,7 +250,7 @@ class ManasOptimizer(FusedMuon):
         return st["manas_q"], st["manas_c"]
 
     def _cnow(self, p):
-        """Fresh-block rank-space buffer (this step's votes at gamma_intra); zeroed at fold."""
+        """Fresh-block rank-space buffer (this step's votes, RAW unit weights); zeroed at fold."""
         st = self.state[p]
         if "manas_cnow" not in st:
             _q, c = self._lowrank_qc(p)
@@ -261,7 +265,7 @@ class ManasOptimizer(FusedMuon):
         q, c = self._lowrank_qc(p)
         total = c
         if self.probe_rho_step is not None and "manas_cnow" in self.state[p]:
-            total = total + self.state[p]["manas_cnow"]
+            total = total + self.probe_gamma_intra * self.state[p]["manas_cnow"]
         cs = self.state[p].get("manas_cs") if self.nexus_gamma else None
         if cs is not None:
             total = total + cs
@@ -354,7 +358,8 @@ class ManasOptimizer(FusedMuon):
         inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
         fresh = self.probe_rho_step is not None
         if fresh:
-            inv = inv * (self.probe_gamma_intra / self.probe_gamma)   # per-vote intra weight
+            inv = inv / self.probe_gamma       # RAW unit votes into the block (gammas applied
+                                               # at probe/fold time, not at storage)
         nxs = (self.nexus_gamma / self.probe_gamma) if self.nexus_gamma else 0.0
         for i, p in enumerate(ps):
             _c = self._cnow(p) if fresh else self.state[p]["manas_c"]   # fresh block vs history
@@ -397,15 +402,13 @@ class ManasOptimizer(FusedMuon):
         else:
             refresh = self._probe_updates % max(self.probe_refresh, 1) == 0
             self._probe_updates += 1
-            fold = (self.probe_gamma / self.probe_gamma_intra
-                    if self.probe_rho_step is not None and self.probe_gamma_intra > 0 else 0.0)
             for p in self._probe_params():
                 stf = self.state[p]
                 if self.probe_rho_step is not None and "manas_c" in stf:
                     c = stf["manas_c"]
                     c.mul_(self.probe_rho_step)              # history ages one step
-                    if "manas_cnow" in stf:                  # fold fresh block in at gamma/vote
-                        c.add_(stf["manas_cnow"], alpha=fold)   # (BEFORE refresh: same basis)
+                    if "manas_cnow" in stf:                  # raw block folds in at gamma/vote
+                        c.add_(stf["manas_cnow"], alpha=self.probe_gamma)  # (BEFORE refresh: same basis)
                         stf["manas_cnow"].zero_()
                 if refresh and p.grad is not None:
                     q, c = self._lowrank_qc(p)
@@ -516,30 +519,40 @@ if __name__ == "__main__":                                           # pragma: n
         o.apply_probe(); o.vote(); raise AssertionError("vote() inside probe must raise")
     except RuntimeError:
         o.remove_probe()
-    # 10) fresh-block two-clock: votes land in cnow at gamma_intra (per-vote, undecayed with
-    #     rho=1), d includes the block, boundary folds it into history at gamma/gamma_intra
-    #     then history decays by rho_step each later boundary
+    # 10) fresh-block two-clock, RAW storage: unit votes land in cnow (coeff 1), gamma_intra
+    #     scales the block only at PROBE time, gamma only at FOLD time; history decays rho_step
     p = torch.nn.Parameter(torch.randn(32, 16))
     o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
                        probe_rho_step=0.9, probe_gamma=0.08, probe_gamma_intra=0.16)
     p.grad = torch.randn(32, 16); o.vote()
     c, cn = o.state[p]["manas_c"], o.state[p]["manas_cnow"]
-    assert c.norm() == 0 and abs(cn.norm().item() - 0.16) < 1e-5, \
-        "first vote must carry gamma_intra into the fresh block, history untouched"
+    assert c.norm() == 0 and abs(cn.norm().item() - 1.0) < 1e-5, \
+        "block stores RAW unit votes; history untouched mid-step"
     p.grad = p.grad + torch.randn(32, 16); o.vote()
     q, _ = o._lowrank_qc(p)
-    assert torch.allclose(o._d_of(p), q @ (c + cn)), "probe offset must include the fresh block"
+    assert torch.allclose(o._d_of(p), q @ (c + 0.16 * cn)), \
+        "probe must scale the raw block by gamma_intra"
     cn_end = cn.clone()
     o._probe_updates = 1                                        # dodge the boundary basis refresh
     o._finish_micro_step()
-    assert cn.norm() == 0 and torch.allclose(c, 0.5 * cn_end, atol=1e-7), \
-        "boundary must fold the block at gamma/gamma_intra and zero it"
+    assert cn.norm() == 0 and torch.allclose(c, 0.08 * cn_end, atol=1e-7), \
+        "boundary must fold the raw block at gamma/vote and zero it"
     c_hist = c.clone()
     p.grad = torch.randn(32, 16); o.vote()                      # next step, then boundary again
     cn2 = cn.clone()
     o._finish_micro_step()
-    assert torch.allclose(c, 0.9 * c_hist + 0.5 * cn2, atol=1e-7), \
-        "second boundary: history decays rho_step, new block folds at gamma/gamma_intra"
+    assert torch.allclose(c, 0.9 * c_hist + 0.08 * cn2, atol=1e-7), \
+        "second boundary: history decays rho_step, new raw block folds at gamma"
+    # 10b) gamma_intra=0: pure-history probing (block never steers a live probe, still folds)
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
+                       probe_rho_step=0.9, probe_gamma=0.08, probe_gamma_intra=0.0)
+    p.grad = torch.randn(32, 16); o.vote()
+    q, c = o._lowrank_qc(p)
+    assert o.state[p]["manas_cnow"].norm() > 0 and torch.allclose(o._d_of(p), q @ c), \
+        "gamma_intra=0 must probe history-only while the block still accumulates"
+    o._probe_updates = 1; o._finish_micro_step()
+    assert c.norm() > 0, "gamma_intra=0 block must still fold into history at gamma"
     for bad in (dict(probe_rho=1.0),                            # rho=1 needs the step clock
                 dict(probe_rho_step=0.9),                       # step clock needs micro_vote
                 dict(probe_gamma_intra=0.1),                    # intra needs the step clock
