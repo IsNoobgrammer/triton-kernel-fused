@@ -41,12 +41,25 @@ plus a full param clone per step and a dense per-param shift cache. Working expl
 u ~= the post-polar momentum direction, and momentum-direction probing is a measured inert
 control. comp= is accepted but IGNORED (DeprecationWarning); code lives in git <= e85af8b.
 
+VOTE-WEIGHTING KNOBS: DEPRECATED AND REMOVED (2026-07-11, BiBo 137M knob bench). Both
+measured against the equal-vote champion (rho.88/g.06/r8, -0.030 vs muon) and lost:
+  rgd_tau  (KL-DRO loss-surprise votes, arXiv 2306.09222): tau {1, 3} within +0.004 of
+           equal votes = no-op, as predicted — batch-MEAN loss spread is too small at 65k
+           tokens and shrinks ~1/sqrt(batch tokens) beyond.
+  cos_beta (cos(g,d) geometry votes): +0.5 (sharpen) neutral, -0.5 (novelty) LOSES HALF the
+           manas gain — direct confirmation the mechanism is variance reduction (re-adding
+           the noise the averaging removed is immediately billed). Equal vote is optimal.
+Both args are accepted but IGNORED (DeprecationWarning); code lives in git <= db41f11.
+
 Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
-    opt = ManasOptimizer(params, ..., rgd_tau=3.0)                           # + RGD (loss) vote weights
-    opt = ManasOptimizer(params, ..., cos_beta=0.5)                          # + cos(g,d) vote weights
     opt = ManasOptimizer(params, ..., micro_vote=True)                       # per-micro-batch votes
     opt = ManasOptimizer(params, ..., micro_vote=True, nexus_gamma=0.03)     # + common-basin walker
+
+    with opt.probe():          # forward/backward run at theta + d
+        loss = model(x).loss
+        loss.backward()
+    opt.step(); opt.zero_grad()
 
 Micro-vote loop (gradient accumulation; vote() is a no-op when micro_vote=False):
     for micro in range(accum):
@@ -54,18 +67,6 @@ Micro-vote loop (gradient accumulation; vote() is a no-op when micro_vote=False)
             (loss / accum).backward()
         opt.vote()
     opt.step(); opt.zero_grad()
-    with opt.probe():          # forward/backward run at theta + d
-        loss = model(x).loss
-        loss.backward()
-    opt.step(); opt.zero_grad()                  # rgd_tau set: opt.step(probe_loss=loss.detach())
-
-RGD vote weighting (rgd_tau, default off): weights each batch's probe vote by the KL-DRO
-factor e^{min(loss,tau)/(tau+1)} (arXiv 2306.09222), EMA-normalized so only batch-RELATIVE
-surprise tilts the consensus — hard batches vote more, the tau clip caps outliers, and the
-weight is clamped to [0.25, 4] (||d|| stays bounded). Probe direction only; the training
-loss and base Muon update are untouched. NOTE: the weight acts on the per-STEP batch-mean
-loss, so its spread — and the whole effect — shrinks ~1/sqrt(batch tokens); at ~8M-token
-batches it degrades gracefully to the validated equal-vote probe (w -> 1), never past it.
 
 Probe memory, two modes:
   probe_rank=None (full)   : one model-shaped fp32 buffer `manas_d` per 2D/3D param.
@@ -138,17 +139,18 @@ class ManasOptimizer(FusedMuon):
         # pure Muon until warmup passes, then the lookahead engages). 0 = active from step 1.
         self.probe_warmup_steps = int(probe_warmup_steps)
         self._manas_step = 0
-        # RGD VOTE WEIGHTING (arXiv 2306.09222, KL-DRO): rgd_tau=None (default) = the validated
-        # equal-vote probe. Set tau > 0 to weight each batch's probe VOTE by w = e^{min(loss,tau)/(tau+1)}
-        # (the paper's g(l) with its gamma = 1/(tau+1)), normalized by a running EMA of w so the
-        # secular loss decline (11 -> 2 over a run) cancels and only batch-relative surprise tilts the
-        # consensus. Hard/surprising batches vote more; the tau clip caps an outlier's vote. This
-        # weights the probe DIRECTION only — the training loss and the base Muon update are untouched.
-        # w is clamped to [0.25, 4] so ||d|| <= 4*gamma/(1-rho) stays bounded. Pass the batch loss via
-        # step(probe_loss=loss) (tensor, no host sync needed — or float).
-        self.rgd_tau = float(rgd_tau) if rgd_tau else None   # None/0/False = off (equal votes)
-        self._probe_loss = None
-        self._rgd_wema = None      # smoothing state, attr-only: lost on resume -> one-EMA-window re-anchor, harmless
+        # rgd_tau / cos_beta VOTE WEIGHTING: DEPRECATED 2026-07-11, ignored (see module docstring:
+        # rgd_tau measured no-op at BiBo; cos_beta +0.5 neutral, -0.5 loses half the gain — the
+        # equal vote IS the mechanism). Code lives in git <= db41f11.
+        if rgd_tau:
+            warnings.warn("ManasOptimizer(rgd_tau=...) is deprecated and IGNORED (measured no-op "
+                          "at BiBo: batch-mean loss spread too small; git <= db41f11)",
+                          DeprecationWarning, stacklevel=2)
+        if cos_beta:
+            warnings.warn("ManasOptimizer(cos_beta=...) is deprecated and IGNORED (BiBo: sharpen "
+                          "neutral, novelty loses half the manas gain; git <= db41f11)",
+                          DeprecationWarning, stacklevel=2)
+        self.rgd_tau, self.cos_beta = None, 0.0
         # probe_norm: 'global' (validated default) = one gamma/||g||_all scalar — a matrix's share of
         # each vote follows its share of the GLOBAL gradient norm, which couples gamma to model
         # width/depth (suspected source of the 80x toy->BiBo gamma shift). 'perparam' = normalize each
@@ -158,17 +160,6 @@ class ManasOptimizer(FusedMuon):
         if probe_norm not in ("global", "perparam"):
             raise ValueError(f"probe_norm must be 'global' or 'perparam', got {probe_norm!r}")
         self.probe_norm = probe_norm
-        # cos(g, d) VOTE WEIGHTING (geometry-surprise; 0 = off, the validated equal vote). Each
-        # matrix's vote is scaled by w = 1 + cos_beta * agree, where agree = cos of THIS batch's
-        # gradient with the accumulated consensus GRADIENT direction (-d, since d stores -grads).
-        # cos_beta > 0: confirming batches vote more (sharpen; risk = rich-get-richer lock-in).
-        # cos_beta < 0: disagreeing batches vote more (novelty; risk = re-amplifying the noise
-        # the averaging removed). Use |cos_beta| <= 1; w is clamped to [0, 2] regardless, so
-        # ||d|| <= 2*gamma/(1-rho) stays bounded. Per-matrix, sync-free, ~one dot product each.
-        # Unlike rgd_tau (batch-MEAN-loss surprise, washes out ~1/sqrt(batch tokens)), the
-        # geometry signal does not concentrate away at large batch. First steps (d = 0) and
-        # nonfinite grads weight neutrally (w = 1).
-        self.cos_beta = float(cos_beta)
         # MICRO-BATCH VOTING (micro_vote=True): with gradient accumulation, d gets one vote per
         # MICRO-batch (call opt.vote() after each backward, OUTSIDE the probe context) instead of
         # one per optimizer step from the accumulated mean. The votes are recovered as rank-space
@@ -189,8 +180,6 @@ class ManasOptimizer(FusedMuon):
         self.nexus_gamma = float(nexus_gamma)
         if self.micro_vote and self.probe_rank is None:
             raise ValueError("micro_vote=True requires a low-rank probe (probe_rank is None)")
-        if self.micro_vote and (self.rgd_tau is not None or self.cos_beta != 0.0):
-            raise NotImplementedError("micro_vote does not compose with rgd_tau/cos_beta yet")
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
@@ -329,11 +318,9 @@ class ManasOptimizer(FusedMuon):
     # ---------------- step ----------------
     @torch.no_grad()
     def step(self, closure=None, probe_loss=None):
+        # probe_loss: accepted for back-compat with the removed rgd_tau wiring; unused.
         if self._probe_on:
             raise RuntimeError("remove_probe() (or exit the probe() context) before step()")
-        if self.rgd_tau is not None and probe_loss is None:
-            raise RuntimeError("rgd_tau is set: pass the batch loss via step(probe_loss=loss)")
-        self._probe_loss = probe_loss            # consumed by _update_probe (RGD vote weight)
         self._manas_step += 1                    # drives the probe warmup gate (see _update_probe)
         loss = super().step(closure)             # fused aurora-K1 Muon on the probe-point grads
         if self.micro_vote:
@@ -390,16 +377,6 @@ class ManasOptimizer(FusedMuon):
         # sync-free guard: zero/inf/nan gradient norm -> inv = 0 -> this step only DECAYS d.
         # perparam: elementwise, so one dead/overflowed matrix skips only ITS vote, not everyone's.
         inv = torch.where(torch.isfinite(inv) & (gn > 0), inv, torch.zeros_like(inv))
-        if self.rgd_tau is not None:             # RGD vote weight (see __init__); all tensor ops, sync-free
-            lt = torch.as_tensor(self._probe_loss, dtype=torch.float32, device=gn.device)
-            w_raw = torch.exp(lt.clamp(max=self.rgd_tau) / (self.rgd_tau + 1.0))
-            w_raw = torch.where(torch.isfinite(w_raw), w_raw,
-                                self._rgd_wema if self._rgd_wema is not None else torch.ones_like(w_raw))
-            if self._rgd_wema is None:           # init at the first observed weight -> w starts ~1, no bias
-                self._rgd_wema = w_raw.clone()
-            self._rgd_wema.mul_(0.98).add_(w_raw, alpha=0.02)
-            inv = inv * (w_raw / self._rgd_wema).clamp(0.25, 4.0)
-        self._probe_loss = None                  # single-use: a stale loss never weights a later vote
         # refresh fires on the FIRST update too (C is still zero -> re-projection lossless), so the
         # basis aligns with real gradients immediately instead of projecting through the random init
         refresh = (self.probe_rank is not None
@@ -408,22 +385,12 @@ class ManasOptimizer(FusedMuon):
         # nan_to_num: with a nonfinite gn, inv is already 0, but inf*0 = NaN elementwise — sanitize
         # the OPERAND so the (zero-scaled) increment is 0, not NaN. gn itself sees the raw grads
         # (an inf entry MUST zero inv). Only bites on bad steps; a fresh tensor either way.
-        def _cos_w(dot, dnorm, i):
-            """Vote weight 1 + beta*agree from <g, d> (agree = -cos: d stores NEGATED grads).
-            d=0 (first steps) or nonfinite -> exactly 1 (neutral). Clamped [0, 2]."""
-            agree = -dot / (dnorm * pn[i]).clamp_min(1e-12)
-            w = 1.0 + self.cos_beta * agree
-            return torch.where(torch.isfinite(w), w, torch.ones_like(w)).clamp(0.0, 2.0)
-
         if self.probe_rank is None:
             ds = [self._full_d(p) for p in ps]
-            torch._foreach_mul_(ds, self.probe_rho)                  # ONE fused decay sweep (direction unchanged)
+            torch._foreach_mul_(ds, self.probe_rho)                  # ONE fused decay sweep
             for i, (p, d) in enumerate(zip(ps, ds)):
                 g32 = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
-                iv = inv if inv.ndim == 0 else inv[i]
-                if self.cos_beta != 0.0:
-                    iv = iv * _cos_w((d * g32).sum(), torch.linalg.vector_norm(d), i)
-                d.addcmul_(g32, iv, value=-1.0)                      # d -= w * (gamma/||g||) * g
+                d.addcmul_(g32, inv if inv.ndim == 0 else inv[i], value=-1.0)   # d -= (gamma/||g||) * g
             return
         for i, p in enumerate(ps):
             q, c = self._lowrank_qc(p)
@@ -437,44 +404,12 @@ class ManasOptimizer(FusedMuon):
                 c.copy_((q_new.mT @ q) @ c)
                 q.copy_(q_new)
             c.mul_(self.probe_rho)
-            proj = q.mT @ gf                                         # (.., r, n) rank-space increment
-            iv = inv if inv.ndim == 0 else inv[i]
-            if self.cos_beta != 0.0:
-                # rank-space cosine: <q@c, g> = sum(c * (q^T g)), ||q@c||_F = ||c||_F (q orthonormal)
-                iv = iv * _cos_w((c * proj).sum(), torch.linalg.vector_norm(c), i)
-            c.addcmul_(proj, iv, value=-1.0)                         # project increment into basis
+            c.addcmul_(q.mT @ gf, inv if inv.ndim == 0 else inv[i], value=-1.0)  # project increment into basis
 
 
 if __name__ == "__main__":                                           # pragma: no cover
-    # Self-check for the RGD vote weighting (probe math only; no NS/CUDA needed).
+    # Self-check (probe math only; no NS/CUDA needed).
     torch.manual_seed(0)
-    def mk(tau):
-        p = torch.nn.Parameter(torch.randn(32, 16))
-        opt = ManasOptimizer([p], probe_rank=None, rgd_tau=tau)
-        return p, opt
-    # 1) constant loss -> w == 1 exactly -> identical d to the equal-vote probe
-    (p0, o0), (p1, o1) = mk(None), mk(3.0)
-    for _ in range(5):
-        g = torch.randn(32, 16)
-        for p, o, kw in ((p0, o0, {}), (p1, o1, {"probe_loss": 2.0})):
-            p.grad = g.clone(); o._manas_step += 1; o._probe_loss = kw.get("probe_loss"); o._update_probe()
-    assert torch.allclose(o0._full_d(p0), o1._full_d(p1), atol=1e-6), "constant loss must reproduce equal votes"
-    # 2) a high-loss batch votes more than a low-loss one (same gradient)
-    (p2, o2), g = mk(3.0)[0:2], torch.randn(32, 16)
-    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = 2.0; o2._update_probe()
-    base = o2._full_d(p2).norm().item()
-    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = 4.0; o2._update_probe()
-    hi = (o2._full_d(p2).norm().item() - 0.98 * base)      # this vote's contribution
-    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = 0.5; o2._update_probe()
-    # 3) nonfinite loss cannot poison d
-    p2.grad = g.clone(); o2._manas_step += 1; o2._probe_loss = float("nan"); o2._update_probe()
-    assert torch.isfinite(o2._full_d(p2)).all(), "nan loss must not poison d"
-    # 4) missing loss with rgd on fails loud
-    try:
-        o2.step(); raise AssertionError("step() without probe_loss must raise when rgd_tau is set")
-    except RuntimeError:
-        pass
-    assert hi > 0, "high-loss vote must contribute"
     # 5) perparam norm: equal-size votes regardless of per-matrix grad scale (global: share-weighted)
     for mode, expect_equal in (("perparam", True), ("global", False)):
         pa, pb = torch.nn.Parameter(torch.randn(32, 16)), torch.nn.Parameter(torch.randn(32, 16))
@@ -490,28 +425,16 @@ if __name__ == "__main__":                                           # pragma: n
     pa.grad = torch.full((32, 16), float("nan")); pb.grad = torch.randn(32, 16)
     o._manas_step += 1; o._update_probe()
     assert o._full_d(pa).norm() == 0 and o._full_d(pb).norm() > 0, "nan matrix must not veto healthy votes"
-    # 7) cos_beta: first vote (d=0) is neutral -> identical to cos_beta=0; then a confirming
-    #    gradient votes MORE at beta>0 and LESS at beta<0 (agree sign accounts for d = -sum g)
-    g1, g2 = torch.randn(32, 16), None
-    outs = {}
-    for beta in (0.0, 0.9, -0.9):
-        p = torch.nn.Parameter(torch.randn(32, 16))
-        o = ManasOptimizer([p], probe_rank=None, cos_beta=beta)
-        p.grad = g1.clone(); o._manas_step += 1; o._update_probe()   # d=0 -> w=1 for every beta
-        if g2 is None:
-            g2 = g1 + 0.1 * torch.randn(32, 16)                     # strongly agreeing second batch
-        d_before = o._full_d(p).clone()
-        p.grad = g2.clone(); o._manas_step += 1; o._update_probe()
-        outs[beta] = (d_before, (o._full_d(p) - 0.98 * d_before))   # second-vote contribution (rho=0.98 default)
-    assert torch.allclose(outs[0.0][0], outs[0.9][0], atol=1e-7), "d=0 first vote must be neutral"
-    n0, npos, nneg = (outs[b][1].norm().item() for b in (0.0, 0.9, -0.9))
-    assert npos > n0 > nneg, f"agreeing vote: beta>0 must amplify, beta<0 damp ({npos:.4f} vs {n0:.4f} vs {nneg:.4f})"
-    # 8) comp= is deprecated: warns and is ignored
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        o = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], comp=1.0)
-    assert o.comp is None and any(issubclass(w.category, DeprecationWarning) for w in caught), \
-        "comp must warn DeprecationWarning and be ignored"
+    # 7) deprecated knobs (comp / rgd_tau / cos_beta): each warns and is ignored
+    for kwargs, attr, off in ((dict(comp=1.0), "comp", None),
+                              (dict(rgd_tau=3.0), "rgd_tau", None),
+                              (dict(cos_beta=0.5), "cos_beta", 0.0)):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            o = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], **kwargs)
+        assert getattr(o, attr) == off and any(issubclass(w.category, DeprecationWarning) for w in caught), \
+            f"{kwargs} must warn DeprecationWarning and be ignored"
+    o.step(probe_loss=2.0)   # legacy rgd wiring stays callable (no grads -> no work)
     # 9) micro voting: deltas of the accumulating grad, walker accumulates in-step, resets at boundary
     p = torch.nn.Parameter(torch.randn(32, 16))
     o = ManasOptimizer([p], probe_rank=4, micro_vote=True, nexus_gamma=0.04)
@@ -531,11 +454,10 @@ if __name__ == "__main__":                                           # pragma: n
         o.apply_probe(); o.vote(); raise AssertionError("vote() inside probe must raise")
     except RuntimeError:
         o.remove_probe()
-    for bad in (dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1),
-                dict(micro_vote=True, rgd_tau=3.0)):
+    for bad in (dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1)):
         try:
             ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], **bad)
             raise AssertionError(f"constructor must reject {bad}")
-        except (ValueError, NotImplementedError):
+        except ValueError:
             pass
-    print("manas rgd+perparam+cos+microvote self-check PASS")
+    print("manas perparam+microvote+nexus self-check PASS")
