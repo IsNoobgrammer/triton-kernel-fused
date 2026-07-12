@@ -51,6 +51,12 @@ measured against the equal-vote champion (rho.88/g.06/r8, -0.030 vs muon) and lo
            the noise the averaging removed is immediately billed). Equal vote is optimal.
 Both args are accepted but IGNORED (DeprecationWarning); code lives in git <= db41f11.
 
+WHEN TO USE (measured recommendation): ga1 -> use plain FusedMuon; ga>=2 -> use Manas.
+At one vote/step the consensus has no spread to work with (info cap): the loss edge is
+~0-0.02 while the probe costs 5-10% tps - wall-clock negative. From 2 votes up the edge
+(-0.03 to -0.145, growing with votes) dwarfs the overhead. Slicing a batch into micro
+batches is FLOPs-free, so "ga1" is almost always a choice, not a constraint.
+
 Usage (training loop):
     opt = ManasOptimizer(params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98)  # rank-8 d default
     opt = ManasOptimizer(params, ..., micro_vote=True)                       # per-micro-batch votes

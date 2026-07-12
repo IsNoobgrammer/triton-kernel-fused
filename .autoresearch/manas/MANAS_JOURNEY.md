@@ -134,6 +134,14 @@ Assembled from grids at every slicing and batch:
   compresses to ~0 - one vote per step means no consensus to sell. The
   answer is slicing (FLOPs-free), not tuning. At multi-GPU scale, DP ranks
   are votes (per-device consensus design), and ga1 stops existing.
+  FINAL RECOMMENDATION (measured): ga1 -> plain Muon (edge ~0-0.02, probe
+  overhead 5-10% tps: wall-clock negative); ga>=2 -> Manas. The window gate
+  was retested under QR-every-boundary dynamics (3 cells, union vs controls):
+  inconclusive-trending-positive but under the +-0.018 replicate bar - gate
+  kept. Named future project for true single-backward ga1: GHOST VOTES
+  (per-example rank-space votes from the outer-product structure of linear
+  grads, Opacus-style hooks - k = batch size votes from ONE backward;
+  decouples votes from accumulation everywhere).
 
 Free-vote scaling at fixed global batch 256 vs LR-TUNED muon:
 128x2 -0.038, 64x4 -0.077, 16x8 -0.145. Near-linear to k=8, ~6% tps cost.
