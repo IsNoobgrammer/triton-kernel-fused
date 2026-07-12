@@ -79,7 +79,8 @@ Probe memory, two modes:
   probe_rank=None (full)   : one model-shaped fp32 buffer `manas_d` per 2D/3D param.
   probe_rank=r  (low-rank) : per matrix, d = Q @ C with Q (.., m, r) orthonormal and C (.., r, n)
       — r(m+n)/(m*n) of the full buffer (~3% at r=8, 512x1536). The basis is a randomized range
-      of the current gradient, refreshed every `probe_refresh` probe updates (GaLore-style); on
+      of the current gradient, refreshed every `probe_refresh` probe updates (GaLore-style;
+      default AUTO = 2/(1-rho) from the active clock — window as fresh as its oldest vote); on
       refresh the old d is re-projected into the new basis (no discontinuity). Probe apply
       materializes Q@C per param (transient), remove recomputes the same product (deterministic
       GEMM -> bit-identical subtract).
@@ -111,7 +112,7 @@ NS8_COEFFS = (_KJ,) * 6 + (_PIN,) * 2          # exp_kappa 'ns8': compressed KJ 
 
 class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
-                 probe_rank=8, probe_refresh=200, comp=None, coeffs=NS8_COEFFS,
+                 probe_rank=8, probe_refresh=None, comp=None, coeffs=NS8_COEFFS,
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
@@ -154,7 +155,11 @@ class ManasOptimizer(FusedMuon):
         # probe_rank: None (full-d) | int (fixed rank) | float in (0,1) (fraction of min(m,n),
         # size-adaptive per matrix). The per-param resolved rank is clamped to [1, min(m,n)].
         self.probe_rank = None if probe_rank is None else probe_rank
-        self.probe_refresh = int(probe_refresh)
+        # probe_refresh: basis rebuild cadence in steps. UNSET -> AUTO from the memory horizon:
+        # 2/(1-rho) with the active rho clock (step clock if set, else the per-vote clock) —
+        # the window should be as fresh as the oldest vote it hosts (rho 0.96 -> 50, 0.98 -> 100).
+        # The old fixed default was 200 = 8 memory-lifetimes stale. c=2 pending the refresh sweep.
+        self._probe_refresh = None if probe_refresh is None else int(probe_refresh)
         # comp / U BUFFER: DEPRECATED 2026-07-11, ignored. The u buffer (rho-decayed memory of
         # APPLIED updates added to the probe offset) failed to separate from no-u TWICE: toy
         # (homogeneous-batch tie, +0.0235 vs +0.0266 within noise) AND the BiBo 137M comp sweep
@@ -220,6 +225,18 @@ class ManasOptimizer(FusedMuon):
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
+
+    @property
+    def probe_refresh(self):
+        """Basis rebuild cadence (steps). Unset -> 2/(1-rho) from the active clock, live."""
+        if self._probe_refresh is not None:
+            return self._probe_refresh
+        rho = self.probe_rho_step if self.probe_rho_step is not None else self.probe_rho
+        return max(2, round(2.0 / max(1.0 - rho, 1e-6)))
+
+    @probe_refresh.setter
+    def probe_refresh(self, v):
+        self._probe_refresh = None if v is None else int(v)
 
     @property
     def probe_gamma_intra(self):
@@ -562,6 +579,16 @@ if __name__ == "__main__":                                           # pragma: n
     o._finish_micro_step()
     assert torch.allclose(c, 0.9 * c_hist + cn2, atol=1e-7), \
         "second boundary: history decays rho_step, new raw block folds at coeff 1"
+    # 10a) refresh auto-couples to the active rho clock; explicit value and live rho both honored
+    o_auto = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4,
+                            micro_vote=True, probe_rho=1.0, probe_rho_step=0.96)
+    assert o_auto.probe_refresh == 50, f"rho_step 0.96 must auto-refresh at 50, got {o_auto.probe_refresh}"
+    o_auto.probe_rho_step = 0.98
+    assert o_auto.probe_refresh == 100, "auto refresh must track rho live"
+    assert ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))],
+                          probe_rho=0.98).probe_refresh == 100, "per-vote clock: 2/(1-rho)"
+    assert ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))],
+                          probe_refresh=200).probe_refresh == 200, "explicit refresh must win"
     # 10b) gamma_intra=0: pure-history probing (block never steers a live probe, still folds)
     p = torch.nn.Parameter(torch.randn(32, 16))
     o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
