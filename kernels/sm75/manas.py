@@ -116,7 +116,8 @@ class ManasOptimizer(FusedMuon):
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
-                 probe_gamma_intra=None, probe_sketch_rho=0.90, probe_sketch_votes=False, **kw):
+                 probe_gamma_intra=None, probe_sketch_rho=0.90, probe_sketch_votes=False,
+                 probe_sketch_min_votes=2, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         # TWO-CLOCK / FRESH-BLOCK MODE (probe_rho_step, micro_vote only): probe_rho_step is the
@@ -188,6 +189,12 @@ class ManasOptimizer(FusedMuon):
         self.probe_sketch_votes = bool(probe_sketch_votes)
         if self.probe_sketch_votes and (self.probe_sketch_rho is None or not micro_vote):
             raise ValueError("probe_sketch_votes requires probe_sketch_rho and micro_vote=True")
+        # probe_sketch_min_votes: the GA1 GATE threshold — a step must cast at least this many
+        # votes for its refresh to aim by the sketch (else snapshot). Default 2 (measured: the
+        # boundary-sum sketch is mildly negative at 1 vote/step). Set 1 to test sketch aim at
+        # ga1 — e.g. the vote-sketch's unit increments (union of equal-voice step directions)
+        # may fix what magnitude-weighted sums got wrong there.
+        self.probe_sketch_min_votes = int(probe_sketch_min_votes)
         # comp / U BUFFER: DEPRECATED 2026-07-11, ignored. The u buffer (rho-decayed memory of
         # APPLIED updates added to the probe offset) failed to separate from no-u TWICE: toy
         # (homogeneous-batch tie, +0.0235 vs +0.0266 within noise) AND the BiBo 137M comp sweep
@@ -526,9 +533,9 @@ class ManasOptimizer(FusedMuon):
                         y = self._sketch_fold(p)          # two-clock window: fold Y_now
                     else:
                         y = self._sketch(p, gf)           # boundary-sum sketch
-                    if self._votes_cast <= 1:
-                        y = None                          # GA1 GATE: one vote = no spread to
-                                                          # cover; sketch lag is pure cost ->
+                    if self._votes_cast < self.probe_sketch_min_votes:
+                        y = None                          # GA1 GATE: too few votes = no spread
+                                                          # to cover; sketch lag is pure cost ->
                                                           # snapshot aim (Y stays warm)
                     if refresh:
                         if y is None:
