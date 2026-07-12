@@ -204,6 +204,8 @@ class ManasOptimizer(FusedMuon):
                           stacklevel=2)
         self.comp = None
         self._probe_on = False
+        self._shift_on = False       # weights currently hold theta + d (lazy shift)
+        self._lazy = None            # fp32-weights check, cached on first apply
         self._probe_updates = 0
         # WARMUP: skip probe-buffer (d) accumulation for the first probe_warmup_steps step()s so the
         # long-memory d isn't poisoned by early noisy gradients (d stays 0 -> probe is a no-op ->
@@ -316,27 +318,27 @@ class ManasOptimizer(FusedMuon):
             st["manas_cnow"] = torch.zeros_like(c)
         return st["manas_cnow"]
 
-    def _d_of(self, p):
-        """Dense probe offset for one param (view for full mode, materialized for low-rank).
-        Low-rank: q @ (history + fresh block if two-clock + walker cs if nexus)."""
-        if self.probe_rank is None:
-            return self._full_d(p)
-        q, c = self._lowrank_qc(p)
+    def _coef_of(self, p):
+        """Rank-space coefficient total the probe applies: d = q @ coef. Fresh-block mode:
+        ALL state is raw (unit votes; only rho_step ever touches history) and both doses are
+        applied HERE, at probe time: coef = gamma*history + gamma_intra*block. Nothing is
+        baked into storage, so either dose can change mid-run and rescales retroactively."""
+        _q, c = self._lowrank_qc(p)
         if self.probe_rho_step is not None:
-            # fresh-block mode: ALL state is raw (unit votes; only rho_step ever touches
-            # history). Both doses are applied HERE, at probe time: d = gamma*history +
-            # gamma_intra*block. Nothing is baked into storage, so either dose can change
-            # mid-run and rescales its buffer uniformly and retroactively.
             total = self.probe_gamma * c
             if "manas_cnow" in self.state[p]:
                 total = total + self.probe_gamma_intra * self.state[p]["manas_cnow"]
-            cs = self.state[p].get("manas_cs") if self.nexus_gamma else None
-            return q @ (total + cs) if cs is not None else q @ total
-        total = c
+        else:
+            total = c
         cs = self.state[p].get("manas_cs") if self.nexus_gamma else None
-        if cs is not None:
-            total = total + cs
-        return q @ total
+        return total + cs if cs is not None else total
+
+    def _d_of(self, p):
+        """Dense probe offset for one param (view for full mode, materialized for low-rank)."""
+        if self.probe_rank is None:
+            return self._full_d(p)
+        q, _c = self._lowrank_qc(p)
+        return q @ self._coef_of(p)
 
     def _sketch_state(self, p):
         """omega (fixed, seeded per-param) + Y + the per-step pad Y_now / prev_yp."""
@@ -381,7 +383,15 @@ class ManasOptimizer(FusedMuon):
             st["manas_cs"] = torch.zeros_like(c)
         return st["manas_prev_proj"], st.get("manas_cs")
 
-    # ---------------- probe application ----------------
+    # ---------------- probe application (LAZY SHIFT) ----------------
+    # Between micros the weights STAY at theta + d: remove_probe() only clears the context
+    # flag, apply_probe() adjusts the weights by the DELTA of the rank-space coefficients
+    # since the last apply (tracked in manas_applied, r x n per param), and step() restores
+    # theta exactly before the base update. This halves the full-tensor passes per step
+    # (2k apply/remove -> k deltas + 1 restore). fp32 weights only (delta adds don't cancel
+    # bit-exactly in low precision); non-fp32 falls back to the exact apply/remove pair.
+    # Consequence to know: code that reads the model BETWEEN micro-batches sees theta + d;
+    # anything after step() (evals, checkpoints) sees clean theta as always.
     @contextmanager
     def probe(self):
         """Run the enclosed forward/backward at theta + d. Nested use / step() inside raise."""
@@ -391,31 +401,76 @@ class ManasOptimizer(FusedMuon):
         finally:
             self.remove_probe()
 
-    def _shift(self, sign):
-        ps = self._probe_params()
-        if self.probe_rank is None and all(p.dtype == torch.float32 for p in ps):
-            # fused fast path (fp32 masters, full-d): ONE foreach over all params
-            if sign > 0:
-                torch._foreach_add_(ps, [self._full_d(p) for p in ps])
-            else:
-                torch._foreach_sub_(ps, [self._full_d(p) for p in ps])
-        else:
-            for p in ps:
-                p.add_(self._d_of(p).to(p.dtype), alpha=sign)
+    def _lazy_ok(self):
+        if self._lazy is None:
+            self._lazy = all(p.dtype == torch.float32 for p in self._probe_params())
+        return self._lazy
 
     @torch.no_grad()
     def apply_probe(self):
         if self._probe_on:
             raise RuntimeError("probe already applied")
-        self._shift(+1)
+        ps = self._probe_params()
+        if self.probe_rank is None:
+            if not self._shift_on:               # full-d: all-or-nothing (d fixed within a step)
+                ds = [self._full_d(p) for p in ps]
+                if self._lazy_ok():
+                    torch._foreach_add_(ps, ds)
+                else:
+                    for p, d in zip(ps, ds):
+                        p.add_(d.to(p.dtype))
+                self._shift_on = True
+        elif self._lazy_ok():
+            for p in ps:                         # low-rank lazy: add only what changed
+                st = self.state[p]
+                q, _c = self._lowrank_qc(p)
+                coef = self._coef_of(p)
+                if "manas_applied" not in st:
+                    st["manas_applied"] = torch.zeros_like(coef)
+                ap = st["manas_applied"]
+                p.add_(q @ (coef - ap))
+                ap.copy_(coef)
+            self._shift_on = True
+        else:
+            for p in ps:                         # exact pair path (non-fp32 weights)
+                p.add_(self._d_of(p).to(p.dtype))
+            self._shift_on = True
         self._probe_on = True
 
     @torch.no_grad()
     def remove_probe(self):
         if not self._probe_on:
             raise RuntimeError("probe not applied")
-        self._shift(-1)                          # deterministic recompute -> exact inverse of apply
         self._probe_on = False
+        if self.probe_rank is not None and not self._lazy_ok():
+            # non-fp32 low-rank: exact inverse now (deterministic recompute, bit-identical)
+            for p in self._probe_params():
+                p.sub_(self._d_of(p).to(p.dtype))
+            self._shift_on = False
+        # full-d (any dtype: same d tensor adds/subs bit-identically) and fp32 low-rank:
+        # LAZY - theta restored at step()
+
+    @torch.no_grad()
+    def _restore_theta(self):
+        """Exactly restore clean theta (called by step() before the base update)."""
+        if not self._shift_on:
+            return
+        ps = self._probe_params()
+        if self.probe_rank is None:
+            ds = [self._full_d(p) for p in ps]
+            if self._lazy_ok():
+                torch._foreach_sub_(ps, ds)
+            else:
+                for p, d in zip(ps, ds):
+                    p.sub_(d.to(p.dtype))
+        else:
+            for p in ps:
+                ap = self.state[p].get("manas_applied")
+                if ap is not None:
+                    q, _c = self._lowrank_qc(p)
+                    p.sub_(q @ ap)
+                    ap.zero_()
+        self._shift_on = False
 
     # ---------------- micro voting ----------------
     @torch.no_grad()
@@ -478,6 +533,7 @@ class ManasOptimizer(FusedMuon):
         if self._probe_on:
             raise RuntimeError("remove_probe() (or exit the probe() context) before step()")
         self._manas_step += 1                    # drives the probe warmup gate (see _update_probe)
+        self._restore_theta()                    # lazy shift: clean theta before the base update
         loss = super().step(closure)             # fused aurora-K1 Muon on the probe-point grads
         if self.micro_vote:
             self._finish_micro_step()
@@ -717,6 +773,26 @@ if __name__ == "__main__":                                           # pragma: n
                        probe_sketch_min_votes=1)
     assert any(issubclass(w.category, DeprecationWarning) for w in caught), \
         "probe_sketch_votes/min_votes must warn DeprecationWarning"
+    # 10L) LAZY SHIFT: weights stay at theta+d between micros (delta-adjusted per apply);
+    #      step-time restore returns clean theta; probes see the CURRENT d each micro
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
+                       probe_rho_step=0.9, probe_gamma=0.08)
+    p0 = p.detach().clone()
+    o._manas_step = 1                                           # past warmup gate
+    o.apply_probe()                                             # d=0: no-op shift
+    assert torch.allclose(p, p0), "empty consensus: probe must not move theta"
+    p.grad = torch.randn(32, 16); o.remove_probe(); o.vote()
+    o.apply_probe()                                             # now shifted by gamma_i*v1
+    d1 = o._d_of(p)
+    assert torch.allclose(p - p0, d1, atol=1e-6), "weights must hold theta + current d"
+    p.grad = p.grad + torch.randn(32, 16); o.remove_probe(); o.vote()
+    o.apply_probe()                                             # delta-adjusted to new d
+    assert torch.allclose(p - p0, o._d_of(p), atol=1e-6), "lazy delta must track d exactly"
+    o.remove_probe()
+    o._restore_theta()
+    assert torch.allclose(p, p0, atol=1e-5), "restore must return clean theta"
+    assert o.state[p]["manas_applied"].norm() == 0 and not o._shift_on
     # 10a) refresh auto-couples to the active rho clock; explicit value and live rho both honored
     o_auto = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4,
                             micro_vote=True, probe_rho=1.0, probe_rho_step=0.96)
