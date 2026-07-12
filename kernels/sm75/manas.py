@@ -116,7 +116,7 @@ class ManasOptimizer(FusedMuon):
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
-                 probe_gamma_intra=None, probe_sketch_rho=None, probe_sketch_votes=False, **kw):
+                 probe_gamma_intra=None, probe_sketch_rho=0.90, probe_sketch_votes=False, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         # TWO-CLOCK / FRESH-BLOCK MODE (probe_rho_step, micro_vote only): probe_rho_step is the
@@ -167,12 +167,17 @@ class ManasOptimizer(FusedMuon):
         # Q = QR(Y) — the frame aims at where gradients have been LIVING (memory 1/(1-rho_q)
         # steps), not where one batch pointed. Cost: one m x r buffer + one rank-r GEMM per
         # boundary (<0.1% step FLOPs). Trade: the aim lags fast landscape rotations by ~memory.
+        # DEFAULT 0.90 (measured: -0.120 vs snapshot's -0.080 at b32ga4/lr3e-3, bowl at 0.90).
+        # None = snapshot refresh. GA1 GATE: at refresh time, if the step cast <= 1 vote the aim
+        # falls back to the snapshot — at one vote/step there is no in-step spread to cover and
+        # the sketch's lag is pure cost (measured mildly negative at b64ga1). Full-rank probes
+        # get no sketch (no window to aim).
         self.probe_sketch_rho = None if probe_sketch_rho is None else float(probe_sketch_rho)
+        if self.probe_sketch_rho is not None and probe_rank is None:
+            self.probe_sketch_rho = None                  # full-d: silently no window/no sketch
         if self.probe_sketch_rho is not None:
             if not (0.0 < self.probe_sketch_rho < 1.0):
                 raise ValueError(f"probe_sketch_rho must be in (0, 1), got {probe_sketch_rho}")
-            if self.probe_rank is None:
-                raise ValueError("probe_sketch_rho requires a low-rank probe")
         # probe_sketch_votes: TWO-CLOCK WINDOW — the sketch mirrors C's architecture exactly.
         # Per vote, the micro-gradient's ambient sketch delta (p.grad@omega differenced, same
         # telescoping trick as vote()) is UNIT-NORMALIZED and accumulated raw into Y_now; at the
@@ -521,6 +526,10 @@ class ManasOptimizer(FusedMuon):
                         y = self._sketch_fold(p)          # two-clock window: fold Y_now
                     else:
                         y = self._sketch(p, gf)           # boundary-sum sketch
+                    if self._votes_cast <= 1:
+                        y = None                          # GA1 GATE: one vote = no spread to
+                                                          # cover; sketch lag is pure cost ->
+                                                          # snapshot aim (Y stays warm)
                     if refresh:
                         if y is None:
                             r = q.shape[-1]
@@ -573,14 +582,9 @@ class ManasOptimizer(FusedMuon):
         for i, p in enumerate(ps):
             q, c = self._lowrank_qc(p)
             gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
-            if self.probe_sketch_rho is None:
-                y = None
-            elif self.probe_sketch_votes:                 # fallback path: use Y as-is (votes
-                y = self.state[p].get("manas_y")          # feed it; no boundary-sum double add)
-                if y is not None and not bool((y != 0).any()):
-                    y = None                              # empty Y -> snapshot aim, not QR(0)
-            else:
-                y = self._sketch(p, gf)
+            # step-vote mode (and the zero-vote fallback) is one vote per step by definition:
+            # no in-step spread to cover -> snapshot aim, no sketch bookkeeping (GA1 GATE)
+            y = None
             if refresh:
                 # window re-aim: EMA sketch (consensus-aimed) if enabled, else randomized range
                 # of the CURRENT gradient (GaLore-style); re-project the old offset either way
@@ -673,21 +677,35 @@ if __name__ == "__main__":                                           # pragma: n
     o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
                        probe_rho_step=0.9, probe_sketch_rho=0.8, probe_refresh=2)
     g1 = torch.randn(32, 16); p.grad = g1.clone(); o.vote()
+    p.grad = g1 + torch.randn(32, 16) * 0.1; o.vote()           # 2 votes: sketch aim eligible
+    G1 = p.grad.clone()
     o._probe_updates = 1                                        # skip refresh on 1st boundary
     o._finish_micro_step()
     om, y = o.state[p]["manas_omega"], o.state[p]["manas_y"]
-    assert torch.allclose(y, g1 @ om, atol=1e-6), "first boundary: Y = G1 @ omega"
+    assert torch.allclose(y, G1 @ om, atol=1e-5), "first boundary: Y = G1 @ omega"
     g2 = torch.randn(32, 16); p.grad = g2.clone(); o.vote()
+    p.grad = g2 + torch.randn(32, 16) * 0.1; o.vote()
+    G2 = p.grad.clone()
     o._finish_micro_step()                                      # counter=2 -> refresh fires
-    assert torch.allclose(y, 0.8 * (g1 @ om) + g2 @ om, atol=1e-5), "Y must EMA across boundaries"
+    assert torch.allclose(y, 0.8 * (G1 @ om) + G2 @ om, atol=1e-4), "Y must EMA across boundaries"
     q, _ = o._lowrank_qc(p)
     assert torch.allclose(q.mT @ q, torch.eye(4), atol=1e-5), "refreshed Q orthonormal"
-    assert torch.allclose(q @ (q.mT @ y), y, atol=1e-4), "refreshed Q must span the sketch"
+    assert torch.allclose(q @ (q.mT @ y), y, atol=1e-3), "refreshed Q must span the sketch"
+    # GA1 GATE: a 1-vote step refreshing must aim by SNAPSHOT (Q must not span the sketch)
+    p.grad = torch.randn(32, 16); o.vote()
+    o._probe_updates = 4                                        # force refresh (counter % 2 == 0)
+    o._finish_micro_step()
+    q, _ = o._lowrank_qc(p)
+    assert not torch.allclose(q @ (q.mT @ y), y, atol=1e-3), \
+        "1-vote refresh must fall back to snapshot aim (gate)"
     o2 = ManasOptimizer([torch.nn.Parameter(torch.randn(32, 16))], probe_rank=4, micro_vote=True,
                         probe_rho=1.0, probe_rho_step=0.9, probe_sketch_rho=0.8)
-    o2._probe_params()[0].grad = torch.randn(32, 16); o2.vote(); o2._probe_updates = 1
+    p2 = o2._probe_params()[0]
+    p2.grad = torch.randn(32, 16); o2.vote()
+    p2.grad = p2.grad + torch.randn(32, 16); o2.vote()
+    o2._probe_updates = 1
     o2._finish_micro_step()
-    assert torch.allclose(o2.state[o2._probe_params()[0]]["manas_omega"], om), \
+    assert torch.allclose(o2.state[p2]["manas_omega"], om), \
         "omega must be deterministic per shape (seeded)"
     # 10v) two-clock window: per-vote UNIT sketch increments (anti-telescoping) into Y_now,
     #      boundary folds Y = rho_q*Y + Y_now and resets per-step buffers
