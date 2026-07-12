@@ -254,6 +254,10 @@ class ManasOptimizer(FusedMuon):
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
+        # internal, not a constructor arg: min votes/step for the window to develop from Y
+        # (the ga1 gate). Default 2 rests on OLD-dynamics (cadence-QR) measurements; set to 1
+        # on an instance to test sketch aim at ga1 under QR-every-boundary dynamics.
+        self._sketch_gate = 2
 
     @property
     def probe_refresh(self):
@@ -511,7 +515,7 @@ class ManasOptimizer(FusedMuon):
                 sk = self.probe_sketch_rho is not None
                 if p.grad is not None and (refresh or sk):
                     q, c = self._lowrank_qc(p)
-                    if sk and self._votes_cast >= 2:
+                    if sk and self._votes_cast >= self._sketch_gate:
                         # THE window path: fold the pad, develop the evidence. Every boundary.
                         y = self._sketch_fold(p)
                         q_new = torch.linalg.qr(y)[0]
