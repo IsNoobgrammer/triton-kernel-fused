@@ -116,7 +116,7 @@ class ManasOptimizer(FusedMuon):
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
-                 probe_gamma_intra=None, probe_sketch_rho=0.90, probe_sketch_votes=None,
+                 probe_gamma_intra=None, probe_sketch_rho=0.96, probe_sketch_votes=None,
                  probe_sketch_min_votes=None, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
