@@ -116,7 +116,7 @@ class ManasOptimizer(FusedMuon):
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
-                 probe_gamma_intra=None, **kw):
+                 probe_gamma_intra=None, probe_sketch_rho=None, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         # TWO-CLOCK / FRESH-BLOCK MODE (probe_rho_step, micro_vote only): probe_rho_step is the
@@ -160,6 +160,19 @@ class ManasOptimizer(FusedMuon):
         # the window should be as fresh as the oldest vote it hosts (rho 0.96 -> 50, 0.98 -> 100).
         # The old fixed default was 200 = 8 memory-lifetimes stale. c=2 pending the refresh sweep.
         self._probe_refresh = None if probe_refresh is None else int(probe_refresh)
+        # probe_sketch_rho: EMA-SKETCH WINDOW. None = snapshot refresh (Q from ONE boundary
+        # gradient's randomized range — a one-sample aim). Set (0,1) = the window becomes a
+        # consensus object like everything it hosts: a persistent sketch Y = rho_q*Y + G@omega
+        # (omega FIXED, seeded per-param) accumulates every step boundary, and refresh takes
+        # Q = QR(Y) — the frame aims at where gradients have been LIVING (memory 1/(1-rho_q)
+        # steps), not where one batch pointed. Cost: one m x r buffer + one rank-r GEMM per
+        # boundary (<0.1% step FLOPs). Trade: the aim lags fast landscape rotations by ~memory.
+        self.probe_sketch_rho = None if probe_sketch_rho is None else float(probe_sketch_rho)
+        if self.probe_sketch_rho is not None:
+            if not (0.0 < self.probe_sketch_rho < 1.0):
+                raise ValueError(f"probe_sketch_rho must be in (0, 1), got {probe_sketch_rho}")
+            if self.probe_rank is None:
+                raise ValueError("probe_sketch_rho requires a low-rank probe")
         # comp / U BUFFER: DEPRECATED 2026-07-11, ignored. The u buffer (rho-decayed memory of
         # APPLIED updates added to the probe offset) failed to separate from no-u TWICE: toy
         # (homogeneous-batch tie, +0.0235 vs +0.0266 within noise) AND the BiBo 137M comp sweep
@@ -305,6 +318,21 @@ class ManasOptimizer(FusedMuon):
             total = total + cs
         return q @ total
 
+    def _sketch(self, p, gf):
+        """EMA range sketch: Y <- rho_q*Y + G @ omega, omega fixed (seeded per-param) so the
+        accumulation is coherent across steps. Returns Y (the consensus-aimed window source)."""
+        st = self.state[p]
+        q, _c = self._lowrank_qc(p)
+        if "manas_omega" not in st:
+            r = q.shape[-1]
+            g = torch.Generator(device="cpu").manual_seed(0x51E7C4 ^ p.numel())
+            st["manas_omega"] = torch.randn(*p.shape[:-2], p.shape[-1], r, generator=g).to(
+                device=p.device, dtype=torch.float32)
+            st["manas_y"] = torch.zeros_like(q)
+        y = st["manas_y"]
+        y.mul_(self.probe_sketch_rho).add_(gf @ st["manas_omega"])
+        return y
+
     def _micro_state(self, p):
         """(prev_proj, cs) rank-space buffers for micro voting; zero-init, reset each step."""
         st = self.state[p]
@@ -444,14 +472,20 @@ class ManasOptimizer(FusedMuon):
                     if "manas_cnow" in stf:                  # raw block folds in at coeff 1
                         c.add_(stf["manas_cnow"])            # (BEFORE refresh: same basis)
                         stf["manas_cnow"].zero_()
-                if refresh and p.grad is not None:
+                if p.grad is not None and (refresh or self.probe_sketch_rho is not None):
                     q, c = self._lowrank_qc(p)
                     gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
-                    r = q.shape[-1]
-                    omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
-                    q_new = torch.linalg.qr(gf @ omega)[0]
-                    c.copy_((q_new.mT @ q) @ c)
-                    q.copy_(q_new)
+                    # sketch accumulates EVERY boundary (Y lives in ambient space - no
+                    # re-projection at swap); snapshot mode only computes at refresh
+                    y = self._sketch(p, gf) if self.probe_sketch_rho is not None else None
+                    if refresh:
+                        if y is None:
+                            r = q.shape[-1]
+                            omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
+                            y = gf @ omega
+                        q_new = torch.linalg.qr(y)[0]
+                        c.copy_((q_new.mT @ q) @ c)
+                        q.copy_(q_new)
                 st = self.state[p]
                 if "manas_prev_proj" in st:
                     st["manas_prev_proj"].zero_()     # p.grad restarts from zero next step
@@ -496,12 +530,16 @@ class ManasOptimizer(FusedMuon):
         for i, p in enumerate(ps):
             q, c = self._lowrank_qc(p)
             gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
+            y = self._sketch(p, gf) if self.probe_sketch_rho is not None else None
             if refresh:
-                # randomized range of the CURRENT gradient (GaLore-style basis refresh),
-                # then re-project the old offset so d is continuous across the swap
-                r = q.shape[-1]
-                omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
-                q_new = torch.linalg.qr(gf @ omega)[0]
+                # window re-aim: EMA sketch (consensus-aimed) if enabled, else randomized range
+                # of the CURRENT gradient (GaLore-style); re-project the old offset either way
+                # so d is continuous across the swap
+                if y is None:
+                    r = q.shape[-1]
+                    omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
+                    y = gf @ omega
+                q_new = torch.linalg.qr(y)[0]
                 c.copy_((q_new.mT @ q) @ c)
                 q.copy_(q_new)
             c.mul_(self.probe_rho)
@@ -579,6 +617,28 @@ if __name__ == "__main__":                                           # pragma: n
     o._finish_micro_step()
     assert torch.allclose(c, 0.9 * c_hist + cn2, atol=1e-7), \
         "second boundary: history decays rho_step, new raw block folds at coeff 1"
+    # 10s) EMA-sketch window: Y accumulates G@omega with FIXED omega every boundary; refresh
+    #      takes Q from QR(Y); omega is deterministic (seeded per-param)
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0,
+                       probe_rho_step=0.9, probe_sketch_rho=0.8, probe_refresh=2)
+    g1 = torch.randn(32, 16); p.grad = g1.clone(); o.vote()
+    o._probe_updates = 1                                        # skip refresh on 1st boundary
+    o._finish_micro_step()
+    om, y = o.state[p]["manas_omega"], o.state[p]["manas_y"]
+    assert torch.allclose(y, g1 @ om, atol=1e-6), "first boundary: Y = G1 @ omega"
+    g2 = torch.randn(32, 16); p.grad = g2.clone(); o.vote()
+    o._finish_micro_step()                                      # counter=2 -> refresh fires
+    assert torch.allclose(y, 0.8 * (g1 @ om) + g2 @ om, atol=1e-5), "Y must EMA across boundaries"
+    q, _ = o._lowrank_qc(p)
+    assert torch.allclose(q.mT @ q, torch.eye(4), atol=1e-5), "refreshed Q orthonormal"
+    assert torch.allclose(q @ (q.mT @ y), y, atol=1e-4), "refreshed Q must span the sketch"
+    o2 = ManasOptimizer([torch.nn.Parameter(torch.randn(32, 16))], probe_rank=4, micro_vote=True,
+                        probe_rho=1.0, probe_rho_step=0.9, probe_sketch_rho=0.8)
+    o2._probe_params()[0].grad = torch.randn(32, 16); o2.vote(); o2._probe_updates = 1
+    o2._finish_micro_step()
+    assert torch.allclose(o2.state[o2._probe_params()[0]]["manas_omega"], om), \
+        "omega must be deterministic per shape (seeded)"
     # 10a) refresh auto-couples to the active rho clock; explicit value and live rho both honored
     o_auto = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4,
                             micro_vote=True, probe_rho=1.0, probe_rho_step=0.96)
