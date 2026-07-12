@@ -381,14 +381,6 @@ class ManasOptimizer(FusedMuon):
         inv = torch.where(torch.isfinite(n) & (n > 0), 1.0 / n, torch.zeros_like(n))
         st["manas_ynow"].add_(delta * inv)
 
-    def _sketch_fold(self, p):
-        """Two-clock window, boundary: Y = rho_q*Y + Y_now; per-step buffers reset."""
-        st = self._sketch_state(p)
-        st["manas_y"].mul_(self.probe_sketch_rho).add_(st["manas_ynow"])
-        st["manas_ynow"].zero_()
-        st["manas_prev_yp"].zero_()          # p.grad restarts from zero next step
-        return st["manas_y"]
-
     def _micro_state(self, p):
         """(prev_proj, cs) rank-space buffers for micro voting; zero-init, reset each step."""
         st = self.state[p]
@@ -594,39 +586,58 @@ class ManasOptimizer(FusedMuon):
         else:
             refresh = self._probe_updates % max(self.probe_refresh, 1) == 0
             self._probe_updates += 1
-            for p in self._probe_params():
-                stf = self.state[p]
-                if self.probe_rho_step is not None and "manas_c" in stf:
-                    c = stf["manas_c"]
-                    c.mul_(self.probe_rho_step)              # history ages one step
-                    if "manas_cnow" in stf:                  # raw block folds in at coeff 1
-                        c.add_(stf["manas_cnow"])            # (BEFORE refresh: same basis)
-                        stf["manas_cnow"].zero_()
-                sk = self.probe_sketch_rho is not None
-                if p.grad is not None and (refresh or sk):
+            ps = self._probe_params()
+            sk = self.probe_sketch_rho is not None
+            # ---- BATCHED BOUNDARY (launch-bound at toy scale: fold/zero via foreach, ----
+            # ---- QR + re-projection batched per shape group instead of per matrix)  ----
+            if self.probe_rho_step is not None:
+                cs_fold = [self.state[p]["manas_c"] for p in ps if "manas_c" in self.state[p]
+                           and "manas_cnow" in self.state[p]]
+                cn_fold = [self.state[p]["manas_cnow"] for p in ps if "manas_c" in self.state[p]
+                           and "manas_cnow" in self.state[p]]
+                if cs_fold:
+                    torch._foreach_mul_(cs_fold, self.probe_rho_step)   # history ages one step
+                    torch._foreach_add_(cs_fold, cn_fold)               # raw block folds, coeff 1
+                    torch._foreach_zero_(cn_fold)                       # (BEFORE develop: same basis)
+            develop = sk and self._votes_cast >= self._sketch_gate
+            gps = [p for p in ps if p.grad is not None and "manas_omega" in self.state[p]] \
+                if sk else []
+            if sk and gps:
+                ys = [self.state[p]["manas_y"] for p in gps]
+                yn = [self.state[p]["manas_ynow"] for p in gps]
+                torch._foreach_mul_(ys, self.probe_sketch_rho)          # Y = rho_q*Y + Y_now
+                torch._foreach_add_(ys, yn)
+                torch._foreach_zero_(yn)
+                torch._foreach_zero_([self.state[p]["manas_prev_yp"] for p in gps])
+            if develop and gps:
+                groups = {}
+                for p in gps:                                            # group by window shape
+                    groups.setdefault(self.state[p]["manas_q"].shape, []).append(p)
+                for shape, grp in groups.items():
+                    y_stk = torch.stack([self.state[p]["manas_y"] for p in grp])
+                    q_stk = torch.stack([self.state[p]["manas_q"] for p in grp])
+                    c_stk = torch.stack([self.state[p]["manas_c"] for p in grp])
+                    q_new = torch.linalg.qr(y_stk)[0]                    # ONE batched QR
+                    c_new = (q_new.mT @ q_stk) @ c_stk                   # ONE batched re-projection
+                    for i, p in enumerate(grp):
+                        self.state[p]["manas_c"].copy_(c_new[i])
+                        self.state[p]["manas_q"].copy_(q_new[i])
+            elif refresh:                        # ga1 gate / no sketch: snapshot cadence
+                for p in ps:
+                    if p.grad is None:
+                        continue
                     q, c = self._lowrank_qc(p)
-                    if sk and self._votes_cast >= self._sketch_gate:
-                        # THE window path: fold the pad, develop the evidence. Every boundary.
-                        y = self._sketch_fold(p)
-                        q_new = torch.linalg.qr(y)[0]
-                        c.copy_((q_new.mT @ q) @ c)
-                        q.copy_(q_new)
-                    else:
-                        if sk:
-                            self._sketch_fold(p)          # keep Y warm through gated steps
-                        if refresh:                       # ga1 gate / no sketch: snapshot cadence
-                            gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0,
-                                                  neginf=0.0).to(torch.float32)
-                            r = q.shape[-1]
-                            omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
-                            q_new = torch.linalg.qr(gf @ omega)[0]
-                            c.copy_((q_new.mT @ q) @ c)
-                            q.copy_(q_new)
-                st = self.state[p]
-                if "manas_prev_proj" in st:
-                    st["manas_prev_proj"].zero_()     # p.grad restarts from zero next step
-                if "manas_cs" in st:
-                    st["manas_cs"].zero_()            # the walker never crosses a step boundary
+                    gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0,
+                                          neginf=0.0).to(torch.float32)
+                    r = q.shape[-1]
+                    omega = torch.randn(*p.shape[:-2], p.shape[-1], r, device=p.device)
+                    q_new = torch.linalg.qr(gf @ omega)[0]
+                    c.copy_((q_new.mT @ q) @ c)
+                    q.copy_(q_new)
+            resets = [self.state[p][k] for p in ps for k in ("manas_prev_proj", "manas_cs")
+                      if k in self.state[p]]
+            if resets:
+                torch._foreach_zero_(resets)     # p.grad restarts; walker never crosses a boundary
         self._votes_cast = 0
 
     @torch.no_grad()
