@@ -123,7 +123,7 @@ class ManasOptimizer(FusedMuon):
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
                  probe_gamma_intra=None, probe_sketch_rho=0.96, probe_sketch_votes=None,
-                 probe_sketch_min_votes=None, **kw):
+                 probe_sketch_min_votes=None, probe_min_votes=2, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         # TWO-CLOCK / FRESH-BLOCK MODE (probe_rho_step, micro_vote only): probe_rho_step is the
@@ -256,6 +256,16 @@ class ManasOptimizer(FusedMuon):
         # the probe shift IS the inner walk. Base Muon consumes mean-grad + alignment force.
         # Walker ceiling = nexus_gamma * (micros per step); keep it in the reach band (~0.2-0.5).
         self.micro_vote = bool(micro_vote)
+        # probe_min_votes (micro_vote mode): the probe ENGAGES only when the previous step
+        # cast at least this many votes. Default 2 = the measured recommendation baked in:
+        # at ga1 Manas IS aurora Muon - no probe shifts, no vote GEMMs, no buffers, zero
+        # overhead (edge ~0-0.02 at one vote/step vs 5-10% tps: wall-clock negative).
+        # Slicing to ga>=2 engages the full stack automatically on the next step. Set 1 to
+        # force the probe at ga1 (legacy behavior; expect task-specific tuning).
+        self.probe_min_votes = int(probe_min_votes)
+        if self.probe_min_votes < 1:
+            raise ValueError(f"probe_min_votes must be >= 1, got {probe_min_votes}")
+        self._votes_last = 0                 # previous step's vote count (0 = not yet seen)
         self.nexus_gamma = float(nexus_gamma)
         if self.micro_vote and self.probe_rank is None:
             raise ValueError("micro_vote=True requires a low-rank probe (probe_rank is None)")
@@ -389,6 +399,12 @@ class ManasOptimizer(FusedMuon):
             st["manas_cs"] = torch.zeros_like(c)
         return st["manas_prev_proj"], st.get("manas_cs")
 
+    def _probe_engaged(self):
+        """micro_vote mode self-gates to pure aurora Muon below probe_min_votes/step
+        (measured: at 1 vote/step the probe is wall-clock negative). Step-vote mode
+        (micro_vote=False) is an explicit legacy choice and always engages."""
+        return (not self.micro_vote) or self._votes_last >= self.probe_min_votes
+
     # ---------------- probe application (LAZY SHIFT) ----------------
     # Between micros the weights STAY at theta + d: remove_probe() only clears the context
     # flag, apply_probe() adjusts the weights by the DELTA of the rank-space coefficients
@@ -416,6 +432,9 @@ class ManasOptimizer(FusedMuon):
     def apply_probe(self):
         if self._probe_on:
             raise RuntimeError("probe already applied")
+        if not self._probe_engaged():           # ga1 self-gate: pure Muon, no shift at all
+            self._probe_on = True
+            return
         ps = self._probe_params()
         if self.probe_rank is None:
             if not self._shift_on:               # full-d: all-or-nothing (d fixed within a step)
@@ -448,7 +467,7 @@ class ManasOptimizer(FusedMuon):
         if not self._probe_on:
             raise RuntimeError("probe not applied")
         self._probe_on = False
-        if self.probe_rank is not None and not self._lazy_ok():
+        if self._shift_on and self.probe_rank is not None and not self._lazy_ok():
             # non-fp32 low-rank: exact inverse now (deterministic recompute, bit-identical)
             for p in self._probe_params():
                 p.sub_(self._d_of(p).to(p.dtype))
@@ -498,6 +517,9 @@ class ManasOptimizer(FusedMuon):
             return
         if self._probe_on:
             raise RuntimeError("vote() must be called outside the probe() context")
+        if not self._probe_engaged():            # ga1 self-gate: count only (so a switch to
+            self._votes_cast += 1                # ga>=2 engages the probe on the next step)
+            return
         if self._manas_step < self.probe_warmup_steps:   # warmup: probe stays a no-op
             return
         ps = [p for p in self._probe_params() if p.grad is not None]
@@ -553,6 +575,12 @@ class ManasOptimizer(FusedMuon):
         accumulated grad, so it can only fire here — a mid-step refresh would desync prev_proj
         and the walker), then reset the per-step buffers. Zero votes cast -> fall back to the
         step-vote so the probe never silently dies (warned once)."""
+        if not self._probe_engaged():
+            # ga1 self-gate: pure-Muon step; record the count so ga>=2 engages next step
+            self._votes_last = self._votes_cast
+            self._votes_cast = 0
+            return
+        self._votes_last = self._votes_cast
         if self._votes_cast == 0:
             if not getattr(self, "_warned_no_votes", False):
                 warnings.warn("micro_vote=True but no vote() was cast this step; falling back "
@@ -659,6 +687,29 @@ class ManasOptimizer(FusedMuon):
 if __name__ == "__main__":                                           # pragma: no cover
     # Self-check (probe math only; no NS/CUDA needed).
     torch.manual_seed(0)
+    # tests exercise the probe machinery directly -> pre-engage the ga1 self-gate
+    # (real training engages after the first step's votes are counted)
+    _orig_init = ManasOptimizer.__init__
+    def _test_init(self, *a, **k):
+        _orig_init(self, *a, **k)
+        self._votes_last = 9
+    ManasOptimizer.__init__ = _test_init
+    # 0) GA1 SELF-GATE: below probe_min_votes/step, manas IS aurora muon (no shift, no state)
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0, probe_rho_step=0.9)
+    o._votes_last = 0                                           # fresh-run condition
+    p0 = p.detach().clone()
+    o._manas_step = 1
+    o.apply_probe()
+    assert torch.allclose(p, p0) and not o._shift_on, "disengaged probe must not touch theta"
+    p.grad = torch.randn(32, 16); o.remove_probe(); o.vote()
+    assert "manas_q" not in o.state[p], "disengaged vote must not allocate probe state"
+    o._finish_micro_step()
+    assert o._votes_last == 1 and not o._probe_engaged(), "ga1: stays pure muon"
+    o.apply_probe(); p.grad = torch.randn(32, 16); o.remove_probe(); o.vote()
+    p.grad = p.grad + torch.randn(32, 16); o.vote()             # 2 votes this step
+    o._finish_micro_step()
+    assert o._votes_last == 2 and o._probe_engaged(), "ga>=2 must engage on the next step"
     # 5) perparam norm: equal-size votes regardless of per-matrix grad scale (global: share-weighted)
     for mode, expect_equal in (("perparam", True), ("global", False)):
         pa, pb = torch.nn.Parameter(torch.randn(32, 16)), torch.nn.Parameter(torch.randn(32, 16))
