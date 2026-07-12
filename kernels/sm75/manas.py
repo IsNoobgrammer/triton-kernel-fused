@@ -116,7 +116,7 @@ class ManasOptimizer(FusedMuon):
                  scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
-                 probe_gamma_intra=None, probe_sketch_rho=None, **kw):
+                 probe_gamma_intra=None, probe_sketch_rho=None, probe_sketch_votes=False, **kw):
         super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
                          aurora_k=aurora_k, **kw)
         # TWO-CLOCK / FRESH-BLOCK MODE (probe_rho_step, micro_vote only): probe_rho_step is the
@@ -173,6 +173,16 @@ class ManasOptimizer(FusedMuon):
                 raise ValueError(f"probe_sketch_rho must be in (0, 1), got {probe_sketch_rho}")
             if self.probe_rank is None:
                 raise ValueError("probe_sketch_rho requires a low-rank probe")
+        # probe_sketch_votes: TWO-CLOCK WINDOW — the sketch mirrors C's architecture exactly.
+        # Per vote, the micro-gradient's ambient sketch delta (p.grad@omega differenced, same
+        # telescoping trick as vote()) is UNIT-NORMALIZED and accumulated raw into Y_now; at the
+        # boundary Y = rho_q*Y + Y_now. Normalization is the point: raw deltas telescope back to
+        # the boundary SUM (spread destroyed); unit increments give each micro DIRECTION equal
+        # voice, so Y covers the vote distribution, not its collapsed mean. Coverage gain should
+        # grow with votes/step (the sum concentrates as k grows). False = boundary-sum sketch.
+        self.probe_sketch_votes = bool(probe_sketch_votes)
+        if self.probe_sketch_votes and (self.probe_sketch_rho is None or not micro_vote):
+            raise ValueError("probe_sketch_votes requires probe_sketch_rho and micro_vote=True")
         # comp / U BUFFER: DEPRECATED 2026-07-11, ignored. The u buffer (rho-decayed memory of
         # APPLIED updates added to the probe offset) failed to separate from no-u TWICE: toy
         # (homogeneous-batch tie, +0.0235 vs +0.0266 within noise) AND the BiBo 137M comp sweep
@@ -318,20 +328,46 @@ class ManasOptimizer(FusedMuon):
             total = total + cs
         return q @ total
 
-    def _sketch(self, p, gf):
-        """EMA range sketch: Y <- rho_q*Y + G @ omega, omega fixed (seeded per-param) so the
-        accumulation is coherent across steps. Returns Y (the consensus-aimed window source)."""
+    def _sketch_state(self, p):
+        """omega (fixed, seeded per-param) + Y (+ Y_now/prev_yp in two-clock-window mode)."""
         st = self.state[p]
-        q, _c = self._lowrank_qc(p)
         if "manas_omega" not in st:
+            q, _c = self._lowrank_qc(p)
             r = q.shape[-1]
             g = torch.Generator(device="cpu").manual_seed(0x51E7C4 ^ p.numel())
             st["manas_omega"] = torch.randn(*p.shape[:-2], p.shape[-1], r, generator=g).to(
                 device=p.device, dtype=torch.float32)
             st["manas_y"] = torch.zeros_like(q)
+            if self.probe_sketch_votes:
+                st["manas_ynow"] = torch.zeros_like(q)
+                st["manas_prev_yp"] = torch.zeros_like(q)
+        return st
+
+    def _sketch(self, p, gf):
+        """Boundary-sum sketch: Y <- rho_q*Y + G @ omega. Returns Y (window aim source)."""
+        st = self._sketch_state(p)
         y = st["manas_y"]
         y.mul_(self.probe_sketch_rho).add_(gf @ st["manas_omega"])
         return y
+
+    def _sketch_vote(self, p, gf):
+        """Two-clock window, per-vote: unit-normalized micro sketch delta into Y_now (raw,
+        coefficient 1 — the same telescoping-difference trick vote() uses for C)."""
+        st = self._sketch_state(p)
+        yp = gf @ st["manas_omega"]
+        delta = yp - st["manas_prev_yp"]
+        st["manas_prev_yp"].copy_(yp)
+        n = torch.linalg.vector_norm(delta)
+        inv = torch.where(torch.isfinite(n) & (n > 0), 1.0 / n, torch.zeros_like(n))
+        st["manas_ynow"].add_(delta * inv)
+
+    def _sketch_fold(self, p):
+        """Two-clock window, boundary: Y = rho_q*Y + Y_now; per-step buffers reset."""
+        st = self._sketch_state(p)
+        st["manas_y"].mul_(self.probe_sketch_rho).add_(st["manas_ynow"])
+        st["manas_ynow"].zero_()
+        st["manas_prev_yp"].zero_()          # p.grad restarts from zero next step
+        return st["manas_y"]
 
     def _micro_state(self, p):
         """(prev_proj, cs) rank-space buffers for micro voting; zero-init, reset each step."""
@@ -410,6 +446,8 @@ class ManasOptimizer(FusedMuon):
             q, _c = self._lowrank_qc(p)
             prev, _cs = self._micro_state(p)
             gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
+            if self.probe_sketch_votes:
+                self._sketch_vote(p, gf)                  # window hears each micro DIRECTION
             proj = q.mT @ gf                              # projection of the accumulated sum
             deltas.append(proj - prev)
             prev.copy_(proj)
@@ -477,7 +515,12 @@ class ManasOptimizer(FusedMuon):
                     gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
                     # sketch accumulates EVERY boundary (Y lives in ambient space - no
                     # re-projection at swap); snapshot mode only computes at refresh
-                    y = self._sketch(p, gf) if self.probe_sketch_rho is not None else None
+                    if self.probe_sketch_rho is None:
+                        y = None
+                    elif self.probe_sketch_votes:
+                        y = self._sketch_fold(p)          # two-clock window: fold Y_now
+                    else:
+                        y = self._sketch(p, gf)           # boundary-sum sketch
                     if refresh:
                         if y is None:
                             r = q.shape[-1]
@@ -530,7 +573,14 @@ class ManasOptimizer(FusedMuon):
         for i, p in enumerate(ps):
             q, c = self._lowrank_qc(p)
             gf = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
-            y = self._sketch(p, gf) if self.probe_sketch_rho is not None else None
+            if self.probe_sketch_rho is None:
+                y = None
+            elif self.probe_sketch_votes:                 # fallback path: use Y as-is (votes
+                y = self.state[p].get("manas_y")          # feed it; no boundary-sum double add)
+                if y is not None and not bool((y != 0).any()):
+                    y = None                              # empty Y -> snapshot aim, not QR(0)
+            else:
+                y = self._sketch(p, gf)
             if refresh:
                 # window re-aim: EMA sketch (consensus-aimed) if enabled, else randomized range
                 # of the CURRENT gradient (GaLore-style); re-project the old offset either way
@@ -639,6 +689,30 @@ if __name__ == "__main__":                                           # pragma: n
     o2._finish_micro_step()
     assert torch.allclose(o2.state[o2._probe_params()[0]]["manas_omega"], om), \
         "omega must be deterministic per shape (seeded)"
+    # 10v) two-clock window: per-vote UNIT sketch increments (anti-telescoping) into Y_now,
+    #      boundary folds Y = rho_q*Y + Y_now and resets per-step buffers
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    o = ManasOptimizer([p], probe_rank=4, micro_vote=True, probe_rho=1.0, probe_rho_step=0.9,
+                       probe_sketch_rho=0.8, probe_sketch_votes=True, probe_refresh=100)
+    g1 = torch.randn(32, 16); p.grad = g1.clone(); o.vote()
+    g2 = torch.randn(32, 16); p.grad = g1 + g2; o.vote()
+    om = o.state[p]["manas_omega"]; yn = o.state[p]["manas_ynow"]
+    u1 = (g1 @ om) / (g1 @ om).norm(); u2 = (g2 @ om) / (g2 @ om).norm()
+    assert torch.allclose(yn, u1 + u2, atol=1e-5), "Y_now must sum UNIT micro sketches"
+    assert not torch.allclose(yn, ((g1 + g2) @ om) / ((g1 + g2) @ om).norm(), atol=1e-2), \
+        "unit increments must NOT telescope to the normalized boundary sum"
+    o._probe_updates = 1
+    o._finish_micro_step()
+    y = o.state[p]["manas_y"]
+    assert torch.allclose(y, u1 + u2, atol=1e-5) and yn.norm() == 0 \
+        and o.state[p]["manas_prev_yp"].norm() == 0, "boundary: fold Y_now, reset per-step buffers"
+    for bad in (dict(probe_sketch_votes=True),                       # needs sketch_rho+micro_vote
+                dict(probe_sketch_votes=True, probe_sketch_rho=0.9)):
+        try:
+            ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4, **bad)
+            raise AssertionError(f"constructor must reject {bad}")
+        except ValueError:
+            pass
     # 10a) refresh auto-couples to the active rho clock; explicit value and live rho both honored
     o_auto = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4,
                             micro_vote=True, probe_rho=1.0, probe_rho_step=0.96)
