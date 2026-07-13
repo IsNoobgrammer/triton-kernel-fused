@@ -611,8 +611,8 @@ class ManasOptimizer(FusedMuon):
                 torch._foreach_zero_([self.state[p]["manas_prev_yp"] for p in gps])
             if develop and gps:
                 groups = {}
-                for p in gps:                                            # group by window shape
-                    groups.setdefault(self.state[p]["manas_q"].shape, []).append(p)
+                for p in gps:                            # group by FULL param shape: q (m,r)
+                    groups.setdefault(p.shape, []).append(p)   # AND c (r,n) must both stack
                 for shape, grp in groups.items():
                     y_stk = torch.stack([self.state[p]["manas_y"] for p in grp])
                     q_stk = torch.stack([self.state[p]["manas_q"] for p in grp])
@@ -817,6 +817,22 @@ if __name__ == "__main__":                                           # pragma: n
     u3 = (g3 @ om) / (g3 @ om).norm(); u4 = (g4 @ om) / (g4 @ om).norm()
     assert torch.allclose(y, 0.8 * (u1 + u2) + u3 + u4, atol=1e-4), \
         "Y must EMA across boundaries (rho_q * old + new pad)"
+    # 10m) MIXED SHAPES: same (m, r) window shape but different n must not cross-stack
+    pmx_a = torch.nn.Parameter(torch.randn(32, 16))
+    pmx_b = torch.nn.Parameter(torch.randn(32, 24))         # same m=32 -> same q shape, n differs
+    omx = ManasOptimizer([pmx_a, pmx_b], probe_rank=4, micro_vote=True, probe_rho=1.0,
+                         probe_rho_step=0.9, probe_sketch_rho=0.8)
+    for _ in range(2):
+        pmx_a.grad = (torch.randn(32, 16) if pmx_a.grad is None
+                      else pmx_a.grad + torch.randn(32, 16))
+        pmx_b.grad = (torch.randn(32, 24) if pmx_b.grad is None
+                      else pmx_b.grad + torch.randn(32, 24))
+        omx.vote()
+    omx._finish_micro_step()                                # batched develop must group correctly
+    for pp, nn in ((pmx_a, 16), (pmx_b, 24)):
+        qx, cx = omx._lowrank_qc(pp)
+        assert qx.shape == (32, 4) and cx.shape == (4, nn) and \
+            torch.allclose(qx.mT @ qx, torch.eye(4), atol=1e-5), "mixed-shape develop broken"
     # GA1 GATE: a 1-vote step must NOT develop from Y (falls to snapshot cadence; here cadence
     # never fires, so Q stays exactly where the last 2-vote boundary left it)
     q_before = q.clone()
