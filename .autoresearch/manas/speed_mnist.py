@@ -92,14 +92,21 @@ DATA = {"mnist1d": data_mnist1d, "mnist": data_mnist}
 MODEL = {"mnist1d": Net1D, "mnist": NetMNIST}
 
 
-def run(ds, seed, lr, manas, x, y, xt, yt):
+def law_gamma(lr):
+    """The dose law at this config: gamma = 0.08 * sqrt(lr/3e-4) * k/sqrt(m)."""
+    return 0.08 * (lr / 3e-4) ** 0.5 * GA / MICRO ** 0.5
+
+
+def run(ds, seed, lr, gamma, x, y, xt, yt):
+    """gamma=None -> muon; else manas at that probe_gamma (sketch window + lazy shift +
+    ga1 self-gate all on current defaults; ga=4 engages the full stack)."""
     torch.manual_seed(seed)
     model = MODEL[ds]().to(DEV)
     mats = [p for p in model.parameters() if p.ndim == 2]
     rest = [p for p in model.parameters() if p.ndim != 2]
     kw = (dict(micro_vote=True, probe_rho=1.0, probe_rho_step=0.96,
-               probe_gamma=0.01, probe_rank=8)                      # gamma_intra unset = gamma
-          if manas else dict(probe_gamma=0.0))
+               probe_gamma=gamma, probe_rank=8)                     # gamma_intra unset = gamma
+          if gamma is not None else dict(probe_gamma=0.0))
     opt = ManasOptimizer(mats, lr=lr, weight_decay=0.01, **kw)
     aux = torch.optim.AdamW(rest, lr=lr, weight_decay=0.01)
 
@@ -148,7 +155,7 @@ if __name__ == "__main__":
         # Phase 1: muon LR tune
         tune = {}
         for lr in (1e-3, 2e-3, 4e-3, 8e-3):
-            r = run(ds, 0, lr, False, x, y, xt, yt)
+            r = run(ds, 0, lr, None, x, y, xt, yt)
             tune[lr] = r["tail"]
             out[ds]["tune"][f"{lr:.0e}"] = {"tail": r["tail"], "acc": r["acc"]}
             save(out)
@@ -156,26 +163,32 @@ if __name__ == "__main__":
         lr_star = min(tune, key=tune.get)
         out[ds]["lr_star"] = lr_star
         print(f"  -> tuned muon lr = {lr_star:.0e}", flush=True)
-        # Phase 2: paired seeds
+        # Phase 2: paired seeds - muon vs OLD recipe (gamma 0.01, pre-sketch era value) vs
+        # NEW recipe (dose-law gamma, sketch window + lazy shift on current defaults)
+        g_law = law_gamma(lr_star)
+        print(f"  law gamma at lr {lr_star:.0e}: {g_law:.4f}", flush=True)
         rows = []
         for sd in SEEDS:
-            rm = run(ds, sd, lr_star, False, x, y, xt, yt)
-            rn = run(ds, sd, lr_star, True, x, y, xt, yt)
+            rm = run(ds, sd, lr_star, None, x, y, xt, yt)
+            ro = run(ds, sd, lr_star, 0.01, x, y, xt, yt)
+            rn = run(ds, sd, lr_star, g_law, x, y, xt, yt)
             s2 = steps_to(rn["losses"], rm["tail"])
-            print(f"  seed {sd}: muon tail {rm['tail']:.4f} acc {rm['acc']:.3f} | "
-                  f"manas tail {rn['tail']:.4f} acc {rn['acc']:.3f} | "
-                  f"delta {rn['tail'] - rm['tail']:+.4f} | manas hits muon-final at step "
+            print(f"  seed {sd}: muon {rm['tail']:.4f}/{rm['acc']:.3f} | "
+                  f"old(g0.01) {ro['tail']:.4f}/{ro['acc']:.3f} ({ro['tail'] - rm['tail']:+.4f}) | "
+                  f"NEW(g{g_law:.3f}) {rn['tail']:.4f}/{rn['acc']:.3f} "
+                  f"({rn['tail'] - rm['tail']:+.4f}) | new hits muon-final at "
                   f"{s2 if s2 else 'never'}/{STEPS[ds]}", flush=True)
-            rows.append({"seed": sd, "muon": rm, "manas": rn, "steps_to_muon_final": s2})
-            out[ds]["rows"] = [{**r, "muon": {k: v for k, v in r["muon"].items() if k != "losses"},
-                                "manas": {k: v for k, v in r["manas"].items() if k != "losses"}}
-                               for r in rows]
+            rows.append({"seed": sd, "muon": rm, "old": ro, "new": rn, "steps_to_muon_final": s2})
+            out[ds]["rows"] = [{**r, **{a: {k: v for k, v in r[a].items() if k != "losses"}
+                                        for a in ("muon", "old", "new")}} for r in rows]
             save(out)
-        dm = np.mean([r["manas"]["tail"] - r["muon"]["tail"] for r in rows])
-        da = np.mean([r["manas"]["acc"] - r["muon"]["acc"] for r in rows])
-        print(f"  == {ds}: mean tail delta {dm:+.4f} (neg = manas faster), "
-              f"mean acc delta {da:+.4f}, {time.time() - t0:.0f}s ==", flush=True)
-        out[ds]["mean_tail_delta"] = float(dm)
-        out[ds]["mean_acc_delta"] = float(da)
+        dn = np.mean([r["new"]["tail"] - r["muon"]["tail"] for r in rows])
+        do = np.mean([r["old"]["tail"] - r["muon"]["tail"] for r in rows])
+        da = np.mean([r["new"]["acc"] - r["muon"]["acc"] for r in rows])
+        print(f"  == {ds}: NEW mean tail delta {dn:+.4f} (old {do:+.4f}), "
+              f"NEW mean acc delta {da:+.4f}, {time.time() - t0:.0f}s ==", flush=True)
+        out[ds]["mean_tail_delta_new"] = float(dn)
+        out[ds]["mean_tail_delta_old"] = float(do)
+        out[ds]["mean_acc_delta_new"] = float(da)
         save(out)
     print("\nwrote speed_mnist_results.json", flush=True)
