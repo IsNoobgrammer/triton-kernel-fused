@@ -83,11 +83,12 @@ Micro-vote loop (gradient accumulation; vote() is a no-op when micro_vote=False)
 
 Probe memory, two modes:
   probe_rank=None (full)   : one model-shaped fp32 buffer `manas_d` per 2D/3D param.
-      With micro_vote + probe_rho_step (RECOMMENDED at 137M+): manas_d (fp32) + manas_prev_g
-      (bf16) = 1.5x model size, no sketch/QR/GEMMs — full-rank unit votes. Motivation: the
+      With micro_vote + probe_rho_step (RECOMMENDED at 137M+): manas_d + manas_prev_g, both
+      bf16 = 1x model size, no sketch/QR/GEMMs — full-rank unit votes. Motivation: the
       BiBo rank ladder was monotone (8 < 32 <= 64 < 512 on train and bpb; r512 beat muon bpb
       at every checkpoint but cost 34% tps in QR) — the sketch was the bottleneck; full
-      rank is the limit of the trend at ~zero compute and Adam-class total memory (2.5x).
+      rank is the limit of the trend at ~zero compute and EXACTLY Adam's total memory (2x
+      with Muon's momentum). bf16 rationale/checks in _full_state.
   probe_rank=r  (low-rank) : per matrix, d = Q @ C with Q (.., m, r) orthonormal and C (.., r, n)
       — r(m+n)/(m*n) of the full buffer (~3% at r=8, 512x1536). The basis is a randomized range
       of the current gradient, refreshed every `probe_refresh` probe updates (GaLore-style;
@@ -266,12 +267,13 @@ class ManasOptimizer(FusedMuon):
         # ladder was MONOTONE (8 < 32 <= 64 < 512 on train AND bpb; r512 the first config to
         # beat muon bpb at every checkpoint) -> the low-rank sketch itself was the bottleneck,
         # not vote count (k=8 == k=4 at fixed rank). Full rank is the limit of that trend and
-        # DELETES the machinery: no Q/omega/QR/sketch — state is manas_d (fp32, votes added
-        # directly, decayed rho_step at boundaries) + manas_prev_g (bf16 snapshot for the
-        # telescoping delta) = 1.5x model size (2.5x total with momentum; Adam pays 2x).
-        # Direct-add == fresh-block at history dose gamma*rho_step (4%, inside the flat
-        # plateau), so gamma_intra must stay == gamma. Shift = gamma*D. Two-clock only
-        # (probe_rho_step required); fp32 weights only (lazy shift). ~5 passes/micro, no GEMMs.
+        # DELETES the machinery: no Q/omega/QR/sketch — state is manas_d (votes added
+        # directly, decayed rho_step at boundaries) + manas_prev_g (snapshot for the
+        # telescoping delta), BOTH bf16 = 1x model size (2x total with momentum — exactly
+        # Adam's bill). Direct-add == fresh-block at history dose gamma*rho_step (4%, inside
+        # the flat plateau), so gamma_intra must stay == gamma. Shift = gamma*D. Two-clock
+        # only (probe_rho_step required); fp32 weights only (lazy shift). ~5 passes/micro,
+        # no GEMMs. bf16 precision audit (swamping, restore drift) in _full_state.
         # probe_min_votes (micro_vote mode): the probe ENGAGES only when the previous step
         # cast at least this many votes. Default 2 = the measured recommendation baked in:
         # at ga1 Manas IS aurora Muon - no probe shifts, no vote GEMMs, no buffers, zero
@@ -467,17 +469,24 @@ class ManasOptimizer(FusedMuon):
         return st["manas_d"]
 
     def _full_state(self, p):
-        """Full-rank micro-vote buffers, 1.5x model size (2.5x total with Muon's momentum):
+        """Full-rank micro-vote buffers, BOTH bf16 = 1x model size (2x total with Muon's
+        momentum — exactly Adam's bill). bf16 keeps the full fp32 exponent range (no
+        overflow/underflow anywhere) and drops mantissa to ~0.4% relative — angular noise
+        far below what the consensus direction itself carries.
         manas_d = D, raw unit votes added DIRECTLY at vote time, decayed rho_step at
         boundaries. No separate fresh block: direct-add == fresh-block with the history dose
         renormalized gamma -> gamma*rho_step (a vote ages one boundary early), a 4% shift
-        inside the measured-flat gamma plateau — requires gamma_intra == gamma (enforced at
-        init). manas_prev_g = bf16 accumulating-grad snapshot for the telescoping vote delta
-        (~0.4% quantization on the delta, eaten by the unit normalization; halves the
-        snapshot)."""
+        inside the measured-flat gamma plateau — requires gamma_intra == gamma (enforced).
+        Swamping check: a unit vote is ~(1-rho) of D per element vs bf16 resolution 2^-8 —
+        votes land ~10x above the rounding floor at rho 0.96 (tight only at rho >= 0.99).
+        Restore drift: theta takes fp32 vote increments but D absorbs them bf16-rounded, so
+        the step-end restore leaks ~gamma*2^-8*|D| per element per step into the weights as
+        a random walk — ~0.1% of weight scale over a 2k-step run, same order as bf16
+        training noise. manas_prev_g = bf16 accumulating-grad snapshot for the telescoping
+        vote delta (~0.4% quantization on the delta, eaten by the unit normalization)."""
         st = self.state[p]
         if "manas_prev_g" not in st:
-            self._full_d(p)
+            st["manas_d"] = torch.zeros_like(p, dtype=torch.bfloat16)
             st["manas_prev_g"] = torch.zeros_like(p, dtype=torch.bfloat16)
         return st
 
@@ -526,7 +535,7 @@ class ManasOptimizer(FusedMuon):
         """Dense probe offset for one param (view for full mode, materialized for low-rank)."""
         if self.probe_rank is None:
             if self.micro_vote:                  # full-rank two-clock: raw storage, dosed here
-                return self.probe_gamma * self._full_state(p)["manas_d"]
+                return self.probe_gamma * self._full_state(p)["manas_d"].to(torch.float32)
             return self._full_d(p)
         q, _c = self._lowrank_qc(p)
         return q @ self._coef_of(p)
@@ -608,15 +617,15 @@ class ManasOptimizer(FusedMuon):
                 # full-rank two-clock: first apply of the step shifts by the dosed total;
                 # every vote() then mirrors its own block increment straight onto theta
                 # (lazy sync), so later applies are no-ops. Restore recomputes the same
-                # total at step() — value-exact, fp32-rounding drift only (same class the
-                # low-rank lazy path accepts). Don't change gamma between micros.
+                # total at step() — value-equal up to bf16 D rounding (drift quantified in
+                # _full_state). Don't change gamma between micros. Per-param loop: mixed
+                # bf16/fp32 in-place foreach is unsupported; ~100 launches, bandwidth-bound.
                 if not self._lazy_ok():
                     raise RuntimeError("full-rank micro_vote requires fp32 weights (lazy shift)")
                 if not self._shift_on:
-                    sps = [p for p in ps if "manas_prev_g" in self.state[p]]
-                    if sps:
-                        torch._foreach_add_(sps, [self.state[p]["manas_d"] for p in sps],
-                                            alpha=self.probe_gamma)
+                    for p in ps:
+                        if "manas_prev_g" in self.state[p]:
+                            p.add_(self.state[p]["manas_d"], alpha=self.probe_gamma)
                     self._shift_on = True
             elif not self._shift_on:             # full-d step-vote: all-or-nothing (d fixed)
                 ds = [self._full_d(p) for p in ps]
@@ -675,10 +684,9 @@ class ManasOptimizer(FusedMuon):
         ps = self._probe_params()
         if self.probe_rank is None:
             if self.micro_vote:                  # subtract the dosed total (see apply_probe)
-                sps = [p for p in ps if "manas_prev_g" in self.state[p]]
-                if sps:
-                    torch._foreach_add_(sps, [self.state[p]["manas_d"] for p in sps],
-                                        alpha=-self.probe_gamma)
+                for p in ps:
+                    if "manas_prev_g" in self.state[p]:
+                        p.add_(self.state[p]["manas_d"], alpha=-self.probe_gamma)
                 self._shift_on = False
                 return
             ds = [self._full_d(p) for p in ps]
@@ -747,7 +755,9 @@ class ManasOptimizer(FusedMuon):
             gn = pn if self.probe_norm == "perparam" else torch.linalg.vector_norm(pn)
             inv = torch.where(torch.isfinite(gn) & (gn > 0), 1.0 / gn, torch.zeros_like(gn))
             invs = [inv] * len(ps) if inv.ndim == 0 else list(inv.unbind())
-            torch._foreach_addcmul_(dhist, deltas, invs, value=-1.0)     # raw unit vote
+            for d, delta, iv in zip(dhist, deltas, invs):        # raw unit vote (bf16 D:
+                d.sub_((delta * iv).to(torch.bfloat16))          # explicit downcast — mixed
+                                                                 # in-place foreach would raise)
             if self._shift_on and self.probe_gamma:
                 torch._foreach_addcmul_(sync, deltas, invs, value=-self.probe_gamma)
             return
@@ -1239,10 +1249,13 @@ if __name__ == "__main__":                                           # pragma: n
     assert torch.allclose(of._d_of(pf), ol._d_of(pl), rtol=0.02, atol=1e-3), \
         "full-rank must equal dose-renormalized low-rank across the boundary"
     st_f = of.state[pf]
-    assert st_f["manas_d"].norm() > 0 and st_f["manas_prev_g"].dtype == torch.bfloat16, \
-        "full-rank: D live, snapshot bf16"
-    # 10G) full-rank lazy sync: theta tracks gamma*D + gamma_i*Dnow through votes;
-    #      restore returns clean theta; boundary resets per-step buffers
+    assert st_f["manas_d"].dtype == torch.bfloat16 \
+        and st_f["manas_prev_g"].dtype == torch.bfloat16 and st_f["manas_d"].norm() > 0, \
+        "full-rank: D live, both buffers bf16"
+    # 10G) full-rank lazy sync: theta tracks gamma*D through votes; restore returns clean
+    #      theta; boundary decays D and resets the snapshot. Tolerances are bf16-sized:
+    #      theta takes fp32 vote increments while D absorbs them bf16-rounded, so sync and
+    #      restore agree to ~gamma*2^-8*|D| (the quantified drift), not machine eps.
     p = torch.nn.Parameter(torch.randn(6, 8))
     o = ManasOptimizer([p], probe_rank=None, micro_vote=True, probe_rho=1.0,
                        probe_rho_step=0.9, probe_gamma=0.05)
@@ -1251,16 +1264,17 @@ if __name__ == "__main__":                                           # pragma: n
     o.apply_probe()
     assert torch.allclose(p, p0) and o._shift_on, "empty consensus: shift flagged, theta still"
     p.grad = torch.randn(6, 8); o.remove_probe(); o.vote()
-    assert torch.allclose(p - p0, o._d_of(p), atol=1e-6), "vote must sync theta to current d"
+    assert torch.allclose(p - p0, o._d_of(p), atol=1e-3), "vote must sync theta to current d"
     o.apply_probe()                                             # no-op (already synced)
     p.grad = p.grad + torch.randn(6, 8); o.remove_probe(); o.vote()
-    assert torch.allclose(p - p0, o._d_of(p), atol=1e-6), "second vote must keep theta synced"
+    assert torch.allclose(p - p0, o._d_of(p), atol=1e-3), "second vote must keep theta synced"
     o._restore_theta()
-    assert torch.allclose(p, p0, atol=1e-5) and not o._shift_on, "restore must return clean theta"
+    assert torch.allclose(p, p0, atol=1e-3) and not o._shift_on, "restore must return clean theta"
     d_pre = o.state[p]["manas_d"].clone()
     o._finish_micro_step()
     st = o.state[p]
-    assert st["manas_prev_g"].norm() == 0 and torch.allclose(st["manas_d"], 0.9 * d_pre), \
+    assert st["manas_prev_g"].norm() == 0 \
+        and torch.allclose(st["manas_d"].float(), 0.9 * d_pre.float(), rtol=0.01), \
         "boundary: D decays rho_step, snapshot resets"
     # 10a) refresh auto-couples to the active rho clock; explicit value and live rho both honored
     o_auto = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4,
