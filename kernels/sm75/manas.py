@@ -304,11 +304,21 @@ class ManasOptimizer(FusedMuon):
         return [p for g in self.param_groups for p in g["params"] if p.ndim in (2, 3)]
 
     def _ensure_groups(self):
-        """Persistent SHAPE-GROUPED backing tensors: same-shape params share one stacked
-        (G, *lead, ...) buffer, and each per-param self.state[p]["manas_X"] is a VIEW into
-        it (so every legacy per-param code path keeps working). The hot per-micro paths
-        (vote / apply_probe / _restore_theta) then run ONE batched matmul + foreach per shape
-        group instead of a Python loop over ~70 matrices, killing the launch overhead."""
+        """Persistent SHAPE-GROUPED + FLAT backing, three layers of the same trick:
+          1. RESTACKED PARAMS: same-shape params' p.data become views into one contiguous
+             (G, *shape) tensor, so the probe shift/restore is a single in-place baddbmm_
+             per group - no materialized d, no unbind, no foreach over G tensors.
+          2. PINNED GRADS (micro_vote, fp32): p.grad is assigned a view into a matching
+             (G, *shape) stack before backward (_pin_grads via apply_probe), so vote()
+             reads the stacked gradient with ZERO copies. Anything may replace p.grad
+             (harness-style synthetic grads); vote() detects that and falls back to the
+             stack-copy path - the pin is a fast path, never a correctness dependency.
+          3. FLAT RANK-SPACE ARENAS: every rank-space buffer kind (c/cnow/prev_proj/
+             applied/cs and y/ynow/prev_yp + GEMM scratch) is ONE flat fp32 tensor with
+             per-group views into it, so cross-group elementwise work (fold, decay, vote
+             accumulate, resets) is a single launch instead of foreach over ~140 views.
+        Each per-param self.state[p]["manas_X"] stays a VIEW into the group buffer, so
+        every legacy per-param code path keeps working."""
         if self._pg is not None:
             return self._pg
         from collections import OrderedDict
@@ -318,34 +328,70 @@ class ManasOptimizer(FusedMuon):
         fresh = self.probe_rho_step is not None
         sk = self.probe_sketch_rho is not None
         nexus = bool(self.nexus_gamma)
-        pg = []
+        dev = next(iter(groups.values()))[0].device
+        metas, c_total, y_total = [], 0, 0
         for shape, grp in groups.items():
-            G = len(grp); p0 = grp[0]
+            p0 = grp[0]; G = len(grp)
             m, n = p0.shape[-2], p0.shape[-1]
-            r = self._rank_for(m, n); lead = tuple(p0.shape[:-2]); dev = p0.device
-            numel = p0.numel()
+            r = self._rank_for(m, n); lead = tuple(p0.shape[:-2])
+            L = 1
+            for s in lead:
+                L *= s
+            metas.append((shape, grp, G, m, n, r, lead, L, c_total, y_total))
+            c_total += G * L * r * n
+            y_total += G * L * m * r
+        fl = {k: torch.zeros(c_total, device=dev, dtype=torch.float32)
+              for k in ("c", "prev_proj", "applied", "projpad")}
+        if fresh:
+            fl["cnow"] = torch.zeros(c_total, device=dev, dtype=torch.float32)
+        if nexus:
+            fl["cs"] = torch.zeros(c_total, device=dev, dtype=torch.float32)
+        if sk:
+            for k in ("y", "ynow", "prev_yp", "ypad"):
+                fl[k] = torch.zeros(y_total, device=dev, dtype=torch.float32)
+        self._flat = fl
+        pg = []
+        for shape, grp, G, m, n, r, lead, L, co, yo in metas:
+            p0 = grp[0]; numel = p0.numel()
+            csz, ysz = G * L * r * n, G * L * m * r
+            def cview(k): return fl[k][co:co + csz].view(G, *lead, r, n)
+            def yview(k): return fl[k][yo:yo + ysz].view(G, *lead, m, r)
             # q init is per-param but shape (hence numel) is identical across the group ->
             # identical seed -> identical q; reproduce it once and stack (bit-for-bit parity).
             gq = torch.Generator(device="cpu").manual_seed(0x9A5 + numel)
             q0 = torch.linalg.qr(torch.randn(*lead, m, r, generator=gq).to(dev))[0].to(torch.float32)
             q_b = q0.unsqueeze(0).expand(G, *q0.shape).contiguous()
-            c_b = torch.zeros(G, *lead, r, n, device=dev, dtype=torch.float32)
-            buf = dict(shape=shape, params=grp, G=G, r=r, lead=lead,
-                       q=q_b, c=c_b, prev_proj=torch.zeros_like(c_b), applied=torch.zeros_like(c_b))
+            # RESTACK params: same values, storage now one contiguous (G, *shape) tensor
+            pstk = torch.empty(G, *shape, device=dev, dtype=p0.dtype)
+            for i, p in enumerate(grp):
+                pstk[i].copy_(p.data)
+                p.data = pstk[i]
+            buf = dict(shape=shape, params=grp, G=G, r=r, lead=lead, co=co, csz=csz,
+                       q=q_b, c=cview("c"), prev_proj=cview("prev_proj"),
+                       applied=cview("applied"), projpad=cview("projpad"),
+                       pstk=pstk, p3=pstk.view(G * L, m, n), q3=q_b.view(G * L, m, r),
+                       a3=fl["applied"][co:co + csz].view(G * L, r, n),
+                       pp3=fl["projpad"][co:co + csz].view(G * L, r, n))
             if fresh:
-                buf["cnow"] = torch.zeros_like(c_b)
+                buf["cnow"] = cview("cnow")
+            if nexus:
+                buf["cs"] = cview("cs")
+            if self.micro_vote and p0.dtype == torch.float32:
+                buf["gstk"] = torch.zeros(G, *shape, device=dev, dtype=torch.float32)
+                buf["gviews"] = list(buf["gstk"].unbind(0))
+                buf["gf"] = torch.empty_like(buf["gstk"])
+                buf["gf3"] = buf["gf"].view(G * L, m, n)
             if sk:
                 go = torch.Generator(device="cpu").manual_seed(0x51E7C4 ^ numel)
                 o0 = torch.randn(*lead, n, r, generator=go).to(dev).to(torch.float32)
                 buf["omega"] = o0.unsqueeze(0).expand(G, *o0.shape).contiguous()
-                buf["y"] = torch.zeros_like(q_b)
-                buf["ynow"] = torch.zeros_like(q_b)
-                buf["prev_yp"] = torch.zeros_like(q_b)
-            if nexus:
-                buf["cs"] = torch.zeros_like(c_b)
+                buf["omega3"] = buf["omega"].view(G * L, n, r)
+                buf["y"] = yview("y"); buf["ynow"] = yview("ynow")
+                buf["prev_yp"] = yview("prev_yp"); buf["ypad"] = yview("ypad")
+                buf["yp3"] = fl["ypad"][yo:yo + ysz].view(G * L, m, r)
             for i, p in enumerate(grp):
                 st = self.state[p]
-                st["manas_q"] = q_b[i]; st["manas_c"] = c_b[i]
+                st["manas_q"] = q_b[i]; st["manas_c"] = buf["c"][i]
                 st["manas_prev_proj"] = buf["prev_proj"][i]; st["manas_applied"] = buf["applied"][i]
                 if fresh: st["manas_cnow"] = buf["cnow"][i]
                 if sk:
@@ -355,6 +401,25 @@ class ManasOptimizer(FusedMuon):
             pg.append(buf)
         self._pg = pg
         return pg
+
+    def _pin_grads(self, pg):
+        """Pin p.grad as views into the group grad stack BEFORE backward, so autograd
+        accumulates straight into the stacked buffer and vote() is copy-free. Only fills
+        missing (None) grads - an existing foreign p.grad is left alone and vote() copies."""
+        for buf in pg:
+            gv = buf.get("gviews")
+            if gv is None:
+                continue
+            miss = [i for i, p in enumerate(buf["params"]) if p.grad is None]
+            if not miss:
+                continue
+            if len(miss) == len(buf["params"]):
+                buf["gstk"].zero_()
+            else:
+                for i in miss:
+                    gv[i].zero_()
+            for i in miss:
+                buf["params"][i].grad = gv[i]
 
     def _full_d(self, p):
         st = self.state[p]
@@ -492,21 +557,26 @@ class ManasOptimizer(FusedMuon):
                         p.add_(d.to(p.dtype))
                 self._shift_on = True
         elif self._lazy_ok():
-            # low-rank lazy, BATCHED per shape group: add only the delta of the coefficients
-            # since the last apply. One matmul + one foreach_add per group (not per matrix).
-            fresh = self.probe_rho_step is not None
-            for buf in self._ensure_groups():
-                if fresh:
-                    coef = self.probe_gamma * buf["c"]
-                    if "cnow" in buf:
-                        coef = coef + self.probe_gamma_intra * buf["cnow"]
-                else:
-                    coef = buf["c"].clone()
-                if "cs" in buf:
-                    coef = coef + buf["cs"]
-                d = buf["q"] @ (coef - buf["applied"])       # (G,*lead,m,n) batched
-                torch._foreach_add_(buf["params"], list(d.unbind(0)))
-                buf["applied"].copy_(coef)
+            # low-rank lazy: coefficient delta on the FLAT arena (a few tiny launches for
+            # ALL groups), then ONE in-place baddbmm_ per shape group writes the shift
+            # straight into the restacked weights - no materialized d, no foreach.
+            pg = self._ensure_groups()
+            if self.micro_vote:
+                self._pin_grads(pg)          # backward lands in the vote()-ready stack
+            fl = self._flat
+            if self.probe_rho_step is not None:
+                coef = self.probe_gamma * fl["c"]
+                if "cnow" in fl:
+                    coef.add_(fl["cnow"], alpha=self.probe_gamma_intra)
+            else:
+                coef = fl["c"].clone()
+            if "cs" in fl:
+                coef.add_(fl["cs"])
+            dcoef = coef - fl["applied"]
+            fl["applied"].copy_(coef)
+            for buf in pg:
+                d3 = dcoef[buf["co"]:buf["co"] + buf["csz"]].view_as(buf["a3"])
+                buf["p3"].baddbmm_(buf["q3"], d3)            # theta += q @ dcoef, in place
             self._shift_on = True
         else:
             for p in ps:                         # exact pair path (non-fp32 weights)
@@ -541,10 +611,9 @@ class ManasOptimizer(FusedMuon):
                 for p, d in zip(ps, ds):
                     p.sub_(d.to(p.dtype))
         elif self._lazy_ok():
-            for buf in self._ensure_groups():        # BATCHED: one matmul + foreach per group
-                d = buf["q"] @ buf["applied"]
-                torch._foreach_sub_(buf["params"], list(d.unbind(0)))
-                buf["applied"].zero_()
+            for buf in self._ensure_groups():        # ONE in-place baddbmm_ per group
+                buf["p3"].baddbmm_(buf["q3"], buf["a3"], alpha=-1.0)
+            self._flat["applied"].zero_()            # one flat launch for all groups
         else:
             for p in ps:
                 ap = self.state[p].get("manas_applied")
@@ -587,47 +656,68 @@ class ManasOptimizer(FusedMuon):
         sk = self.probe_sketch_rho is not None
         nxs = (self.nexus_gamma / self.probe_gamma) if self.nexus_gamma else 0.0
         if len(ps) == len(self._probe_params()):
-            # ================= BATCHED per shape group (launch-bound fix) =================
-            # ONE stacked matmul + a handful of foreach/elementwise per shape group instead of
-            # a Python loop over ~70 matrices. Bit-parity with the per-param path (same math,
-            # only the reduction ORDER of the global grad-norm differs, ~1e-7).
-            self._ensure_groups()
-            gdelta, pnorms = [], []
-            for buf in self._pg:
-                g_stk = torch.stack([p.grad for p in buf["params"]])
-                gf = torch.nan_to_num(g_stk, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
+            # ============ BATCHED per shape group + FLAT tail (launch-bound fix) ============
+            # Per group: sanitize the PINNED grad stack in place-free out= (zero copies when
+            # backward accumulated into our views) and run the two rank-r GEMMs with out=
+            # into the flat scratch arenas. Then the whole vote tail (delta, norm, decay,
+            # accumulate) is a handful of launches on the FLAT tensors, all groups at once.
+            # Bit-parity with the per-param path (same elementwise math; only the reduction
+            # ORDER of the global grad-norm differs, ~1e-7).
+            pg = self._ensure_groups()
+            fl = self._flat
+            pnorms = []
+            for buf in pg:
+                gv = buf.get("gviews")
+                if gv is not None and all(p.grad is gv[i]
+                                          for i, p in enumerate(buf["params"])):
+                    torch.nan_to_num(buf["gstk"], nan=0.0, posinf=0.0, neginf=0.0,
+                                     out=buf["gf"])
+                    gf3 = buf["gf3"]
+                else:                        # foreign grads (synthetic/harness): copy path
+                    g_stk = torch.stack([p.grad for p in buf["params"]])
+                    gf = torch.nan_to_num(g_stk, nan=0.0, posinf=0.0,
+                                          neginf=0.0).to(torch.float32)
+                    gf3 = gf.view_as(buf["p3"])
                 if sk:
-                    yp = gf @ buf["omega"]
-                    dy = yp - buf["prev_yp"]
-                    buf["prev_yp"].copy_(yp)
+                    torch.matmul(gf3, buf["omega3"], out=buf["yp3"])
+                    dy = buf["ypad"] - buf["prev_yp"]
+                    buf["prev_yp"].copy_(buf["ypad"])
                     ny = torch.linalg.vector_norm(dy, dim=tuple(range(1, dy.ndim)))
                     invy = torch.where(torch.isfinite(ny) & (ny > 0), 1.0 / ny, torch.zeros_like(ny))
                     buf["ynow"].add_(dy * invy.view(-1, *([1] * (dy.ndim - 1))))
-                proj = buf["q"].mT @ gf
-                delta = proj - buf["prev_proj"]
-                buf["prev_proj"].copy_(proj)
-                gdelta.append(delta)
-                pnorms.append(torch.linalg.vector_norm(delta, dim=tuple(range(1, delta.ndim))))
-            if self.probe_norm == "perparam":
-                invs = []
-                for pn in pnorms:
-                    iv = self.probe_gamma / pn
-                    invs.append(torch.where(torch.isfinite(iv) & (pn > 0), iv, torch.zeros_like(iv)))
-            else:
+                torch.matmul(buf["q3"].mT, gf3, out=buf["pp3"])
+            delta = fl["projpad"] - fl["prev_proj"]              # ALL groups, one launch
+            fl["prev_proj"].copy_(fl["projpad"])
+            for buf in pg:                                       # per-matrix norms (ragged)
+                dv = delta[buf["co"]:buf["co"] + buf["csz"]].view(buf["G"], -1)
+                pnorms.append(torch.linalg.vector_norm(dv, dim=1))
+            if self.probe_norm != "perparam":                    # global (default): flat tail
                 gn = torch.linalg.vector_norm(torch.cat(pnorms))
                 iv0 = self.probe_gamma / gn
                 iv0 = torch.where(torch.isfinite(iv0) & (gn > 0), iv0, torch.zeros_like(iv0))
-                invs = [iv0] * len(self._pg)
-            for j, buf in enumerate(self._pg):
-                iv = invs[j] / self.probe_gamma if fresh else invs[j]   # raw unit votes (fresh)
-                delta = gdelta[j]
-                ivb = iv if iv.ndim == 0 else iv.view(-1, *([1] * (delta.ndim - 1)))
+                if fresh:
+                    iv0 = iv0 / self.probe_gamma                 # raw unit votes (fresh)
+                tgt = fl["cnow"] if fresh else fl["c"]
+                if self.probe_rho != 1.0:
+                    tgt.mul_(self.probe_rho)
+                tgt.addcmul_(delta, iv0, value=-1.0)             # consensus vote
+                if nxs:
+                    fl["cs"].addcmul_(delta, iv0 * nxs, value=-1.0)   # walker
+                return
+            for j, buf in enumerate(pg):                         # perparam: ragged per group
+                pn = pnorms[j]
+                iv = self.probe_gamma / pn
+                iv = torch.where(torch.isfinite(iv) & (pn > 0), iv, torch.zeros_like(iv))
+                if fresh:
+                    iv = iv / self.probe_gamma
+                dg = delta[buf["co"]:buf["co"] + buf["csz"]].view_as(buf["c"])
+                ivb = iv.view(-1, *([1] * (dg.ndim - 1)))
                 tgt = buf["cnow"] if fresh else buf["c"]
                 if self.probe_rho != 1.0:
                     tgt.mul_(self.probe_rho)
-                tgt.addcmul_(delta, ivb, value=-1.0)                     # consensus vote
+                tgt.addcmul_(dg, ivb, value=-1.0)
                 if nxs:
-                    buf["cs"].addcmul_(delta, ivb * nxs, value=-1.0)     # walker
+                    buf["cs"].addcmul_(dg, ivb * nxs, value=-1.0)
             return
         # ================= fallback: per-param (partial-grad step) =================
         deltas, norms = [], []
@@ -697,28 +787,46 @@ class ManasOptimizer(FusedMuon):
             self._probe_updates += 1
             ps = self._probe_params()
             sk = self.probe_sketch_rho is not None
-            # ---- BATCHED BOUNDARY (launch-bound at toy scale: fold/zero via foreach, ----
-            # ---- QR + re-projection batched per shape group instead of per matrix)  ----
+            # ---- BATCHED BOUNDARY: folds/zeros are single launches on the FLAT arenas, ----
+            # ---- QR + re-projection run straight off the group buffers (no re-stack)  ----
+            fl = getattr(self, "_flat", None) if self._pg is not None else None
             if self.probe_rho_step is not None:
-                cs_fold = [self.state[p]["manas_c"] for p in ps if "manas_c" in self.state[p]
-                           and "manas_cnow" in self.state[p]]
-                cn_fold = [self.state[p]["manas_cnow"] for p in ps if "manas_c" in self.state[p]
-                           and "manas_cnow" in self.state[p]]
-                if cs_fold:
-                    torch._foreach_mul_(cs_fold, self.probe_rho_step)   # history ages one step
-                    torch._foreach_add_(cs_fold, cn_fold)               # raw block folds, coeff 1
-                    torch._foreach_zero_(cn_fold)                       # (BEFORE develop: same basis)
+                if fl is not None and "cnow" in fl:
+                    fl["c"].mul_(self.probe_rho_step)       # history ages one step
+                    fl["c"].add_(fl["cnow"])                # raw block folds, coeff 1
+                    fl["cnow"].zero_()                      # (BEFORE develop: same basis)
+                else:
+                    cs_fold = [self.state[p]["manas_c"] for p in ps if "manas_c" in self.state[p]
+                               and "manas_cnow" in self.state[p]]
+                    cn_fold = [self.state[p]["manas_cnow"] for p in ps if "manas_c" in self.state[p]
+                               and "manas_cnow" in self.state[p]]
+                    if cs_fold:
+                        torch._foreach_mul_(cs_fold, self.probe_rho_step)
+                        torch._foreach_add_(cs_fold, cn_fold)
+                        torch._foreach_zero_(cn_fold)
             develop = sk and self._votes_cast >= self._sketch_gate
             gps = [p for p in ps if p.grad is not None and "manas_omega" in self.state[p]] \
                 if sk else []
-            if sk and gps:
+            full = sk and fl is not None and "y" in fl and len(gps) == len(ps)
+            if full:
+                fl["y"].mul_(self.probe_sketch_rho)         # Y = rho_q*Y + Y_now, one launch
+                fl["y"].add_(fl["ynow"])
+                fl["ynow"].zero_()
+                fl["prev_yp"].zero_()
+            elif sk and gps:
                 ys = [self.state[p]["manas_y"] for p in gps]
                 yn = [self.state[p]["manas_ynow"] for p in gps]
-                torch._foreach_mul_(ys, self.probe_sketch_rho)          # Y = rho_q*Y + Y_now
+                torch._foreach_mul_(ys, self.probe_sketch_rho)
                 torch._foreach_add_(ys, yn)
                 torch._foreach_zero_(yn)
                 torch._foreach_zero_([self.state[p]["manas_prev_yp"] for p in gps])
-            if develop and gps:
+            if develop and full:
+                for buf in self._pg:                        # already stacked: QR in place
+                    q_new = torch.linalg.qr(buf["y"])[0]
+                    c_new = (q_new.mT @ buf["q"]) @ buf["c"]
+                    buf["c"].copy_(c_new)
+                    buf["q"].copy_(q_new)
+            elif develop and gps:
                 groups = {}
                 for p in gps:                            # group by FULL param shape: q (m,r)
                     groups.setdefault(p.shape, []).append(p)   # AND c (r,n) must both stack
@@ -743,10 +851,15 @@ class ManasOptimizer(FusedMuon):
                     q_new = torch.linalg.qr(gf @ omega)[0]
                     c.copy_((q_new.mT @ q) @ c)
                     q.copy_(q_new)
-            resets = [self.state[p][k] for p in ps for k in ("manas_prev_proj", "manas_cs")
-                      if k in self.state[p]]
-            if resets:
-                torch._foreach_zero_(resets)     # p.grad restarts; walker never crosses a boundary
+            if fl is not None:
+                fl["prev_proj"].zero_()          # p.grad restarts; walker never crosses
+                if "cs" in fl:
+                    fl["cs"].zero_()
+            else:
+                resets = [self.state[p][k] for p in ps for k in ("manas_prev_proj", "manas_cs")
+                          if k in self.state[p]]
+                if resets:
+                    torch._foreach_zero_(resets)
         self._votes_cast = 0
 
     @torch.no_grad()
