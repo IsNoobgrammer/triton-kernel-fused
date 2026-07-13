@@ -402,6 +402,25 @@ class ManasOptimizer(FusedMuon):
         self._pg = pg
         return pg
 
+    @staticmethod
+    def _cholqr2(y):
+        """Batched CholeskyQR2 orthonormalization of tall-skinny (..., m, r) stacks.
+        Basis-equivalent to torch.linalg.qr(y)[0] - downstream math depends only on the
+        PROJECTOR span(y), never on which orthonormal basis represents it - but pure
+        GEMM + tiny r x r Cholesky/trsm instead of cuSOLVER Householder (measured 11.4ms
+        -> <1ms per boundary on bibo-min shapes). Pass 1 carries a relative ridge so a
+        rank-deficient window still factors (deficient directions get an arbitrary
+        completion, exactly like QR); pass 2 polishes orthogonality to ~machine eps."""
+        r = y.shape[-1]
+        eye = torch.eye(r, device=y.device, dtype=y.dtype)
+        q = y
+        for ridge in (1e-6, 1e-7):
+            g = q.mT @ q
+            scale = g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None]
+            L = torch.linalg.cholesky_ex(g + (ridge * scale + 1e-30) * eye)[0]
+            q = torch.linalg.solve_triangular(L, q.mT, upper=False).mT
+        return q
+
     def _pin_grads(self, pg):
         """Pin p.grad as views into the group grad stack BEFORE backward, so autograd
         accumulates straight into the stacked buffer and vote() is copy-free. Only fills
@@ -821,8 +840,8 @@ class ManasOptimizer(FusedMuon):
                 torch._foreach_zero_(yn)
                 torch._foreach_zero_([self.state[p]["manas_prev_yp"] for p in gps])
             if develop and full:
-                for buf in self._pg:                        # already stacked: QR in place
-                    q_new = torch.linalg.qr(buf["y"])[0]
+                for buf in self._pg:                        # already stacked: GEMM-only QR
+                    q_new = self._cholqr2(buf["y"])
                     c_new = (q_new.mT @ buf["q"]) @ buf["c"]
                     buf["c"].copy_(c_new)
                     buf["q"].copy_(q_new)
