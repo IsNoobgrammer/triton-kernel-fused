@@ -83,6 +83,11 @@ Micro-vote loop (gradient accumulation; vote() is a no-op when micro_vote=False)
 
 Probe memory, two modes:
   probe_rank=None (full)   : one model-shaped fp32 buffer `manas_d` per 2D/3D param.
+      With micro_vote + probe_rho_step (RECOMMENDED at 137M+): 3 fp32 buffers per param
+      (D/Dnow/prev_g), no sketch/QR/GEMMs — full-rank unit votes. Motivation: the BiBo
+      rank ladder was monotone (8 < 32 <= 64 < 512 on train and bpb; r512 beat muon bpb
+      at every checkpoint but cost 34% tps in QR) — the sketch was the bottleneck; full
+      rank is the limit of the trend at ~zero compute.
   probe_rank=r  (low-rank) : per matrix, d = Q @ C with Q (.., m, r) orthonormal and C (.., r, n)
       — r(m+n)/(m*n) of the full buffer (~3% at r=8, 512x1536). The basis is a randomized range
       of the current gradient, refreshed every `probe_refresh` probe updates (GaLore-style;
@@ -257,6 +262,15 @@ class ManasOptimizer(FusedMuon):
         # the probe shift IS the inner walk. Base Muon consumes mean-grad + alignment force.
         # Walker ceiling = nexus_gamma * (micros per step); keep it in the reach band (~0.2-0.5).
         self.micro_vote = bool(micro_vote)
+        # FULL-RANK MICRO-VOTE (probe_rank=None + micro_vote, 2026-07-14): the BiBo 137M rank
+        # ladder was MONOTONE (8 < 32 <= 64 < 512 on train AND bpb; r512 the first config to
+        # beat muon bpb at every checkpoint) -> the low-rank sketch itself was the bottleneck,
+        # not vote count (k=8 == k=4 at fixed rank). Full rank is the limit of that trend and
+        # DELETES the machinery: no Q/omega/QR/sketch — state is 3 fp32 model-shaped buffers
+        # (manas_d history, manas_dnow fresh block, manas_prev_g snapshot), the vote is a
+        # telescoping full-grad delta, unit-normalized, raw storage, both doses at probe time:
+        # shift = gamma*D + gamma_intra*Dnow. Two-clock only (probe_rho_step required);
+        # fp32 weights only (lazy shift). Costs ~5 elementwise passes/micro, no GEMMs.
         # probe_min_votes (micro_vote mode): the probe ENGAGES only when the previous step
         # cast at least this many votes. Default 2 = the measured recommendation baked in:
         # at ga1 Manas IS aurora Muon - no probe shifts, no vote GEMMs, no buffers, zero
@@ -269,7 +283,10 @@ class ManasOptimizer(FusedMuon):
         self._votes_last = 0                 # previous step's vote count (0 = not yet seen)
         self.nexus_gamma = float(nexus_gamma)
         if self.micro_vote and self.probe_rank is None:
-            raise ValueError("micro_vote=True requires a low-rank probe (probe_rank is None)")
+            if self.probe_rho_step is None:
+                raise ValueError("full-rank micro_vote requires probe_rho_step (two-clock mode)")
+            if self.nexus_gamma:
+                raise ValueError("nexus_gamma requires a low-rank probe")
         if self.nexus_gamma and not self.micro_vote:
             raise ValueError("nexus_gamma requires micro_vote=True")
         self._votes_cast = 0
@@ -445,6 +462,17 @@ class ManasOptimizer(FusedMuon):
             st["manas_d"] = torch.zeros_like(p, dtype=torch.float32)
         return st["manas_d"]
 
+    def _full_state(self, p):
+        """Full-rank micro-vote buffers: manas_d = history D (raw unit votes, rho_step-decayed
+        at boundaries), manas_dnow = this step's fresh block, manas_prev_g = accumulating-grad
+        snapshot for the telescoping vote delta. All fp32, model-shaped."""
+        st = self.state[p]
+        if "manas_dnow" not in st:
+            self._full_d(p)
+            st["manas_dnow"] = torch.zeros_like(p, dtype=torch.float32)
+            st["manas_prev_g"] = torch.zeros_like(p, dtype=torch.float32)
+        return st
+
     def _rank_for(self, m, n):
         r = self.probe_rank
         r = max(1, round(r * min(m, n))) if isinstance(r, float) else int(r)   # float => fraction
@@ -489,6 +517,10 @@ class ManasOptimizer(FusedMuon):
     def _d_of(self, p):
         """Dense probe offset for one param (view for full mode, materialized for low-rank)."""
         if self.probe_rank is None:
+            if self.micro_vote:                  # full-rank two-clock: raw storage, dosed here
+                st = self._full_state(p)
+                return self.probe_gamma * st["manas_d"] \
+                    + self.probe_gamma_intra * st["manas_dnow"]
             return self._full_d(p)
         q, _c = self._lowrank_qc(p)
         return q @ self._coef_of(p)
@@ -566,7 +598,23 @@ class ManasOptimizer(FusedMuon):
             return
         ps = self._probe_params()
         if self.probe_rank is None:
-            if not self._shift_on:               # full-d: all-or-nothing (d fixed within a step)
+            if self.micro_vote:
+                # full-rank two-clock: first apply of the step shifts by the dosed total;
+                # every vote() then mirrors its own block increment straight onto theta
+                # (lazy sync), so later applies are no-ops. Restore recomputes the same
+                # total at step() — value-exact, fp32-rounding drift only (same class the
+                # low-rank lazy path accepts). Don't change gamma between micros.
+                if not self._lazy_ok():
+                    raise RuntimeError("full-rank micro_vote requires fp32 weights (lazy shift)")
+                if not self._shift_on:
+                    sps = [p for p in ps if "manas_dnow" in self.state[p]]
+                    if sps:
+                        torch._foreach_add_(sps, [self.state[p]["manas_d"] for p in sps],
+                                            alpha=self.probe_gamma)
+                        torch._foreach_add_(sps, [self.state[p]["manas_dnow"] for p in sps],
+                                            alpha=self.probe_gamma_intra)
+                    self._shift_on = True
+            elif not self._shift_on:             # full-d step-vote: all-or-nothing (d fixed)
                 ds = [self._full_d(p) for p in ps]
                 if self._lazy_ok():
                     torch._foreach_add_(ps, ds)
@@ -622,6 +670,15 @@ class ManasOptimizer(FusedMuon):
             return
         ps = self._probe_params()
         if self.probe_rank is None:
+            if self.micro_vote:                  # subtract the dosed total (see apply_probe)
+                sps = [p for p in ps if "manas_dnow" in self.state[p]]
+                if sps:
+                    torch._foreach_add_(sps, [self.state[p]["manas_d"] for p in sps],
+                                        alpha=-self.probe_gamma)
+                    torch._foreach_add_(sps, [self.state[p]["manas_dnow"] for p in sps],
+                                        alpha=-self.probe_gamma_intra)
+                self._shift_on = False
+                return
             ds = [self._full_d(p) for p in ps]
             if self._lazy_ok():
                 torch._foreach_sub_(ps, ds)
@@ -670,6 +727,26 @@ class ManasOptimizer(FusedMuon):
         if not ps or self.probe_gamma == 0.0:
             return
         self._votes_cast += 1
+        if self.probe_rank is None:
+            # ---- FULL-RANK vote: telescoping full-grad delta, unit-normalized, raw into
+            # Dnow; theta (already shifted, lazy) mirrors the increment so the next micro
+            # probes at the CURRENT consensus without a re-apply. ~5 passes, no GEMMs. ----
+            deltas, dnows, norms, sync = [], [], [], []
+            for p in ps:
+                st = self._full_state(p)
+                delta = torch.nan_to_num_(p.grad.to(torch.float32) - st["manas_prev_g"],
+                                          nan=0.0, posinf=0.0, neginf=0.0)
+                st["manas_prev_g"].copy_(p.grad)
+                deltas.append(delta); dnows.append(st["manas_dnow"]); sync.append(p)
+                norms.append(torch.linalg.vector_norm(delta))
+            pn = torch.stack(norms)
+            gn = pn if self.probe_norm == "perparam" else torch.linalg.vector_norm(pn)
+            inv = torch.where(torch.isfinite(gn) & (gn > 0), 1.0 / gn, torch.zeros_like(gn))
+            invs = [inv] * len(ps) if inv.ndim == 0 else list(inv.unbind())
+            torch._foreach_addcmul_(dnows, deltas, invs, value=-1.0)     # raw unit vote
+            if self._shift_on and self.probe_gamma_intra:
+                torch._foreach_addcmul_(sync, deltas, invs, value=-self.probe_gamma_intra)
+            return
         fresh = self.probe_rho_step is not None
         sk = self.probe_sketch_rho is not None
         nxs = (self.nexus_gamma / self.probe_gamma) if self.nexus_gamma else 0.0
@@ -796,6 +873,20 @@ class ManasOptimizer(FusedMuon):
             self._votes_cast = 0
             return
         self._votes_last = self._votes_cast
+        if self.probe_rank is None:
+            # full-rank boundary: history ages one step, raw block folds at coeff 1,
+            # per-step buffers reset. Zero votes -> decay only (probe never poisons).
+            sts = [self.state[p] for p in self._probe_params()
+                   if "manas_dnow" in self.state[p]]
+            if sts:
+                torch._foreach_mul_([s["manas_d"] for s in sts], self.probe_rho_step)
+                if self._votes_cast:
+                    torch._foreach_add_([s["manas_d"] for s in sts],
+                                        [s["manas_dnow"] for s in sts])
+                torch._foreach_zero_([s["manas_dnow"] for s in sts])
+                torch._foreach_zero_([s["manas_prev_g"] for s in sts])
+            self._votes_cast = 0
+            return
         if self._votes_cast == 0:
             if not getattr(self, "_warned_no_votes", False):
                 warnings.warn("micro_vote=True but no vote() was cast this step; falling back "
@@ -1123,6 +1214,49 @@ if __name__ == "__main__":                                           # pragma: n
     o._restore_theta()
     assert torch.allclose(p, p0, atol=1e-5), "restore must return clean theta"
     assert o.state[p]["manas_applied"].norm() == 0 and not o._shift_on
+    # 10F) FULL-RANK micro-vote == low-rank at COMPLETE rank (m <= n, r = m: q is m x m
+    #      orthogonal, so projection is lossless and the two modes must agree exactly)
+    pf = torch.nn.Parameter(torch.randn(4, 16))
+    pl = torch.nn.Parameter(pf.detach().clone())
+    of = ManasOptimizer([pf], probe_rank=None, micro_vote=True, probe_rho=1.0,
+                        probe_rho_step=0.9, probe_gamma=0.08)
+    ol = ManasOptimizer([pl], probe_rank=4, micro_vote=True, probe_rho=1.0,
+                        probe_rho_step=0.9, probe_gamma=0.08, probe_sketch_rho=None)
+    of._probe_updates = ol._probe_updates = 1                   # dodge boundary refresh
+    gseq = [torch.randn(4, 16) for _ in range(3)]
+    for o_, p_ in ((of, pf), (ol, pl)):
+        p_.grad = gseq[0].clone(); o_.vote()
+        p_.grad = p_.grad + gseq[1]; o_.vote()
+    assert torch.allclose(of._d_of(pf), ol._d_of(pl), atol=1e-5), \
+        "full-rank must equal low-rank at complete rank (in-step)"
+    of._finish_micro_step(); ol._finish_micro_step()
+    for o_, p_ in ((of, pf), (ol, pl)):
+        p_.grad = gseq[2].clone(); o_.vote()
+    assert torch.allclose(of._d_of(pf), ol._d_of(pl), atol=1e-5), \
+        "full-rank must equal low-rank across the boundary (fold + decay parity)"
+    st_f = of.state[pf]
+    assert st_f["manas_dnow"].norm() > 0 and st_f["manas_d"].norm() > 0, \
+        "full-rank: history and fresh block both live"
+    # 10G) full-rank lazy sync: theta tracks gamma*D + gamma_i*Dnow through votes;
+    #      restore returns clean theta; boundary resets per-step buffers
+    p = torch.nn.Parameter(torch.randn(6, 8))
+    o = ManasOptimizer([p], probe_rank=None, micro_vote=True, probe_rho=1.0,
+                       probe_rho_step=0.9, probe_gamma=0.05)
+    p0 = p.detach().clone()
+    o._manas_step = 1
+    o.apply_probe()
+    assert torch.allclose(p, p0) and o._shift_on, "empty consensus: shift flagged, theta still"
+    p.grad = torch.randn(6, 8); o.remove_probe(); o.vote()
+    assert torch.allclose(p - p0, o._d_of(p), atol=1e-6), "vote must sync theta to current d"
+    o.apply_probe()                                             # no-op (already synced)
+    p.grad = p.grad + torch.randn(6, 8); o.remove_probe(); o.vote()
+    assert torch.allclose(p - p0, o._d_of(p), atol=1e-6), "second vote must keep theta synced"
+    o._restore_theta()
+    assert torch.allclose(p, p0, atol=1e-5) and not o._shift_on, "restore must return clean theta"
+    o._finish_micro_step()
+    st = o.state[p]
+    assert st["manas_dnow"].norm() == 0 and st["manas_prev_g"].norm() == 0 \
+        and st["manas_d"].norm() > 0, "boundary: block folds into history, snapshots reset"
     # 10a) refresh auto-couples to the active rho clock; explicit value and live rho both honored
     o_auto = ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], probe_rank=4,
                             micro_vote=True, probe_rho=1.0, probe_rho_step=0.96)
@@ -1147,7 +1281,10 @@ if __name__ == "__main__":                                           # pragma: n
                 dict(probe_rho_step=0.9),                       # step clock needs micro_vote
                 dict(probe_gamma_intra=0.1),                    # intra needs the step clock
                 dict(probe_rank=4, micro_vote=True, probe_rho_step=1.0),
-                dict(probe_rank=None, micro_vote=True), dict(nexus_gamma=0.1)):
+                dict(probe_rank=None, micro_vote=True),         # full micro needs the step clock
+                dict(probe_rank=None, micro_vote=True, probe_rho=1.0,
+                     probe_rho_step=0.9, nexus_gamma=0.1),      # walker is rank-space only
+                dict(nexus_gamma=0.1)):
         try:
             ManasOptimizer([torch.nn.Parameter(torch.randn(8, 4))], **bad)
             raise AssertionError(f"constructor must reject {bad}")
