@@ -379,8 +379,7 @@ class ManasOptimizer(FusedMuon):
             if self.micro_vote and p0.dtype == torch.float32:
                 buf["gstk"] = torch.zeros(G, *shape, device=dev, dtype=torch.float32)
                 buf["gviews"] = list(buf["gstk"].unbind(0))
-                buf["gf"] = torch.empty_like(buf["gstk"])
-                buf["gf3"] = buf["gf"].view(G * L, m, n)
+                buf["g3"] = buf["gstk"].view(G * L, m, n)
             if sk:
                 go = torch.Generator(device="cpu").manual_seed(0x51E7C4 ^ numel)
                 o0 = torch.randn(*lead, n, r, generator=go).to(dev).to(torch.float32)
@@ -689,9 +688,13 @@ class ManasOptimizer(FusedMuon):
                 gv = buf.get("gviews")
                 if gv is not None and all(p.grad is gv[i]
                                           for i, p in enumerate(buf["params"])):
-                    torch.nan_to_num(buf["gstk"], nan=0.0, posinf=0.0, neginf=0.0,
-                                     out=buf["gf"])
-                    gf3 = buf["gf3"]
+                    # zero-copy: GEMM straight off the RAW pinned grad stack. The
+                    # nonfinite guard moves to RANK SPACE (delta/dy sanitized below) -
+                    # bit-identical on finite grads, and skips a full read+write pass.
+                    # Degradation on a nonfinite micro: its projection columns zero out
+                    # and the NEXT micro's delta is zeroed too (prev buffers hold the
+                    # poison until then); boundary resets fully - same recovery contract.
+                    gf3 = buf["g3"]
                 else:                        # foreign grads (synthetic/harness): copy path
                     g_stk = torch.stack([p.grad for p in buf["params"]])
                     gf = torch.nan_to_num(g_stk, nan=0.0, posinf=0.0,
@@ -699,13 +702,15 @@ class ManasOptimizer(FusedMuon):
                     gf3 = gf.view_as(buf["p3"])
                 if sk:
                     torch.matmul(gf3, buf["omega3"], out=buf["yp3"])
-                    dy = buf["ypad"] - buf["prev_yp"]
+                    dy = torch.nan_to_num_(buf["ypad"] - buf["prev_yp"],
+                                           nan=0.0, posinf=0.0, neginf=0.0)
                     buf["prev_yp"].copy_(buf["ypad"])
                     ny = torch.linalg.vector_norm(dy, dim=tuple(range(1, dy.ndim)))
                     invy = torch.where(torch.isfinite(ny) & (ny > 0), 1.0 / ny, torch.zeros_like(ny))
                     buf["ynow"].add_(dy * invy.view(-1, *([1] * (dy.ndim - 1))))
                 torch.matmul(buf["q3"].mT, gf3, out=buf["pp3"])
-            delta = fl["projpad"] - fl["prev_proj"]              # ALL groups, one launch
+            delta = torch.nan_to_num_(fl["projpad"] - fl["prev_proj"],
+                                      nan=0.0, posinf=0.0, neginf=0.0)   # one flat launch
             fl["prev_proj"].copy_(fl["projpad"])
             for buf in pg:                                       # per-matrix norms (ragged)
                 dv = delta[buf["co"]:buf["co"] + buf["csz"]].view(buf["G"], -1)
