@@ -32,7 +32,7 @@ def _rel(a, b):
     return ((a - b).abs().max() / (b.abs().max() + 1e-8)).item()
 
 
-def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, I_=None):
+def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, I_=None, raw=False):
     global I
     I_saved, I = I, (I_ or I)
     E = len(codes)
@@ -46,7 +46,7 @@ def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, 
 
     def run(fn):
         h, gu, dw, w = (t.detach().clone().requires_grad_(True) for t in (hid, gup, dwn, wt))
-        a = ap.detach().clone().requires_grad_(True)
+        a = None if raw else ap.detach().clone().requires_grad_(True)
         if autocast:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = fn(h, idx, w, gu, dw, act_codes, a)
@@ -54,7 +54,7 @@ def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, 
             out = fn(h, idx, w, gu, dw, act_codes, a)
         gsig = torch.randn_like(out.float()) * 0.1
         (out.float() * gsig).sum().backward()
-        return out, h.grad, gu.grad, dw.grad, w.grad, a.grad, gsig
+        return out, h.grad, gu.grad, dw.grad, w.grad, (None if raw else a.grad), gsig
 
     torch.manual_seed(7)   # same grad signal both runs
     o1, gh1, ggu1, gdw1, gw1, ga1, _ = run(moe_per_expert)
@@ -77,6 +77,9 @@ def main():
     ok = True
     # fp32 baseline (tight) — row-fused path (I=96 <= 1024)
     ok &= check("all-situ fp32", [5] * 6)
+    ok &= check("all-situ-RAW fp32", [5] * 6, raw=True)              # parameter-free: tanh(g)*sigmoid(g)
+    ok &= check("mixed-RAW fp32", [0, 1, 2, 5, 0, 5], raw=True)
+    ok &= check("situ-RAW pure-bf16", [5] * 6, raw=True, dtype=torch.bfloat16, tol=3e-2)
     ok &= check("all-relu2 fp32", [1] * 6)
     ok &= check("all-normsilu fp32", [2] * 6)
     ok &= check("mixed 0/1/2/5 fp32", [0, 1, 2, 5, 0, 5])
