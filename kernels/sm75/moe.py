@@ -598,12 +598,13 @@ class _PerExpertMoE(torch.autograd.Function):
         st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
         counts_t = torch.tensor(counts, device=dev)
-        row_act = torch.repeat_interleave(act_codes, counts_t).to(torch.int32)   # (M,) once, no per-expert contiguous
+        M_rows = idx.numel()   # output_size: statically known -> repeat_interleave skips its host sync
+        row_act = torch.repeat_interleave(act_codes, counts_t, output_size=M_rows).to(torch.int32)
         if any(c == 5 for c in codes):
             if act_params is None:
                 raise ValueError("act_codes contain 5 (SiTU) but act_params (E,2) is None")
-            row_alpha = act_params[:, 0].float().repeat_interleave(counts_t).contiguous()
-            row_gamma = act_params[:, 1].float().repeat_interleave(counts_t).contiguous()
+            row_alpha = act_params[:, 0].float().repeat_interleave(counts_t, output_size=M_rows).contiguous()
+            row_gamma = act_params[:, 1].float().repeat_interleave(counts_t, output_size=M_rows).contiguous()
         else:
             row_alpha = row_gamma = None
         # per-expert activations kept as LISTS — the GEMM outputs ARE the storage; no contiguous
