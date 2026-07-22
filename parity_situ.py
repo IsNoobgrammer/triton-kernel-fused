@@ -32,7 +32,9 @@ def _rel(a, b):
     return ((a - b).abs().max() / (b.abs().max() + 1e-8)).item()
 
 
-def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4):
+def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, I_=None):
+    global I
+    I_saved, I = I, (I_ or I)
     E = len(codes)
     E_glu = sum(1 for c in codes if c in (0, 1, 2, 5))
     assert all(c in (0, 1, 2, 5) for c in codes[:E_glu]), "GLU codes must precede specials"
@@ -66,18 +68,29 @@ def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4):
     status = "PASS" if worst < tol else "FAIL"
     print(f"[{status}] {name:<28} worst={worst:.2e}  " +
           "  ".join(f"{k}={v:.1e}" for k, v in rels.items()), flush=True)
+    I = I_saved
     return worst < tol
 
 
 def main():
     torch.manual_seed(0)
     ok = True
+    # fp32 baseline (tight) — row-fused path (I=96 <= 1024)
     ok &= check("all-situ fp32", [5] * 6)
+    ok &= check("all-relu2 fp32", [1] * 6)
+    ok &= check("all-normsilu fp32", [2] * 6)
     ok &= check("mixed 0/1/2/5 fp32", [0, 1, 2, 5, 0, 5])
     ok &= check("situ+specials fp32", [0, 5, 2, 5, 3, 4])
     ok &= check("empty-experts fp32", [5, 5, 5, 5, 0, 2], cap=4)   # experts 4,5 get zero rows
+    # tiled fallback path (I=1536 > _ROWFUSE_MAX_I) — both paths stay gated
+    ok &= check("mixed fp32 I=1536 (tiled)", [0, 1, 2, 5, 0, 5], I_=1536)
+    ok &= check("situ+spec fp32 I=1536", [0, 5, 2, 5, 3, 4], I_=1536)
+    # bf16 baselines: pure-bf16 tensors AND autocast-on-fp32 (loose, bf16 floor)
+    ok &= check("mixed pure-bf16", [0, 1, 2, 5, 0, 5], dtype=torch.bfloat16, tol=3e-2)
+    ok &= check("all-normsilu pure-bf16", [2] * 6, dtype=torch.bfloat16, tol=3e-2)
     ok &= check("all-situ bf16-ac", [5] * 6, autocast=True, tol=3e-2)
     ok &= check("mixed+specials bf16-ac", [0, 5, 2, 5, 3, 4], autocast=True, tol=3e-2)
+    ok &= check("mixed bf16-ac I=1536", [0, 1, 2, 5, 0, 5], autocast=True, tol=3e-2, I_=1536)
     print("\nPARITY " + ("OK" if ok else "FAILED"))
     raise SystemExit(0 if ok else 1)
 

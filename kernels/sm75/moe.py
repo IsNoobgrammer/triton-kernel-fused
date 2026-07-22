@@ -136,6 +136,76 @@ def _row_s_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, I,
         tl.store(S_ptr + row, 0.0)
 
 
+# ── row-fused (v2) GLU kernels: one program per row spans the FULL intermediate dim, so the
+# NormSiLU rms, the backward's S-coupling term, and SiTU's dalpha/dgamma row sums all happen
+# IN-REGISTER in the same pass. 1 launch fwd + 1 launch bwd for every code — no pre-pass kernels,
+# no extra HBM reads (fwd ~4N->3N, bwd ~9N->5N for NormSiLU). Used when I <= _ROWFUSE_MAX_I;
+# larger I falls back to the tiled kernels + pre-pass path below (kept unchanged).
+_ROWFUSE_MAX_I = 1024
+
+
+@triton.jit
+def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, I,
+                        s_gu_m, s_gu_i, s_o_m, s_o_i,
+                        EPS: tl.constexpr, BLOCK_I: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_I)
+    msk = offs < I
+    gate = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=msk, other=0.0).to(tl.float32)
+    up = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=msk, other=0.0).to(tl.float32)
+    at = tl.load(Act_ptr + row)
+    aa = tl.load(Alpha_ptr + row).to(tl.float32)
+    gg = tl.load(Gamma_ptr + row).to(tl.float32)
+    r = tl.sqrt(tl.sum(gate * gate) / I + EPS)           # consumed only where at==2
+    gn = tl.where(at == 2, gate / r, gate)
+    sig = 1.0 / (1.0 + tl.exp(-gn))                       # sigma(gate) for codes 0/1/5, sigma(gate/r) for 2
+    f = gn * sig                                          # silu: covers code 0 (gn=gate) AND code 2 (gn=gate/r)
+    relu = tl.maximum(gate, 0.0)
+    t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0    # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
+    act = tl.where(at == 1, relu * relu, tl.where(at == 5, gg * t5 * sig, f))
+    tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
+
+
+@triton.jit
+def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
+                        GradGateUp_ptr, DA_ptr, DG_ptr, I,
+                        s_go_m, s_go_i, s_gu_m, s_gu_i, s_ggu_m, s_ggu_i,
+                        EPS: tl.constexpr, WANT_AP: tl.constexpr, BLOCK_I: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_I)
+    msk = offs < I
+    go = tl.load(GradOut_ptr + row * s_go_m + offs * s_go_i, mask=msk, other=0.0).to(tl.float32)
+    gate = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=msk, other=0.0).to(tl.float32)
+    up = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=msk, other=0.0).to(tl.float32)
+    at = tl.load(Act_ptr + row)
+    aa = tl.load(Alpha_ptr + row).to(tl.float32)
+    gg = tl.load(Gamma_ptr + row).to(tl.float32)
+    r = tl.sqrt(tl.sum(gate * gate) / I + EPS)
+    gn = tl.where(at == 2, gate / r, gate)
+    sig = 1.0 / (1.0 + tl.exp(-gn))
+    f = gn * sig
+    df = sig * (1.0 + gn * (1.0 - sig))
+    relu = tl.maximum(gate, 0.0)
+    t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0
+    situ = gg * t5 * sig
+    dsitu = gg * (aa * (1.0 - t5 * t5) * sig + t5 * sig * (1.0 - sig))
+    act = tl.where(at == 1, relu * relu, tl.where(at == 5, situ, f))
+    gu_ = go * up
+    # NormSiLU RMS-coupling: S = sum(go*up*silu'(gn)*gn); grad = (go*up*silu'(gn) - (S/I)*gn)/r
+    S = tl.sum(tl.where(at == 2, gu_ * df * gn, 0.0))
+    grad_gate = tl.where(at == 2, (gu_ * df - (S / I) * gn) / r,
+                         gu_ * tl.where(at == 0, df, tl.where(at == 5, dsitu, 2.0 * relu)))
+    tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=msk)
+    tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=msk)
+    if WANT_AP:
+        if at == 5:
+            tl.store(DA_ptr + row, tl.sum(gu_ * gg * gate * (1.0 - t5 * t5) * sig))
+            tl.store(DG_ptr + row, tl.sum(gu_ * t5 * sig))
+        else:
+            tl.store(DA_ptr + row, 0.0)
+            tl.store(DG_ptr + row, 0.0)
+
+
 @triton.jit
 def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Rms_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, M, I,
                     s_gu_m, s_gu_i, s_o_m, s_o_i,
@@ -250,14 +320,21 @@ def _row_rms(gate_up, row_act, I):
 
 def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
     """code_hint: host-side int when EVERY row shares one act code (the per-expert path) — lets
-    non-NormSiLU slices skip the _row_rms launch entirely (rms is only read where at==2).
-    row_alpha/row_gamma: per-row fp32 SiTU scalars (code 5); None -> 1.0 (unread where at!=5)."""
+    non-NormSiLU slices skip the _row_rms launch on the tiled fallback path (row-fused path needs
+    no pre-pass at all). row_alpha/row_gamma: per-row fp32 SiTU scalars (code 5); None -> 1.0."""
     M, twoI = gate_up.shape; I = twoI // 2
-    skip_ns = code_hint is not None and code_hint != 2
-    rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
+    if I <= _ROWFUSE_MAX_I:
+        if M > 0:
+            BLOCK_I = max(16, triton.next_power_of_2(I))
+            _glu_fwd_row_kernel[(M,)](gate_up, row_act, ra, rg, out, I,
+                                      gate_up.stride(0), gate_up.stride(1), out.stride(0), out.stride(1),
+                                      EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=(8 if BLOCK_I >= 1024 else 4))
+        return out
+    skip_ns = code_hint is not None and code_hint != 2
+    rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
     BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
     _glu_fwd_kernel[grid](gate_up, row_act, rms, ra, rg, out, M, I, gate_up.stride(0), gate_up.stride(1),
@@ -265,8 +342,29 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
     return out
 
 
-def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
+def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None,
+             want_situ_grads=False):
+    """Returns ggu, or (ggu, da_rows, dg_rows) when want_situ_grads (requires row_alpha/row_gamma).
+    Row-fused path (I <= _ROWFUSE_MAX_I): ONE kernel computes grad_gate_up + the SiTU per-row
+    param grads in the same pass; tiled fallback uses the pre-pass kernels + _row_situ_bwd."""
     M, twoI = gate_up.shape; I = twoI // 2
+    ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
+    rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
+    ggu = torch.empty_like(gate_up)
+    if I <= _ROWFUSE_MAX_I:
+        if want_situ_grads:
+            da = torch.empty(M, device=gate_up.device, dtype=torch.float32)
+            dg = torch.empty(M, device=gate_up.device, dtype=torch.float32)
+        else:
+            da = dg = gate_up                 # dead pointers: WANT_AP=0 compiles the stores out
+        if M > 0:
+            BLOCK_I = max(16, triton.next_power_of_2(I))
+            _glu_bwd_row_kernel[(M,)](grad_out, gate_up, row_act, ra, rg, ggu, da, dg, I,
+                                      grad_out.stride(0), grad_out.stride(1),
+                                      gate_up.stride(0), gate_up.stride(1), ggu.stride(0), ggu.stride(1),
+                                      EPS=_NS_EPS, WANT_AP=want_situ_grads, BLOCK_I=BLOCK_I,
+                                      num_warps=(8 if BLOCK_I >= 1024 else 4))
+        return (ggu, da, dg) if want_situ_grads else ggu
     skip_ns = code_hint is not None and code_hint != 2
     if skip_ns:
         rms = _ones(M, gate_up.device)      # r=1 / S=0 semantics; values unread where at!=2
@@ -278,15 +376,15 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
             _row_s_kernel[(M,)](grad_out, gate_up, row_act, rms, sbuf, I,
                                 grad_out.stride(0), grad_out.stride(1),
                                 gate_up.stride(0), gate_up.stride(1), BLOCK_I=_NS_BLOCK_I)
-    ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
-    rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
-    ggu = torch.empty_like(gate_up)
     BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
     _glu_bwd_kernel[grid](grad_out, gate_up, row_act, rms, sbuf, ra, rg, ggu, M, I,
                           grad_out.stride(0), grad_out.stride(1),
                           gate_up.stride(0), gate_up.stride(1), ggu.stride(0), ggu.stride(1),
                           BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I)
+    if want_situ_grads:
+        da, dg = _row_situ_bwd(grad_out, gate_up, row_act, ra, rg)
+        return ggu, da, dg
     return ggu
 
 
@@ -322,11 +420,11 @@ class BatchedGLU(torch.autograd.Function):
         ra = row_alpha if ctx.has_situ else None
         rg = row_gamma if ctx.has_situ else None
         go = grad_out.contiguous()
-        ggu = _glu_bwd(go, gate_up, row_act, row_alpha=ra, row_gamma=rg)
         if ctx.has_situ and (ctx.needs_input_grad[2] or ctx.needs_input_grad[3]):
-            da, dg = _row_situ_bwd(go, gate_up, row_act, row_alpha, row_gamma)
+            ggu, da, dg = _glu_bwd(go, gate_up, row_act, row_alpha=ra, row_gamma=rg,
+                                   want_situ_grads=True)
             return ggu, None, da, dg
-        return ggu, None, None, None
+        return _glu_bwd(go, gate_up, row_act, row_alpha=ra, row_gamma=rg), None, None, None
 
 
 # ───────────────────────── grouped GEMM kernels ─────────────────────────
@@ -665,14 +763,16 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
             grad_down_proj[e] = ge.t() @ it                            # (H,m)@(m,I) -> (H,I)
             is_situ = codes[e] == 5
-            grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en], code_hint=codes[e],
-                                    row_alpha=(row_alpha[s:en] if is_situ else None),
-                                    row_gamma=(row_gamma[s:en] if is_situ else None))   # (m,2I)
             if is_situ and want_ap:
-                da, dg = _row_situ_bwd(grad_inter.contiguous(), gate_up_l[e], row_act[s:en],
-                                       row_alpha[s:en], row_gamma[s:en])
+                grad_gate_up, da, dg = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en],
+                                                code_hint=5, row_alpha=row_alpha[s:en],
+                                                row_gamma=row_gamma[s:en], want_situ_grads=True)
                 grad_act_params[e, 0] = da.sum()
                 grad_act_params[e, 1] = dg.sum()
+            else:
+                grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en], code_hint=codes[e],
+                                        row_alpha=(row_alpha[s:en] if is_situ else None),
+                                        row_gamma=(row_gamma[s:en] if is_situ else None))   # (m,2I)
             grad_gate_up_proj[e] = grad_gate_up.t() @ x_s[s:en]        # (2I,m)@(m,H) -> (2I,H)
             grad_hidden.index_add_(0, st[s:en], grad_gate_up @ gate_up_proj[e])  # scatter dX straight in
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
