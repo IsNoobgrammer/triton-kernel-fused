@@ -419,7 +419,7 @@ class BatchedGLU(torch.autograd.Function):
         gate_up, row_act, row_alpha, row_gamma = ctx.saved_tensors
         ra = row_alpha if ctx.has_situ else None
         rg = row_gamma if ctx.has_situ else None
-        go = grad_out.contiguous()
+        go = grad_out   # kernels take explicit strides: broadcast/expanded grads work un-materialized
         if ctx.has_situ and (ctx.needs_input_grad[2] or ctx.needs_input_grad[3]):
             ggu, da, dg = _glu_bwd(go, gate_up, row_act, row_alpha=ra, row_gamma=rg,
                                    want_situ_grads=True)
