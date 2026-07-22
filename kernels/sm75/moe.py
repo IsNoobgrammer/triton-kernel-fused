@@ -1,8 +1,15 @@
 """Fused PolyGLU MoE experts — the hard one. Per-expert + grouped paths + naive-eager reference.
 
 PolyGLU: experts are GLU MLPs with *heterogeneous* activations — each expert carries an
-activation code (0=SiLU, 1=ReLU², 2=NormSiLU), e.g. groups of three [SiLU, ReLU², NormSiLU].
+activation code (0=SiLU, 1=ReLU², 2=NormSiLU, 5=SiTU), e.g. groups of three [SiLU, ReLU², NormSiLU].
 Pass an `act_codes` (E,) int32 tensor alongside the expert weights.
+
+SiTU (code 5, Jul 22 2026): gamma * tanh(alpha * gate) * sigmoid(gate) — bounded gate activation
+with LEARNABLE per-expert scalars (DyT-style alpha inside the tanh; the toy round showed the alpha
+is load-bearing). Pass `act_params` (E, 2) fp32 [alpha, gamma] to the per-expert path; rows gather
+their expert's scalars. Fully elementwise: unlike NormSiLU there is NO row reduction in fwd — the
+only extra work is a per-row bwd pass for the dalpha/dgamma sums (only launched for code-5 slices).
+Per-expert path only (grouped paths reject code 5, same policy as the Identity/Zero specials).
 
 NormSiLU (code 2, replaced Tanh Jul 7 2026): SiLU(gate / rms(gate)) — per-row RMS over the
 intermediate dim, gain-free, eps 1e-6 (DECO intra-expert stage adapted to GLU; matches BiBo's
@@ -62,6 +69,19 @@ _NS_EPS = 1e-6         # NormSiLU rms eps — must match BiBo eager (_NORMSILU_E
 _NS_BLOCK_I = 256      # row-reduction chunk (I=768 -> 3 iters); fixed block, no autotune (MoE rule)
 
 
+def _code_max(act_codes):
+    """Max act code with a ONE-TIME host sync per tensor: act_codes is static model config, so the
+    result is cached as a python attribute on the tensor (dispatchers call this per layer per step)."""
+    m = getattr(act_codes, "_code_max_cache", None)
+    if m is None:
+        m = int(act_codes.max())
+        try:
+            act_codes._code_max_cache = m
+        except Exception:
+            pass                      # exotic tensor subclass: fall back to syncing each call
+    return m
+
+
 def _amp_cast(*ts):
     """Under autocast, cast float tensors to the ACTIVE autocast dtype (fp16/bf16) so the custom
     Functions see one consistent dtype end-to-end; no-op outside autocast. Grads returned for the
@@ -117,7 +137,8 @@ def _row_s_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, I,
 
 
 @triton.jit
-def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Rms_ptr, Out_ptr, M, I, s_gu_m, s_gu_i, s_o_m, s_o_i,
+def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Rms_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, M, I,
+                    s_gu_m, s_gu_i, s_o_m, s_o_i,
                     BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr):
     pid_m = tl.program_id(0); pid_i = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -127,17 +148,23 @@ def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Rms_ptr, Out_ptr, M, I, s_gu_m, s_gu_i,
     up = tl.load(GateUp_ptr + offs_m[:, None] * s_gu_m + (I + offs_i)[None, :] * s_gu_i, mask=mask, other=0.0).to(tl.float32)
     at = tl.load(Act_ptr + offs_m, mask=mask_m, other=0)[:, None]
     r = tl.load(Rms_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
-    silu = gate * (1.0 / (1.0 + tl.exp(-gate)))
+    aa = tl.load(Alpha_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]   # 1.0 where at!=5
+    gg = tl.load(Gamma_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
+    sig = 1.0 / (1.0 + tl.exp(-gate))
+    silu = gate * sig
     relu = tl.maximum(gate, 0.0)
     gn = gate / r                                    # r==1.0 for non-NormSiLU rows
     nsilu = gn * (1.0 / (1.0 + tl.exp(-gn)))
-    act = tl.where(at == 0, silu, tl.where(at == 1, relu * relu, nsilu))
+    t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0   # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
+    situ = gg * t5 * sig                                 # SiTU: gamma * tanh(alpha*g) * sigmoid(g)
+    act = tl.where(at == 0, silu, tl.where(at == 1, relu * relu, tl.where(at == 5, situ, nsilu)))
     tl.store(Out_ptr + offs_m[:, None] * s_o_m + offs_i[None, :] * s_o_i,
              (act * up).to(Out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
-def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, GradGateUp_ptr, M, I,
+def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, Alpha_ptr, Gamma_ptr,
+                    GradGateUp_ptr, M, I,
                     s_go_m, s_go_i, s_gu_m, s_gu_i, s_ggu_m, s_ggu_i,
                     BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr):
     pid_m = tl.program_id(0); pid_i = tl.program_id(1)
@@ -150,17 +177,52 @@ def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, GradGateUp
     at = tl.load(Act_ptr + offs_m, mask=mask_m, other=0)[:, None]
     r = tl.load(Rms_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
     sv = tl.load(S_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
+    aa = tl.load(Alpha_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]   # 1.0 where at!=5
+    gg = tl.load(Gamma_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
     sig = 1.0 / (1.0 + tl.exp(-gate)); silu = gate * sig; dsilu = sig * (1.0 + gate * (1.0 - sig))
     relu = tl.maximum(gate, 0.0); relu2 = relu * relu; drelu2 = 2.0 * relu
     gn = gate / r
     sig_n = 1.0 / (1.0 + tl.exp(-gn)); nsilu = gn * sig_n
     dnsilu = sig_n * (1.0 + gn * (1.0 - sig_n))
-    act = tl.where(at == 0, silu, tl.where(at == 1, relu2, nsilu))
+    t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0   # tanh(alpha*g), exact sigmoid identity
+    situ = gg * t5 * sig
+    dsitu = gg * (aa * (1.0 - t5 * t5) * sig + t5 * sig * (1.0 - sig))
+    act = tl.where(at == 0, silu, tl.where(at == 1, relu2, tl.where(at == 5, situ, nsilu)))
     # NormSiLU grad has the extra RMS-coupling term: (go·up·silu'(ĝ) − (S/I)·ĝ)/r
     grad_gate = tl.where(at == 2, (go * up * dnsilu - (sv / I) * gn) / r,
-                         go * up * tl.where(at == 0, dsilu, drelu2))
+                         go * up * tl.where(at == 0, dsilu, tl.where(at == 5, dsitu, drelu2)))
     tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + offs_i[None, :] * s_ggu_i, grad_gate, mask=mask)
     tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + (I + offs_i)[None, :] * s_ggu_i, go * act, mask=mask)
+
+
+@triton.jit
+def _row_situ_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr, DA_ptr, DG_ptr, I,
+                         s_go_m, s_go_i, s_gu_m, s_gu_i, BLOCK_I: tl.constexpr):
+    # per-row SiTU param-grad sums (only at==5 rows):
+    #   dgamma_row = sum_j go*up*tanh(a*g)*sig(g) ; dalpha_row = sum_j go*up*gamma*g*(1-t^2)*sig(g)
+    row = tl.program_id(0)
+    at = tl.load(Act_ptr + row)
+    if at == 5:
+        a = tl.load(Alpha_ptr + row).to(tl.float32)
+        gm = tl.load(Gamma_ptr + row).to(tl.float32)
+        acc_a = tl.zeros([BLOCK_I], dtype=tl.float32)
+        acc_g = tl.zeros([BLOCK_I], dtype=tl.float32)
+        for i0 in range(0, I, BLOCK_I):
+            offs = i0 + tl.arange(0, BLOCK_I)
+            m = offs < I
+            go = tl.load(GradOut_ptr + row * s_go_m + offs * s_go_i, mask=m, other=0.0).to(tl.float32)
+            gate = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
+            up = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
+            t = 2.0 / (1.0 + tl.exp(-2.0 * a * gate)) - 1.0   # tanh(a*g), exact sigmoid identity
+            sig = 1.0 / (1.0 + tl.exp(-gate))
+            gu = go * up
+            acc_g += gu * t * sig
+            acc_a += gu * gm * gate * (1.0 - t * t) * sig
+        tl.store(DA_ptr + row, tl.sum(acc_a))
+        tl.store(DG_ptr + row, tl.sum(acc_g))
+    else:
+        tl.store(DA_ptr + row, 0.0)
+        tl.store(DG_ptr + row, 0.0)
 
 
 # reusable fp32 ones — dummy Rms/S input for slices KNOWN to have no NormSiLU rows (r=1, S=0
@@ -186,21 +248,24 @@ def _row_rms(gate_up, row_act, I):
     return rms
 
 
-def _glu_fwd(gate_up, row_act, code_hint=None):
+def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
     """code_hint: host-side int when EVERY row shares one act code (the per-expert path) — lets
-    non-NormSiLU slices skip the _row_rms launch entirely (rms is only read where at==2)."""
+    non-NormSiLU slices skip the _row_rms launch entirely (rms is only read where at==2).
+    row_alpha/row_gamma: per-row fp32 SiTU scalars (code 5); None -> 1.0 (unread where at!=5)."""
     M, twoI = gate_up.shape; I = twoI // 2
     skip_ns = code_hint is not None and code_hint != 2
     rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
+    ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
+    rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
     BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
-    _glu_fwd_kernel[grid](gate_up, row_act, rms, out, M, I, gate_up.stride(0), gate_up.stride(1),
+    _glu_fwd_kernel[grid](gate_up, row_act, rms, ra, rg, out, M, I, gate_up.stride(0), gate_up.stride(1),
                           out.stride(0), out.stride(1), BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I)
     return out
 
 
-def _glu_bwd(grad_out, gate_up, row_act, code_hint=None):
+def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
     M, twoI = gate_up.shape; I = twoI // 2
     skip_ns = code_hint is not None and code_hint != 2
     if skip_ns:
@@ -213,26 +278,55 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None):
             _row_s_kernel[(M,)](grad_out, gate_up, row_act, rms, sbuf, I,
                                 grad_out.stride(0), grad_out.stride(1),
                                 gate_up.stride(0), gate_up.stride(1), BLOCK_I=_NS_BLOCK_I)
+    ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
+    rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     ggu = torch.empty_like(gate_up)
     BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
-    _glu_bwd_kernel[grid](grad_out, gate_up, row_act, rms, sbuf, ggu, M, I, grad_out.stride(0), grad_out.stride(1),
+    _glu_bwd_kernel[grid](grad_out, gate_up, row_act, rms, sbuf, ra, rg, ggu, M, I,
+                          grad_out.stride(0), grad_out.stride(1),
                           gate_up.stride(0), gate_up.stride(1), ggu.stride(0), ggu.stride(1),
                           BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I)
     return ggu
 
 
+def _row_situ_bwd(grad_out, gate_up, row_act, row_alpha, row_gamma):
+    """Per-row SiTU dalpha/dgamma sums (fp32, (M,) each; zero for at!=5 rows)."""
+    M, twoI = gate_up.shape; I = twoI // 2
+    da = torch.empty(M, device=gate_up.device, dtype=torch.float32)
+    dg = torch.empty(M, device=gate_up.device, dtype=torch.float32)
+    if M > 0:
+        _row_situ_bwd_kernel[(M,)](grad_out, gate_up, row_act, row_alpha, row_gamma, da, dg, I,
+                                   grad_out.stride(0), grad_out.stride(1),
+                                   gate_up.stride(0), gate_up.stride(1), BLOCK_I=_NS_BLOCK_I)
+    return da, dg
+
+
 class BatchedGLU(torch.autograd.Function):
-    """PolyGLU activation: out = act_{row}(gate) * up, with a per-row activation code."""
+    """PolyGLU activation: out = act_{row}(gate) * up, with a per-row activation code.
+    Optional per-row SiTU scalars (code 5): grads returned PER ROW (fp32) — build row_alpha/row_gamma
+    differentiably (e.g. repeat_interleave of an (E,) param) and autograd sums them per expert."""
     @staticmethod
-    def forward(ctx, gate_up, row_act):
-        ctx.save_for_backward(gate_up, row_act)
-        return _glu_fwd(gate_up, row_act)
+    def forward(ctx, gate_up, row_act, row_alpha=None, row_gamma=None):
+        if (row_alpha is None) != (row_gamma is None):
+            raise ValueError("row_alpha and row_gamma must be passed together (both or neither)")
+        ctx.save_for_backward(gate_up, row_act,
+                              row_alpha if row_alpha is not None else torch.empty(0),
+                              row_gamma if row_gamma is not None else torch.empty(0))
+        ctx.has_situ = row_alpha is not None
+        return _glu_fwd(gate_up, row_act, row_alpha=row_alpha, row_gamma=row_gamma)
 
     @staticmethod
     def backward(ctx, grad_out):
-        gate_up, row_act = ctx.saved_tensors
-        return _glu_bwd(grad_out.contiguous(), gate_up, row_act), None
+        gate_up, row_act, row_alpha, row_gamma = ctx.saved_tensors
+        ra = row_alpha if ctx.has_situ else None
+        rg = row_gamma if ctx.has_situ else None
+        go = grad_out.contiguous()
+        ggu = _glu_bwd(go, gate_up, row_act, row_alpha=ra, row_gamma=rg)
+        if ctx.has_situ and (ctx.needs_input_grad[2] or ctx.needs_input_grad[3]):
+            da, dg = _row_situ_bwd(go, gate_up, row_act, row_alpha, row_gamma)
+            return ggu, None, da, dg
+        return ggu, None, None, None
 
 
 # ───────────────────────── grouped GEMM kernels ─────────────────────────
@@ -381,7 +475,12 @@ class _GroupedMoE(torch.autograd.Function):
 
 def moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
     """Block-scheduled grouped-GEMM PolyGLU MoE. hidden (N,H), indices/weights (N,k),
-    gate_up_proj (E,2I,H), down_proj (E,H,I), act_codes (E,) int32 -> (N,H)."""
+    gate_up_proj (E,2I,H), down_proj (E,H,I), act_codes (E,) int32 -> (N,H).
+    Code 5 (SiTU) is rejected — it needs act_params, which only the per-expert path carries. Codes
+    3/4 are ACCEPTED for legacy diagnostics (grouped_parity.py / bench.py) but produce the documented
+    wrong grads on specials stacks; moe() never routes them here."""
+    if _code_max(act_codes) > 4:
+        raise ValueError("code 5 (SiTU) unsupported on the grouped path; use moe_per_expert(act_params=...)")
     return _GroupedMoE.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
 
 
@@ -400,6 +499,8 @@ def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_
         raise RuntimeError("torch._grouped_mm unavailable in this torch build")
     if torch.cuda.get_device_capability(hidden.device)[0] < 8:
         raise RuntimeError("torch._grouped_mm needs bf16 tensor cores (sm_80+); skipped on this GPU")
+    if _code_max(act_codes) > 4:
+        raise ValueError("code 5 (SiTU) unsupported on the grouped-cublas path; use moe_per_expert(act_params=...)")
     N, H = hidden.shape
     E = gate_up_proj.shape[0]
     flat_t = torch.arange(N, device=hidden.device).unsqueeze(1).expand_as(top_k_indices).flatten()
@@ -484,19 +585,27 @@ class _PerExpertMoE(torch.autograd.Function):
     2× the GEMMs of forward (dX AND dW per fwd GEMM — irreducible matmul autodiff), but no glue."""
 
     @staticmethod
-    def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes):
+    def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes, act_params=None):
         # AMP-safe, dtype-agnostic: cast float args to the ACTIVE autocast dtype (fp16 or bf16) so
         # forward GEMMs, saved tensors, and the manual backward stay dtype-consistent. Without this,
         # autocast rewrote the fwd GEMMs while saving fp32 weights -> mixed-dtype backward.
+        # act_params (E,2) fp32 [alpha,gamma] stays fp32 (scalar params, precision-sensitive).
         hidden, wt, gate_up_proj, down_proj = _amp_cast(hidden, wt, gate_up_proj, down_proj)
         N, H = hidden.shape
         E = act_codes.shape[0]                  # total routed experts (GLU + specials)
-        codes = act_codes.tolist()              # 0/1/2 = GLU (weight slot e), 3 = Identity, 4 = Zero
+        codes = act_codes.tolist()              # 0/1/2/5 = GLU (weight slot e), 3 = Identity, 4 = Zero
         top_k = idx.shape[1]; dev = hidden.device
         st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
         counts_t = torch.tensor(counts, device=dev)
         row_act = torch.repeat_interleave(act_codes, counts_t).to(torch.int32)   # (M,) once, no per-expert contiguous
+        if any(c == 5 for c in codes):
+            if act_params is None:
+                raise ValueError("act_codes contain 5 (SiTU) but act_params (E,2) is None")
+            row_alpha = act_params[:, 0].float().repeat_interleave(counts_t).contiguous()
+            row_gamma = act_params[:, 1].float().repeat_interleave(counts_t).contiguous()
+        else:
+            row_alpha = row_gamma = None
         # per-expert activations kept as LISTS — the GEMM outputs ARE the storage; no contiguous
         # buffer + slice-copy (that was a pure DtoD-memcpy + memory tax).
         gate_up_l = [None] * E; inter_l = [None] * E; eo_l = [None] * E
@@ -511,18 +620,22 @@ class _PerExpertMoE(torch.autograd.Function):
                 _combine_scatter(x_s[s:en], sw[s:en], st[s:en], out)
                 continue
             gu = x_s[s:en] @ gate_up_proj[e].t()                         # GLU expert; weight slot = e (GLU first)
-            it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e])   # uniform slice: non-NS skips rms launch
+            it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e],   # uniform slice: non-NS skips rms launch
+                          row_alpha=(row_alpha[s:en] if codes[e] == 5 else None),
+                          row_gamma=(row_gamma[s:en] if codes[e] == 5 else None))
             eo = it @ down_proj[e].t()
             gate_up_l[e] = gu; inter_l[e] = it; eo_l[e] = eo
             _combine_scatter(eo, sw[s:en], st[s:en], out)   # fused (eo*w)->fp32 scatter (1 kernel, was mul+cast+index_add)
-        ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj)
+        ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
+                              row_alpha if row_alpha is not None else torch.empty(0),
+                              row_gamma if row_gamma is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_l); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
-        ctx.codes = codes
+        ctx.codes = codes; ctx.has_situ = row_alpha is not None
         return out.to(hidden.dtype)
 
     @staticmethod
     def backward(ctx, grad_out):
-        x_s, st, sw, order, row_act, gate_up_proj, down_proj = ctx.saved_tensors
+        (x_s, st, sw, order, row_act, gate_up_proj, down_proj, row_alpha, row_gamma) = ctx.saved_tensors
         gate_up_l, inter_l, eo_l = ctx.lists
         N, H, top_k, E = ctx.shapes; bounds = ctx.bounds; codes = ctx.codes
         M = st.numel()
@@ -530,6 +643,9 @@ class _PerExpertMoE(torch.autograd.Function):
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
         grad_down_proj = torch.zeros_like(down_proj)
         grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
+        want_ap = ctx.has_situ and ctx.needs_input_grad[6]   # skip param-grad work when alpha/gamma frozen
+        grad_act_params = (torch.zeros(E, 2, device=grad_out.device, dtype=torch.float32)
+                           if want_ap else None)
         for e in range(E):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
@@ -547,23 +663,35 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_w_s[s:en] = gw.to(grad_out.dtype)
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
             grad_down_proj[e] = ge.t() @ it                            # (H,m)@(m,I) -> (H,I)
-            grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en], code_hint=codes[e])   # (m,2I)
+            is_situ = codes[e] == 5
+            grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en], code_hint=codes[e],
+                                    row_alpha=(row_alpha[s:en] if is_situ else None),
+                                    row_gamma=(row_gamma[s:en] if is_situ else None))   # (m,2I)
+            if is_situ and want_ap:
+                da, dg = _row_situ_bwd(grad_inter.contiguous(), gate_up_l[e], row_act[s:en],
+                                       row_alpha[s:en], row_gamma[s:en])
+                grad_act_params[e, 0] = da.sum()
+                grad_act_params[e, 1] = dg.sum()
             grad_gate_up_proj[e] = grad_gate_up.t() @ x_s[s:en]        # (2I,m)@(m,H) -> (2I,H)
             grad_hidden.index_add_(0, st[s:en], grad_gate_up @ gate_up_proj[e])  # scatter dX straight in
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
         grad_wt[order] = grad_w_s
-        return grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj, None
+        return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj, None,
+                grad_act_params)
 
 
-def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
+def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
+                   act_params=None):
     """Sorted dispatch + cuBLAS GEMMs + fused PolyGLU activation + weighted scatter, MANUAL backward
-    (no autograd-composition glue). Wins at low token counts."""
-    return _PerExpertMoE.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
+    (no autograd-composition glue). Wins at low token counts.
+    act_params: (E,2) fp32 [alpha,gamma] per expert — required iff any act code is 5 (SiTU)."""
+    return _PerExpertMoE.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj,
+                               act_codes, act_params)
 
 
-def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
+def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params=None):
     """Auto: grouped at >= GROUPED_MIN_TOKENS rows (N*top_k) on Ampere+ (sm_80+) AND only when every
-    expert is a GLU (act_codes in {0,1,2}); else per-expert.
+    expert is a GLU (act_codes in {0,1,2}); else per-expert (which alone supports codes 3/4/5).
 
     The grouped path's tl.dot GEMMs are catastrophic on Turing (T4, sm_75) — measured ~0.1x vs compiled
     eager — so it is NEVER chosen on sm_<80; per-expert (cuBLAS) wins there. The grouped path also does
@@ -574,31 +702,37 @@ def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes
     is in the stack. per-expert is correct on every arch and is itself a large win (T4 ~2.9x; Blackwell
     ~4x fwd+bwd). To use grouped on a mixed stack, fix _GroupedMoE to special-case codes 3/4 first."""
     cap_major = torch.cuda.get_device_capability(hidden.device)[0]
-    glu_only = int(act_codes.max()) <= 2                          # codes 3 (Identity) / 4 (Zero) unsupported by grouped
+    glu_only = _code_max(act_codes) <= 2       # codes 3/4 (specials) AND 5 (SiTU) -> per-expert; cached, no per-call sync
     if top_k_indices.numel() >= GROUPED_MIN_TOKENS and cap_major >= 8 and glu_only:
         return moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
-    return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
+    return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
+                          act_params)
 
 
 # ───────────────────────── naive eager reference (the slow baseline) ─────────────────────────
-def _act_eager(gate, code):
+def _act_eager(gate, code, alpha=None, gamma=None):
     if code == 0:
         return F.silu(gate)
     if code == 1:
         return F.relu(gate) ** 2
+    if code == 5:
+        # SiTU: gamma * tanh(alpha*g) * sigmoid(g), fp32 math, learnable per-expert scalars
+        g = gate.float()
+        return (gamma * torch.tanh(alpha * g) * torch.sigmoid(g)).to(gate.dtype)
     # NormSiLU: SiLU(rms-normed gate), gain-free — matches BiBo eager (_NORMSILU_EPS)
     g = gate.float()
     g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
     return F.silu(g).to(gate.dtype)
 
 
-def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
+def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
+              act_params=None):
     """Hand-written MoE: per-expert boolean mask (GPU sync each iter), unfused activation,
     E tiny GEMMs. Correct, and deliberately the slow baseline the fused paths beat."""
     N, H = hidden.shape
     twoI = gate_up_proj.shape[1]
     I = twoI // 2
-    codes = act_codes.tolist()          # 0/1/2 = GLU (weight slot e), 3 = Identity, 4 = Zero
+    codes = act_codes.tolist()          # 0/1/2/5 = GLU (weight slot e), 3 = Identity, 4 = Zero
     E = len(codes)                       # total routed experts (GLU + specials)
     out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):
@@ -612,6 +746,7 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
             out[rows] += (hidden[rows] * w.unsqueeze(-1)).float()
             continue
         gate_up = hidden[rows] @ gate_up_proj[e].t()
-        inter = _act_eager(gate_up[:, :I], codes[e]) * gate_up[:, I:]
+        a, g = (act_params[e, 0], act_params[e, 1]) if codes[e] == 5 else (None, None)
+        inter = _act_eager(gate_up[:, :I], codes[e], a, g) * gate_up[:, I:]
         out[rows] += ((inter @ down_proj[e].t()) * w.unsqueeze(-1)).float()
     return out.to(hidden.dtype)

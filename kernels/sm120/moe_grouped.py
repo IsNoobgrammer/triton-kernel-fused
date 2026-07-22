@@ -81,6 +81,9 @@ def moe_grouped_cublas_polyglu(hidden, top_k_indices, top_k_weights, gate_up_pro
     act_codes (E,) int32 where E = E_glu + n_special. GLU codes (0/1/2) index weight slots 0..E_glu-1;
     Identity (3) / Zero (4) are param-free and handled on the sorted tail. Returns (N,H).
     """
+    from kernels.sm75.moe import _code_max
+    if _code_max(act_codes) > 4:   # cached: one host sync per act_codes tensor lifetime
+        raise ValueError("code 5 (SiTU) unsupported on the grouped path; use moe_per_expert(act_params=...)")
     N, H = hidden.shape
     e_glu = gate_up_proj.shape[0]
     e_total = act_codes.shape[0]

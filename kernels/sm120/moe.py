@@ -16,7 +16,7 @@ The old GLU-only `moe_grouped` (sm75, tl.dot) is still re-exported for parity be
 `moe()` here — it has no special-expert handling and the cuBLAS grouped path supersedes it on Blackwell.
 """
 from kernels.sm75.moe import (  # noqa: F401
-    moe_per_expert, moe_eager, moe_grouped, moe_grouped_cublas, GROUPED_MIN_TOKENS,
+    moe_per_expert, moe_eager, moe_grouped, moe_grouped_cublas, GROUPED_MIN_TOKENS, _code_max,
 )
 from .moe_grouped import (
     moe_grouped_cublas_polyglu, grouped_supported, prefer_grouped, GROUPED_TOKENS_PER_EXPERT_MAX,
@@ -29,16 +29,20 @@ __all__ = [
 ]
 
 
-def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
+def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params=None):
     """Auto-dispatch on Blackwell: cuBLAS grouped when supported AND tokens-per-expert is low (its win
     regime, where it beats per-expert on time at <= memory); else the per-expert champion.
 
     The grouped path handles Identity (3) / Zero (4) special experts directly, so unlike the old
-    sm75 grouped there is no `glu_only` restriction. per-expert is the fallback whenever grouped is
-    unsupported (no torch._grouped_mm / sm_<80 / non-bf16-fp16 / unaligned shapes) or tokens-per-expert
-    is high enough that the per-expert GEMMs are already efficient.
+    sm75 grouped there is no `glu_only` restriction — but NOT code 5 (SiTU, needs act_params), which
+    always takes per-expert. per-expert is also the fallback whenever grouped is unsupported (no
+    torch._grouped_mm / sm_<80 / non-bf16-fp16 / unaligned shapes) or tokens-per-expert is high
+    enough that the per-expert GEMMs are already efficient.
     """
-    if grouped_supported(hidden, gate_up_proj, down_proj) and prefer_grouped(top_k_indices, gate_up_proj):
+    if (grouped_supported(hidden, gate_up_proj, down_proj)
+            and prefer_grouped(top_k_indices, gate_up_proj)
+            and _code_max(act_codes) <= 4):   # cached (one sync per act_codes tensor), checked LAST
         return moe_grouped_cublas_polyglu(hidden, top_k_indices, top_k_weights,
                                           gate_up_proj, down_proj, act_codes)
-    return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
+    return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
+                          act_params)
