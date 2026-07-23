@@ -865,6 +865,12 @@ def _act_eager(gate, code, alpha=None, gamma=None):
         g = gate.float()
         r = torch.sqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
         return (torch.sqrt(r) * F.silu(g / r)).to(gate.dtype)
+    if code == 7:
+        # ts_norm: tanh(sigmoid(g/rms(g))), bounded normalized composition. EAGER-ONLY (no fused kernel
+        # yet) — the moe_per_expert Triton path does NOT handle code 7; route code-7 stacks via moe_eager.
+        g = gate.float()
+        z = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
+        return torch.tanh(torch.sigmoid(z)).to(gate.dtype)
     # NormSiLU: SiLU(rms-normed gate), gain-free — matches BiBo eager (_NORMSILU_EPS)
     g = gate.float()
     g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
