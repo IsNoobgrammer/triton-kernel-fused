@@ -352,10 +352,23 @@ def _ap_stride(row_alpha):
     return 0 if (row_alpha is not None and row_alpha.numel() == 1) else 1
 
 
+def _ts_norm_eager(gate_up):
+    """ts_norm (act code 7) applied EAGERLY to a (M,2I) gate_up slice: tanh(sigmoid(g/rms(g))) * up.
+    Pure autograd-native torch — lets the FUSED per-expert MoE (fast dispatch + cuBLAS GEMMs) use code 7
+    with NO Triton activation kernel; the elementwise activation is the only eager part."""
+    I = gate_up.shape[1] // 2
+    g = gate_up[:, :I].float(); u = gate_up[:, I:]
+    z = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
+    return torch.tanh(torch.sigmoid(z)).to(gate_up.dtype) * u
+
+
 def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
     """code_hint: host-side int when EVERY row shares one act code (the per-expert path) — lets
     non-NormSiLU slices skip the _row_rms launch on the tiled fallback path (row-fused path needs
-    no pre-pass at all). row_alpha/row_gamma: per-row fp32 SiTU scalars (code 5); None -> 1.0."""
+    no pre-pass at all). row_alpha/row_gamma: per-row fp32 SiTU scalars (code 5); None -> 1.0.
+    code_hint==7 (ts_norm): eager torch activation, no Triton kernel (GEMMs upstream stay fused)."""
+    if code_hint == 7:
+        return _ts_norm_eager(gate_up)
     M, twoI = gate_up.shape; I = twoI // 2
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
@@ -382,7 +395,14 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
              want_situ_grads=False):
     """Returns ggu, or (ggu, da_rows, dg_rows) when want_situ_grads (requires row_alpha/row_gamma).
     Row-fused path (I <= _ROWFUSE_MAX_I): ONE kernel computes grad_gate_up + the SiTU per-row
-    param grads in the same pass; tiled fallback uses the pre-pass kernels + _row_situ_bwd."""
+    param grads in the same pass; tiled fallback uses the pre-pass kernels + _row_situ_bwd.
+    code_hint==7 (ts_norm): eager-activation backward via autograd (no Triton, no hand-derived math)."""
+    if code_hint == 7:
+        gu = gate_up.detach().requires_grad_(True)
+        with torch.enable_grad():
+            inter = _ts_norm_eager(gu)
+        ggu_c7, = torch.autograd.grad(inter, gu, grad_out.to(inter.dtype))
+        return (ggu_c7, None, None) if want_situ_grads else ggu_c7
     M, twoI = gate_up.shape; I = twoI // 2
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma

@@ -36,8 +36,8 @@ def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, 
     global I
     I_saved, I = I, (I_ or I)
     E = len(codes)
-    E_glu = sum(1 for c in codes if c in (0, 1, 2, 5, 6))
-    assert all(c in (0, 1, 2, 5, 6) for c in codes[:E_glu]), "GLU codes must precede specials"
+    E_glu = sum(1 for c in codes if c in (0, 1, 2, 5, 6, 7))
+    assert all(c in (0, 1, 2, 5, 6, 7) for c in codes[:E_glu]), "GLU codes must precede specials"
     hid, gup, dwn, g = _mk(E_glu, dtype=dtype)
     idx, wt = _route(E, g, cap)
     act_codes = torch.tensor(codes, dtype=torch.int32, device=DEV)
@@ -90,6 +90,13 @@ def main():
     ok &= check("radial fp32 I=1536 (tiled)", [0, 2, 6, 0, 2, 6], raw=True, I_=1536)
     ok &= check("radial+spec fp32 I=1536", [2, 6, 6, 3, 4], raw=True, I_=1536)
     ok &= check("radial bf16-ac I=1536", [0, 2, 6, 0], raw=True, autocast=True, tol=3e-2, I_=1536)
+    # code 7 = ts_norm (tanh(sigmoid(g/rms(g)))): FUSED per-expert path w/ EAGER activation vs moe_eager ref.
+    ok &= check("all-tsn fp32", [7] * 6, raw=True)
+    ok &= check("mixed-tsn fp32", [0, 2, 7, 0, 2, 7], raw=True)
+    ok &= check("tsn+situ fp32", [2, 5, 7, 0], raw=False)                    # 7 ignores ap, 5 uses it
+    ok &= check("tsn pure-bf16", [7] * 6, raw=True, dtype=torch.bfloat16, tol=3e-2)
+    ok &= check("tsn fp32 I=1536 (tiled)", [0, 2, 7, 0, 2, 7], raw=True, I_=1536)
+    ok &= check("tsn+spec fp32 I=1536", [2, 7, 7, 3, 4], raw=True, I_=1536)
     ok &= check("mixed 0/1/2/5 fp32", [0, 1, 2, 5, 0, 5])
     ok &= check("situ+specials fp32", [0, 5, 2, 5, 3, 4])
     ok &= check("empty-experts fp32", [5, 5, 5, 5, 0, 2], cap=4)   # experts 4,5 get zero rows
