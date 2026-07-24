@@ -1,7 +1,7 @@
 """Fused PolyGLU MoE experts — the hard one. Per-expert + grouped paths + naive-eager reference.
 
 PolyGLU: experts are GLU MLPs with *heterogeneous* activations — each expert carries an
-activation code (0=SiLU, 1=ReLU², 2=NormSiLU, 5=SiTU), e.g. groups of three [SiLU, ReLU², NormSiLU].
+activation code (0=SiLU, 1=ReLU², 2=NormSiLU, 5=SiTU, 6=NormReLU²), e.g. [SiLU, ReLU², NormSiLU].
 Pass an `act_codes` (E,) int32 tensor alongside the expert weights.
 
 SiTU (code 5, Jul 22 2026): tanh(gate) * sigmoid(gate) — SiLU with the linear factor replaced by
@@ -19,6 +19,11 @@ eager _POLYGLU_ACTIVATIONS). The RMS is a row reduction, so the elementwise GLU 
 one-program-per-row pre-pass each way: _row_rms_kernel (fwd: r per row) and _row_s_kernel
 (bwd: S = Σ_j go·up·silu'(ĝ)·ĝ, the RMS-coupling term of the gradient
 grad_gate = (go·up·silu'(ĝ) − (S/I)·ĝ)/r, where ĝ = gate/r).
+
+NormReLU² (code 6, tag "Z", Jul 24 2026): ReLU(gate / rms(gate))² — the NormSiLU RMS normalization
+applied to ReLU² instead of SiLU (regularizes the otherwise unbounded ReLU² gate the same way). Same
+per-row RMS pre-pass (eps 1e-6, gain-free) and same RMS-coupling backward term as code 2, with silu'(ĝ)
+replaced by 2·ReLU(ĝ). Pure-GLU, parameter-free → per-expert path (grouped stays codes 0/1/2 only).
 
 Why MoE can't be ONE fused kernel (unlike SwiGLU / XSA / CE)
 ------------------------------------------------------------
@@ -102,40 +107,40 @@ def _amp_cast(*ts):
 @triton.jit
 def _row_rms_kernel(GateUp_ptr, Act_ptr, Rms_ptr, I, s_gu_m, s_gu_i,
                     EPS: tl.constexpr, BLOCK_I: tl.constexpr):
+    # per-row RMS of the gate half; consumed where at in {2 (NormSiLU), 6 (NormReLU²)}, else r=1.
     row = tl.program_id(0)
     at = tl.load(Act_ptr + row)
-    if at == 2:
-        acc = tl.zeros([BLOCK_I], dtype=tl.float32)
-        for i0 in range(0, I, BLOCK_I):
-            offs = i0 + tl.arange(0, BLOCK_I)
-            g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
-            acc += g * g
-        tl.store(Rms_ptr + row, tl.sqrt(tl.sum(acc) / I + EPS))
-    else:
-        tl.store(Rms_ptr + row, 1.0)
+    acc = tl.zeros([BLOCK_I], dtype=tl.float32)
+    for i0 in range(0, I, BLOCK_I):
+        offs = i0 + tl.arange(0, BLOCK_I)
+        g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
+        acc += g * g
+    rms = tl.sqrt(tl.sum(acc) / I + EPS)
+    tl.store(Rms_ptr + row, tl.where((at == 2) | (at == 6), rms, 1.0))
 
 
 @triton.jit
 def _row_s_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, I,
                   s_go_m, s_go_i, s_gu_m, s_gu_i, BLOCK_I: tl.constexpr):
-    # S = sum_j go_j * up_j * silu'(g_j/r) * (g_j/r) — the RMS-coupling term of the NormSiLU grad.
+    # RMS-coupling term S = sum_j go*up*f'(ĝ)*ĝ, ĝ=gate/r. f'=silu' (code 2) or 2·ReLU (code 6).
+    # r=1 for non-normalized rows (from _row_rms), and S is READ only where at in {2,6}, so the
+    # value computed for other rows is harmless.
     row = tl.program_id(0)
     at = tl.load(Act_ptr + row)
-    if at == 2:
-        r = tl.load(Rms_ptr + row)
-        acc = tl.zeros([BLOCK_I], dtype=tl.float32)
-        for i0 in range(0, I, BLOCK_I):
-            offs = i0 + tl.arange(0, BLOCK_I)
-            m = offs < I
-            go = tl.load(GradOut_ptr + row * s_go_m + offs * s_go_i, mask=m, other=0.0).to(tl.float32)
-            gate = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
-            up = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
-            gn = gate / r
-            sig = 1.0 / (1.0 + tl.exp(-gn))
-            acc += go * up * (sig * (1.0 + gn * (1.0 - sig))) * gn
-        tl.store(S_ptr + row, tl.sum(acc))
-    else:
-        tl.store(S_ptr + row, 0.0)
+    is_nr = at == 6
+    r = tl.load(Rms_ptr + row)
+    acc = tl.zeros([BLOCK_I], dtype=tl.float32)
+    for i0 in range(0, I, BLOCK_I):
+        offs = i0 + tl.arange(0, BLOCK_I)
+        m = offs < I
+        go = tl.load(GradOut_ptr + row * s_go_m + offs * s_go_i, mask=m, other=0.0).to(tl.float32)
+        gate = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        up = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        gn = gate / r
+        sig = 1.0 / (1.0 + tl.exp(-gn))
+        df = tl.where(is_nr, 2.0 * tl.maximum(gn, 0.0), sig * (1.0 + gn * (1.0 - sig)))
+        acc += go * up * df * gn
+    tl.store(S_ptr + row, tl.sum(acc))
 
 
 # ── row-fused (v2) GLU kernels: one program per row spans the FULL intermediate dim, so the
@@ -158,13 +163,13 @@ def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, I,
     at = tl.load(Act_ptr + row)
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
     gg = tl.load(Gamma_ptr + row * s_ap).to(tl.float32)
-    r = tl.sqrt(tl.sum(gate * gate) / I + EPS)           # consumed only where at==2
-    gn = tl.where(at == 2, gate / r, gate)
-    sig = 1.0 / (1.0 + tl.exp(-gn))                       # sigma(gate) for codes 0/1/5, sigma(gate/r) for 2
-    f = gn * sig                                          # silu: covers code 0 (gn=gate) AND code 2 (gn=gate/r)
-    relu = tl.maximum(gate, 0.0)
+    r = tl.sqrt(tl.sum(gate * gate) / I + EPS)           # consumed where at in {2,6}
+    gn = tl.where((at == 2) | (at == 6), gate / r, gate)
+    sig = 1.0 / (1.0 + tl.exp(-gn))                       # sigma(ĝ): ĝ=gate for 0/1/5, gate/r for 2/6
+    f = gn * sig                                          # silu(ĝ): code 0 (ĝ=gate) AND code 2 (ĝ=gate/r)
+    relu = tl.maximum(gn, 0.0)                            # relu(ĝ): code 1 (ĝ=gate) AND code 6 (ĝ=gate/r)
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0    # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
-    act = tl.where(at == 1, relu * relu, tl.where(at == 5, gg * t5 * sig, f))
+    act = tl.where((at == 1) | (at == 6), relu * relu, tl.where(at == 5, gg * t5 * sig, f))
     tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
 
 
@@ -183,20 +188,24 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
     gg = tl.load(Gamma_ptr + row * s_ap).to(tl.float32)
     r = tl.sqrt(tl.sum(gate * gate) / I + EPS)
-    gn = tl.where(at == 2, gate / r, gate)
+    is_norm = (at == 2) | (at == 6)
+    gn = tl.where(is_norm, gate / r, gate)
     sig = 1.0 / (1.0 + tl.exp(-gn))
     f = gn * sig
-    df = sig * (1.0 + gn * (1.0 - sig))
-    relu = tl.maximum(gate, 0.0)
+    df = sig * (1.0 + gn * (1.0 - sig))                   # silu'(ĝ)
+    relu = tl.maximum(gn, 0.0)                            # relu(ĝ): code 1 (ĝ=gate) AND code 6 (ĝ=gate/r)
+    drelu2 = 2.0 * relu                                   # d/dĝ relu(ĝ)²
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0
     situ = gg * t5 * sig
     dsitu = gg * (aa * (1.0 - t5 * t5) * sig + t5 * sig * (1.0 - sig))
-    act = tl.where(at == 1, relu * relu, tl.where(at == 5, situ, f))
+    act = tl.where((at == 1) | (at == 6), relu * relu, tl.where(at == 5, situ, f))
     gu_ = go * up
-    # NormSiLU RMS-coupling: S = sum(go*up*silu'(gn)*gn); grad = (go*up*silu'(gn) - (S/I)*gn)/r
-    S = tl.sum(tl.where(at == 2, gu_ * df * gn, 0.0))
-    grad_gate = tl.where(at == 2, (gu_ * df - (S / I) * gn) / r,
-                         gu_ * tl.where(at == 0, df, tl.where(at == 5, dsitu, 2.0 * relu)))
+    # RMS-coupling (codes 2/6): S = sum(go*up*f'(ĝ)*ĝ); grad = (go*up*f'(ĝ) - (S/I)*ĝ)/r.
+    # f'(ĝ) = silu'(ĝ) for code 2, 2·relu(ĝ) for code 6.
+    dfn = tl.where(at == 6, drelu2, df)
+    S = tl.sum(tl.where(is_norm, gu_ * dfn * gn, 0.0))
+    grad_gate = tl.where(is_norm, (gu_ * dfn - (S / I) * gn) / r,
+                         gu_ * tl.where(at == 0, df, tl.where(at == 5, dsitu, drelu2)))
     tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=msk)
     tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=msk)
     if WANT_AP:
@@ -225,11 +234,13 @@ def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Rms_ptr, Alpha_ptr, Gamma_ptr, Out_ptr,
     sig = 1.0 / (1.0 + tl.exp(-gate))
     silu = gate * sig
     relu = tl.maximum(gate, 0.0)
-    gn = gate / r                                    # r==1.0 for non-NormSiLU rows
+    gn = gate / r                                    # r==1.0 for non-normalized rows (codes 0/1/5)
     nsilu = gn * (1.0 / (1.0 + tl.exp(-gn)))
+    nrelu2 = tl.maximum(gn, 0.0) * tl.maximum(gn, 0.0)  # NormReLU²: relu(gate/r)²
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0   # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
     situ = gg * t5 * sig                                 # SiTU: gamma * tanh(alpha*g) * sigmoid(g)
-    act = tl.where(at == 0, silu, tl.where(at == 1, relu * relu, tl.where(at == 5, situ, nsilu)))
+    act = tl.where(at == 0, silu, tl.where(at == 1, relu * relu,
+              tl.where(at == 5, situ, tl.where(at == 6, nrelu2, nsilu))))
     tl.store(Out_ptr + offs_m[:, None] * s_o_m + offs_i[None, :] * s_o_i,
              (act * up).to(Out_ptr.dtype.element_ty), mask=mask)
 
@@ -256,13 +267,16 @@ def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, Alpha_ptr,
     gn = gate / r
     sig_n = 1.0 / (1.0 + tl.exp(-gn)); nsilu = gn * sig_n
     dnsilu = sig_n * (1.0 + gn * (1.0 - sig_n))
+    relu_n = tl.maximum(gn, 0.0); nrelu2 = relu_n * relu_n; dnrelu2 = 2.0 * relu_n   # NormReLU² (code 6)
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0   # tanh(alpha*g), exact sigmoid identity
     situ = gg * t5 * sig
     dsitu = gg * (aa * (1.0 - t5 * t5) * sig + t5 * sig * (1.0 - sig))
-    act = tl.where(at == 0, silu, tl.where(at == 1, relu2, tl.where(at == 5, situ, nsilu)))
-    # NormSiLU grad has the extra RMS-coupling term: (go·up·silu'(ĝ) − (S/I)·ĝ)/r
+    act = tl.where(at == 0, silu, tl.where(at == 1, relu2,
+              tl.where(at == 5, situ, tl.where(at == 6, nrelu2, nsilu))))
+    # NormSiLU/NormReLU² grad has the extra RMS-coupling term: (go·up·f'(ĝ) − (S/I)·ĝ)/r
     grad_gate = tl.where(at == 2, (go * up * dnsilu - (sv / I) * gn) / r,
-                         go * up * tl.where(at == 0, dsilu, tl.where(at == 5, dsitu, drelu2)))
+                 tl.where(at == 6, (go * up * dnrelu2 - (sv / I) * gn) / r,
+                          go * up * tl.where(at == 0, dsilu, tl.where(at == 5, dsitu, drelu2))))
     tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + offs_i[None, :] * s_ggu_i, grad_gate, mask=mask)
     tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + (I + offs_i)[None, :] * s_ggu_i, go * act, mask=mask)
 
@@ -341,7 +355,7 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
                                       _ap_stride(row_alpha),
                                       EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=(8 if BLOCK_I >= 1024 else 4))
         return out
-    skip_ns = code_hint is not None and code_hint != 2
+    skip_ns = code_hint is not None and code_hint not in (2, 6)   # codes 2/6 both need the row RMS
     rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
     BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
@@ -375,7 +389,7 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
                                       EPS=_NS_EPS, WANT_AP=want_situ_grads, BLOCK_I=BLOCK_I,
                                       num_warps=(8 if BLOCK_I >= 1024 else 4))
         return (ggu, da, dg) if want_situ_grads else ggu
-    skip_ns = code_hint is not None and code_hint != 2
+    skip_ns = code_hint is not None and code_hint not in (2, 6)   # codes 2/6 both need the row RMS
     if skip_ns:
         rms = _ones(M, gate_up.device)      # r=1 / S=0 semantics; values unread where at!=2
         sbuf = rms
@@ -830,6 +844,11 @@ def _act_eager(gate, code, alpha=None, gamma=None):
         # SiTU: gamma * tanh(alpha*g) * sigmoid(g), fp32 math, learnable per-expert scalars
         g = gate.float()
         return (gamma * torch.tanh(alpha * g) * torch.sigmoid(g)).to(gate.dtype)
+    if code == 6:
+        # NormReLU²: ReLU(rms-normed gate)², gain-free — same RMS as NormSiLU (_NS_EPS)
+        g = gate.float()
+        g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
+        return (F.relu(g) ** 2).to(gate.dtype)
     # NormSiLU: SiLU(rms-normed gate), gain-free — matches BiBo eager (_NORMSILU_EPS)
     g = gate.float()
     g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
