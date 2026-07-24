@@ -36,8 +36,8 @@ def check(name, codes, cap=None, dtype=torch.float32, autocast=False, tol=1e-4, 
     global I
     I_saved, I = I, (I_ or I)
     E = len(codes)
-    E_glu = sum(1 for c in codes if c in (0, 1, 2, 5, 6))
-    assert all(c in (0, 1, 2, 5, 6) for c in codes[:E_glu]), "GLU codes must precede specials"
+    E_glu = sum(1 for c in codes if c in (0, 1, 2, 5, 6, 7))
+    assert all(c in (0, 1, 2, 5, 6, 7) for c in codes[:E_glu]), "GLU codes must precede specials"
     hid, gup, dwn, g = _mk(E_glu, dtype=dtype)
     idx, wt = _route(E, g, cap)
     act_codes = torch.tensor(codes, dtype=torch.int32, device=DEV)
@@ -83,19 +83,24 @@ def main():
     ok &= check("all-relu2 fp32", [1] * 6)
     ok &= check("all-normsilu fp32", [2] * 6)
     ok &= check("all-normrelu2 fp32", [6] * 6)                       # code 6: relu(gate/rms)²
+    ok &= check("all-normsitu fp32", [7] * 6)                         # code 7: tanh(gate/rms)*sig(gate/rms)
     ok &= check("mixed 0/1/2/5 fp32", [0, 1, 2, 5, 0, 5])
     ok &= check("mixed 1/2/6 fp32", [1, 2, 6, 6, 2, 1])              # relu2 vs normrelu2 vs normsilu
+    ok &= check("mixed 2/5/7 fp32", [2, 5, 7, 7, 5, 2])              # normsilu vs situ vs normsitu
     ok &= check("normrelu2+specials fp32", [6, 2, 6, 5, 3, 4])
+    ok &= check("normsitu+specials fp32", [7, 2, 7, 5, 3, 4])
     ok &= check("situ+specials fp32", [0, 5, 2, 5, 3, 4])
     ok &= check("empty-experts fp32", [5, 5, 5, 5, 0, 2], cap=4)   # experts 4,5 get zero rows
     # tiled fallback path (I=1536 > _ROWFUSE_MAX_I) — both paths stay gated
     ok &= check("mixed fp32 I=1536 (tiled)", [0, 1, 2, 5, 0, 5], I_=1536)
     ok &= check("normrelu2 fp32 I=1536", [1, 2, 6, 6, 0, 6], I_=1536)
+    ok &= check("normsitu fp32 I=1536", [2, 5, 7, 7, 0, 7], I_=1536)
     ok &= check("situ+spec fp32 I=1536", [0, 5, 2, 5, 3, 4], I_=1536)
     # bf16 baselines: pure-bf16 tensors AND autocast-on-fp32 (loose, bf16 floor)
     ok &= check("mixed pure-bf16", [0, 1, 2, 5, 0, 5], dtype=torch.bfloat16, tol=3e-2)
     ok &= check("all-normsilu pure-bf16", [2] * 6, dtype=torch.bfloat16, tol=3e-2)
     ok &= check("all-normrelu2 pure-bf16", [6] * 6, dtype=torch.bfloat16, tol=3e-2)
+    ok &= check("all-normsitu pure-bf16", [7] * 6, dtype=torch.bfloat16, tol=3e-2)
     ok &= check("all-situ bf16-ac", [5] * 6, autocast=True, tol=3e-2)
     ok &= check("mixed+specials bf16-ac", [0, 5, 2, 5, 3, 4], autocast=True, tol=3e-2)
     ok &= check("normrelu2 bf16-ac I=1536", [1, 2, 6, 6, 0, 6], autocast=True, tol=3e-2, I_=1536)
