@@ -4,6 +4,17 @@ PolyGLU: experts are GLU MLPs with *heterogeneous* activations — each expert c
 activation code (0=SiLU, 1=ReLU², 2=NormSiLU, 5=SiTU, 6=NormReLU², 7=NormSiTU), e.g. [SiLU, ReLU², NormSiLU].
 Pass an `act_codes` (E,) int32 tensor alongside the expert weights.
 
+SPECIAL (param-free, no GEMM) codes 3 and 4 are NOT activations — they mark an expert whose whole
+body is a signed passthrough of the input: code 3 = +Identity (out += w*x), code 4 = -Identity
+(out += -w*x). They own no slot in gate_up_proj/down_proj, so the GLU block must come FIRST in the
+stack (weight slot == expert index) and the specials must be the trailing indices.
+Code 4 was the ZERO expert (emit nothing) until Jul 26 2026. It was replaced because a Zero expert's
+output is identically 0, so d(loss)/d(its router weight) = <grad_out, 0> = 0 — the router gets no
+gradient telling it that picking Zero was right, and every Zero assignment is therefore driven by
+the load balancer alone. The ± pair still spans "skip this layer" (equal weights cancel) but reaches
+it with live gradient on both branches. LongCat-Flash (arXiv:2509.01322) likewise uses identity,
+never zero, for its zero-COMPUTATION experts.
+
 SiTU (code 5, Jul 22 2026): tanh(gate) * sigmoid(gate) — SiLU with the linear factor replaced by
 tanh; bounded, fully elementwise, and PARAMETER-FREE by default (the menu design: activations carry
 no learnable params or norms — scaling lives in the gate/up projections; NormSiLU is likewise
@@ -738,7 +749,7 @@ class _PerExpertMoE(torch.autograd.Function):
         hidden, wt, gate_up_proj, down_proj = _amp_cast(hidden, wt, gate_up_proj, down_proj)
         N, H = hidden.shape
         E = act_codes.shape[0]                  # total routed experts (GLU + specials)
-        codes = act_codes.tolist()              # 0/1/2/5 = GLU (weight slot e), 3 = Identity, 4 = Zero
+        codes = act_codes.tolist()              # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
         top_k = idx.shape[1]; dev = hidden.device
         st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
@@ -757,10 +768,8 @@ class _PerExpertMoE(torch.autograd.Function):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
-            if codes[e] == 4:                                            # Zero expert: contributes nothing
-                continue
-            if codes[e] == 3:                                            # Identity: weighted passthrough of input
-                _combine_scatter(x_s[s:en], sw[s:en], st[s:en], out)
+            if codes[e] == 3 or codes[e] == 4:      # ±Identity: signed weighted passthrough, out += (±w)*x
+                _combine_scatter(x_s[s:en], sw[s:en] if codes[e] == 3 else -sw[s:en], st[s:en], out)
                 continue
             gu = x_s[s:en] @ gate_up_proj[e].t()                         # GLU expert; weight slot = e (GLU first)
             _has_ap = codes[e] == 5 and ap32 is not None
@@ -793,11 +802,13 @@ class _PerExpertMoE(torch.autograd.Function):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
-            if codes[e] == 4:                                          # Zero: no grad
-                continue
-            if codes[e] == 3:                                          # Identity: out=w*input -> dx=w*go, dw=sum(go*input)
-                ge, gw = _combine_bwd(grad_out, x_s[s:en], sw[s:en], st[s:en])
-                grad_w_s[s:en] = gw.to(grad_out.dtype)
+            if codes[e] == 3 or codes[e] == 4:
+                # ±Identity: out = (sgn*w)*x  ->  dx = (sgn*w)*go, dw = sgn*sum(go*x).
+                # _combine_bwd(go, eo, w, tok) returns (go*w, sum_h(go*eo)), so feeding it the SIGNED
+                # weight gives dx directly and d/d(sgn*w); one extra sgn recovers dw.
+                sgn = 1.0 if codes[e] == 3 else -1.0
+                ge, gw = _combine_bwd(grad_out, x_s[s:en], sw[s:en] * sgn, st[s:en])
+                grad_w_s[s:en] = (gw * sgn).to(grad_out.dtype)
                 grad_hidden.index_add_(0, st[s:en], ge)
                 continue
             it = inter_l[e]                                            # (m,I)
@@ -841,9 +852,9 @@ def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes
 
     The grouped path's tl.dot GEMMs are catastrophic on Turing (T4, sm_75) — measured ~0.1x vs compiled
     eager — so it is NEVER chosen on sm_<80; per-expert (cuBLAS) wins there. The grouped path also does
-    NOT implement the Identity (code 3) / Zero (code 4) special experts — it runs GLU over every expert
+    NOT implement the ±Identity (codes 3/4) special experts — it runs GLU over every expert
     uniformly — so it is correct ONLY for pure-GLU stacks. With a special expert present it produces
-    wrong output and gradients (measured: grad rel ~1.6e+03 on the 9-GLU+Identity+Zero stack), so we
+    wrong output and gradients (measured: grad rel ~1.6e+03 on the 9-GLU+2-special stack), so we
     fall back to the per-expert path (which handles codes 3/4 in fwd and bwd) whenever a special expert
     is in the stack. per-expert is correct on every arch and is itself a large win (T4 ~2.9x; Blackwell
     ~4x fwd+bwd). To use grouped on a mixed stack, fix _GroupedMoE to special-case codes 3/4 first."""
@@ -888,7 +899,7 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
     N, H = hidden.shape
     twoI = gate_up_proj.shape[1]
     I = twoI // 2
-    codes = act_codes.tolist()          # 0/1/2/5 = GLU (weight slot e), 3 = Identity, 4 = Zero
+    codes = act_codes.tolist()          # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
     E = len(codes)                       # total routed experts (GLU + specials)
     out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):
@@ -896,10 +907,9 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
         if not bool(rows.any()):
             continue
         w = (top_k_weights * (top_k_indices == e)).sum(-1)[rows]
-        if codes[e] == 4:                                                # Zero: contributes nothing
-            continue
-        if codes[e] == 3:                                                # Identity: weighted passthrough
-            out[rows] += (hidden[rows] * w.unsqueeze(-1)).float()
+        if codes[e] == 3 or codes[e] == 4:                               # ±Identity: signed passthrough
+            sgn = 1.0 if codes[e] == 3 else -1.0
+            out[rows] += (hidden[rows] * (sgn * w).unsqueeze(-1)).float()
             continue
         gate_up = hidden[rows] @ gate_up_proj[e].t()
         a, g = ((act_params[e, 0], act_params[e, 1]) if codes[e] == 5 and act_params is not None

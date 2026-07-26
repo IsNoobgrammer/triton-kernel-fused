@@ -28,21 +28,30 @@ def dense_weights(idx, w, E):
 
 
 def main():
-    # E=11 routed = 9 PolyGLU (3*3) + Identity + Zero (1 pair), matching the BiBo production stack
+    # E=11 routed = 9 PolyGLU (3*3) + (+Identity) + (-Identity) (1 pair), the BiBo production stack
     cfg = BiBoConfig(hidden_size=512, num_attention_heads=8, num_key_value_heads=2,
                      router_type="conv", kernel_size=4, num_experts_per_tok=2,
-                     polyglu_expert_multiplier=3, special_expert_pairs=1)
+                     polyglu_expert_multiplier=3, special_expert_pairs=1,
+                     # norm_topk_prob=True means SOFTMAX over the gathered top-k in BiBo as of
+                     # Jul 26 2026; fused_router still implements the old MiMo w/sum(w). Until the
+                     # kernel gains a softmax mode this gate can only test the divide-by-sum arm
+                     # (measured gap on the softmax arm: weights rel 2.6e-2, grads rel 6.6e-1).
+                     norm_topk_prob=False)
     router = BiBoMoERouter(cfg).to(DEV).half()
     E = router.num_routed_experts
     K = router.kernel_size
     top_k = router.top_k
     B, S, H = 16, 1024, cfg.hidden_size
+    H_ = cfg.hidden_size
     print(f"config: E={E} K={K} top_k={top_k} norm_topk_prob={router.norm_topk_prob} "
           f"scaling={router.routed_scaling_factor} act={router.router_activation} gate={router.gate_type}")
 
     # non-zero bias so we actually exercise bias-affects-selection
     router.bias.copy_(torch.randn(E, device=DEV) * 0.1)
-    weight = router.gate_conv.weight.detach()                 # (E,H,K) fp16
+    # The conv router weight is stored 2D (E, H*K) on purpose -- so Muon orthogonalizes EXPERTS, not
+    # kernel taps (see BiBo ablate/common/optim.py). fused_router wants the (E,H,K) conv layout, which
+    # is just a view: H*K is contiguous [h-major, k-minor], matching Conv1d's (out, in, kernel).
+    weight = router.gate_conv.detach().view(E, H_, K)         # (E,H,K) fp16
     bias = router.bias.detach().float()
 
     x = torch.randn(B, S, H, device=DEV, dtype=torch.float16)
@@ -50,12 +59,12 @@ def main():
 
     # ---- forward + grads: BiBo ----
     xb = x.clone().requires_grad_(True)
-    router.gate_conv.weight.requires_grad_(True)
+    router.gate_conv.requires_grad_(True)
     idx_b, w_b = router(xb)
     dw_b = dense_weights(idx_b, w_b, E)
     loss_b = (dw_b * G).sum()
     loss_b.backward()
-    gx_b, gw_b = xb.grad.detach(), router.gate_conv.weight.grad.detach()
+    gx_b, gw_b = xb.grad.detach(), router.gate_conv.grad.detach().view(E, H_, K)
 
     # ---- forward + grads: ours (cudnn) ----
     xo = x.clone().requires_grad_(True)

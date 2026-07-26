@@ -24,7 +24,9 @@ PolyGLU + special experts
 The GLU experts (act codes 0/1/2) own weight slots 0..E_glu-1 and form a CONTIGUOUS PREFIX once tokens
 are sorted by expert id, so exactly those rows go through the grouped GEMM with per-row activation codes
 (PolyGLU). The special experts live at the tail: Identity (code 3) = weighted passthrough handled by a
-cheap scatter; Zero (code 4) = skip. They have no weight GEMM, so they never enter the grouped call.
+cheap scatter; -Identity (code 4) = the same scatter with the weight negated. (Code 4 meant ZERO --
+emit nothing -- until Jul 26 2026; see kernels/sm75/moe.py for why that expert was retired.) They have
+no weight GEMM, so they never enter the grouped call.
 This is what the old GLU-only `kernels.sm75.moe.moe_grouped` lacked (it ran GLU over every expert and
 produced grad rel ~5.7 on a stack containing codes 3/4). This path is correct on that stack (grad PASS).
 
@@ -79,7 +81,7 @@ def moe_grouped_cublas_polyglu(hidden, top_k_indices, top_k_weights, gate_up_pro
 
     hidden (N,H); top_k_indices/top_k_weights (N,k); gate_up_proj (E_glu,2I,H); down_proj (E_glu,H,I);
     act_codes (E,) int32 where E = E_glu + n_special. GLU codes (0/1/2) index weight slots 0..E_glu-1;
-    Identity (3) / Zero (4) are param-free and handled on the sorted tail. Returns (N,H).
+    +Identity (3) / -Identity (4) are param-free and handled on the sorted tail. Returns (N,H).
     """
     from kernels.sm75.moe import _code_max
     if _code_max(act_codes) > 4:   # cached: one host sync per act_codes tensor lifetime
@@ -111,12 +113,12 @@ def moe_grouped_cublas_polyglu(hidden, top_k_indices, top_k_weights, gate_up_pro
     out.index_add_(0, st_glu, eo * sw_glu.unsqueeze(-1))
 
     n_routed = st.shape[0]
-    if n_glu < n_routed:                                   # special experts on the sorted tail
-        tail_e = sorted_e[n_glu:]
-        tail_codes = act_codes.index_select(0, tail_e)
-        id_sel = (tail_codes == 3).nonzero(as_tuple=True)[0]   # Identity = weighted passthrough; Zero = skip
-        if id_sel.numel() > 0:
-            id_tok = st[n_glu:].index_select(0, id_sel)
-            id_w = sw[n_glu:].index_select(0, id_sel)
-            out.index_add_(0, id_tok, hidden.index_select(0, id_tok) * id_w.unsqueeze(-1))
+    if n_glu < n_routed:
+        # ±Identity specials on the sorted tail. Every tail expert is a special (GLU owns [0,e_glu)
+        # and the sort is by expert id), and BOTH signs contribute, so there is nothing to select --
+        # just flip the weight for code 4. This also drops the old nonzero() host sync.
+        tail_codes = act_codes.index_select(0, sorted_e[n_glu:])
+        sgn = torch.where(tail_codes == 3, 1.0, -1.0).to(sw.dtype)
+        tok = st[n_glu:]
+        out.index_add_(0, tok, hidden.index_select(0, tok) * (sw[n_glu:] * sgn).unsqueeze(-1))
     return out

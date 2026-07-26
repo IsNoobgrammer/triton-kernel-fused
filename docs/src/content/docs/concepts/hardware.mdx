@@ -81,7 +81,7 @@ The compute-bound wins (Muon, MoE) **widen** the most off Turing — Blackwell's
 Blackwell adds a second MoE path: `moe_grouped_cublas_polyglu` — one cuBLAS grouped GEMM
 (`torch._grouped_mm`, autograd-native) over all routed tokens instead of one GEMM per expert. Unlike the
 older GLU-only grouped path (whose gradients were wrong on the special experts), it is **correct on the
-Identity/Zero stack** and supports PolyGLU, and it beats the per-expert path by **~2–3× at or below
+±Identity stack** and supports PolyGLU, and it beats the per-expert path by **~2–3× at or below
 per-expert memory** when tokens-per-expert is low — the many-experts regime real MoEs live in. `moe()`
 dispatches to it automatically by tokens-per-expert; per-expert stays the correct, leaner fallback. See the
 [MoE page](/triton-kernel-fused/kernels/moe/).

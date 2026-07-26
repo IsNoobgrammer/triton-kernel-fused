@@ -130,7 +130,7 @@ champion):
 
 Scaling the token count **up** at a fixed expert count actually favors per-expert (its GEMMs grow large
 and efficient), so the grouped edge is about expert count and routing sparsity, not batch size. This
-applies to **ordinary pure-GLU MoEs too** — a stack with no Identity/Zero is just the case where the
+applies to **ordinary pure-GLU MoEs too** — a stack with no ±Identity specials is just the case where the
 special-expert tail is empty (measured pure-GLU: 32 experts → ~2.6× at lower memory; 16 → ~1.8×).
 
 ### Automatic dispatch
@@ -157,13 +157,13 @@ balanced one. Pick per-expert explicitly if you are memory-bound at high `top_k`
 | Function | When | Notes |
 |---|---|---|
 | `moe` | auto | On `sm_120`: cuBLAS grouped (`moe_grouped_cublas_polyglu`) when supported and tokens-per-expert ≤ 2048; else per-expert. On `sm_75`/older: always per-expert. |
-| `moe_grouped_cublas_polyglu` | `sm_120`, many experts | One cuBLAS grouped GEMM (`torch._grouped_mm`) over all routed tokens; PolyGLU + Identity/Zero; autograd-native. The Blackwell scale win. |
+| `moe_grouped_cublas_polyglu` | `sm_120`, many experts | One cuBLAS grouped GEMM (`torch._grouped_mm`) over all routed tokens; PolyGLU + ±Identity; autograd-native. The Blackwell scale win. |
 | `moe_per_expert` | small token counts, all of Turing, high tokens-per-expert, or memory-bound at high `top_k` | Sorted dispatch + per-expert cuBLAS GEMMs + fused PolyGLU + weighted scatter, manual backward. Correct on every arch; the universal fallback. |
 | `moe_grouped` | legacy / parity only | The original GLU-only `tl.dot` grouped GEMM. Catastrophic on Turing, superseded by the cuBLAS path on Blackwell. Not used by `moe()`. |
 | `moe_eager` | reference only | The slow masked-loop baseline the fused paths beat — keep for parity checks. |
 
 <Aside type="caution" title="Two grouped implementations — they differ on special experts">
-1. **`sm_120` cuBLAS grouped** (`moe_grouped_cublas_polyglu`) — **handles Identity/Zero correctly** and is
+1. **`sm_120` cuBLAS grouped** (`moe_grouped_cublas_polyglu`) — **handles ±Identity correctly** and is
    what `moe()` dispatches to on Blackwell when tokens-per-expert is low. No special-expert restriction.
 2. **Legacy `tl.dot` grouped** (`moe_grouped`, from `sm75`) — runs a GLU over every expert uniformly, so it
    is correct **only** for pure-GLU stacks (codes `0/1/2`), and is catastrophic on Turing (~0.1× vs compiled
