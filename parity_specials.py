@@ -85,7 +85,7 @@ def main():
         paths = [("moe_eager", moe_eager), ("moe_per_expert", moe_per_expert)]
         if torch.cuda.get_device_capability(DEV)[0] >= 12 and dtype is torch.bfloat16:
             from kernels.sm120.moe_grouped import moe_grouped_cublas_polyglu, grouped_supported
-            if grouped_supported(hidden, gup):
+            if grouped_supported(hidden, gup, dn):
                 paths.append(("sm120 grouped", moe_grouped_cublas_polyglu))
 
         for name, fn in paths:
