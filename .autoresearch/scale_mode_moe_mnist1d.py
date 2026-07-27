@@ -75,9 +75,14 @@ class MoENet1D(nn.Module):
 def run(mode, seed, tr, idtest, ood_x, ood_y):
     torch.manual_seed(seed)
     model = MoENet1D().to(M.DEV)
-    muon_p = [p for p in model.parameters() if p.ndim in (2, 3)]
-    rest = [p for p in model.parameters() if p.ndim not in (2, 3)]
-    n3 = sum(1 for p in muon_p if p.ndim == 3)
+    # EXCLUDE THE CONV STEM. Its weight is (16,1,5) -- 3D, so a bare `ndim in (2,3)` filter sweeps
+    # it into Muon, where NS would batch over 16 slices of a 1x5 "matrix". Meaningless, and
+    # manas_mnist1d is explicit that convs never go to Muon. Only the 6 MoE stacks (3 blocks x
+    # gate_up/down) plus the 2D linears belong here.
+    muon_p = [q for n, q in model.named_parameters() if q.ndim in (2, 3) and "stem" not in n]
+    rest = [q for n, q in model.named_parameters() if q.ndim not in (2, 3) or "stem" in n]
+    n3 = sum(1 for q in muon_p if q.ndim == 3)
+    assert n3 == 6, f"expected 6 3D expert stacks (3 blocks x 2), got {n3}"
     opt = FusedMuon([{"params": muon_p}], lr=2e-3, momentum=0.95, weight_decay=0.01,
                     coeffs=NS8, ns_dtype=torch.bfloat16, scale_mode=mode)
     aux = torch.optim.AdamW(rest, lr=2e-3, weight_decay=0.01)

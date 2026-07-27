@@ -24,7 +24,9 @@ from kernels.sm75.manas import ManasOptimizer
 
 torch.set_num_threads(os.cpu_count() or 8)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-GA, MICRO = 4, 64                       # global batch 256 = 64 x 4 votes
+# slicing via env (global batch stays GA*MICRO): default 64x4; e.g. MANAS_GA=8 MANAS_MICRO=32
+GA = int(os.environ.get("MANAS_GA", 4))
+MICRO = int(os.environ.get("MANAS_MICRO", 64))
 STEPS = {"mnist1d": 600, "mnist": 350}
 SEEDS = (0, 1, 2)
 
@@ -93,8 +95,11 @@ MODEL = {"mnist1d": Net1D, "mnist": NetMNIST}
 
 
 def law_gamma(lr):
-    """The dose law at this config: gamma = 0.08 * sqrt(lr/3e-4) * k/sqrt(m)."""
-    return 0.08 * (lr / 3e-4) ** 0.5 * GA / MICRO ** 0.5
+    """The dose law at this config: gamma = 0.08 * sqrt(lr/3e-4) * k/sqrt(m).
+    MANAS_GCAP caps it: the law's constant/k-range are LM-family-calibrated, and the toy's
+    overdose cliff sits lower (32x8 law dose 0.207 cratered acc; 0.073 is toy-validated)."""
+    g = 0.08 * (lr / 3e-4) ** 0.5 * GA / MICRO ** 0.5
+    return min(g, float(os.environ.get("MANAS_GCAP", "inf")))
 
 
 def run(ds, seed, lr, gamma, x, y, xt, yt):

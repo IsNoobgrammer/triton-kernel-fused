@@ -18,6 +18,7 @@ from kernels.sm75.manas import ManasOptimizer
 
 EVAL_EVERY = 10
 LR0, LR_END = 1e-3, 1e-4
+TAG = os.environ.get("MANAS_TAG", "")     # suffix for output files (e.g. _32x8)
 
 
 def lr_at(t, steps):
@@ -72,7 +73,7 @@ if __name__ == "__main__":
                 out[ds][name].append(accs)
                 print(f"  seed {sd} {name}: final acc {accs[-1]:.3f}", flush=True)
         out[ds]["steps"] = ev
-    with open(os.path.join(HERE, "speed_mnist_acc.json"), "w") as f:
+    with open(os.path.join(HERE, f"speed_mnist_acc{TAG}.json"), "w") as f:
         json.dump(out, f)
 
     import matplotlib
@@ -89,9 +90,9 @@ if __name__ == "__main__":
             for row in a:
                 ax.plot(ev, row, color=color, alpha=0.20, lw=1)
             ax.plot(ev, a.mean(0), color=color, lw=2.4, label=LABELS[name])
-        ax.set_title(f"{ds}: test acc vs step (cosine lr {LR0:.0e}->{LR_END:.0e}, 3-seed mean)")
+        ax.set_title(f"{ds}: test acc vs step ({MICRO}x{GA}, cosine lr {LR0:.0e}->{LR_END:.0e}, 3-seed mean)")
         ax.set_xlabel("step"); ax.set_ylabel("test acc")
         ax.legend(loc="lower right", fontsize=8); ax.grid(alpha=0.25)
     fig.tight_layout()
-    fig.savefig(os.path.join(HERE, "speed_mnist_acc.png"), dpi=130)
-    print("wrote speed_mnist_acc.png/json", flush=True)
+    fig.savefig(os.path.join(HERE, f"speed_mnist_acc{TAG}.png"), dpi=130)
+    print(f"wrote speed_mnist_acc{TAG}.png/json", flush=True)

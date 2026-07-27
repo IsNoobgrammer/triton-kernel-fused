@@ -1,0 +1,1 @@
+{"objective":"min overhead + min kinvariance, correct=true","baseline":{"muon":15.212,"overhead_k4":69.634,"kinvariance":83.989},"champion":{"overhead_k2":20.596,"overhead_k4":28.077,"overhead_k8":42.75,"kinvariance":22.171,"correct":true,"max_err":6.26e-08,"branch":"manas-fast-wip","commit":"0f894c3"},"run_number":2,"status":"finalized iter1"}
