@@ -819,15 +819,20 @@ class _PerExpertMoE(torch.autograd.Function):
             # _glu_fwd was measured sitting exactly at HBM bandwidth: its whole cost is re-reading
             # the (M,2I) gu that cuBLAS had to land in memory. Computing the activation while the
             # accumulators are still in registers removes that read. 1.32x on the real load spread.
+            # The GENERIC grouped GEMMs (it@W2 here, grad_inter + dX-with-scatter in backward) are
+            # activation-agnostic, so their tile map is built whenever the arch/dtype allows -- NOT
+            # gated on fused_supported(). It used to be, which silently cost the RMS-normed codes
+            # (2/6/7) three activation-independent wins at once, the dX scatter (and its 23.9 ms/step
+            # index_add) included. Only the two FUSED-EPILOGUE kernels need a pointwise activation.
+            # Each kernel autotuned to a different BM, so each needs its own map (a few small GPU ops).
+            if _FUSED_GLU is not None and _FUSED_GLU.tiles_supported(x_s):
+                tile_map_gg = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
+                                                        bm=_FUSED_GLU._GG[0])
             fused = None
-            if _FUSED_GLU is not None and _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes):
+            if tile_map_gg is not None and _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes):
                 tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
                 fused = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0], want_gu=True)
                 tile_map = tm
-                # the generic grouped GEMM autotuned to BM=128, the fused GLU to BM=64,
-                # so each gets its own tile map (both are a handful of small GPU ops)
-                tile_map_gg = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
-                                                        bm=_FUSED_GLU._GG[0])
                 tile_map_bw = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
                                                         bm=_FUSED_GLU._BBM)
             if fused is not None:
@@ -905,7 +910,12 @@ class _PerExpertMoE(torch.autograd.Function):
                 grad_gate_up = _FUSED_GLU.fused_dinter_glu_bwd(
                     ge_all, down_proj, gu_all, ctx.tile_map_bw, codes[0])
             else:
-                grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
+                # No fused epilogue (RMS-normed act): grad_it must be materialized for _glu_bwd's row
+                # reduction anyway, but the GEMM producing it is still activation-agnostic Triton.
+                grad_inter = (_FUSED_GLU.grouped_gemm(ge_all, down_proj, ctx.tile_map_gg)
+                              if ctx.tile_map_gg is not None else None)
+                if grad_inter is None:
+                    grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
                 grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
             grad_hidden = None

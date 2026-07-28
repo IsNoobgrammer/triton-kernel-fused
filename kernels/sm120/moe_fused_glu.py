@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fused_gate_up_glu", "fused_supported", "build_tile_map"]
+__all__ = ["fused_gate_up_glu", "fused_supported", "tiles_supported", "build_tile_map"]
 
 _BM, _BN, _BK, _WARPS, _STAGES = 64, 256, 32, 8, 3      # autotuned for WRITE_GU=True (1.09x over 64/128/64)
 
@@ -62,13 +62,27 @@ def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM, ACT,
                  mask=mask_m[:, None])
 
 
-def fused_supported(hidden, gate_up_proj, codes):
-    """Only the NON-normalized pointwise GLUs: codes 2/6/7 need a per-row RMS over the gate half,
-    which a GEMM epilogue cannot see (it holds a BN-wide slice of the row, not the whole row)."""
-    I = gate_up_proj.shape[1] // 2
-    return (hidden.dtype is torch.bfloat16
+def tiles_supported(hidden):
+    """Can this device/dtype run the ACTIVATION-AGNOSTIC grouped GEMMs (`grouped_gemm`,
+    `grouped_gemm_scatter`)? Those three call sites -- it@W2, grad_inter, dX+scatter -- do not touch
+    the activation at all, so they must NOT be gated on `fused_supported`. Doing that cost the
+    RMS-normed codes (2/6/7) three wins they were entitled to, including the fused dX scatter whose
+    absence brings back a 23.9 ms/step index_add. tl.dot GEMMs are catastrophic on Turing (~0.1x),
+    hence sm_80+."""
+    return (hidden.dtype in (torch.bfloat16, torch.float16)
+            and hidden.device.type == "cuda"
             and torch.cuda.get_device_capability(hidden.device)[0] >= 8
-            and gate_up_proj.is_contiguous() and hidden.is_contiguous()
+            and hidden.is_contiguous())
+
+
+def fused_supported(hidden, gate_up_proj, codes):
+    """The FUSED-EPILOGUE kernels only: codes 2/6/7 need a per-row RMS over the gate half, which a
+    GEMM epilogue cannot see (it holds a BN-wide slice of the row, not the whole row). Widening BN to
+    span I=768 would need a BM x 1024 fp32 accumulator pair = 128 KB of registers -> spills. Those
+    codes keep the separate row-fused `_glu_fwd`/`_glu_bwd`, which are already at the HBM roofline."""
+    I = gate_up_proj.shape[1] // 2
+    return (tiles_supported(hidden) and hidden.dtype is torch.bfloat16
+            and gate_up_proj.is_contiguous()
             and I % _BN == 0 and gate_up_proj.shape[2] % _BK == 0
             and len(set(codes)) == 1 and codes[0] in (0, 1))
 
