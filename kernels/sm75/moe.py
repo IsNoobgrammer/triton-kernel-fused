@@ -111,7 +111,6 @@ def _code_max(act_codes):
 # Profiling put bfloat16_copy_kernel at 7.87 ms/micro-batch. Tensor._version bumps on any in-place
 # write, so an optimizer step invalidates the entry automatically -- a stale cast is not possible.
 _CAST_CACHE = {}
-_L2_BYTES = 48 << 20      # target gu bytes per chunk; keeps the GEMM->activation hop in L2
 
 
 def _cached_cast(t, dt):
@@ -810,36 +809,11 @@ class _PerExpertMoE(torch.autograd.Function):
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
         if use_gmm:
-            # CHUNKED over experts, and gu/it are NEVER persisted.
-            # One grouped GEMM over all 64 experts makes gu ~805 MB/layer -- far past L2 -- so the
-            # activation re-reads it from HBM. Measured: batching cut _glu_fwd launches 511->8 but
-            # its time went UP (4.73->6.52 ms), because the per-expert version kept a 12.6 MB gu hot
-            # in L2 between GEMM1 and the activation. Chunking restores that locality.
-            # gu and it are then only needed again in backward, where recomputing them per chunk
-            # costs one extra GEMM per layer (~21 us) but avoids writing+re-reading 805 MB + 402 MB
-            # per layer. _glu_fwd/_glu_bwd were measured sitting exactly at HBM bandwidth, so this
-            # is the one change that actually moves them.
+            gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
             hint = codes[0] if len(set(codes)) == 1 else None
-            twoI = gate_up_proj.shape[1]
-            rows_per_chunk = max(1, _L2_BYTES // (twoI * hidden.element_size()))
-            eo_all = torch.empty(M_tot, H, device=dev, dtype=hidden.dtype)
-            chunks = []
-            c0 = 0
-            while c0 < E:
-                c1, rows = c0, 0
-                while c1 < E and (rows == 0 or rows + counts[c1] <= rows_per_chunk):
-                    rows += counts[c1]; c1 += 1
-                r0, r1 = bounds[c0], bounds[c1]
-                if r1 > r0:
-                    coff = counts_t[c0:c1].cumsum(0).to(torch.int32)
-                    chunks.append((c0, c1, r0, r1, coff))
-                    gu_c = torch._grouped_mm(x_s[r0:r1],
-                                             gate_up_proj[c0:c1].transpose(1, 2), offs=coff)
-                    it_c = _glu_fwd(gu_c, row_act[r0:r1], code_hint=hint)   # gu_c hot in L2
-                    eo_all[r0:r1] = torch._grouped_mm(it_c,
-                                                      down_proj[c0:c1].transpose(1, 2), offs=coff)
-                c0 = c1
-            gate_up_l = None; inter_l = chunks          # backward recomputes gu/it per chunk
+            it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
+            eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
+            gate_up_l = gu_all; inter_l = it_all
         elif uniform:
             gu_all = torch.empty(M_tot, 2 * gate_up_proj.shape[1] // 2, device=dev, dtype=hidden.dtype)
             for e in range(E):
@@ -878,8 +852,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
-        ctx.offs = offs
-        ctx.hint = codes[0] if len(set(codes)) == 1 else None; ctx.shapes = (N, H, top_k, E)
+        ctx.offs = offs; ctx.shapes = (N, H, top_k, E)
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
@@ -891,21 +864,15 @@ class _PerExpertMoE(torch.autograd.Function):
         N, H, top_k, E = ctx.shapes; bounds = ctx.bounds; codes = ctx.codes
         M = st.numel()
         if ctx.offs is not None:
-            chunks = inter_l; hint = ctx.hint
-            ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)       # ONE call, all rows
-            grad_gate_up_proj = torch.zeros_like(gate_up_proj)
-            grad_down_proj = torch.zeros_like(down_proj)
-            grad_x = torch.empty(M, H, device=grad_out.device, dtype=grad_out.dtype)
-            for (c0, c1, r0, r1, coff) in chunks:
-                W1c = gate_up_proj[c0:c1]; W2c = down_proj[c0:c1]
-                gu_c = torch._grouped_mm(x_s[r0:r1], W1c.transpose(1, 2), offs=coff)  # recompute
-                it_c = _glu_fwd(gu_c, row_act[r0:r1], code_hint=hint)                 # L2-resident
-                ge_c = ge_all[r0:r1]
-                grad_inter = torch._grouped_mm(ge_c, W2c, offs=coff)
-                grad_down_proj[c0:c1] = torch._grouped_mm(ge_c.t(), it_c, offs=coff)
-                ggu = _glu_bwd(grad_inter, gu_c, row_act[r0:r1], code_hint=hint)
-                grad_gate_up_proj[c0:c1] = torch._grouped_mm(ggu.t(), x_s[r0:r1], offs=coff)
-                grad_x[r0:r1] = torch._grouped_mm(ggu, W1c, offs=coff)
+            gu_all, it_all = gate_up_l, inter_l
+            offs = ctx.offs
+            ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)
+            grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
+            grad_down_proj = torch._grouped_mm(ge_all.t(), it_all, offs=offs)
+            hint = codes[0] if len(set(codes)) == 1 else None
+            grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
+            grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
+            grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
             grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
             grad_hidden.index_add_(0, st, grad_x)
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
