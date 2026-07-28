@@ -23,17 +23,16 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fused_gate_up_glu", "fused_supported", "tiles_supported", "build_tile_map",
-           "grouped_gemm_glu", "normed_fused_supported"]
+__all__ = ["fused_gate_up_glu", "fused_supported", "gemm_supported", "tiles_supported",
+           "build_tile_map"]
 
 _BM, _BN, _BK, _WARPS, _STAGES = 64, 256, 32, 8, 3      # autotuned for WRITE_GU=True (1.09x over 64/128/64)
-_NS_EPS = 1e-6                                          # must match _NS_EPS in kernels/sm75/moe.py
 
 
 @triton.jit
-def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM, RSS,
+def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM,
                         H: tl.constexpr, I: tl.constexpr, CODE: tl.constexpr,
-                        WRITE_GU: tl.constexpr, NORMED: tl.constexpr,
+                        WRITE_GU: tl.constexpr, ACT: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     t = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -53,15 +52,7 @@ def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM, RSS,
         wu = tl.load(Wb + (I + rn[:, None]) * H + rk[None, :])
         ag = tl.dot(x, tl.trans(wg), ag)
         au = tl.dot(x, tl.trans(wu), au)
-    if NORMED:
-        # codes 2/6/7: the activation needs rms over the WHOLE gate row, which this tile cannot see.
-        # Emit the row's sum of squares instead (one fp32 atomic per tile, ~1 MB of traffic) and let
-        # the down-projection GEMM apply the activation in its prologue -- the rms is a per-row
-        # SCALAR, so everything after it is tile-local. Square the bf16-ROUNDED gate: the backward
-        # recomputes rms from the stored gu, and this keeps the two within bf16 of each other.
-        agb = ag.to(tl.bfloat16).to(tl.float32)
-        tl.atomic_add(RSS + rm, tl.sum(agb * agb, axis=1), mask=mask_m)
-    else:
+    if ACT:
         if CODE == 1:
             act = tl.maximum(ag, 0.0) * tl.maximum(ag, 0.0)   # ReLU^2
         else:
@@ -86,16 +77,28 @@ def tiles_supported(hidden):
             and hidden.is_contiguous())
 
 
-def fused_supported(hidden, gate_up_proj, codes):
-    """The FUSED-EPILOGUE kernels only: codes 2/6/7 need a per-row RMS over the gate half, which a
-    GEMM epilogue cannot see (it holds a BN-wide slice of the row, not the whole row). Widening BN to
-    span I=768 would need a BM x 1024 fp32 accumulator pair = 128 KB of registers -> spills. Those
-    codes keep the separate row-fused `_glu_fwd`/`_glu_bwd`, which are already at the HBM roofline."""
+def gemm_supported(hidden, gate_up_proj, codes):
+    """Can `fused_gate_up_glu` run this gate_up GEMM at all? Tiling + a single uniform GLU code.
+    True for the RMS-normed codes too -- they just pass act=False and keep `_glu_fwd`. Worth 1.16x
+    over cuBLAS on the gate_up GEMM alone (1.903 -> 1.643 ms at 64 experts / 262k rows)."""
     I = gate_up_proj.shape[1] // 2
     return (tiles_supported(hidden) and hidden.dtype is torch.bfloat16
             and gate_up_proj.is_contiguous()
             and I % _BN == 0 and gate_up_proj.shape[2] % _BK == 0
-            and len(set(codes)) == 1 and codes[0] in (0, 1))
+            and len(set(codes)) == 1 and codes[0] in (0, 1, 2, 6, 7))
+
+
+def fused_supported(hidden, gate_up_proj, codes):
+    """...and can it also fuse the ACTIVATION into that GEMM's epilogue? Only for the pointwise
+    codes. 2/6/7 need a per-row RMS over the gate half, which a tile holding a BN-wide slice cannot
+    see; widening BN to span I=768 needs a BM x 1024 fp32 accumulator PAIR (256 KB at BM=32) and
+    spills. Measured alternative, rejected: moving the activation into the down-projection GEMM's
+    prologue instead. That works -- rms is a per-row scalar, so it is tile-local once known -- but it
+    forces BN=N=512, whose 512xBK shared-memory B-tile caps BK at 16, and the crippled GEMM gives it
+    all back (1.636 ms vs 0.815 + 0.773 = 1.588 for the two separate kernels). See
+    tune_glu_prologue.py. The normed codes keep row-fused `_glu_fwd`/`_glu_bwd`, already at the HBM
+    roofline."""
+    return gemm_supported(hidden, gate_up_proj, codes) and codes[0] in (0, 1)
 
 
 def build_tile_map(counts, counts_t, device, bm=None):
@@ -119,95 +122,19 @@ def build_tile_map(counts, counts_t, device, bm=None):
     return te, ts, tm
 
 
-def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True, normed=False):
-    """(M,H) x (E,2I,H) -> gu (M,2I) plus either it (M,I), or -- when `normed` -- the per-row rms of
-    the gate half, for `grouped_gemm_glu` to finish the activation with."""
+def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True, act=True):
+    """(M,H) x (E,2I,H) -> (gu (M,2I), it (M,I)). `act=False` runs the GEMM only and returns it=None,
+    for the RMS-normed codes whose activation a tile-local epilogue cannot express (see
+    `fused_supported`); the caller then runs `_glu_fwd` over gu as usual."""
     TE, TS, TM = tile_map
     M, H = x_s.shape
     I = gate_up_proj.shape[1] // 2
-    it = torch.empty(M, I, device=x_s.device, dtype=x_s.dtype)
+    it = torch.empty(M, I, device=x_s.device, dtype=x_s.dtype) if act else None
     gu = torch.empty(M, 2 * I, device=x_s.device, dtype=x_s.dtype) if want_gu else it
-    rss = torch.zeros(M, device=x_s.device, dtype=torch.float32) if normed else None
     _gate_up_glu_kernel[(TE.numel(), I // _BN)](
-        x_s, gate_up_proj, gu, it, TE, TS, TM, rss, H, I, code, want_gu, normed,
+        x_s, gate_up_proj, gu, it, TE, TS, TM, H, I, code, want_gu, act,
         _BM, _BN, _BK, num_warps=_WARPS, num_stages=_STAGES)
-    if normed:
-        return gu, (rss / I + _NS_EPS).sqrt_()
     return gu, it
-
-
-# ─────────────── grouped GEMM with a fused NORMED-GLU prologue (it @ W2, codes 2/6/7) ───────────────
-# `it = f(ag/r) * au` only exists so the down-projection GEMM can read it back: _glu_fwd_row_kernel
-# profiled at 9.97 ms/micro-batch reading gu (2I) and writing it (I) for exactly that. Building `it`
-# in the GEMM's PROLOGUE deletes the kernel -- the rms `r` is a per-row scalar, so once the gate GEMM
-# has emitted it the activation is tile-local and needs no row reduction at all.
-#
-# BN MUST EQUAL N. With N split across n-tiles every tile re-reads the same gu rows, and 2 tiles
-# already read 4I -- more than the 3I the separate kernel moved. One n-tile per row block is the
-# whole point, so `grouped_gemm_glu` returns None (caller falls back) unless N == BN.
-_GGA = (64, 512, 64, 8, 3)         # BM=64 keeps the BM x 512 fp32 accumulator at 128 KB
-
-
-@triton.jit
-def _grouped_gemm_glu_kernel(GU, RMS, B, C, IT, TE, TS, TM,
-                             I: tl.constexpr, N: tl.constexpr, CODE: tl.constexpr,
-                             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    t = tl.program_id(0)
-    e = tl.load(TE + t)
-    r0 = tl.load(TS + t)
-    mm = tl.load(TM + t)
-    rm = r0 + tl.arange(0, BM)
-    rn = tl.arange(0, BN)
-    mask_m = tl.arange(0, BM) < mm
-    Bb = B + e.to(tl.int64) * (I * N)
-    r = tl.load(RMS + rm, mask=mask_m, other=1.0)[:, None]
-    acc = tl.zeros((BM, BN), tl.float32)
-    for k0 in range(0, I, BK):                      # K runs over the intermediate dim
-        rk = k0 + tl.arange(0, BK)
-        ag = tl.load(GU + rm[:, None] * (2 * I) + rk[None, :],
-                     mask=mask_m[:, None], other=0.0).to(tl.float32)
-        au = tl.load(GU + rm[:, None] * (2 * I) + (I + rk[None, :]),
-                     mask=mask_m[:, None], other=0.0).to(tl.float32)
-        gn = ag / r
-        sig = tl.sigmoid(gn)
-        if CODE == 6:                               # NormReLU^2
-            act = tl.maximum(gn, 0.0) * tl.maximum(gn, 0.0)
-        elif CODE == 7:                             # NormSiTU: tanh as 2*sigmoid(2z)-1
-            act = (2.0 / (1.0 + tl.exp(-2.0 * gn)) - 1.0) * sig
-        else:                                       # NormSiLU (code 2)
-            act = gn * sig
-        it = (act * au).to(tl.bfloat16)
-        tl.store(IT + rm[:, None] * I + rk[None, :], it, mask=mask_m[:, None])
-        w = tl.load(Bb + rk[:, None] * N + rn[None, :])
-        acc = tl.dot(it, w, acc)
-    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=mask_m[:, None])
-
-
-def grouped_gemm_glu(gu, rms, b_ink, tile_map, code):
-    """f(gate/rms)*up @ b -> (eo, it). b is (E, I, N). None when the shape does not fit the tiles."""
-    TE, TS, TM = tile_map
-    M = gu.shape[0]
-    I = gu.shape[1] // 2
-    N = b_ink.shape[2]
-    BM, BN, BK, w, st = _GGA
-    if N != BN or I % BK or TE is None:
-        return None
-    eo = torch.empty(M, N, device=gu.device, dtype=gu.dtype)
-    it = torch.empty(M, I, device=gu.device, dtype=gu.dtype)
-    _grouped_gemm_glu_kernel[(TE.numel(),)](gu, rms, b_ink, eo, it, TE, TS, TM, I, N, code,
-                                            BM, BN, BK, num_warps=w, num_stages=st)
-    return eo, it
-
-
-def normed_fused_supported(hidden, gate_up_proj, down_proj, codes):
-    """Codes 2/6/7 on the gate-rms + GLU-prologue pair: the same tiling the pointwise fused path
-    needs, plus H == _GGA[1] so the prologue reads gu exactly once per row."""
-    I = gate_up_proj.shape[1] // 2
-    return (tiles_supported(hidden) and hidden.dtype is torch.bfloat16
-            and gate_up_proj.is_contiguous()
-            and I % _BN == 0 and gate_up_proj.shape[2] % _BK == 0
-            and down_proj.shape[1] == _GGA[1] and I % _GGA[2] == 0
-            and len(set(codes)) == 1 and codes[0] in (2, 6, 7))
 
 
 # ───────────────────────── fused backward: grad_inter GEMM + GLU backward ─────────────────────────

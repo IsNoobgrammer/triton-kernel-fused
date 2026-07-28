@@ -828,43 +828,30 @@ class _PerExpertMoE(torch.autograd.Function):
             if _FUSED_GLU is not None and _FUSED_GLU.tiles_supported(x_s):
                 tile_map_gg = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
                                                         bm=_FUSED_GLU._GG[0])
-            fused = None; normed = None
-            if tile_map_gg is not None and _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes):
+            # The Triton gate_up GEMM beats cuBLAS by 1.16x on its own (1.903 -> 1.643 ms), so the
+            # RMS-normed codes take it too -- with act=False, since only a POINTWISE activation fits
+            # a tile-local epilogue. They then run _glu_fwd over gu exactly as before. Fusing their
+            # activation into the down-projection GEMM's prologue instead was built and measured: it
+            # loses (see fused_supported).
+            gu_all = it_all = None
+            if tile_map_gg is not None and _FUSED_GLU.gemm_supported(x_s, gate_up_proj, codes):
                 tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
-                fused = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0], want_gu=True)
-                tile_map = tm
-                tile_map_bw = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
-                                                        bm=_FUSED_GLU._BBM)
-            elif tile_map_gg is not None and _FUSED_GLU.normed_fused_supported(
-                    x_s, gate_up_proj, down_proj, codes):
-                # codes 2/6/7. A GEMM epilogue cannot see the whole gate row, but the rms it needs is
-                # a per-row SCALAR -- so the gate GEMM emits the row sum-of-squares and the DOWN
-                # projection applies the activation in its prologue. That deletes _glu_fwd (9.97
-                # ms/micro-batch of pure gu round-trip) instead of just moving it.
-                # both kernels tile at BM=64, so one map serves them (bwd still fuses only for 0/1,
-                # hence ctx.tile_map stays None -- see the backward)
-                tm64 = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
-                gu_all, rms_all = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm64,
-                                                               codes[0], want_gu=True, normed=True)
-                normed = (gu_all, rms_all, tm64)
-            if fused is not None:
-                gu_all, it_all = fused
-            elif normed is None:
+                act = _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes)
+                gu_all, it_all = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
+                                                              want_gu=True, act=act)
+                if act:      # backward only fuses its epilogue for the pointwise codes
+                    tile_map = tm
+                    tile_map_bw = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
+                                                            bm=_FUSED_GLU._BBM)
+            if gu_all is None:
                 gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
+            if it_all is None:
                 it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
-            dp_t = down_proj.transpose(1, 2)
-            if not dp_t.is_contiguous():
-                dp_t = dp_t.contiguous()
             eo_all = None
-            if normed is not None:                   # GEMM builds `it` in its prologue
-                gu_all, rms_all, tm64 = normed
-                eo_it = _FUSED_GLU.grouped_gemm_glu(gu_all, rms_all, dp_t, tm64, codes[0])
-                if eo_it is None:                    # shape did not fit -> plain two-kernel path
-                    it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
-                else:
-                    eo_all, it_all = eo_it
-            if eo_all is None and tile_map_gg is not None:
-                eo_all = _FUSED_GLU.grouped_gemm(it_all, dp_t, tile_map_gg)
+            if tile_map_gg is not None:
+                eo_all = _FUSED_GLU.grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
+                                                 if not down_proj.transpose(1, 2).is_contiguous()
+                                                 else down_proj.transpose(1, 2), tile_map_gg)
             if eo_all is None:
                 eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
             gate_up_l = gu_all; inter_l = it_all
