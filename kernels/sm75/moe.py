@@ -117,27 +117,6 @@ except Exception:
     _FUSED_GLU = None
 
 
-_T_CACHE = {}
-
-
-def _cached_transpose12(t):
-    """Contiguous (E,K,N) view of an (E,N,K) weight, CACHED on version.
-
-    The Triton grouped GEMM wants a contiguous (E,K,N); down_proj is stored (E,H,I) so the
-    transpose is non-contiguous. Calling .contiguous() inline copied ~50 MB per call, 32 calls per
-    step -- 3.2 GB of pure copying for a tensor that only changes when the optimizer steps."""
-    key = t.untyped_storage().data_ptr()
-    hit = _T_CACHE.get(key)
-    if hit is not None and hit[0] == t._version and hit[1].shape[0] == t.shape[0]:
-        return hit[1]
-    c = t.transpose(1, 2).contiguous()
-    _T_CACHE[key] = (t._version, c)
-    if len(_T_CACHE) > 128:
-        for k in list(_T_CACHE)[:64]:
-            _T_CACHE.pop(k, None)
-    return c
-
-
 def _cached_cast(t, dt):
     key = t.untyped_storage().data_ptr()
     hit = _CAST_CACHE.get(key)
@@ -858,7 +837,9 @@ class _PerExpertMoE(torch.autograd.Function):
                 it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
             eo_all = None
             if tile_map_gg is not None:
-                eo_all = _FUSED_GLU.grouped_gemm(it_all, _cached_transpose12(down_proj), tile_map_gg)
+                eo_all = _FUSED_GLU.grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
+                                                 if not down_proj.transpose(1, 2).is_contiguous()
+                                                 else down_proj.transpose(1, 2), tile_map_gg)
             if eo_all is None:
                 eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
             gate_up_l = gu_all; inter_l = it_all
