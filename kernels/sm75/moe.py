@@ -776,7 +776,21 @@ class _PerExpertMoE(torch.autograd.Function):
         # over every row. Only valid when no special expert is in the stack: codes 3/4 rows must skip
         # the GLU entirely, and a whole-buffer call would run it on them.
         uniform = all(c <= 2 or c >= 6 for c in codes) and ap32 is None
-        if uniform:
+        # _grouped_mm runs ALL experts' GEMMs in ONE launch. Its GPU time is the same as the
+        # per-expert loop (measured 0.99x), but the loop costs 64 python-level torch.mm calls per
+        # GEMM per layer -- 2048 per micro-batch across the four GEMMs -- and the step is partly
+        # CPU-launch-bound: batching the row ops cut launches 511->8 and gained 3ms/micro-batch of
+        # wall time while those kernels' own time got slightly WORSE. So this is a launch-count fix.
+        use_gmm = (uniform and hasattr(torch, "_grouped_mm")
+                   and hidden.dtype in (torch.bfloat16, torch.float16))
+        offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
+        if use_gmm:
+            gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
+            hint = codes[0] if len(set(codes)) == 1 else None
+            it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
+            eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
+            gate_up_l = gu_all; inter_l = it_all
+        elif uniform:
             gu_all = torch.empty(M_tot, 2 * gate_up_proj.shape[1] // 2, device=dev, dtype=hidden.dtype)
             for e in range(E):
                 s, en = bounds[e], bounds[e + 1]
@@ -813,7 +827,8 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.sw_eff = sw_eff
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
-        ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform; ctx.shapes = (N, H, top_k, E)
+        ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
+        ctx.offs = offs; ctx.shapes = (N, H, top_k, E)
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
@@ -824,6 +839,22 @@ class _PerExpertMoE(torch.autograd.Function):
         sw_eff = ctx.sw_eff
         N, H, top_k, E = ctx.shapes; bounds = ctx.bounds; codes = ctx.codes
         M = st.numel()
+        if ctx.offs is not None:
+            gu_all, it_all = gate_up_l, inter_l
+            offs = ctx.offs
+            ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)
+            grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
+            grad_down_proj = torch._grouped_mm(ge_all.t(), it_all, offs=offs)
+            hint = codes[0] if len(set(codes)) == 1 else None
+            grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
+            grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
+            grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
+            grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
+            grad_hidden.index_add_(0, st, grad_x)
+            grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
+            grad_wt[order] = gw_all.to(grad_out.dtype)
+            return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,
+                    None, None)
         if ctx.uniform:
             # Mirror of the forward's batched row-ops: _combine_bwd, the GLU backward and the dX
             # scatter are all row maps, so each runs ONCE over (M,*) instead of once per expert.
