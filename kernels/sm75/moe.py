@@ -770,30 +770,50 @@ class _PerExpertMoE(torch.autograd.Function):
         M_tot = st.numel()
         eo_all = torch.empty(M_tot, H, device=dev, dtype=hidden.dtype)
         sw_eff = sw                                    # -Identity folds its sign into the weight
-        for e in range(E):
-            s, en = bounds[e], bounds[e + 1]
-            if en == s:
-                continue
-            if codes[e] == 3 or codes[e] == 4:      # ±Identity: signed weighted passthrough
-                eo_all[s:en].copy_(x_s[s:en])
-                if codes[e] == 4:
-                    if sw_eff is sw:
-                        sw_eff = sw.clone()
-                    sw_eff[s:en].neg_()
-                continue
-            gu = x_s[s:en] @ gate_up_proj[e].t()                         # GLU expert; weight slot = e (GLU first)
-            _has_ap = codes[e] == 5 and ap32 is not None
-            it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e],   # uniform slice: non-NS skips rms launch
-                          row_alpha=(ap32[e, 0:1] if _has_ap else None),
-                          row_gamma=(ap32[e, 1:2] if _has_ap else None))
-            torch.mm(it, down_proj[e].t(), out=eo_all[s:en])   # write the slice directly: no temp + DtoD
-            gate_up_l[e] = gu; inter_l[e] = it
+        # BATCHED ROW-OPS. The activation is a pure ROW map, so it does not need to be called once
+        # per expert -- with 64 experts x 8 layers that was 512 launches per micro-batch on slices of
+        # one logical (M,2I) tensor. Give the GEMMs a contiguous gu buffer (out=) and run ONE _glu_fwd
+        # over every row. Only valid when no special expert is in the stack: codes 3/4 rows must skip
+        # the GLU entirely, and a whole-buffer call would run it on them.
+        uniform = all(c <= 2 or c >= 6 for c in codes) and ap32 is None
+        if uniform:
+            gu_all = torch.empty(M_tot, 2 * gate_up_proj.shape[1] // 2, device=dev, dtype=hidden.dtype)
+            for e in range(E):
+                s, en = bounds[e], bounds[e + 1]
+                if en > s:
+                    torch.mm(x_s[s:en], gate_up_proj[e].t(), out=gu_all[s:en])
+            hint = codes[0] if len(set(codes)) == 1 else None
+            it_all = _glu_fwd(gu_all, row_act, code_hint=hint)        # ONE launch, all rows
+            for e in range(E):
+                s, en = bounds[e], bounds[e + 1]
+                if en > s:
+                    torch.mm(it_all[s:en], down_proj[e].t(), out=eo_all[s:en])
+            gate_up_l = gu_all; inter_l = it_all
+        else:
+            for e in range(E):
+                s, en = bounds[e], bounds[e + 1]
+                if en == s:
+                    continue
+                if codes[e] == 3 or codes[e] == 4:      # ±Identity: signed weighted passthrough
+                    eo_all[s:en].copy_(x_s[s:en])
+                    if codes[e] == 4:
+                        if sw_eff is sw:
+                            sw_eff = sw.clone()
+                        sw_eff[s:en].neg_()
+                    continue
+                gu = x_s[s:en] @ gate_up_proj[e].t()                     # GLU expert; weight slot = e
+                _has_ap = codes[e] == 5 and ap32 is not None
+                it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e],
+                              row_alpha=(ap32[e, 0:1] if _has_ap else None),
+                              row_gamma=(ap32[e, 1:2] if _has_ap else None))
+                torch.mm(it, down_proj[e].t(), out=eo_all[s:en])
+                gate_up_l[e] = gu; inter_l[e] = it
         out = torch.zeros(N, H, device=dev, dtype=torch.float32)          # fp32 accumulate (MiMo)
         _combine_scatter(eo_all, sw_eff, st, out)          # ONE fused (eo*w)->fp32 scatter over all rows
         ctx.sw_eff = sw_eff
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
-        ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
+        ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform; ctx.shapes = (N, H, top_k, E)
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
@@ -804,6 +824,38 @@ class _PerExpertMoE(torch.autograd.Function):
         sw_eff = ctx.sw_eff
         N, H, top_k, E = ctx.shapes; bounds = ctx.bounds; codes = ctx.codes
         M = st.numel()
+        if ctx.uniform:
+            # Mirror of the forward's batched row-ops: _combine_bwd, the GLU backward and the dX
+            # scatter are all row maps, so each runs ONCE over (M,*) instead of once per expert.
+            # At 64 experts x 8 layers that is 512 launches -> 8 for each of the three.
+            gu_all, it_all = gate_up_l, inter_l
+            Icols = it_all.shape[1]
+            ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)      # ONE call
+            grad_w_s = gw_all.to(grad_out.dtype)
+            grad_inter = torch.empty(M, Icols, device=grad_out.device, dtype=grad_out.dtype)
+            grad_gate_up_proj = torch.zeros_like(gate_up_proj)
+            grad_down_proj = torch.zeros_like(down_proj)
+            for e in range(E):
+                s, en = bounds[e], bounds[e + 1]
+                if en == s:
+                    continue
+                torch.mm(ge_all[s:en], down_proj[e], out=grad_inter[s:en])
+                torch.mm(ge_all[s:en].t(), it_all[s:en], out=grad_down_proj[e])
+            hint = codes[0] if len(set(codes)) == 1 else None
+            grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)   # ONE call
+            grad_x = torch.empty(M, H, device=grad_out.device, dtype=grad_out.dtype)
+            for e in range(E):
+                s, en = bounds[e], bounds[e + 1]
+                if en == s:
+                    continue
+                torch.mm(grad_gate_up[s:en].t(), x_s[s:en], out=grad_gate_up_proj[e])
+                torch.mm(grad_gate_up[s:en], gate_up_proj[e], out=grad_x[s:en])
+            grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
+            grad_hidden.index_add_(0, st, grad_x)                        # ONE scatter
+            grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
+            grad_wt[order] = grad_w_s
+            return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,
+                    None, None)
         grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
         grad_down_proj = torch.zeros_like(down_proj)
