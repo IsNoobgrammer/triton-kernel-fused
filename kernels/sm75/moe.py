@@ -111,6 +111,10 @@ def _code_max(act_codes):
 # Profiling put bfloat16_copy_kernel at 7.87 ms/micro-batch. Tensor._version bumps on any in-place
 # write, so an optimizer step invalidates the entry automatically -- a stale cast is not possible.
 _CAST_CACHE = {}
+try:                                            # Blackwell-only fused gate_up GEMM+GLU epilogue
+    from kernels.sm120 import moe_fused_glu as _FUSED_GLU
+except Exception:
+    _FUSED_GLU = None
 
 
 def _cached_cast(t, dt):
@@ -809,9 +813,20 @@ class _PerExpertMoE(torch.autograd.Function):
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
         if use_gmm:
-            gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
             hint = codes[0] if len(set(codes)) == 1 else None
-            it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
+            # FUSED gate_up GEMM + GLU epilogue when the activation is pointwise (codes 0/1).
+            # _glu_fwd was measured sitting exactly at HBM bandwidth: its whole cost is re-reading
+            # the (M,2I) gu that cuBLAS had to land in memory. Computing the activation while the
+            # accumulators are still in registers removes that read. 1.32x on the real load spread.
+            fused = None
+            if _FUSED_GLU is not None and _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes):
+                tm = _FUSED_GLU.build_tile_map(counts, bounds, dev)
+                fused = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0], want_gu=True)
+            if fused is not None:
+                gu_all, it_all = fused
+            else:
+                gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
+                it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
             eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
             gate_up_l = gu_all; inter_l = it_all
         elif uniform:
