@@ -160,3 +160,45 @@ def fused_dinter_glu_bwd(ge, down_proj, gu, tile_map, code):
         ge, down_proj, gu, dgu, TE, TS, TM, H, I, code,
         _BBM, _BBN, _BBK, num_warps=_BWARPS, num_stages=_BSTAGES)
     return dgu
+
+
+# ───────────────────────── generic grouped GEMM (no epilogue) ─────────────────────────
+# For the two remaining activation-side MoE GEMMs: `it @ W2` (forward) and `ggu @ W1` (backward dX).
+# Same tile-map structure as the fused kernels; the fused gate_up GEMM measured 1.58 ms against
+# cuBLAS's 2.10 ms for the GEMM ALONE on this shape, so Triton is worth using here too.
+@triton.jit
+def _grouped_gemm_kernel(A, B, C, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
+                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    t = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    e = tl.load(TE + t)
+    r0 = tl.load(TS + t)
+    mm = tl.load(TM + t)
+    rm = r0 + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    mask_m = tl.arange(0, BM) < mm
+    Bb = B + e.to(tl.int64) * (K * N)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        a = tl.load(A + rm[:, None] * K + rk[None, :], mask=mask_m[:, None], other=0.0)
+        b = tl.load(Bb + rk[:, None] * N + rn[None, :])
+        acc = tl.dot(a, b, acc)
+    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+_GG = (64, 128, 64, 4, 3)
+
+
+def grouped_gemm(a, b_enk, tile_map, out=None):
+    """a (M,K) x b (E,K,N) -> (M,N), rows grouped by expert via the tile map."""
+    TE, TS, TM = tile_map
+    M, K = a.shape
+    N = b_enk.shape[2]
+    if N % _GG[1] or K % _GG[2]:
+        return None                                   # caller falls back
+    c = torch.empty(M, N, device=a.device, dtype=a.dtype) if out is None else out
+    BM, BN, BK, w, st = _GG
+    _grouped_gemm_kernel[(TE.numel(), N // BN)](a, b_enk, c, TE, TS, TM, K, N,
+                                                BM, BN, BK, num_warps=w, num_stages=st)
+    return c
