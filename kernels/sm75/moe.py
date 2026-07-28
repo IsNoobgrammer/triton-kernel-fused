@@ -812,7 +812,7 @@ class _PerExpertMoE(torch.autograd.Function):
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
-        tile_map = None; tile_map_gg = None
+        tile_map = None; tile_map_gg = None; tile_map_bw = None
         if use_gmm:
             hint = codes[0] if len(set(codes)) == 1 else None
             # FUSED gate_up GEMM + GLU epilogue when the activation is pointwise (codes 0/1).
@@ -828,6 +828,8 @@ class _PerExpertMoE(torch.autograd.Function):
                 # so each gets its own tile map (both are a handful of small GPU ops)
                 tile_map_gg = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
                                                         bm=_FUSED_GLU._GG[0])
+                tile_map_bw = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
+                                                        bm=_FUSED_GLU._BBM)
             if fused is not None:
                 gu_all, it_all = fused
             else:
@@ -879,7 +881,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
-        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg
+        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
@@ -901,7 +903,7 @@ class _PerExpertMoE(torch.autograd.Function):
             # non-GEMM kernel, and sat exactly at HBM bandwidth.
             if ctx.tile_map is not None:
                 grad_gate_up = _FUSED_GLU.fused_dinter_glu_bwd(
-                    ge_all, down_proj, gu_all, ctx.tile_map, codes[0])
+                    ge_all, down_proj, gu_all, ctx.tile_map_bw, codes[0])
             else:
                 grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
                 grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)

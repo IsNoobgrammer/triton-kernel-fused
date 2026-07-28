@@ -25,7 +25,7 @@ import triton.language as tl
 
 __all__ = ["fused_gate_up_glu", "fused_supported", "build_tile_map"]
 
-_BM, _BN, _BK, _WARPS, _STAGES = 64, 128, 64, 4, 3      # autotuned for WRITE_GU=True
+_BM, _BN, _BK, _WARPS, _STAGES = 64, 256, 32, 8, 3      # autotuned for WRITE_GU=True (1.09x over 64/128/64)
 
 
 @triton.jit
@@ -114,7 +114,7 @@ def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True):
 # re-reads gu (M,2I) -- profiled as a cuBLAS GEMM plus _glu_bwd at 42.5 ms/step, the single largest
 # non-GEMM kernel. Computing grad_it in registers and applying the GLU backward in the same epilogue
 # removes the grad_it round-trip entirely.
-_BBM, _BBN, _BBK, _BWARPS, _BSTAGES = 64, 128, 64, 4, 3
+_BBM, _BBN, _BBK, _BWARPS, _BSTAGES = 32, 256, 64, 8, 3   # autotuned (1.21x over 64/128/64)
 
 
 @triton.jit
@@ -148,6 +148,9 @@ def _dinter_glu_bwd_kernel(GE, W2, GU, DGU, TE, TS, TM,
         d_au = gi * (ag * sg)
     tl.store(DGU + rm[:, None] * (2 * I) + rn[None, :], d_ag.to(tl.bfloat16), mask=mask_m[:, None])
     tl.store(DGU + rm[:, None] * (2 * I) + (I + rn[None, :]), d_au.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+BWD_BM = _BBM        # the backward tunes to a different BM, so it needs its own tile map
 
 
 def fused_dinter_glu_bwd(ge, down_proj, gu, tile_map, code):
