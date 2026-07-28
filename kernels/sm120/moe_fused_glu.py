@@ -73,14 +73,24 @@ def fused_supported(hidden, gate_up_proj, codes):
             and len(set(codes)) == 1 and codes[0] in (0, 1))
 
 
-def build_tile_map(counts, bounds, device):
-    te, ts, tm = [], [], []
-    for e, c in enumerate(counts):
-        for r in range(0, c, _BM):
-            te.append(e); ts.append(bounds[e] + r); tm.append(min(_BM, c - r))
-    return (torch.tensor(te, device=device, dtype=torch.int32),
-            torch.tensor(ts, device=device, dtype=torch.int32),
-            torch.tensor(tm, device=device, dtype=torch.int32))
+def build_tile_map(counts, counts_t, device):
+    """(tile -> expert, first row, valid rows), built VECTORIZED on the GPU.
+
+    The obvious host-side double loop costs ~4k python iterations plus three H2D copies EVERY call
+    -- 32 calls per step at 8 MoE layers x grad_accum 4. Measured: it turned a kernel that is 1.32x
+    faster in isolation into a 2% end-to-end LOSS. Only the per-expert tile COUNTS are computed on
+    the host (64 ints, no sync -- `counts` is already materialized for the sort); everything else
+    is torch ops on tensors that are already resident."""
+    ntile = [(c + _BM - 1) // _BM for c in counts]
+    total = sum(ntile)
+    nt = torch.tensor(ntile, device=device, dtype=torch.int32)
+    te = torch.repeat_interleave(torch.arange(len(counts), device=device, dtype=torch.int32), nt)
+    start = torch.cumsum(nt, 0) - nt                       # first tile index of each expert
+    within = torch.arange(total, device=device, dtype=torch.int32) - start[te]
+    bnd = torch.cumsum(counts_t, 0) - counts_t             # first row of each expert
+    ts = (bnd[te] + within * _BM).to(torch.int32)
+    tm = torch.clamp(counts_t[te] - within * _BM, max=_BM).to(torch.int32)
+    return te, ts, tm
 
 
 def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True):

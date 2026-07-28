@@ -820,7 +820,7 @@ class _PerExpertMoE(torch.autograd.Function):
             # accumulators are still in registers removes that read. 1.32x on the real load spread.
             fused = None
             if _FUSED_GLU is not None and _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes):
-                tm = _FUSED_GLU.build_tile_map(counts, bounds, dev)
+                tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
                 fused = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0], want_gu=True)
             if fused is not None:
                 gu_all, it_all = fused
