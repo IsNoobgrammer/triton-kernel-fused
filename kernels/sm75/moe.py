@@ -812,7 +812,7 @@ class _PerExpertMoE(torch.autograd.Function):
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
-        tile_map = None; tile_map_gg = None; tile_map_bw = None
+        tile_map = None; tile_map_gg = None; tile_map_bw = None; tile_map_gs = None
         if use_gmm:
             hint = codes[0] if len(set(codes)) == 1 else None
             # FUSED gate_up GEMM + GLU epilogue when the activation is pointwise (codes 0/1).
@@ -830,6 +830,8 @@ class _PerExpertMoE(torch.autograd.Function):
                                                         bm=_FUSED_GLU._GG[0])
                 tile_map_bw = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
                                                         bm=_FUSED_GLU._BBM)
+                tile_map_gs = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
+                                                        bm=_FUSED_GLU._GS[0])
             if fused is not None:
                 gu_all, it_all = fused
             else:
@@ -881,7 +883,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
-        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw
+        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw; ctx.tile_map_gs = tile_map_gs
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
@@ -911,7 +913,7 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_hidden = None
             if ctx.tile_map_gg is not None:                 # GEMM + scatter-add in one kernel
                 gh32 = _FUSED_GLU.grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
-                                                       ctx.tile_map_gg, N)
+                                                       ctx.tile_map_gs, N)
                 if gh32 is not None:
                     grad_hidden = gh32.to(grad_out.dtype)
             if grad_hidden is None:
