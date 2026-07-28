@@ -26,17 +26,24 @@ importlib.import_module("kernels.sm120.moe")
 M = importlib.import_module("kernels.sm75.moe")
 
 H, I, E, TOP_K, N = 512, 768, 8, 2, 4096
-CODES = {0: "silu", 1: "relu2", 2: "normsilu", 6: "normrelu2", 7: "normsitu"}
+CODES = {0: "silu", 1: "relu2", 2: "normsilu", 6: "normrelu2", 7: "normsitu",
+         # MIXED stacks: `uniform` in moe_per_expert means "no special experts, no act_params",
+         # NOT "one code", so 2+7 still takes the batched grouped path. It loses only the fused
+         # gate_up GEMM (gemm_supported wants a single code), which measured as a wash anyway.
+         (2, 7): "normsilu+normsitu", (0, 2): "silu+normsilu"}
 
 
 def build(code, dtype, dev):
+    """`code` is an int (uniform stack) or a list of per-expert codes (mixed stack)."""
     g = torch.Generator(device=dev).manual_seed(0)
     hid = (torch.randn(N, H, generator=g, device=dev, dtype=torch.float32) * 0.5)
     w1 = torch.randn(E, 2 * I, H, generator=g, device=dev, dtype=torch.float32) * (H ** -0.5)
     w2 = torch.randn(E, H, I, generator=g, device=dev, dtype=torch.float32) * (I ** -0.5)
     logits = torch.randn(N, E, generator=g, device=dev, dtype=torch.float32)
     wt, idx = logits.softmax(-1).topk(TOP_K, dim=-1)
-    codes = torch.full((E,), code, device=dev, dtype=torch.int32)
+    codes = (torch.tensor([code[i % len(code)] for i in range(E)], device=dev, dtype=torch.int32)
+             if isinstance(code, (list, tuple))
+             else torch.full((E,), code, device=dev, dtype=torch.int32))
     ts = [t.to(dtype).detach().requires_grad_(True) for t in (hid, w1, w2)]
     return ts, idx.contiguous(), wt.to(dtype).detach(), codes
 
@@ -81,14 +88,17 @@ def main():
             assert fired["map"], f"code {code} ({name}): no tile map built -- back on the cuBLAS path"
             # fwd it@W2 always; bwd grad_inter only for the normed codes (0/1 fuse it into the
             # backward epilogue kernel, which grouped_gemm never sees)
+            # Uniform 0/1 fuse grad_inter into the backward epilogue, so grouped_gemm fires once
+            # (fwd it@W2). Everything else -- normed, and every MIXED stack -- fires twice.
             want_gemm = 1 if code in (0, 1) else 2
-            assert fired["gemm"] >= want_gemm,                 f"code {code}: grouped_gemm fired {fired['gemm']}x, want >={want_gemm}"
+            assert fired["gemm"] >= want_gemm, \
+                f"code {code}: grouped_gemm fired {fired['gemm']}x, want >={want_gemm}"
             assert fired["scatter"] == 1, f"code {code}: dX scatter fired {fired['scatter']}x, want 1"
             rel = [((a - b).norm() / b.norm().clamp_min(1e-12)).item()
                    for a, b in zip([got_o] + got_g, [ref_o] + ref_g)]
             good = max(rel) < 5e-2                      # bf16 vs fp32 reference
             ok &= good
-            print(f"code {code:>2} {name:<10} {'PASS' if good else 'FAIL'}  "
+            print(f"code {str(code):>7} {name:<18} {'PASS' if good else 'FAIL'}  "
                   f"rel out/dx/dw1/dw2 = " + " ".join(f"{r:.1e}" for r in rel) +
                   f"   [gemm x{fired['gemm']}, scatter x{fired['scatter']}]")
         print("ALL PASS" if ok else "FAILURES ABOVE")
