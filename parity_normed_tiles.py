@@ -14,7 +14,14 @@ import importlib
 
 import torch
 
-# kernels/sm75/__init__.py re-exports a `moe` FUNCTION, which shadows the submodule of the same
+# Import sm120 FIRST. kernels.sm75.moe pulls in the fused-GLU module via
+# `from kernels.sm120 import moe_fused_glu`, which runs kernels/sm120/__init__.py, which imports
+# kernels.sm75.moe right back. Reaching sm75.moe first therefore hits a partially-initialized
+# module, the ImportError is swallowed, and _FUSED_GLU silently becomes None -- i.e. a bench or
+# parity script that imports sm75 directly measures the CUBLAS path while believing it measured
+# the fused one. BiBo imports sm120 first, so training is unaffected.
+importlib.import_module("kernels.sm120.moe")
+# kernels/sm75/__init__.py also re-exports a `moe` FUNCTION, shadowing the submodule of the same
 # name -- `from kernels.sm75 import moe` hands back the function. Grab the module itself.
 M = importlib.import_module("kernels.sm75.moe")
 
