@@ -73,7 +73,7 @@ def fused_supported(hidden, gate_up_proj, codes):
             and len(set(codes)) == 1 and codes[0] in (0, 1))
 
 
-def build_tile_map(counts, counts_t, device):
+def build_tile_map(counts, counts_t, device, bm=None):
     """(tile -> expert, first row, valid rows), built VECTORIZED on the GPU.
 
     The obvious host-side double loop costs ~4k python iterations plus three H2D copies EVERY call
@@ -81,15 +81,16 @@ def build_tile_map(counts, counts_t, device):
     faster in isolation into a 2% end-to-end LOSS. Only the per-expert tile COUNTS are computed on
     the host (64 ints, no sync -- `counts` is already materialized for the sort); everything else
     is torch ops on tensors that are already resident."""
-    ntile = [(c + _BM - 1) // _BM for c in counts]
+    bm = _BM if bm is None else bm
+    ntile = [(c + bm - 1) // bm for c in counts]
     total = sum(ntile)
     nt = torch.tensor(ntile, device=device, dtype=torch.int32)
     te = torch.repeat_interleave(torch.arange(len(counts), device=device, dtype=torch.int32), nt)
     start = torch.cumsum(nt, 0) - nt                       # first tile index of each expert
     within = torch.arange(total, device=device, dtype=torch.int32) - start[te]
     bnd = torch.cumsum(counts_t, 0) - counts_t             # first row of each expert
-    ts = (bnd[te] + within * _BM).to(torch.int32)
-    tm = torch.clamp(counts_t[te] - within * _BM, max=_BM).to(torch.int32)
+    ts = (bnd[te] + within * bm).to(torch.int32)
+    tm = torch.clamp(counts_t[te] - within * bm, max=bm).to(torch.int32)
     return te, ts, tm
 
 
@@ -187,7 +188,8 @@ def _grouped_gemm_kernel(A, B, C, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
     tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=mask_m[:, None])
 
 
-_GG = (64, 128, 64, 4, 3)
+# autotuned: it@W2 1.11->0.77 ms (1.43x), ggu@W1 1.84->1.41 ms (1.30x) vs cuBLAS grouped
+_GG = (128, 256, 64, 8, 3)
 
 
 def grouped_gemm(a, b_enk, tile_map, out=None):
@@ -195,7 +197,7 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
     TE, TS, TM = tile_map
     M, K = a.shape
     N = b_enk.shape[2]
-    if N % _GG[1] or K % _GG[2]:
+    if N % _GG[1] or K % _GG[2] or TE is None:
         return None                                   # caller falls back
     c = torch.empty(M, N, device=a.device, dtype=a.dtype) if out is None else out
     BM, BN, BK, w, st = _GG

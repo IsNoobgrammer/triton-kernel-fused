@@ -812,7 +812,7 @@ class _PerExpertMoE(torch.autograd.Function):
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
-        tile_map = None
+        tile_map = None; tile_map_gg = None
         if use_gmm:
             hint = codes[0] if len(set(codes)) == 1 else None
             # FUSED gate_up GEMM + GLU epilogue when the activation is pointwise (codes 0/1).
@@ -824,12 +824,22 @@ class _PerExpertMoE(torch.autograd.Function):
                 tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
                 fused = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0], want_gu=True)
                 tile_map = tm
+                # the generic grouped GEMM autotuned to BM=128, the fused GLU to BM=64,
+                # so each gets its own tile map (both are a handful of small GPU ops)
+                tile_map_gg = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
+                                                        bm=_FUSED_GLU._GG[0])
             if fused is not None:
                 gu_all, it_all = fused
             else:
                 gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
                 it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
-            eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
+            eo_all = None
+            if tile_map_gg is not None:
+                eo_all = _FUSED_GLU.grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
+                                                 if not down_proj.transpose(1, 2).is_contiguous()
+                                                 else down_proj.transpose(1, 2), tile_map_gg)
+            if eo_all is None:
+                eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
             gate_up_l = gu_all; inter_l = it_all
         elif uniform:
             gu_all = torch.empty(M_tot, 2 * gate_up_proj.shape[1] // 2, device=dev, dtype=hidden.dtype)
@@ -869,7 +879,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
-        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map
+        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
@@ -896,7 +906,10 @@ class _PerExpertMoE(torch.autograd.Function):
                 grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
                 grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
-            grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
+            grad_x = (_FUSED_GLU.grouped_gemm(grad_gate_up, gate_up_proj, ctx.tile_map_gg)
+                      if ctx.tile_map_gg is not None else None)
+            if grad_x is None:
+                grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
             grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
             grad_hidden.index_add_(0, st, grad_x)
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
