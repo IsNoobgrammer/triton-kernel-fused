@@ -869,7 +869,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
-        ctx.offs = offs; ctx.shapes = (N, H, top_k, E)
+        ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
