@@ -246,3 +246,45 @@ def grouped_dw(a, b, row0, rown, E):
     _dw_kernel[(E, N1 // BM, N2 // BN)](a, b, c, row0, rown, N1, N2,
                                         BM, BN, BK, num_warps=w, num_stages=st)
     return c
+
+
+# ───────────────── grouped GEMM with a fused scatter-add epilogue (dX path) ─────────────────
+# grad_hidden = index_add(grad_x) where grad_x = ggu @ W1. Done separately that materializes
+# grad_x (M,H) and re-reads it -- profiled as indexFuncLargeIndex at 23.9 ms/step on top of the
+# GEMM. Scattering straight from the GEMM's accumulator removes both. fp32 destination: bf16
+# atomics are not reliably available, and the forward combine already accumulates in fp32.
+@triton.jit
+def _grouped_gemm_scatter_kernel(A, B, OUT, TOK, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
+                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    t = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    e = tl.load(TE + t)
+    r0 = tl.load(TS + t)
+    mm = tl.load(TM + t)
+    rm = r0 + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    mask_m = tl.arange(0, BM) < mm
+    Bb = B + e.to(tl.int64) * (K * N)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        a = tl.load(A + rm[:, None] * K + rk[None, :], mask=mask_m[:, None], other=0.0)
+        b = tl.load(Bb + rk[:, None] * N + rn[None, :])
+        acc = tl.dot(a, b, acc)
+    tok = tl.load(TOK + rm, mask=mask_m, other=0)
+    tl.atomic_add(OUT + tok[:, None] * N + rn[None, :], acc, mask=mask_m[:, None])
+
+
+def grouped_gemm_scatter(a, b_enk, tok, tile_map, n_rows_out):
+    """(a @ b) scattered-added into an (n_rows_out, N) fp32 buffer at `tok`. Returns None if the
+    shape does not fit the tuned tiles, so the caller can fall back."""
+    TE, TS, TM = tile_map
+    M, K = a.shape
+    N = b_enk.shape[2]
+    BM, BN, BK, w, st = _GG
+    if N % BN or K % BK:
+        return None
+    out = torch.zeros(n_rows_out, N, device=a.device, dtype=torch.float32)
+    _grouped_gemm_scatter_kernel[(TE.numel(), N // BN)](a, b_enk, out, tok, TE, TS, TM, K, N,
+                                                        BM, BN, BK, num_warps=w, num_stages=st)
+    return out

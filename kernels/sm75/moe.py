@@ -908,12 +908,16 @@ class _PerExpertMoE(torch.autograd.Function):
                 grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
                 grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
-            grad_x = (_FUSED_GLU.grouped_gemm(grad_gate_up, gate_up_proj, ctx.tile_map_gg)
-                      if ctx.tile_map_gg is not None else None)
-            if grad_x is None:
+            grad_hidden = None
+            if ctx.tile_map_gg is not None:                 # GEMM + scatter-add in one kernel
+                gh32 = _FUSED_GLU.grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
+                                                       ctx.tile_map_gg, N)
+                if gh32 is not None:
+                    grad_hidden = gh32.to(grad_out.dtype)
+            if grad_hidden is None:
                 grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
-            grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
-            grad_hidden.index_add_(0, st, grad_x)
+                grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
+                grad_hidden.index_add_(0, st, grad_x)
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
             grad_wt[order] = gw_all.to(grad_out.dtype)
             return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,
