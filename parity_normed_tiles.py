@@ -25,7 +25,7 @@ importlib.import_module("kernels.sm120.moe")
 # name -- `from kernels.sm75 import moe` hands back the function. Grab the module itself.
 M = importlib.import_module("kernels.sm75.moe")
 
-H, I, E, TOP_K, N = 512, 768, 8, 2, 4096
+H, I, E, TOP_K, N = 512, 768, 8, 2, 4096     # H must be _GGA[1] for the normed GLU prologue
 CODES = {0: "silu", 1: "relu2", 2: "normsilu", 6: "normrelu2", 7: "normsitu"}
 
 
@@ -55,10 +55,10 @@ def main():
         raise SystemExit("grouped path unavailable on this device -- nothing to check")
 
     # (b) the tile map must be built, and grouped_gemm must not bail to None, for EVERY code.
-    fired = {"map": 0, "gemm": 0, "scatter": 0}
+    fired = {"map": 0, "gemm": 0, "scatter": 0, "glu_gemm": 0}
     fg = M._FUSED_GLU
     assert fg is not None, "sm120 fused-GLU module did not import"
-    orig = (fg.build_tile_map, fg.grouped_gemm, fg.grouped_gemm_scatter)
+    orig = (fg.build_tile_map, fg.grouped_gemm, fg.grouped_gemm_scatter, fg.grouped_gemm_glu)
 
     def wrap(key, f, none_ok=False):
         def inner(*a, **k):
@@ -71,6 +71,7 @@ def main():
     fg.build_tile_map = wrap("map", orig[0])
     fg.grouped_gemm = wrap("gemm", orig[1])
     fg.grouped_gemm_scatter = wrap("scatter", orig[2])
+    fg.grouped_gemm_glu = wrap("glu_gemm", orig[3])
     try:
         ok = True
         for code, name in CODES.items():
@@ -79,10 +80,11 @@ def main():
             ref_o, ref_g = run(M.moe_eager, code, torch.float32, dev)
             got_o, got_g = run(M.moe_per_expert, code, torch.bfloat16, dev)
             assert fired["map"], f"code {code} ({name}): no tile map built -- back on the cuBLAS path"
-            # fwd it@W2 always; bwd grad_inter only for the normed codes (0/1 fuse it into the epilogue)
-            want_gemm = 1 if code in (0, 1) else 2
-            assert fired["gemm"] >= want_gemm, \
-                f"code {code}: grouped_gemm fired {fired['gemm']}x, want >={want_gemm}"
+            # 0/1: fwd it@W2 via grouped_gemm, bwd grad_inter fused into the epilogue kernel.
+            # 2/6/7: fwd it@W2 via the GLU-PROLOGUE kernel, bwd grad_inter via grouped_gemm.
+            want = {"gemm": 1, "glu_gemm": 0} if code in (0, 1) else {"gemm": 1, "glu_gemm": 1}
+            for key, n in want.items():
+                assert fired[key] >= n, f"code {code}: {key} fired {fired[key]}x, want >={n}"
             assert fired["scatter"] == 1, f"code {code}: dX scatter fired {fired['scatter']}x, want 1"
             rel = [((a - b).norm() / b.norm().clamp_min(1e-12)).item()
                    for a, b in zip([got_o] + got_g, [ref_o] + ref_g)]
@@ -90,11 +92,13 @@ def main():
             ok &= good
             print(f"code {code:>2} {name:<10} {'PASS' if good else 'FAIL'}  "
                   f"rel out/dx/dw1/dw2 = " + " ".join(f"{r:.1e}" for r in rel) +
-                  f"   [gemm x{fired['gemm']}, scatter x{fired['scatter']}]")
+                  f"   [gemm x{fired['gemm']}, glu_gemm x{fired['glu_gemm']}, "
+                  f"scatter x{fired['scatter']}]")
         print("ALL PASS" if ok else "FAILURES ABOVE")
         raise SystemExit(0 if ok else 1)
     finally:
-        fg.build_tile_map, fg.grouped_gemm, fg.grouped_gemm_scatter = orig
+        (fg.build_tile_map, fg.grouped_gemm, fg.grouped_gemm_scatter,
+         fg.grouped_gemm_glu) = orig
 
 
 if __name__ == "__main__":
