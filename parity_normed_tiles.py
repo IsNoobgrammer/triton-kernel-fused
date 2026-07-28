@@ -10,9 +10,13 @@ This asserts (a) the tile map is built for every code, (b) `grouped_gemm` actual
 BiBo shape rather than returning None, and (c) numerics are unchanged vs moe_eager. Run on the box:
     python parity_normed_tiles.py
 """
+import importlib
+
 import torch
 
-from kernels.sm75 import moe as M
+# kernels/sm75/__init__.py re-exports a `moe` FUNCTION, which shadows the submodule of the same
+# name -- `from kernels.sm75 import moe` hands back the function. Grab the module itself.
+M = importlib.import_module("kernels.sm75.moe")
 
 H, I, E, TOP_K, N = 512, 768, 8, 2, 4096
 CODES = {0: "silu", 1: "relu2", 2: "normsilu", 6: "normrelu2", 7: "normsitu"}
