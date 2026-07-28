@@ -812,6 +812,7 @@ class _PerExpertMoE(torch.autograd.Function):
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
+        tile_map = None
         if use_gmm:
             hint = codes[0] if len(set(codes)) == 1 else None
             # FUSED gate_up GEMM + GLU epilogue when the activation is pointwise (codes 0/1).
@@ -822,6 +823,7 @@ class _PerExpertMoE(torch.autograd.Function):
             if _FUSED_GLU is not None and _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes):
                 tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
                 fused = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0], want_gu=True)
+                tile_map = tm
             if fused is not None:
                 gu_all, it_all = fused
             else:
@@ -882,10 +884,17 @@ class _PerExpertMoE(torch.autograd.Function):
             gu_all, it_all = gate_up_l, inter_l
             offs = ctx.offs
             ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)
-            grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
             grad_down_proj = torch._grouped_mm(ge_all.t(), it_all, offs=offs)
             hint = codes[0] if len(set(codes)) == 1 else None
-            grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
+            # Fused grad_inter GEMM + GLU backward: computing grad_it in registers avoids
+            # materializing (M,I) and re-reading (M,2I) gu. _glu_bwd was 42.5 ms/step, the largest
+            # non-GEMM kernel, and sat exactly at HBM bandwidth.
+            if ctx.tile_map is not None:
+                grad_gate_up = _FUSED_GLU.fused_dinter_glu_bwd(
+                    ge_all, down_proj, gu_all, ctx.tile_map, codes[0])
+            else:
+                grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
+                grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
             grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
             grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)

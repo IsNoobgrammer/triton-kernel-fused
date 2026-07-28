@@ -104,3 +104,59 @@ def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True):
         x_s, gate_up_proj, gu, it, TE, TS, TM, None, H, I, code, want_gu,
         _BM, _BN, _BK, num_warps=_WARPS, num_stages=_STAGES)
     return gu, it
+
+
+# ───────────────────────── fused backward: grad_inter GEMM + GLU backward ─────────────────────────
+# Forward is it = act(ag) * au. Backward needs
+#     grad_ag = grad_it * act'(ag) * au ,  grad_au = grad_it * act(ag)
+# and grad_it is itself a GEMM (ge @ W2). Doing them separately materializes grad_it (M,I) and
+# re-reads gu (M,2I) -- profiled as a cuBLAS GEMM plus _glu_bwd at 42.5 ms/step, the single largest
+# non-GEMM kernel. Computing grad_it in registers and applying the GLU backward in the same epilogue
+# removes the grad_it round-trip entirely.
+_BBM, _BBN, _BBK, _BWARPS, _BSTAGES = 64, 128, 64, 4, 3
+
+
+@triton.jit
+def _dinter_glu_bwd_kernel(GE, W2, GU, DGU, TE, TS, TM,
+                           H: tl.constexpr, I: tl.constexpr, CODE: tl.constexpr,
+                           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    t = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    e = tl.load(TE + t)
+    r0 = tl.load(TS + t)
+    mm = tl.load(TM + t)
+    rm = r0 + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    mask_m = tl.arange(0, BM) < mm
+    Wb = W2 + e.to(tl.int64) * (H * I)
+    gi = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, H, BK):                      # grad_it = ge @ W2[e]   (K = H)
+        rk = k0 + tl.arange(0, BK)
+        ge = tl.load(GE + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
+        w = tl.load(Wb + rk[:, None] * I + rn[None, :])
+        gi = tl.dot(ge, w, gi)
+    ag = tl.load(GU + rm[:, None] * (2 * I) + rn[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
+    au = tl.load(GU + rm[:, None] * (2 * I) + (I + rn[None, :]), mask=mask_m[:, None], other=0.0).to(tl.float32)
+    if CODE == 1:                                   # ReLU^2:  act = relu(ag)^2
+        r = tl.maximum(ag, 0.0)
+        d_ag = gi * (2.0 * r) * au
+        d_au = gi * (r * r)
+    else:                                           # SiLU:    act = ag*sigmoid(ag)
+        sg = tl.sigmoid(ag)
+        d_ag = gi * (sg * (1.0 + ag * (1.0 - sg))) * au
+        d_au = gi * (ag * sg)
+    tl.store(DGU + rm[:, None] * (2 * I) + rn[None, :], d_ag.to(tl.bfloat16), mask=mask_m[:, None])
+    tl.store(DGU + rm[:, None] * (2 * I) + (I + rn[None, :]), d_au.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+def fused_dinter_glu_bwd(ge, down_proj, gu, tile_map, code):
+    """ge (M,H), down_proj (E,H,I), gu (M,2I) -> grad_gate_up (M,2I). Replaces
+    `grad_inter = grouped_mm(ge, W2)` followed by `_glu_bwd(grad_inter, gu)`."""
+    TE, TS, TM = tile_map
+    M, H = ge.shape
+    I = down_proj.shape[2]
+    dgu = torch.empty(M, 2 * I, device=ge.device, dtype=ge.dtype)
+    _dinter_glu_bwd_kernel[(TE.numel(), I // _BBN)](
+        ge, down_proj, gu, dgu, TE, TS, TM, H, I, code,
+        _BBM, _BBN, _BBK, num_warps=_BWARPS, num_stages=_BSTAGES)
+    return dgu
