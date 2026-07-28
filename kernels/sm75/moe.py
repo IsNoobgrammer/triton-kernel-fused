@@ -762,33 +762,46 @@ class _PerExpertMoE(torch.autograd.Function):
         ap32 = act_params.float().contiguous() if act_params is not None else None
         # per-expert activations kept as LISTS — the GEMM outputs ARE the storage; no contiguous
         # buffer + slice-copy (that was a pure DtoD-memcpy + memory tax).
-        gate_up_l = [None] * E; inter_l = [None] * E; eo_l = [None] * E
-        out = torch.zeros(N, H, device=dev, dtype=torch.float32)          # fp32 accumulate (MiMo)
+        gate_up_l = [None] * E; inter_l = [None] * E
+        # ONE contiguous (M,H) expert-output buffer + ONE scatter at the end, instead of E scatters.
+        # At 64 experts x 8 layers the per-expert scatter was 512 kernel launches per micro-batch for
+        # the SAME total atomic traffic; the second GEMM now writes straight into its slice (out=),
+        # so this also removes the per-expert output allocation.
+        M_tot = st.numel()
+        eo_all = torch.empty(M_tot, H, device=dev, dtype=hidden.dtype)
+        sw_eff = sw                                    # -Identity folds its sign into the weight
         for e in range(E):
             s, en = bounds[e], bounds[e + 1]
             if en == s:
                 continue
-            if codes[e] == 3 or codes[e] == 4:      # ±Identity: signed weighted passthrough, out += (±w)*x
-                _combine_scatter(x_s[s:en], sw[s:en] if codes[e] == 3 else -sw[s:en], st[s:en], out)
+            if codes[e] == 3 or codes[e] == 4:      # ±Identity: signed weighted passthrough
+                eo_all[s:en].copy_(x_s[s:en])
+                if codes[e] == 4:
+                    if sw_eff is sw:
+                        sw_eff = sw.clone()
+                    sw_eff[s:en].neg_()
                 continue
             gu = x_s[s:en] @ gate_up_proj[e].t()                         # GLU expert; weight slot = e (GLU first)
             _has_ap = codes[e] == 5 and ap32 is not None
             it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e],   # uniform slice: non-NS skips rms launch
                           row_alpha=(ap32[e, 0:1] if _has_ap else None),
                           row_gamma=(ap32[e, 1:2] if _has_ap else None))
-            eo = it @ down_proj[e].t()
-            gate_up_l[e] = gu; inter_l[e] = it; eo_l[e] = eo
-            _combine_scatter(eo, sw[s:en], st[s:en], out)   # fused (eo*w)->fp32 scatter (1 kernel, was mul+cast+index_add)
+            torch.mm(it, down_proj[e].t(), out=eo_all[s:en])   # write the slice directly: no temp + DtoD
+            gate_up_l[e] = gu; inter_l[e] = it
+        out = torch.zeros(N, H, device=dev, dtype=torch.float32)          # fp32 accumulate (MiMo)
+        _combine_scatter(eo_all, sw_eff, st, out)          # ONE fused (eo*w)->fp32 scatter over all rows
+        ctx.sw_eff = sw_eff
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
-        ctx.lists = (gate_up_l, inter_l, eo_l); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
+        ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.shapes = (N, H, top_k, E)
         ctx.codes = codes; ctx.has_situ = ap32 is not None
         return out.to(hidden.dtype)
 
     @staticmethod
     def backward(ctx, grad_out):
         (x_s, st, sw, order, row_act, gate_up_proj, down_proj, ap32) = ctx.saved_tensors
-        gate_up_l, inter_l, eo_l = ctx.lists
+        gate_up_l, inter_l, eo_all = ctx.lists
+        sw_eff = ctx.sw_eff
         N, H, top_k, E = ctx.shapes; bounds = ctx.bounds; codes = ctx.codes
         M = st.numel()
         grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
@@ -807,16 +820,16 @@ class _PerExpertMoE(torch.autograd.Function):
                 # _combine_bwd(go, eo, w, tok) returns (go*w, sum_h(go*eo)), so feeding it the SIGNED
                 # weight gives dx directly and d/d(sgn*w); one extra sgn recovers dw.
                 sgn = 1.0 if codes[e] == 3 else -1.0
-                ge, gw = _combine_bwd(grad_out, x_s[s:en], sw[s:en] * sgn, st[s:en])
-                grad_w_s[s:en] = (gw * sgn).to(grad_out.dtype)
+                ge, gw = _combine_bwd(grad_out, x_s[s:en], sw_eff[s:en], st[s:en])
+                grad_w_s[s:en].copy_(gw * sgn)          # cast+copy in one, no temp
                 grad_hidden.index_add_(0, st[s:en], ge)
                 continue
             it = inter_l[e]                                            # (m,I)
             # fused combine bwd: gather grad_out[tok], emit grad_eo=go*w and grad_w=sum_h(go*eo)
-            ge, gw = _combine_bwd(grad_out, eo_l[e], sw[s:en], st[s:en])   # (m,H), (m,) fp32
-            grad_w_s[s:en] = gw.to(grad_out.dtype)
+            ge, gw = _combine_bwd(grad_out, eo_all[s:en], sw[s:en], st[s:en])  # (m,H), (m,) fp32
+            grad_w_s[s:en].copy_(gw)                    # cast+copy in one, no temp
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
-            grad_down_proj[e] = ge.t() @ it                            # (H,m)@(m,I) -> (H,I)
+            torch.mm(ge.t(), it, out=grad_down_proj[e])                 # (H,m)@(m,I) -> (H,I)
             is_situ = codes[e] == 5
             if is_situ and want_ap:
                 grad_gate_up, da, dg = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en],
@@ -829,7 +842,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en], code_hint=codes[e],
                                         row_alpha=(ap32[e, 0:1] if _has_ap else None),
                                         row_gamma=(ap32[e, 1:2] if _has_ap else None))   # (m,2I)
-            grad_gate_up_proj[e] = grad_gate_up.t() @ x_s[s:en]        # (2I,m)@(m,H) -> (2I,H)
+            torch.mm(grad_gate_up.t(), x_s[s:en], out=grad_gate_up_proj[e])  # (2I,m)@(m,H)->(2I,H)
             grad_hidden.index_add_(0, st[s:en], grad_gate_up @ gate_up_proj[e])  # scatter dX straight in
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
         grad_wt[order] = grad_w_s
