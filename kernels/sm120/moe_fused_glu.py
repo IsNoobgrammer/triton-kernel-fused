@@ -275,17 +275,13 @@ def _grouped_gemm_scatter_kernel(A, B, OUT, TOK, TE, TS, TM, K: tl.constexpr, N:
     tl.atomic_add(OUT + tok[:, None] * N + rn[None, :], acc, mask=mask_m[:, None])
 
 
-_GS = (64, 256, 32, 8, 3)     # autotuned separately: the atomic epilogue prefers a
-                              # smaller BM than the plain GEMM (2.19 -> 1.97 ms)
-
-
 def grouped_gemm_scatter(a, b_enk, tok, tile_map, n_rows_out):
     """(a @ b) scattered-added into an (n_rows_out, N) fp32 buffer at `tok`. Returns None if the
     shape does not fit the tuned tiles, so the caller can fall back."""
     TE, TS, TM = tile_map
     M, K = a.shape
     N = b_enk.shape[2]
-    BM, BN, BK, w, st = _GS
+    BM, BN, BK, w, st = _GG
     if N % BN or K % BK:
         return None
     out = torch.zeros(n_rows_out, N, device=a.device, dtype=torch.float32)
