@@ -105,13 +105,37 @@ def _code_max(act_codes):
     return m
 
 
+# Cast cache for the big 3D EXPERT STACKS only, keyed on (storage, version, dtype).
+# The expert weights are fp32 masters that change ONCE per optimizer step, but _amp_cast ran on
+# every micro-batch: with grad_accum=4 that is 3 redundant casts of ~300 MB per MoE layer.
+# Profiling put bfloat16_copy_kernel at 7.87 ms/micro-batch. Tensor._version bumps on any in-place
+# write, so an optimizer step invalidates the entry automatically -- a stale cast is not possible.
+_CAST_CACHE = {}
+
+
+def _cached_cast(t, dt):
+    key = t.untyped_storage().data_ptr()
+    hit = _CAST_CACHE.get(key)
+    if hit is not None and hit[0] == t._version and hit[1] is dt and hit[2].shape == t.shape:
+        return hit[2]
+    c = t.to(dt)
+    _CAST_CACHE[key] = (t._version, dt, c)
+    if len(_CAST_CACHE) > 256:                     # bounded: ~2 entries per MoE layer
+        for k in list(_CAST_CACHE)[:128]:
+            _CAST_CACHE.pop(k, None)
+    return c
+
+
 def _amp_cast(*ts):
     """Under autocast, cast float tensors to the ACTIVE autocast dtype (fp16/bf16) so the custom
     Functions see one consistent dtype end-to-end; no-op outside autocast. Grads returned for the
-    cast tensors are dtype-converted back by the autograd engine at the Function boundary."""
+    cast tensors are dtype-converted back by the autograd engine at the Function boundary.
+
+    3D expert stacks go through _cached_cast (see above); activations are cast fresh every call."""
     if torch.is_autocast_enabled("cuda"):
         dt = torch.get_autocast_dtype("cuda")
-        return tuple(t.to(dt) if t.is_floating_point() else t for t in ts)
+        return tuple((_cached_cast(t, dt) if (t.ndim == 3 and t.dtype != dt) else t.to(dt))
+                     if t.is_floating_point() else t for t in ts)
     return ts
 
 
