@@ -204,3 +204,42 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
     _grouped_gemm_kernel[(TE.numel(), N // BN)](a, b_enk, c, TE, TS, TM, K, N,
                                                 BM, BN, BK, num_warps=w, num_stages=st)
     return c
+
+
+# ───────────────────────── grouped dW GEMM: A^T @ B per expert ─────────────────────────
+# The two weight-gradient GEMMs (ge^T @ it -> (E,H,I) and ggu^T @ x_s -> (E,2I,H)) reduce over the
+# expert's ROWS rather than over a shared K, so they need their own kernel: one program per
+# (expert, N1 tile, N2 tile), looping the expert's rows in BK chunks.
+_DW = (64, 64, 64, 4, 3)
+
+
+@triton.jit
+def _dw_kernel(A, B, C, ROW0, ROWN, N1: tl.constexpr, N2: tl.constexpr,
+               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    e = tl.program_id(0)
+    p1 = tl.program_id(1)
+    p2 = tl.program_id(2)
+    r0 = tl.load(ROW0 + e)
+    nr = tl.load(ROWN + e)
+    r1 = p1 * BM + tl.arange(0, BM)          # over N1 (columns of A)
+    r2 = p2 * BN + tl.arange(0, BN)          # over N2 (columns of B)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, nr, BK):
+        rk = k0 + tl.arange(0, BK)
+        mk = rk < nr
+        a = tl.load(A + (r0 + rk[:, None]) * N1 + r1[None, :], mask=mk[:, None], other=0.0)
+        b = tl.load(B + (r0 + rk[:, None]) * N2 + r2[None, :], mask=mk[:, None], other=0.0)
+        acc = tl.dot(tl.trans(a), b, acc)
+    tl.store(C + e.to(tl.int64) * (N1 * N2) + r1[:, None] * N2 + r2[None, :], acc.to(tl.bfloat16))
+
+
+def grouped_dw(a, b, row0, rown, E):
+    """a (M,N1), b (M,N2), rows grouped by expert -> (E, N1, N2) = per-expert a^T @ b."""
+    N1 = a.shape[1]; N2 = b.shape[1]
+    BM, BN, BK, w, st = _DW
+    if N1 % BM or N2 % BN:
+        return None
+    c = torch.empty(E, N1, N2, device=a.device, dtype=a.dtype)
+    _dw_kernel[(E, N1 // BM, N2 // BN)](a, b, c, row0, rown, N1, N2,
+                                        BM, BN, BK, num_warps=w, num_stages=st)
+    return c
