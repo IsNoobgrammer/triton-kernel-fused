@@ -22,7 +22,7 @@ NAMES = {0: "silu", 2: "normsilu", 7: "normsitu"}
 def eager(gate, up, code, alpha):
     g = gate.float()
     x = g if code == 0 else g * torch.rsqrt(g.square().mean(-1, keepdim=True) + EPS)
-    z = alpha * x
+    z = alpha.unsqueeze(-1) * x          # (rows,) -> broadcast over the intermediate dim
     act = F.silu(z) if code in (0, 2) else torch.tanh(z) * torch.sigmoid(z)
     return act * up.float()
 
