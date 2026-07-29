@@ -67,8 +67,49 @@ def main():
         ok &= same
         print(f"  code {code} {NAMES[code]:<10} {'IDENTICAL' if same else 'DIFFERS  <-- FAIL'}")
 
+    ok &= end_to_end(dev)
     print("\nALL PASS" if ok else "\nFAILURES ABOVE")
     raise SystemExit(0 if ok else 1)
+
+
+def end_to_end(dev):
+    """The check the kernel-level tests above CANNOT make: that moe_per_expert actually PLUMBS
+    act_params through for non-SiTU codes. It did not -- both the fwd and the bwd gated alpha on
+    `codes[e] == 5`, so alpha was inert for silu/normsilu/normsitu and sat at exactly 1.000 for a
+    full training run while still costing the uniform fast path. Kernel parity passed the whole
+    time because it called _glu_fwd directly. Verified two ways: alpha must MOVE the output, and
+    d_alpha must match a central finite difference of the real loss."""
+    H, Ei, E, N, K = 512, 768, 4, 256, 2
+    codes_l = [0, 2, 7, 0]
+    print("\nend-to-end moe_per_expert (the plumbing test):")
+    g = torch.Generator(device=dev).manual_seed(11)
+    rn = lambda *s: torch.randn(*s, generator=g, device=dev, dtype=torch.float32)
+    hid, gup, dwn = rn(N, H) * 0.1, rn(E, 2 * Ei, H) * 0.05, rn(E, H, Ei) * 0.05
+    idx = torch.randint(0, E, (N, K), generator=g, device=dev, dtype=torch.int64)
+    wt, go = torch.rand(N, K, generator=g, device=dev), rn(N, H)
+    codes = torch.tensor(codes_l, dtype=torch.int32, device=dev)
+    loss = lambda ap: (M.moe_per_expert(hid, idx, wt, gup, dwn, codes, act_params=ap) * go).sum()
+
+    base = loss(None)
+    ap = torch.ones(E, 2, device=dev, dtype=torch.float32)
+    ap[:, 0] = torch.tensor([0.7, 1.3, 0.8, 1.2], device=dev)
+    apg = ap.clone().requires_grad_(True)
+    lv = loss(apg)
+    lv.backward()
+    live = not torch.allclose(base, lv, rtol=1e-6)
+    print(f"  alpha changes the output: {'YES' if live else 'NO   <-- FAIL (alpha is inert)'}")
+
+    h, fd_ok = 1e-3, True
+    for e in range(E):
+        p, m = ap.clone(), ap.clone()
+        p[e, 0] += h; m[e, 0] -= h
+        fd = ((loss(p) - loss(m)) / (2 * h)).item()
+        an = apg.grad[e, 0].item()
+        good = abs(fd - an) <= 2e-3 * max(abs(fd), 1.0)
+        fd_ok &= good and an != 0.0
+        print(f"  expert {e} code {codes_l[e]:<2} d_alpha analytic={an:>11.4f} fd={fd:>11.4f}"
+              f"{'' if good else '   <-- FAIL'}")
+    return live and fd_ok
 
 
 if __name__ == "__main__":

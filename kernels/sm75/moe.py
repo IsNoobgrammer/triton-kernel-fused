@@ -906,7 +906,11 @@ class _PerExpertMoE(torch.autograd.Function):
                         sw_eff[s:en].neg_()
                     continue
                 gu = x_s[s:en] @ gate_up_proj[e].t()                     # GLU expert; weight slot = e
-                _has_ap = codes[e] == 5 and ap32 is not None
+                # alpha applies to EVERY GLU code, not just SiTU: act(alpha_e*x) where x is the raw
+                # gate (0/1) or gate/rms(gate) (2/6/7). Gating this on codes[e]==5 silently made the
+                # feature inert for silu/normsilu/normsitu -- alpha stayed exactly 1.0 for a whole
+                # 60-step run while still costing the uniform fast path (ap32 is not None -> per-expert).
+                _has_ap = ap32 is not None
                 it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e],
                               row_alpha=(ap32[e, 0:1] if _has_ap else None),
                               row_gamma=(ap32[e, 1:2] if _has_ap else None))
@@ -1022,15 +1026,17 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_w_s[s:en].copy_(gw)                    # cast+copy in one, no temp
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
             torch.mm(ge.t(), it, out=grad_down_proj[e])                 # (H,m)@(m,I) -> (H,I)
-            is_situ = codes[e] == 5
-            if is_situ and want_ap:
+            # mirrors the forward: alpha is live for every GLU code, so d_alpha must be too. The row
+            # kernel writes DG=0 for non-SiTU codes (a per-expert OUTPUT gain is redundant with the
+            # router weight), so gamma simply stays at its init there.
+            if want_ap:
                 grad_gate_up, da, dg = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en],
-                                                code_hint=5, row_alpha=ap32[e, 0:1],
+                                                code_hint=codes[e], row_alpha=ap32[e, 0:1],
                                                 row_gamma=ap32[e, 1:2], want_situ_grads=True)
                 grad_act_params[e, 0] = da.sum()
                 grad_act_params[e, 1] = dg.sum()
             else:
-                _has_ap = is_situ and ctx.has_situ
+                _has_ap = ctx.has_situ
                 grad_gate_up = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en], code_hint=codes[e],
                                         row_alpha=(ap32[e, 0:1] if _has_ap else None),
                                         row_gamma=(ap32[e, 1:2] if _has_ap else None))   # (m,2I)
