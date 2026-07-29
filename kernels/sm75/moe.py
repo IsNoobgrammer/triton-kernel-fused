@@ -213,13 +213,20 @@ def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, I,
     gg = tl.load(Gamma_ptr + row * s_ap).to(tl.float32)
     r = tl.sqrt(tl.sum(gate * gate) / I + EPS)           # consumed where at in {2,6,7}
     gn = tl.where((at == 2) | (at == 6) | (at == 7), gate / r, gate)
-    sig = 1.0 / (1.0 + tl.exp(-gn))                       # sigma(ĝ): ĝ=gate for 0/1/5, gate/r for 2/6
-    f = gn * sig                                          # silu(ĝ): code 0 (ĝ=gate) AND code 2 (ĝ=gate/r)
-    relu = tl.maximum(gn, 0.0)                            # relu(ĝ): code 1 (ĝ=gate) AND code 6 (ĝ=gate/r)
-    tgn = 2.0 / (1.0 + tl.exp(-2.0 * gn)) - 1.0          # tanh(g_hat) for NormSiTU (code 7), from the shared g_hat
+    # PER-EXPERT INPUT SCALE alpha: z = alpha * x, x = gate (0/1) or gate/r (2/6/7). For the NORMED
+    # codes alpha MUST sit AFTER the rms -- rms is positively homogeneous, so alpha*g/rms(alpha*g)
+    # == g/rms(g) and scaling before the norm is exactly inert. Code 5 (SiTU) keeps its own older
+    # semantics (alpha inside tanh, sigmoid on the RAW gate) so its numerics are untouched.
+    # alpha == 1 gives z == gn bit-exactly, so every code is byte-identical when the feature is off.
+    z = tl.where(at == 5, gn, aa * gn)
+    sig = 1.0 / (1.0 + tl.exp(-z))                        # sigma(z)
+    f = z * sig                                           # silu(z): codes 0 and 2
+    relu = tl.maximum(z, 0.0)                             # relu(z): codes 1 and 6
+    tgn = 2.0 / (1.0 + tl.exp(-2.0 * z)) - 1.0           # tanh(z) for NormSiTU (code 7)
+    sig5 = 1.0 / (1.0 + tl.exp(-gate))                   # code 5 only: sigma on the RAW gate
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0    # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
     act = tl.where((at == 1) | (at == 6), relu * relu,
-              tl.where(at == 5, gg * t5 * sig, tl.where(at == 7, tgn * sig, f)))
+              tl.where(at == 5, gg * t5 * sig5, tl.where(at == 7, tgn * sig, f)))
     tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
 
 
@@ -240,35 +247,41 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
     r = tl.sqrt(tl.sum(gate * gate) / I + EPS)
     is_norm = (at == 2) | (at == 6) | (at == 7)
     gn = tl.where(is_norm, gate / r, gate)
-    sig = 1.0 / (1.0 + tl.exp(-gn))
-    f = gn * sig
-    df = sig * (1.0 + gn * (1.0 - sig))                   # silu'(ĝ)
-    relu = tl.maximum(gn, 0.0)                            # relu(ĝ): code 1 (ĝ=gate) AND code 6 (ĝ=gate/r)
-    drelu2 = 2.0 * relu                                   # d/dĝ relu(ĝ)²
-    tgn = 2.0 / (1.0 + tl.exp(-2.0 * gn)) - 1.0          # tanh(g_hat) for NormSiTU (code 7)
-    nsitu = tgn * sig                                    # tanh(g_hat)*sigmoid(g_hat)
-    dnsitu = (1.0 - tgn * tgn) * sig + tgn * sig * (1.0 - sig)   # d/dg_hat [tanh(g_hat)*sigmoid(g_hat)]
+    z = tl.where(at == 5, gn, aa * gn)                    # see the forward kernel for why alpha
+    sig = 1.0 / (1.0 + tl.exp(-z))                        # sits AFTER the rms for codes 2/6/7
+    f = z * sig
+    df = sig * (1.0 + z * (1.0 - sig))                    # silu'(z)
+    relu = tl.maximum(z, 0.0)
+    drelu2 = 2.0 * relu                                   # d/dz relu(z)^2
+    tgn = 2.0 / (1.0 + tl.exp(-2.0 * z)) - 1.0
+    nsitu = tgn * sig
+    dnsitu = (1.0 - tgn * tgn) * sig + tgn * sig * (1.0 - sig)
+    sig5 = 1.0 / (1.0 + tl.exp(-gate))                    # code 5 keeps sigma on the RAW gate
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0
-    situ = gg * t5 * sig
-    dsitu = gg * (aa * (1.0 - t5 * t5) * sig + t5 * sig * (1.0 - sig))
+    situ = gg * t5 * sig5
+    dsitu = gg * (aa * (1.0 - t5 * t5) * sig5 + t5 * sig5 * (1.0 - sig5))
     act = tl.where((at == 1) | (at == 6), relu * relu,
               tl.where(at == 5, situ, tl.where(at == 7, nsitu, f)))
     gu_ = go * up
-    # RMS-coupling (codes 2/6): S = sum(go*up*f'(ĝ)*ĝ); grad = (go*up*f'(ĝ) - (S/I)*ĝ)/r.
-    # f'(ĝ) = silu'(ĝ) for code 2, 2·relu(ĝ) for code 6.
-    dfn = tl.where(at == 6, drelu2, tl.where(at == 7, dnsitu, df))
+    # f'(z) for every non-SiTU code, so one expression serves the RMS coupling AND dalpha.
+    dfn = tl.where((at == 1) | (at == 6), drelu2, tl.where(at == 7, dnsitu, df))
+    # RMS coupling (2/6/7): d/dg = alpha*(gu*f'(z) - (S/I)*ghat)/r  with S = sum(gu*f'(z)*ghat).
+    # S uses GHAT, not z -- it comes from d(ghat)/dg, which alpha does not enter.
     S = tl.sum(tl.where(is_norm, gu_ * dfn * gn, 0.0))
-    grad_gate = tl.where(is_norm, (gu_ * dfn - (S / I) * gn) / r,
-                         gu_ * tl.where(at == 0, df, tl.where(at == 5, dsitu, drelu2)))
+    grad_gate = tl.where(is_norm, aa * (gu_ * dfn - (S / I) * gn) / r,
+                         tl.where(at == 5, gu_ * dsitu, aa * gu_ * dfn))
     tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=msk)
     tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=msk)
     if WANT_AP:
+        # dalpha = d/dalpha sum_j gu_j * f(alpha*x_j) = sum_j gu_j * f'(z_j) * x_j, x = gn.
+        # For the normed codes that is exactly the S reduction above.
         if at == 5:
-            tl.store(DA_ptr + row, tl.sum(gu_ * gg * gate * (1.0 - t5 * t5) * sig))
-            tl.store(DG_ptr + row, tl.sum(gu_ * t5 * sig))
+            tl.store(DA_ptr + row, tl.sum(gu_ * gg * gate * (1.0 - t5 * t5) * sig5))
+            tl.store(DG_ptr + row, tl.sum(gu_ * t5 * sig5))
         else:
-            tl.store(DA_ptr + row, 0.0)
-            tl.store(DG_ptr + row, 0.0)
+            tl.store(DA_ptr + row, tl.sum(gu_ * dfn * gn))
+            tl.store(DG_ptr + row, 0.0)          # no gamma: a per-expert OUTPUT gain is redundant
+                                                 # with the router weight (g_e*w*f == (g_e*w)*f)
 
 
 @triton.jit
@@ -404,6 +417,12 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
     non-NormSiLU slices skip the _row_rms launch on the tiled fallback path (row-fused path needs
     no pre-pass at all). row_alpha/row_gamma: per-row fp32 SiTU scalars (code 5); None -> 1.0."""
     M, twoI = gate_up.shape; I = twoI // 2
+    if (row_alpha is not None and I > _ROWFUSE_MAX_I
+            and not (code_hint is not None and code_hint == 5)):
+        raise NotImplementedError(
+            "per-expert alpha is implemented in the ROW-FUSED GLU kernels only (I <= "
+            f"{_ROWFUSE_MAX_I}); got I={I}. The tiled path still carries alpha for code 5 (SiTU) "
+            "alone. Implement z=alpha*x in _glu_fwd_kernel/_glu_bwd_kernel before using it here.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
@@ -431,6 +450,12 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
     Row-fused path (I <= _ROWFUSE_MAX_I): ONE kernel computes grad_gate_up + the SiTU per-row
     param grads in the same pass; tiled fallback uses the pre-pass kernels + _row_situ_bwd."""
     M, twoI = gate_up.shape; I = twoI // 2
+    if (row_alpha is not None and I > _ROWFUSE_MAX_I
+            and not (code_hint is not None and code_hint == 5)):
+        raise NotImplementedError(
+            "per-expert alpha is implemented in the ROW-FUSED GLU kernels only (I <= "
+            f"{_ROWFUSE_MAX_I}); got I={I}. The tiled path still carries alpha for code 5 (SiTU) "
+            "alone. Implement z=alpha*x in _glu_fwd_kernel/_glu_bwd_kernel before using it here.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     ggu = torch.empty_like(gate_up)
