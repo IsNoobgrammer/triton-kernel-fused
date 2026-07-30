@@ -104,7 +104,13 @@ def end_to_end(dev):
 
     apg = ap.clone().requires_grad_(True)
     loss(apg).backward()
-    h, ok = 1e-3, True
+    # h=1e-2, NOT 1e-3: the loss is ~22, whose fp32 resolution is ~2.6e-6, so at h=1e-3 the
+    # difference loss(p)-loss(m) (~6e-4) keeps only ~2 significant digits and the FD carries ~0.8%
+    # cancellation error. Verified by sweeping h against a fixed analytic value: err went
+    # 2.45e-3 (h=1e-3) -> 9.6e-5 (3e-3) -> 1.3e-4 (1e-2) -> 3.2e-5 (3e-2), i.e. error FALLING as h
+    # grows = cancellation, not truncation. The loss itself is bit-repeatable (spread 0.0 over 5
+    # evals), so this is not the fp32 atomic scatter.
+    h, ok = 1e-2, True
     for col, nm in ((0, "alpha"), (1, "gamma")):
         for e in range(E):
             p_, m_ = ap.clone(), ap.clone()
