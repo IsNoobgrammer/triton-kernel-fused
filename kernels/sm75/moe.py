@@ -232,9 +232,16 @@ def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, I,
     tgn = 2.0 / (1.0 + tl.exp(-2.0 * z)) - 1.0           # tanh(z) for NormSiTU (code 7)
     sig5 = 1.0 / (1.0 + tl.exp(-gate))                   # code 5 only: sigma on the RAW gate
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0    # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
+    # code 9 = DECOUPLED SiLU: gamma * SiLU(alpha * g) on the RAW gate. In plain SiLU(z) the linear
+    # factor and the sigmoid argument are the SAME z, so one scale cannot give large magnitude AND an
+    # unsaturated gate -- measured: at gate rms ~7 and alpha 0.74, sigma(z) is 0.995, i.e. the gate has
+    # collapsed to ReLU. Radial (code 8) escapes that by pinning the gate argument at rms 1 while r^p
+    # carries the magnitude. Code 9 tests whether a STATIC pair does the same job: alpha sets the gate
+    # temperature, gamma the magnitude. Unlike codes 0/1/2/6/7/8, gamma is LIVE here.
     act = tl.where((at == 1) | (at == 6), relu * relu,
               tl.where(at == 5, gg * t5 * sig5,
-                  tl.where(at == 7, tgn * sig, tl.where(at == 8, rp * f, f))))
+                  tl.where(at == 7, tgn * sig,
+                      tl.where(at == 8, rp * f, tl.where(at == 9, gg * f, f)))))
     tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
 
 
@@ -274,7 +281,8 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
     dsitu = gg * (aa * (1.0 - t5 * t5) * sig5 + t5 * sig5 * (1.0 - sig5))
     act = tl.where((at == 1) | (at == 6), relu * relu,
               tl.where(at == 5, situ,
-                  tl.where(at == 7, nsitu, tl.where(at == 8, rp * f, f))))
+                  tl.where(at == 7, nsitu,
+                      tl.where(at == 8, rp * f, tl.where(at == 9, gg * f, f)))))
     gu_ = go * up
     # f'(z) for every non-SiTU code, so one expression serves the RMS coupling AND dalpha.
     dfn = tl.where((at == 1) | (at == 6), drelu2, tl.where(at == 7, dnsitu, df))
@@ -285,9 +293,10 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
     #   dL/dg_i = r^(p-1) * [gu_i*silu'(ghat_i) - (ghat_i/I)*(S - p*T)]
     # which is the code-2 coupling with S -> (S - p*T). MUST be tested before is_norm: 8 is in it.
     T = tl.sum(tl.where(at == 8, gu_ * f, 0.0))
-    grad_gate = tl.where(at == 8, rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
-                    tl.where(is_norm, aa * (gu_ * dfn - (S / I) * gn) / r,
-                        tl.where(at == 5, gu_ * dsitu, aa * gu_ * dfn)))
+    grad_gate = tl.where(at == 9, gg * aa * gu_ * df,
+                    tl.where(at == 8, rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
+                        tl.where(is_norm, aa * (gu_ * dfn - (S / I) * gn) / r,
+                            tl.where(at == 5, gu_ * dsitu, aa * gu_ * dfn))))
     tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=msk)
     tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=msk)
     if WANT_AP:
@@ -300,9 +309,15 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
             # code 8: alpha is the exponent LOGIT, so d/dalpha = dp/dalpha * dL/dp with
             # dL/dp = T*r^p*ln(r) and dp/dalpha = p(1-p). Reuses T -- nothing extra to compute.
             da8 = p8 * (1.0 - p8) * rp * lr8 * T
-            tl.store(DA_ptr + row, tl.where(at == 8, da8, tl.sum(gu_ * dfn * gn)))
-            tl.store(DG_ptr + row, 0.0)          # no gamma: a per-expert OUTPUT gain is redundant
-                                                 # with the router weight (g_e*w*f == (g_e*w)*f)
+            # code 9: d/dalpha [gamma*f(alpha*g)] = gamma*f'(z)*g ; d/dgamma = f(z).
+            da9 = gg * tl.sum(gu_ * df * gate)
+            tl.store(DA_ptr + row, tl.where(at == 9, da9,
+                                      tl.where(at == 8, da8, tl.sum(gu_ * dfn * gn))))
+            # gamma is LIVE for code 9 only. For 0/1/2/6/7/8 a per-expert OUTPUT gain would be
+            # redundant with the router weight IF that weight were free -- but with norm_topk_prob
+            # the top-k weights are sum-normalized to 1 and CANNOT express per-expert scale, which
+            # is exactly what code 9 exists to test.
+            tl.store(DG_ptr + row, tl.where(at == 9, tl.sum(gu_ * f), 0.0))
 
 
 @triton.jit
@@ -449,6 +464,11 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
             "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
             "exponent LOGIT theta, p=sigmoid(theta). With alpha absent the kernel would default to "
             "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
+    if code_hint == 9 and (row_alpha is None or row_gamma is None):
+        raise ValueError(
+            "act code 9 (decoupled SiLU, gamma*SiLU(alpha*g)) needs BOTH row_alpha (gate "
+            "temperature) and row_gamma (output magnitude) -- decoupling them is the entire point. "
+            "Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
@@ -487,6 +507,11 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
             "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
             "exponent LOGIT theta, p=sigmoid(theta). With alpha absent the kernel would default to "
             "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
+    if code_hint == 9 and (row_alpha is None or row_gamma is None):
+        raise ValueError(
+            "act code 9 (decoupled SiLU, gamma*SiLU(alpha*g)) needs BOTH row_alpha (gate "
+            "temperature) and row_gamma (output magnitude) -- decoupling them is the entire point. "
+            "Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     ggu = torch.empty_like(gate_up)
@@ -1128,6 +1153,13 @@ def _act_eager(gate, code, alpha=None, gamma=None):
         g = gate.float()
         g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
         return (torch.tanh(g) * torch.sigmoid(g)).to(gate.dtype)
+    if code == 9:
+        # DECOUPLED SiLU: gamma * SiLU(alpha * g) on the RAW gate. alpha = gate temperature,
+        # gamma = output magnitude -- the two jobs plain SiLU has to do with one number.
+        g = gate.float()
+        a = alpha if torch.is_tensor(alpha) else torch.tensor(alpha, device=g.device)
+        gm = gamma if torch.is_tensor(gamma) else torch.tensor(gamma, device=g.device)
+        return (gm * F.silu(a * g)).to(gate.dtype)
     if code == 8:
         # RADIAL NormSiLU: r^p * SiLU(g/r), r = rms(gate), p = sigmoid(alpha) bounded in (0,1).
         # `alpha` is the exponent LOGIT here, not an input scale.
