@@ -211,22 +211,30 @@ def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr, Out_ptr, I,
     at = tl.load(Act_ptr + row)
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
     gg = tl.load(Gamma_ptr + row * s_ap).to(tl.float32)
-    r = tl.sqrt(tl.sum(gate * gate) / I + EPS)           # consumed where at in {2,6,7}
-    gn = tl.where((at == 2) | (at == 6) | (at == 7), gate / r, gate)
+    r = tl.sqrt(tl.sum(gate * gate) / I + EPS)           # consumed where at in {2,6,7,8}
+    gn = tl.where((at == 2) | (at == 6) | (at == 7) | (at == 8), gate / r, gate)
+    # code 8 = RADIAL NormSiLU: r^p * SiLU(g/r), p = sigmoid(alpha) in (0,1). NormSiLU discards the
+    # per-token gate radius r entirely; this puts a BOUNDED fraction of it back. p must be bounded --
+    # the toy round measured full p=1 (raw magnitude passthrough) as harmful (testCE 10.2 vs 3.8) and
+    # unbounded-learnable as worse than fixed p=0.5, while bounded-learnable was the best arm.
+    # alpha is REUSED as the exponent logit here, so code 8 takes no input scale (z = gn below).
+    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    rp = tl.exp(p8 * tl.log(r))                          # r^p
     # PER-EXPERT INPUT SCALE alpha: z = alpha * x, x = gate (0/1) or gate/r (2/6/7). For the NORMED
     # codes alpha MUST sit AFTER the rms -- rms is positively homogeneous, so alpha*g/rms(alpha*g)
     # == g/rms(g) and scaling before the norm is exactly inert. Code 5 (SiTU) keeps its own older
     # semantics (alpha inside tanh, sigmoid on the RAW gate) so its numerics are untouched.
     # alpha == 1 gives z == gn bit-exactly, so every code is byte-identical when the feature is off.
-    z = tl.where(at == 5, gn, aa * gn)
+    z = tl.where((at == 5) | (at == 8), gn, aa * gn)      # 5 and 8 spend alpha on something else
     sig = 1.0 / (1.0 + tl.exp(-z))                        # sigma(z)
-    f = z * sig                                           # silu(z): codes 0 and 2
+    f = z * sig                                           # silu(z): codes 0, 2 and 8
     relu = tl.maximum(z, 0.0)                             # relu(z): codes 1 and 6
     tgn = 2.0 / (1.0 + tl.exp(-2.0 * z)) - 1.0           # tanh(z) for NormSiTU (code 7)
     sig5 = 1.0 / (1.0 + tl.exp(-gate))                   # code 5 only: sigma on the RAW gate
     t5 = 2.0 / (1.0 + tl.exp(-2.0 * aa * gate)) - 1.0    # tanh(alpha*g) = 2*sigmoid(2*alpha*g)-1 (exact)
     act = tl.where((at == 1) | (at == 6), relu * relu,
-              tl.where(at == 5, gg * t5 * sig5, tl.where(at == 7, tgn * sig, f)))
+              tl.where(at == 5, gg * t5 * sig5,
+                  tl.where(at == 7, tgn * sig, tl.where(at == 8, rp * f, f))))
     tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
 
 
@@ -245,9 +253,13 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
     gg = tl.load(Gamma_ptr + row * s_ap).to(tl.float32)
     r = tl.sqrt(tl.sum(gate * gate) / I + EPS)
-    is_norm = (at == 2) | (at == 6) | (at == 7)
+    is_norm = (at == 2) | (at == 6) | (at == 7) | (at == 8)
     gn = tl.where(is_norm, gate / r, gate)
-    z = tl.where(at == 5, gn, aa * gn)                    # see the forward kernel for why alpha
+    p8 = 1.0 / (1.0 + tl.exp(-aa))                        # code 8 radial exponent, bounded (0,1)
+    lr8 = tl.log(r)
+    rp = tl.exp(p8 * lr8)                                 # r^p
+    rpm1 = tl.exp((p8 - 1.0) * lr8)                       # r^(p-1)
+    z = tl.where((at == 5) | (at == 8), gn, aa * gn)      # see the forward kernel for why alpha
     sig = 1.0 / (1.0 + tl.exp(-z))                        # sits AFTER the rms for codes 2/6/7
     f = z * sig
     df = sig * (1.0 + z * (1.0 - sig))                    # silu'(z)
@@ -261,15 +273,21 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
     situ = gg * t5 * sig5
     dsitu = gg * (aa * (1.0 - t5 * t5) * sig5 + t5 * sig5 * (1.0 - sig5))
     act = tl.where((at == 1) | (at == 6), relu * relu,
-              tl.where(at == 5, situ, tl.where(at == 7, nsitu, f)))
+              tl.where(at == 5, situ,
+                  tl.where(at == 7, nsitu, tl.where(at == 8, rp * f, f))))
     gu_ = go * up
     # f'(z) for every non-SiTU code, so one expression serves the RMS coupling AND dalpha.
     dfn = tl.where((at == 1) | (at == 6), drelu2, tl.where(at == 7, dnsitu, df))
     # RMS coupling (2/6/7): d/dg = alpha*(gu*f'(z) - (S/I)*ghat)/r  with S = sum(gu*f'(z)*ghat).
     # S uses GHAT, not z -- it comes from d(ghat)/dg, which alpha does not enter.
     S = tl.sum(tl.where(is_norm, gu_ * dfn * gn, 0.0))
-    grad_gate = tl.where(is_norm, aa * (gu_ * dfn - (S / I) * gn) / r,
-                         tl.where(at == 5, gu_ * dsitu, aa * gu_ * dfn))
+    # code 8 adds the d(r^p)/dg path: with A_j = r^p*SiLU(ghat_j) and T = sum(gu*SiLU(ghat)),
+    #   dL/dg_i = r^(p-1) * [gu_i*silu'(ghat_i) - (ghat_i/I)*(S - p*T)]
+    # which is the code-2 coupling with S -> (S - p*T). MUST be tested before is_norm: 8 is in it.
+    T = tl.sum(tl.where(at == 8, gu_ * f, 0.0))
+    grad_gate = tl.where(at == 8, rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
+                    tl.where(is_norm, aa * (gu_ * dfn - (S / I) * gn) / r,
+                        tl.where(at == 5, gu_ * dsitu, aa * gu_ * dfn)))
     tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=msk)
     tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=msk)
     if WANT_AP:
@@ -279,7 +297,10 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr, Gamma_ptr,
             tl.store(DA_ptr + row, tl.sum(gu_ * gg * gate * (1.0 - t5 * t5) * sig5))
             tl.store(DG_ptr + row, tl.sum(gu_ * t5 * sig5))
         else:
-            tl.store(DA_ptr + row, tl.sum(gu_ * dfn * gn))
+            # code 8: alpha is the exponent LOGIT, so d/dalpha = dp/dalpha * dL/dp with
+            # dL/dp = T*r^p*ln(r) and dp/dalpha = p(1-p). Reuses T -- nothing extra to compute.
+            da8 = p8 * (1.0 - p8) * rp * lr8 * T
+            tl.store(DA_ptr + row, tl.where(at == 8, da8, tl.sum(gu_ * dfn * gn)))
             tl.store(DG_ptr + row, 0.0)          # no gamma: a per-expert OUTPUT gain is redundant
                                                  # with the router weight (g_e*w*f == (g_e*w)*f)
 
@@ -423,6 +444,11 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
             "per-expert alpha is implemented in the ROW-FUSED GLU kernels only (I <= "
             f"{_ROWFUSE_MAX_I}); got I={I}. The tiled path still carries alpha for code 5 (SiTU) "
             "alone. Implement z=alpha*x in _glu_fwd_kernel/_glu_bwd_kernel before using it here.")
+    if code_hint == 8 and row_alpha is None:
+        raise ValueError(
+            "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
+            "exponent LOGIT theta, p=sigmoid(theta). With alpha absent the kernel would default to "
+            "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
@@ -434,7 +460,7 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_gamma=None):
                                       _ap_stride(row_alpha),
                                       EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=(8 if BLOCK_I >= 1024 else 4))
         return out
-    skip_ns = code_hint is not None and code_hint not in (2, 6, 7)   # codes 2/6/7 need the row RMS
+    skip_ns = code_hint is not None and code_hint not in (2, 6, 7, 8)  # 2/6/7/8 need the row RMS
     rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
     BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
@@ -456,6 +482,11 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
             "per-expert alpha is implemented in the ROW-FUSED GLU kernels only (I <= "
             f"{_ROWFUSE_MAX_I}); got I={I}. The tiled path still carries alpha for code 5 (SiTU) "
             "alone. Implement z=alpha*x in _glu_fwd_kernel/_glu_bwd_kernel before using it here.")
+    if code_hint == 8 and row_alpha is None:
+        raise ValueError(
+            "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
+            "exponent LOGIT theta, p=sigmoid(theta). With alpha absent the kernel would default to "
+            "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     rg = _ones(M, gate_up.device) if row_gamma is None else row_gamma
     ggu = torch.empty_like(gate_up)
@@ -474,7 +505,7 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, row_gam
                                       EPS=_NS_EPS, WANT_AP=want_situ_grads, BLOCK_I=BLOCK_I,
                                       num_warps=(8 if BLOCK_I >= 1024 else 4))
         return (ggu, da, dg) if want_situ_grads else ggu
-    skip_ns = code_hint is not None and code_hint not in (2, 6, 7)   # codes 2/6/7 need the row RMS
+    skip_ns = code_hint is not None and code_hint not in (2, 6, 7, 8)  # 2/6/7/8 need the row RMS
     if skip_ns:
         rms = _ones(M, gate_up.device)      # r=1 / S=0 semantics; values unread where at!=2
         sbuf = rms
@@ -1097,6 +1128,13 @@ def _act_eager(gate, code, alpha=None, gamma=None):
         g = gate.float()
         g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
         return (torch.tanh(g) * torch.sigmoid(g)).to(gate.dtype)
+    if code == 8:
+        # RADIAL NormSiLU: r^p * SiLU(g/r), r = rms(gate), p = sigmoid(alpha) bounded in (0,1).
+        # `alpha` is the exponent LOGIT here, not an input scale.
+        g = gate.float()
+        r = torch.sqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
+        p = torch.sigmoid(alpha if torch.is_tensor(alpha) else torch.tensor(alpha, device=g.device))
+        return (r.pow(p) * F.silu(g / r)).to(gate.dtype)
     # NormSiLU: SiLU(rms-normed gate), gain-free — matches BiBo eager (_NORMSILU_EPS)
     g = gate.float()
     g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
