@@ -46,8 +46,15 @@ def main():
     diff = p_c - p_nc
     ratio = diff / (LR * WD * p0)
 
-    near0 = (ratio.abs() < 1e-4)
-    near1 = ((ratio - 1.0).abs() < 1e-4)
+    # TOL: the two branches compute the same decay in different ORDERS -- non-cautious does
+    # p.mul_(1-lam), cautious does p.sub_(p*mask, alpha=lam) -- which differ by 1 fp32 ulp. In these
+    # ratio units that floor is eps/lam = 1.19e-7/1e-3 = 1.19e-4, so a 1e-4 tolerance sits exactly ON
+    # it and misclassifies ~1.5% of coordinates (measured: 511/32768 off, median 1.09e-4, max gap
+    # 1.191e-4 vs eps/lam 1.192e-4 -- an exact match). 1e-3 is 10x above the rounding floor and
+    # 1000x below the 0-vs-1 separation, so it discriminates the two classes with margin both ways.
+    TOL = 1e-3
+    near0 = (ratio.abs() < TOL)
+    near1 = ((ratio - 1.0).abs() < TOL)
     binary = (near0 | near1).all().item()
     print(f"diff/(lr*wd*p0) is exactly 0 or 1 everywhere: "
           f"{'YES' if binary else 'NO  <-- FAIL'}   "
