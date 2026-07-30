@@ -114,7 +114,7 @@ class FusedMuon(optim.Optimizer):
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
                  spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0, xorth_backend="ns",
                  xorth_ns_iters=18, xorth_ema=0.95, xorth_gate_ref=0.3,
-                 xorth_warmup_steps=0, xorth_where="post"):
+                 xorth_warmup_steps=0, xorth_where="post", cautious_decay=True):
         # xorth_post is a GROUP-level option (like lr/wd): the constructor value is only the default;
         # pass param groups to scope whitening to the params whose leading dim IS an expert axis:
         #   FusedMuon([{"params": expert_stacks, "xorth_post": 0.01},
@@ -124,6 +124,18 @@ class FusedMuon(optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay,
                         xorth_post=float(xorth_post))
         super().__init__(params, defaults)
+        # CAUTIOUS WEIGHT DECAY (modded-nanogpt / nanochat; reported a clear win, and the Kimi team
+        # recommended testing it): decay a coordinate ONLY where the update is already pushing |W| UP.
+        #   same sign as p  -> the update grows |W|, decay opposes it            -> APPLY
+        #   opposite sign   -> the update already shrinks |W|, decay would pile on -> SKIP
+        # So it drops the REDUNDANT half of the decay and keeps the half that regularizes growth --
+        # roughly wd 0.1's norm control at wd 0.05's collateral damage. Note the applied update is
+        # delta_p = sc_alpha*out with sc_alpha < 0, so "same sign as p" is (out * p) < 0.
+        # It is still lr-mediated, so it does NOT rescue the late-anneal collapse that closed the wd
+        # axis (see the ||W*|| ~ sqrt(lr/2wd) vs sqrt(2*lr*wd) analysis) -- different problem.
+        # cautious_decay=False restores the previous behaviour BIT-EXACTLY (the decay stays a single
+        # pre-loop _foreach_mul_); True moves it to the scatter site because the mask needs `out`.
+        self.cautious_decay = bool(cautious_decay)
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype if ns_dtype is not None else self.DEFAULT_NS_DTYPE
         self.scale_mode = _scaling.validate(scale_mode)
@@ -321,6 +333,11 @@ class FusedMuon(optim.Optimizer):
         """Launch-bound killer: warm a few eager steps, capture the compute body into a CUDA graph, then
         replay it (one launch) every subsequent step. Falls back to permanent eager on any capture error
         so a graph-unfriendly environment degrades to the fused-mixed champion instead of crashing."""
+        if self.cautious_decay and any(g["weight_decay"] != 0 for g in self.param_groups):
+            raise NotImplementedError(
+                "cautious_decay is not implemented on the CUDA-graph path: _build_graph_work plans the "
+                "decay as a single pre-update _foreach_mul_, but the cautious mask needs the "
+                "orthogonalized update. Run with use_graph=False (the default) or cautious_decay=False.")
         work, decay = self._build_graph_work()
         self._gather(work)                                    # always eager — reads current grads
         if self._graph is not None:
@@ -381,7 +398,9 @@ class FusedMuon(optim.Optimizer):
             # (AdamW-8bit norm): fp32 master weights, fp32 grads, fp16 momentum state + NS.
             plan = self._plan(group, params)
             spectral = self.spectral_wd > 0 and wd != 0
-            if wd != 0 and not spectral:
+            # cautious decay needs `out`, so it is applied at the scatter site below instead of here
+            cautious = self.cautious_decay and wd != 0 and not spectral
+            if wd != 0 and not spectral and not cautious:
                 torch._foreach_mul_(params, 1.0 - lr * wd)            # decoupled weight decay (fp32 master)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
@@ -427,9 +446,15 @@ class FusedMuon(optim.Optimizer):
                     if do_xorth and self.xorth_where == "post":       # POST-NS: whiten the orthogonalized update
                         self._whiten_chunk(out, members, r, c, xp)
                     # scatter the scaled update to the fp32 masters in ONE foreach (fp16->fp32 upcast)
-                    torch._foreach_add_([p for p, _, _ in members],
-                                        [out[o:o + n].reshape(p.shape) for p, o, n in members],
-                                        alpha=sc_alpha)
+                    _pl = [p for p, _, _ in members]
+                    _ul = [out[o:o + n].reshape(p.shape) for p, o, n in members]
+                    if cautious:
+                        # decay only where the update grows |W|: delta_p = sc_alpha*out, sc_alpha<0,
+                        # so "delta_p has p's sign" <=> out*p < 0. Uses the PRE-update p, matching
+                        # decoupled-decay semantics. Elementwise, negligible against Newton-Schulz.
+                        for _p, _u in zip(_pl, _ul):
+                            _p.sub_(_p * ((_u * _p) < 0), alpha=lr * wd)
+                    torch._foreach_add_(_pl, _ul, alpha=sc_alpha)
 
         return loss
 
@@ -519,7 +544,13 @@ class DistributedMuon(FusedMuon):
                 u = blob[off:off + n].view_as(p); off += n
                 lr, wd = g["lr"], g["weight_decay"]
                 if wd != 0:
-                    p.mul_(1.0 - lr * wd)
+                    if self.cautious_decay:
+                        # same rule as FusedMuon.step: the applied delta is -lr*(scaled u), so
+                        # "delta has p's sign" <=> u*p < 0. u here is the pre-scale update; the
+                        # per-row/aurora rescales below are positive, so they cannot flip the sign.
+                        p.sub_(p * ((u * p) < 0), alpha=lr * wd)
+                    else:
+                        p.mul_(1.0 - lr * wd)
                 if aurora:                                            # blob is already the fully scaled update
                     p.add_(u, alpha=-lr)
                 elif perrow:                                          # per-row rescale (identical on every rank -> still bit-consistent)

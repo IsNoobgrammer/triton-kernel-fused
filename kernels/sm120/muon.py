@@ -102,7 +102,11 @@ class FusedMuon(_FusedMuon75):
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
                                           group["weight_decay"], group["nesterov"])
             plan = self._plan(group, params)
-            if wd != 0:
+            # cautious decay needs the orthogonalized update, so it moves to the scatter site below.
+            # See FusedMuon.__init__ in kernels/sm75/muon.py for the rule and why it is not a fix for
+            # the late-anneal collapse. cautious_decay=False keeps this pre-loop form bit-exactly.
+            cautious = self.cautious_decay and wd != 0
+            if wd != 0 and not cautious:
                 torch._foreach_mul_(params, 1.0 - lr * wd)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
@@ -139,8 +143,14 @@ class FusedMuon(_FusedMuon75):
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
                     if do_xorth and self.xorth_where == "post":   # POST-NS: whiten the orthogonalized update
                         self._whiten_chunk(out, members, r, c, xp)
-                    torch._foreach_add_([p for p, _, _ in members],
-                                        [out[o:o + n].reshape(p.shape) for p, o, n in members],
+                    _pl = [p for p, _, _ in members]
+                    _ul = [out[o:o + n].reshape(p.shape) for p, o, n in members]
+                    if cautious:
+                        # applied delta = (negative alpha) * out, so "delta has p's sign" <=> out*p < 0.
+                        # Uses the PRE-update p, matching decoupled-decay semantics.
+                        for _p, _u in zip(_pl, _ul):
+                            _p.sub_(_p * ((_u * _p) < 0), alpha=lr * wd)
+                    torch._foreach_add_(_pl, _ul,
                                         alpha=(-lr if (perrow or aurora or aurora_ema) else alpha))
         return loss
 
