@@ -8,8 +8,12 @@ from L1 -- back to ~3N/5N, and no width limit.
 This asserts the restructure changed NOTHING numerically: at I <= 1024 both paths exist, so they are
 compared head-to-head; above it, the looped path is checked against the fp64 eager reference.
 """
+import importlib
+
 import torch
-import kernels.sm75.moe as M
+
+importlib.import_module("kernels.sm120.moe")     # sm120 first (see parity_normed_tiles)
+M = importlib.import_module("kernels.sm75.moe")  # `kernels.sm75.moe` the MODULE, not the exported fn
 
 torch.manual_seed(0)
 dev = "cuda"
