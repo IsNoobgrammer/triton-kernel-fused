@@ -44,7 +44,7 @@ def main():
         ones = torch.ones(MROWS, device=dev, dtype=torch.float32)
 
         out_k = M._glu_fwd(gu, row_act, code_hint=CODE, row_alpha=th.detach())
-        ggu_k, dth_k, _ = M._glu_bwd(go, gu, row_act, code_hint=CODE, row_alpha=th.detach(),
+        ggu_k, dth_k = M._glu_bwd(go, gu, row_act, code_hint=CODE, row_alpha=th.detach(),
                                      want_act_grads=True)
 
         ref = eager(gu[:, :I], gu[:, I:], th)
