@@ -115,7 +115,11 @@ def build_tile_map(counts, counts_t, device, bm=None):
     bm = _BM if bm is None else bm
     ntile = [(c + bm - 1) // bm for c in counts]
     total = sum(ntile)
-    nt = torch.tensor(ntile, device=device, dtype=torch.int32)
+    # nt from counts_t, which is ALREADY on the device -- torch.tensor(ntile, device=...) was a
+    # PAGEABLE H2D every call (32/step at 8 MoE layers x grad_accum 4; the profile put pageable H2D
+    # at 2.2% of CUDA time, ~1.5ms per copy because pageable cannot overlap). `total` stays a host
+    # sum of the already-materialized `counts` list, so this adds no sync.
+    nt = ((counts_t + (bm - 1)) // bm).to(torch.int32)
     te = torch.repeat_interleave(torch.arange(len(counts), device=device, dtype=torch.int32), nt)
     start = torch.cumsum(nt, 0) - nt                       # first tile index of each expert
     within = torch.arange(total, device=device, dtype=torch.int32) - start[te]
