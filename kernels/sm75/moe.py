@@ -863,13 +863,23 @@ class _PerExpertMoE(torch.autograd.Function):
         # one logical (M,2I) tensor. Give the GEMMs a contiguous gu buffer (out=) and run ONE _glu_fwd
         # over every row. Only valid when no special expert is in the stack: codes 3/4 rows must skip
         # the GLU entirely, and a whole-buffer call would run it on them.
-        uniform = all(c <= 2 or c >= 6 for c in codes) and ap32 is None
+        # `uniform`'s REAL requirement is NO SPECIAL EXPERTS: codes 3/4 must skip the GLU and a
+        # whole-buffer call would run it on them. act_params used to disqualify a stack too, which
+        # forced RADIAL onto the per-expert loop -- profiled at 178 host DtoH syncs and ~1863
+        # _glu_bwd_row_kernel launches per step (vs 32 batched), with Memcpy DtoH the single largest
+        # kernel in the whole step at 11.2%. It never had to: _glu_fwd/_glu_bwd take a PER-ROW alpha
+        # (see _ap_stride), and rows are sorted by expert, so the per-expert scalar expands with one
+        # on-device repeat_interleave -- exactly how row_act is already built.
+        uniform = all(c <= 2 or c >= 6 for c in codes)
+        # per-row alpha for the batched row-ops (None when the feature is off -> byte-identical)
+        row_ap = (torch.repeat_interleave(ap32[:, 0].contiguous(), counts_t, output_size=M_rows)
+                  if ap32 is not None else None)
         # _grouped_mm runs ALL experts' GEMMs in ONE launch. Its GPU time is the same as the
         # per-expert loop (measured 0.99x), but the loop costs 64 python-level torch.mm calls per
         # GEMM per layer -- 2048 per micro-batch across the four GEMMs -- and the step is partly
         # CPU-launch-bound: batching the row ops cut launches 511->8 and gained 3ms/micro-batch of
         # wall time while those kernels' own time got slightly WORSE. So this is a launch-count fix.
-        use_gmm = (uniform and hasattr(torch, "_grouped_mm")
+        use_gmm = (uniform and ap32 is None and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
         tile_map = None; tile_map_gg = None; tile_map_bw = None
@@ -922,7 +932,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 if en > s:
                     torch.mm(x_s[s:en], gate_up_proj[e].t(), out=gu_all[s:en])
             hint = codes[0] if len(set(codes)) == 1 else None
-            it_all = _glu_fwd(gu_all, row_act, code_hint=hint)        # ONE launch, all rows
+            it_all = _glu_fwd(gu_all, row_act, code_hint=hint, row_alpha=row_ap)   # ONE launch
             for e in range(E):
                 s, en = bounds[e], bounds[e + 1]
                 if en > s:
@@ -957,6 +967,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
+        ctx.row_ap = row_ap; ctx.counts_t = counts_t
         ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw
         ctx.codes = codes; ctx.has_ap = ap32 is not None
         return out.to(hidden.dtype)
@@ -1021,7 +1032,21 @@ class _PerExpertMoE(torch.autograd.Function):
                 torch.mm(ge_all[s:en], down_proj[e], out=grad_inter[s:en])
                 torch.mm(ge_all[s:en].t(), it_all[s:en], out=grad_down_proj[e])
             hint = codes[0] if len(set(codes)) == 1 else None
-            grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)   # ONE call
+            want_ap_u = ctx.has_ap and ctx.needs_input_grad[6]
+            grad_act_params = None
+            if want_ap_u:
+                grad_gate_up, da_rows = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
+                                                 row_alpha=ctx.row_ap, want_act_grads=True)
+                # da comes back PER ROW; fold it back to per-expert. Rows are sorted by expert, so
+                # the owner index is the same repeat_interleave that built row_act/row_ap.
+                grad_act_params = torch.zeros(E, 2, device=grad_out.device, dtype=torch.float32)
+                own = torch.repeat_interleave(
+                    torch.arange(E, device=grad_out.device), ctx.counts_t, output_size=M)
+                grad_act_params[:, 0] = torch.zeros(E, device=grad_out.device,
+                                                    dtype=torch.float32).index_add_(0, own, da_rows)
+            else:
+                grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
+                                        row_alpha=ctx.row_ap)          # ONE call
             grad_x = torch.empty(M, H, device=grad_out.device, dtype=grad_out.dtype)
             for e in range(E):
                 s, en = bounds[e], bounds[e + 1]
@@ -1034,7 +1059,7 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
             grad_wt[order] = grad_w_s
             return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,
-                    None, None)
+                    None, grad_act_params)
         grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
         grad_down_proj = torch.zeros_like(down_proj)
