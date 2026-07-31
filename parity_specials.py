@@ -67,8 +67,8 @@ def rel(x, y):
 def main():
     torch.manual_seed(0)
     N, H, I, k = 512, 128, 96, 2
-    # 6 GLU (silu/relu2/normsilu cycled) + 2 +Identity + 2 -Identity -- both signs, multi-expert blocks
-    codes = [0, 1, 2, 0, 1, 2, 3, 3, 4, 4]
+    # 6 GLU (silu/radial/normsilu cycled) + 2 +Identity + 2 -Identity -- both signs, multi-expert blocks
+    codes = [0, 8, 2, 0, 8, 2, 3, 3, 4, 4]
     E, e_glu = len(codes), 6
     codes_t = torch.tensor(codes, dtype=torch.int32, device=DEV)
 

@@ -85,7 +85,7 @@ def moe_grouped_cublas_polyglu(hidden, top_k_indices, top_k_weights, gate_up_pro
     """
     from kernels.sm75.moe import _code_max
     if _code_max(act_codes) > 4:   # cached: one host sync per act_codes tensor lifetime
-        raise ValueError("code 5 (SiTU) unsupported on the grouped path; use moe_per_expert(act_params=...)")
+        raise ValueError("code 8 (radial) unsupported on the grouped path; use moe_per_expert(act_params=...)")
     N, H = hidden.shape
     e_glu = gate_up_proj.shape[0]
     e_total = act_codes.shape[0]

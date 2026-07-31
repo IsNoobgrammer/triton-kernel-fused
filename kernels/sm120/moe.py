@@ -34,7 +34,7 @@ def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes
     regime, where it beats per-expert on time at <= memory); else the per-expert champion.
 
     The grouped path handles +Identity (3) / -Identity (4) special experts directly, so unlike the old
-    sm75 grouped there is no `glu_only` restriction — but NOT code 5 (SiTU, needs act_params), which
+    sm75 grouped there is no `glu_only` restriction — but NOT code 8 (radial, needs act_params), which
     always takes per-expert. per-expert is also the fallback whenever grouped is unsupported (no
     torch._grouped_mm / sm_<80 / non-bf16-fp16 / unaligned shapes) or tokens-per-expert is high
     enough that the per-expert GEMMs are already efficient.

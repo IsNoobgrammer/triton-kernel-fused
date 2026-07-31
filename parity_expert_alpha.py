@@ -16,7 +16,7 @@ importlib.import_module("kernels.sm120.moe")           # sm120 first (see parity
 M = importlib.import_module("kernels.sm75.moe")
 
 MROWS, I, EPS = 512, 768, 1e-6
-NAMES = {0: "silu", 2: "normsilu", 7: "normsitu"}
+NAMES = {0: "silu", 2: "normsilu"}
 
 
 def eager(gate, up, code, alpha):
@@ -41,9 +41,8 @@ def main():
             a = torch.full((MROWS,), alpha, device=dev, dtype=torch.float32).requires_grad_(True)
             ones = torch.ones(MROWS, device=dev, dtype=torch.float32)
 
-            out_k = M._glu_fwd(gu, row_act, row_alpha=a.detach(), row_gamma=ones)
-            ggu_k, da_k, _ = M._glu_bwd(go, gu, row_act, row_alpha=a.detach(), row_gamma=ones,
-                                        want_situ_grads=True)
+            out_k = M._glu_fwd(gu, row_act, row_alpha=a.detach())
+            ggu_k, da_k = M._glu_bwd(go, gu, row_act, row_alpha=a.detach(), want_act_grads=True)
 
             ref = eager(gu[:, :I], gu[:, I:], code, a)
             (ref * go).sum().backward()
@@ -61,7 +60,7 @@ def main():
         gu = torch.randn(MROWS, 2 * I, generator=g, device=dev, dtype=torch.float32)
         ra = torch.full((MROWS,), 1.0, device=dev, dtype=torch.float32)
         row_act = torch.full((MROWS,), code, device=dev, dtype=torch.int32)
-        a_out = M._glu_fwd(gu, row_act, row_alpha=ra, row_gamma=ra)
+        a_out = M._glu_fwd(gu, row_act, row_alpha=ra)
         b_out = M._glu_fwd(gu, row_act)
         same = torch.equal(a_out, b_out)
         ok &= same
@@ -75,7 +74,7 @@ def main():
 def end_to_end(dev):
     """The check the kernel-level tests above CANNOT make: that moe_per_expert actually PLUMBS
     act_params through for non-SiTU codes. It did not -- both the fwd and the bwd gated alpha on
-    `codes[e] == 5`, so alpha was inert for silu/normsilu/normsitu and sat at exactly 1.000 for a
+    `codes[e] == 5`, so alpha was inert for silu/normsilu and sat at exactly 1.000 for a
     full training run while still costing the uniform fast path. Kernel parity passed the whole
     time because it called _glu_fwd directly. Verified two ways: alpha must MOVE the output, and
     d_alpha must match a central finite difference of the real loss."""
