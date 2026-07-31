@@ -180,7 +180,7 @@ def _row_s_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, I,
 # IN-REGISTER in the same pass. 1 launch fwd + 1 launch bwd for every code — no pre-pass kernels,
 # no extra HBM reads (fwd ~4N->3N, bwd ~9N->5N for NormSiLU). Used when I <= _ROWFUSE_MAX_I;
 # larger I falls back to the tiled kernels + pre-pass path below (kept unchanged).
-_ROWFUSE_MAX_I = 1024
+_ROWFUSE_MAX_I = 1024      # above this a row will not fit in registers -> looped kernels
 
 
 @triton.jit
@@ -337,33 +337,116 @@ def _ap_stride(row_alpha):
     return 0 if (row_alpha is not None and row_alpha.numel() == 1) else 1
 
 
-def _alpha_tile_gap(row_alpha, I, code_hint):
-    """Why per-expert alpha (and therefore RADIAL) is capped at I <= _ROWFUSE_MAX_I.
+# ── LOOPED row-fused kernels: one program per row, but the row is walked in BLOCK_I chunks so it
+# is not held in registers all at once. Removes the _ROWFUSE_MAX_I cap for the codes that need a
+# row reduction (2, 8) and for per-expert alpha, WITHOUT the tiled path's pre-pass kernels.
+#
+# WHY THIS IS THE RIGHT SHAPE. The rms is a row reduction, so the tiled kernels cannot see a whole
+# row and need _row_rms (fwd) and _row_s (bwd) pre-passes that go to HBM: 4N fwd / 9N bwd against
+# plain silu's 3N / 6N. Looping instead keeps the reduction inside one program and the second pass
+# re-reads the SAME row, which by then is resident in L1 (a row is I*4 B: 16 KB at I=4096, and
+# gate+up+grad is 48 KB, comfortably inside L1/SMEM). So the traffic is back to ~3N fwd / ~5N bwd.
+# NUMERICALLY IDENTICAL to the single-pass kernel: the same sum(g*g), just accumulated in chunks
+# (fp32 accumulator either way; chunked summation is if anything slightly better conditioned).
+@triton.jit
+def _glu_fwd_rowloop_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, I,
+                            s_gu_m, s_gu_i, s_o_m, s_o_i, s_ap,
+                            EPS: tl.constexpr, BLOCK_I: tl.constexpr):
+    row = tl.program_id(0)
+    at = tl.load(Act_ptr + row)
+    aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
+    is_norm = (at == 2) | (at == 8)
+    acc = tl.zeros([BLOCK_I], dtype=tl.float32)
+    for i0 in range(0, I, BLOCK_I):                      # pass 1: sum of squares -> r
+        offs = i0 + tl.arange(0, BLOCK_I)
+        g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
+        acc += g * g
+    r = tl.sqrt(tl.sum(acc) / I + EPS)
+    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    rp = tl.exp(p8 * tl.log(r))
+    for i0 in range(0, I, BLOCK_I):                      # pass 2: activate (row now in L1)
+        offs = i0 + tl.arange(0, BLOCK_I)
+        m = offs < I
+        g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        gn = tl.where(is_norm, g / r, g)
+        z = tl.where(at == 8, gn, aa * gn)
+        f = z * (1.0 / (1.0 + tl.exp(-z)))
+        act = tl.where(at == 8, rp * f, f)
+        tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * u).to(Out_ptr.dtype.element_ty), mask=m)
 
-    NOT because p is high-dimensional -- p is one scalar per expert and costs a single load. The
-    binding constraint is `r = rms(gate over I)`, a ROW REDUCTION. The row-fused kernel owns a whole
-    row per program and gets r from one in-register tl.sum; above _ROWFUSE_MAX_I the row no longer
-    fits in registers, so the tiled kernels split each row across programs and r must come from the
-    _row_rms pre-pass. That part already works.
 
-    What actually breaks on the tiled path:
-      * FORWARD is fine -- _glu_fwd_kernel applies z = alpha*gn today.
-      * BACKWARD is not: _row_s_kernel builds the coupling S = sum(gu*silu'(g_hat)*g_hat) from
-        sig(gn), NOT from sig(alpha*gn), so S is silently WRONG whenever alpha != 1.
-      * RADIAL additionally needs a SECOND row reduction T = sum(gu*silu(g_hat)) for both its
-        gate coupling (S -> S - p*T) and its dalpha; no such pre-pass exists.
+@triton.jit
+def _glu_bwd_rowloop_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
+                            GradGateUp_ptr, DA_ptr, I,
+                            s_go_m, s_go_i, s_gu_m, s_gu_i, s_ggu_m, s_ggu_i, s_ap,
+                            EPS: tl.constexpr, WANT_AP: tl.constexpr, BLOCK_I: tl.constexpr):
+    row = tl.program_id(0)
+    at = tl.load(Act_ptr + row)
+    aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
+    is_norm = (at == 2) | (at == 8)
+    acc = tl.zeros([BLOCK_I], dtype=tl.float32)
+    for i0 in range(0, I, BLOCK_I):                      # pass 1a: r
+        offs = i0 + tl.arange(0, BLOCK_I)
+        g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
+        acc += g * g
+    r = tl.sqrt(tl.sum(acc) / I + EPS)
+    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    lr8 = tl.log(r)
+    rp = tl.exp(p8 * lr8)
+    rpm1 = tl.exp((p8 - 1.0) * lr8)
+    sa = tl.zeros([BLOCK_I], dtype=tl.float32)           # SA = sum(gu*silu'(z)*gn), all codes
+    tt = tl.zeros([BLOCK_I], dtype=tl.float32)           # T  = sum(gu*silu(z)),      code 8 only
+    for i0 in range(0, I, BLOCK_I):                      # pass 1b: the two row reductions
+        offs = i0 + tl.arange(0, BLOCK_I)
+        m = offs < I
+        go = tl.load(GradOut_ptr + row * s_go_m + offs * s_go_i, mask=m, other=0.0).to(tl.float32)
+        g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        gn = tl.where(is_norm, g / r, g)
+        z = tl.where(at == 8, gn, aa * gn)
+        sig = 1.0 / (1.0 + tl.exp(-z))
+        f = z * sig
+        df = sig * (1.0 + z * (1.0 - sig))
+        gu_ = go * u
+        sa += tl.where(m, gu_ * df * gn, 0.0)
+        tt += tl.where(m & (at == 8), gu_ * f, 0.0)
+    SA = tl.sum(sa)
+    T = tl.sum(tt)
+    S = tl.where(is_norm, SA, 0.0)
+    for i0 in range(0, I, BLOCK_I):                      # pass 2: write grads
+        offs = i0 + tl.arange(0, BLOCK_I)
+        m = offs < I
+        go = tl.load(GradOut_ptr + row * s_go_m + offs * s_go_i, mask=m, other=0.0).to(tl.float32)
+        g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
+        gn = tl.where(is_norm, g / r, g)
+        z = tl.where(at == 8, gn, aa * gn)
+        sig = 1.0 / (1.0 + tl.exp(-z))
+        f = z * sig
+        df = sig * (1.0 + z * (1.0 - sig))
+        act = tl.where(at == 8, rp * f, f)
+        gu_ = go * u
+        grad_gate = tl.where(at == 8, rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
+                        tl.where(is_norm, aa * (gu_ * df - (S / I) * gn) / r, aa * gu_ * df))
+        tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=m)
+        tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=m)
+    if WANT_AP:
+        da8 = p8 * (1.0 - p8) * rp * lr8 * T
+        tl.store(DA_ptr + row, tl.where(at == 8, da8, SA))
 
-    To lift the cap: teach _row_s_kernel to read alpha, add a _row_t_kernel clone for T, and add
-    the at==8 branches to _glu_fwd_kernel/_glu_bwd_kernel."""
-    if row_alpha is None or I <= _ROWFUSE_MAX_I:
-        return
-    raise NotImplementedError(
-        f"per-expert alpha needs the ROW-FUSED GLU kernels (I <= {_ROWFUSE_MAX_I}); got I={I}. "
-        "The tiled FORWARD already applies alpha; the blocker is that _row_s_kernel computes the "
-        "backward coupling S from sig(gate/r) instead of sig(alpha*gate/r), and radial (code 8) "
-        "also needs a T = sum(gu*silu(ghat)) pre-pass that does not exist. See _alpha_tile_gap. "
-        + ("Code 8 (radial) ALWAYS carries alpha, so radial is capped here too."
-           if code_hint == 8 else ""))
+
+_LOOP_BLOCK_I = 1024      # chunk the row walk at this width in the looped kernels
+
+
+def _needs_row(row_act, code_hint, row_alpha):
+    """True when this slice needs a ROW REDUCTION (codes 2/8) or per-expert alpha, i.e. when the
+    tiled kernels cannot serve it without HBM pre-passes."""
+    if row_alpha is not None:
+        return True
+    if code_hint is not None:
+        return code_hint in (2, 8)
+    return True               # mixed codes: assume a normed one is present, take the row path
 
 
 def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
@@ -372,7 +455,6 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
     no pre-pass at all). row_alpha: per-row fp32 scalar -- the input scale for codes 0/2, the
     exponent LOGIT theta for code 8 (p = sigmoid(theta)); None -> 1.0."""
     M, twoI = gate_up.shape; I = twoI // 2
-    _alpha_tile_gap(row_alpha, I, code_hint)
     if code_hint == 8 and row_alpha is None:
         raise ValueError(
             "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
@@ -387,6 +469,14 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
                                       gate_up.stride(0), gate_up.stride(1), out.stride(0), out.stride(1),
                                       _ap_stride(row_alpha),
                                       EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=(8 if BLOCK_I >= 1024 else 4))
+        return out
+    if _needs_row(row_act, code_hint, row_alpha):
+        # wide row + a row reduction: loop instead of paying the tiled path's HBM pre-pass
+        if M > 0:
+            _glu_fwd_rowloop_kernel[(M,)](gate_up, row_act, ra, out, I,
+                                          gate_up.stride(0), gate_up.stride(1),
+                                          out.stride(0), out.stride(1), _ap_stride(row_alpha),
+                                          EPS=_NS_EPS, BLOCK_I=_LOOP_BLOCK_I, num_warps=8)
         return out
     skip_ns = code_hint is not None and code_hint not in (2, 6, 7, 8)  # 2/6/7/8 need the row RMS
     rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
@@ -403,7 +493,6 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
     computes grad_gate_up AND the per-row alpha grad in the SAME pass. The tiled path has no alpha
     (row_alpha with I > _ROWFUSE_MAX_I raises), so want_act_grads is row-path only."""
     M, twoI = gate_up.shape; I = twoI // 2
-    _alpha_tile_gap(row_alpha, I, code_hint)
     if code_hint == 8 and row_alpha is None:
         raise ValueError(
             "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
@@ -425,6 +514,20 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
                                       EPS=_NS_EPS, WANT_AP=want_act_grads, BLOCK_I=BLOCK_I,
                                       num_warps=(8 if BLOCK_I >= 1024 else 4))
         return (ggu, da) if want_act_grads else ggu
+    if _needs_row(row_act, code_hint, row_alpha):
+        ggu = torch.empty_like(gate_up)
+        if want_act_grads:
+            da = torch.empty(M, device=gate_up.device, dtype=torch.float32)
+        else:
+            da = gate_up
+        if M > 0:
+            _glu_bwd_rowloop_kernel[(M,)](grad_out, gate_up, row_act, ra, ggu, da, I,
+                                          grad_out.stride(0), grad_out.stride(1),
+                                          gate_up.stride(0), gate_up.stride(1),
+                                          ggu.stride(0), ggu.stride(1), _ap_stride(row_alpha),
+                                          EPS=_NS_EPS, WANT_AP=want_act_grads,
+                                          BLOCK_I=_LOOP_BLOCK_I, num_warps=8)
+        return (ggu, da) if want_act_grads else ggu
     skip_ns = code_hint is not None and code_hint not in (2, 6, 7, 8)  # 2/6/7/8 need the row RMS
     if skip_ns:
         rms = _ones(M, gate_up.device)      # r=1 / S=0 semantics; values unread where at!=2
@@ -443,10 +546,8 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
                           gate_up.stride(0), gate_up.stride(1), ggu.stride(0), ggu.stride(1),
                           _ap_stride(row_alpha),
                           BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I)
-    if want_act_grads:
-        raise NotImplementedError(
-            "per-expert act params are row-path only (I <= %d); the tiled path carries no alpha."
-            % _ROWFUSE_MAX_I)
+    if want_act_grads:                      # unreachable: _needs_row is True whenever alpha is set
+        raise AssertionError("want_act_grads reached the tiled path")
     return ggu
 
 
