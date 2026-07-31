@@ -689,11 +689,15 @@ def _sort_by_expert(idx, wt, E):
     ntok, top_k = idx.shape
     flat_t = torch.arange(ntok, device=idx.device).unsqueeze(1).expand_as(idx).flatten()
     sorted_e, order = idx.flatten().sort()
-    counts = torch.bincount(sorted_e, minlength=E).tolist()
+    counts_dev = torch.bincount(sorted_e, minlength=E)          # stays on device
+    counts = counts_dev.tolist()                                 # one DtoH; host bounds need it
     bounds = [0]
     for c in counts:
         bounds.append(bounds[-1] + c)
-    return flat_t[order], wt.flatten()[order], order, counts, bounds
+    # Return the DEVICE tensor too: callers used to rebuild it with torch.tensor(counts, device=dev),
+    # shipping the same 64 ints straight back over PCIe -- a pointless DtoH->HtoD round trip, 8 MoE
+    # layers x 4 micro-batches per step.
+    return flat_t[order], wt.flatten()[order], order, counts, bounds, counts_dev
 
 
 # ───────────────────────── grouped path ─────────────────────────
@@ -704,11 +708,10 @@ class _GroupedMoE(torch.autograd.Function):
         ntok, H = x.shape
         top_k = idx.shape[1]; E = gate_up_proj.shape[0]; I = gate_up_proj.shape[1] // 2
         dev = x.device
-        st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
+        st, sw, order, counts, bounds, counts_t = _sort_by_expert(idx, wt, E)
         e_start = torch.tensor(bounds[:E], dtype=torch.int32, device=dev)
         e_end = torch.tensor(bounds[1:], dtype=torch.int32, device=dev)
         te, ts = _build_schedule(counts, bounds, E, dev)
-        counts_t = torch.tensor(counts, device=dev)
         row_act = torch.repeat_interleave(act_codes, counts_t).to(torch.int32)
         x_s = x[st].contiguous()
         gate_up = _grouped_mm(x_s, gate_up_proj, te, ts, e_end, 2 * I)
@@ -864,9 +867,8 @@ class _PerExpertMoE(torch.autograd.Function):
         E = act_codes.shape[0]                  # total routed experts (GLU + specials)
         codes = _codes_list(act_codes)              # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
         top_k = idx.shape[1]; dev = hidden.device
-        st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
+        st, sw, order, counts, bounds, counts_t = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
-        counts_t = torch.tensor(counts, device=dev)
         M_rows = idx.numel()   # output_size: statically known -> repeat_interleave skips its host sync
         row_act = torch.repeat_interleave(act_codes, counts_t, output_size=M_rows).to(torch.int32)
         # act_params None => alpha = 1, the DEFAULT (and byte-identical to no-alpha). Passing it enables the
