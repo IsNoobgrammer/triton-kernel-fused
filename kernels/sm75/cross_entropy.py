@@ -1,42 +1,9 @@
-"""Fused-linear cross-entropy (cut-cross-entropy style), cuBLAS-chunked.
-
-Standard CE on an LM head materializes the full (N, V) logits — at vocab 80k+ and 16k
-tokens that is the memory bottleneck (and often OOMs). This fuses the LM-head GEMM with
-the softmax-CE so the (N, V) logits are NEVER materialized: the forward streams logits in
-row-chunks via cuBLAS. CE's gradient w.r.t. logits = (softmax - onehot)/n needs only the
-logits + labels (the loss is scalar -> the upstream grad is a scalar), so the DEFAULT
-"fused" path computes the FULL gradient inside the forward chunk loop while each logit
-chunk is live (one Triton kernel does lse + writes grad in place), forms grad_hidden /
-grad_weight via cuBLAS, then DISCARDS the chunk. Backward is a scalar scale. 3 GEMMs over
-the data, NO recompute. Peak memory is bounded by one (chunk, V) transient + the grad
-accumulators, not the full (N, V).
-
-Memory: the 1/n_valid scale is folded into the grad-logits kernel (n_valid comes from the
-labels, known BEFORE the loop), so grad_weight accumulates directly in weight.dtype via
-in-place addmm_ (cuBLAS beta=1, fp32 internal compute) — no fp32 (V,H) accumulator, no
-per-chunk (V,H) temp, no backward cast. Grads for frozen inputs (needs_input_grad) skip
-their GEMM + buffer entirely, so a frozen lm_head / no-grad eval pays only GEMM 1 + lse.
-
-T4 (N=16384 V=81000 H=512): ~0.96x compiled fwd+bwd at 3.75x less peak (820 vs 3072 MB @192MB
-budget; 4.48x less @128MB) — beats Liger's fused-linear CE on speed AND memory. Grad-exact vs
-F.cross_entropy (loss Δ~1e-6, grad rel 4.1e-4 fp16).
-
-Drop-in (replaces `F.cross_entropy(hidden @ lm_head.weight.T, labels)`):
-    from kernels.sm75.cross_entropy import fused_linear_cross_entropy
-    loss = fused_linear_cross_entropy(hidden, lm_head.weight, labels)   # hidden (N,H), weight (V,H)
-
-Supports ignore_index (default -100). Any vocab; H up to a few thousand.
-"""
 import torch
 import triton
 import triton.language as tl
 
 __all__ = ["fused_linear_cross_entropy"]
 
-# (chunk, V) fp16 transient budget. 192 MiB -> chunk ~1242 at V=81000. T4-tuned default: the
-# T4 ce_fit sweep (128..512MB step 64) put 192MB at the latency knee — fastest budget in all 3
-# runs (0.57x compiled, stable) AND 3.40x less peak; bigger budgets are both slower and heavier.
-# Lower for less peak memory at the cost of a few more cuBLAS launches; raise if you have headroom.
 _BWD_LOGITS_BUDGET = 192 * 1024 * 1024
 
 
@@ -50,8 +17,6 @@ def _grad_logits_kernel(L_ptr, Lse_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
     mask_m = offs_m < M
     mask_v = offs_v < Vv
     mask = mask_m[:, None] & mask_v[None, :]
-    # 1/n_valid folded here (Nv is a device scalar -> no host sync). Keeps grad-logit
-    # magnitudes ~1/N so the fp16 grad_weight addmm_ accumulation cannot overflow.
     scale = 1.0 / tl.load(Nv_ptr)
     lse = tl.load(Lse_ptr + offs_m, mask=mask_m, other=0.0)
     lab = tl.load(Lab_ptr + offs_m, mask=mask_m, other=ignore_index)
@@ -65,9 +30,6 @@ def _grad_logits_kernel(L_ptr, Lse_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
 
 def _grad_logits_inplace(logits, lse, labels, nv, ignore_index):
     M, Vv = logits.shape
-    # T4 ce_probe tile sweep (2026-07-04): 8x1024/w4 = 213 GB/s vs the old 32x256/w4 = 170 GB/s
-    # (wide contiguous-V tiles win on this bandwidth-bound pass). In-place kernel -> no @autotune
-    # (autotune re-runs corrupt the buffer, the Liger NaN trap); config is hard-coded from the sweep.
     BLOCK_M, BLOCK_V = 8, 1024
     _grad_logits_kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(Vv, BLOCK_V))](
         logits, lse, labels, nv, M, Vv, ignore_index,
@@ -78,10 +40,6 @@ def _grad_logits_inplace(logits, lse, labels, nv, ignore_index):
 @triton.jit
 def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_index,
                        BLOCK_V: tl.constexpr):
-    # One program per row of a chunk. Online-softmax over V — reads the fp16 logits, accumulates
-    # max+sum in fp32 REGISTERS (never materializes an fp32 (C,V) buffer), and gathers the target
-    # logit in the SAME launch. Replaces the old .float() + torch.logsumexp + .gather (3 passes +
-    # an fp32 (C,V) alloc) with one streaming pass. This is the forward-latency/memory win.
     row = tl.program_id(0)
     lab = tl.load(Lab_ptr + row)
     m = -float("inf")
@@ -102,20 +60,8 @@ def _chunk_rows(N, V, budget=None):
 
 
 class _CEFusedFwdBwd(torch.autograd.Function):
-    # FUSED forward+backward (Liger-style): CE's grad w.r.t. logits = (softmax - onehot)/n needs
-    # ONLY logits + labels (loss is scalar -> the upstream grad is just a scalar multiplier), so the
-    # whole gradient is computed in the FORWARD chunk loop while logits are live, then the logit
-    # buffer is discarded. No (N,V) ever stored, NO backward recompute GEMM. GEMMs per chunk = 3
-    # (logits, grad_h, grad_w) -> 3 total over the data, vs recompute's 4. The 1/n_valid scale is
-    # applied IN the grad-logits kernel, so gh/gw are the final grads up to the (scalar) upstream
-    # grad_out; backward is one scalar multiply. grad_weight accumulates in weight.dtype via
-    # addmm_ (beta=1) — no fp32 (V,H) buffer, no per-chunk mm temp, no backward cast.
     @staticmethod
     def forward(ctx, hidden, weight, labels, ignore_index, budget):
-        # AMP-safe, dtype-agnostic: under autocast, cast BOTH gemm operands to the active autocast
-        # dtype up front so every op (incl. out=/addmm_, which autocast cannot rewrite) sees one
-        # consistent dtype. Without this, autocast rewrote mm() to the AMP dtype while out=gh kept
-        # hidden's original dtype -> dtype error. No autocast -> inputs pass through untouched.
         if torch.is_autocast_enabled("cuda"):
             dt = torch.get_autocast_dtype("cuda")
             hidden, weight = hidden.to(dt), weight.to(dt)
@@ -134,41 +80,26 @@ class _CEFusedFwdBwd(torch.autograd.Function):
         for i in range(0, N, C):
             cl = min(C, N - i)
             hc = hidden[i:i + C]
-            logits = torch.mm(hc, weight.t())                            # GEMM 1: (C,V) fp16
-            # grad-in-forward, NO recompute. Two well-occupied launches beat one per-row double-pass
-            # on T4: (1) _fwd_reduce = per-row online-softmax -> lse+target (per-row is intrinsic to
-            # the reduction); (2) _grad_logits_inplace = 2D grid (chunk/32 x V/256 programs) that
-            # OVERWRITES logits in place with grad = (softmax-onehot)/n. The 2D grid saturates the
-            # SMs; the fused one-program-per-row kernel (only `chunk` programs, V streamed twice
-            # serially) was launch/occupancy-bound on T4 and lost to Liger. logits IS grad after (2).
+            logits = torch.mm(hc, weight.t())
             _fwd_reduce_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
                                       cl, V, logits.stride(0), logits.stride(1), ignore_index,
                                       BLOCK_V=1024)
             if need_grad:
                 _grad_logits_inplace(logits, lse[i:i + C], labels[i:i + C], nv, ignore_index)
                 if need_gh:
-                    torch.mm(logits, weight, out=gh[i:i + C])            # GEMM 2: (C,H)
+                    torch.mm(logits, weight, out=gh[i:i + C])
                 if need_gw:
-                    gw.addmm_(logits.t(), hc)                            # GEMM 3: (V,H) in place
+                    gw.addmm_(logits.t(), hc)
         loss = ((lse - tgt) * valid).sum() / n_valid
         ctx.save_for_backward(gh, gw)
         return loss
 
     @staticmethod
     def backward(ctx, grad_out):
-        gh, gw = ctx.saved_tensors                                       # already scaled by 1/n_valid
+        gh, gw = ctx.saved_tensors
         return (gh * grad_out.to(gh.dtype) if gh is not None else None,
                 gw * grad_out.to(gw.dtype) if gw is not None else None, None, None, None)
 
 
 def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, bwd_logits_budget=None):
-    """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
-
-    Fused fwd+bwd: the gradient is computed in the FORWARD chunk loop (CE grad needs only
-    logits+labels), scaled by 1/n_valid in-kernel, and stashed; backward is a scalar multiply.
-    Never materializes (N,V); 3 GEMMs over the data, NO recompute; grad_weight accumulates in
-    weight.dtype (no fp32 (V,H) buffer). Frozen inputs skip their GEMM + grad buffer.
-
-    `bwd_logits_budget` (bytes) caps the (chunk,V) transient -> MEMORY dial. T4-tuned default 192MB
-    (chunk ~1242 at V=81000). Chunk size barely moves latency (GEMM-bound); lower it for less peak."""
     return _CEFusedFwdBwd.apply(hidden, weight, labels, ignore_index, bwd_logits_budget)

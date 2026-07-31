@@ -1,34 +1,3 @@
-﻿"""Gram-space Newton-Schulz ("gram NS") — iterate on the n x n Gram matrix, not on X.
-
-Math (same identity as Dao-AILab/gram-newton-schulz): one X-space NS step is
-X <- C X with C = aI + bA + cA^2, A = X X^T. Every C_k and A_k is a polynomial in
-G = X0 X0^T, so they are ALL symmetric and ALL commute. Consequences:
-
-  1. A (here `R`) can be updated in Gram space: R <- C R C^T = C^2 R. The five
-     rectangular `B X` GEMMs (cost r*n^3 each, r = m/n) collapse into ONE final
-     apply X = Q X0, with Q = prod C_k accumulated as Q <- C Q.
-  2. Every product in the loop (C^2, C^2 R, C Q) has a symmetric result, so the
-     triangle+mirror symmul kernels halve ALL of them (symmul2 below adds the
-     two-input case S1 @ S2).
-
-FLOPs (units of n^3, symmul-halved): gram NS = 1.5r + 8.5 vs symmul NS = 7.5r + 2.5
--> tie at r=1, 1.52x at r=2, 2.24x at r=4. Gate on r: square matrices keep symmul NS.
-
-Numerics: kappa(Gram) = kappa(X)^2, and a pure Gram loop never re-reads X, so the
-NS self-correction is lost — on ILL-CONDITIONED inputs (kappa>=1e2; real momentum
-matrices) plain gram drifts (vs-truth 0.193 vs champion 0.122 at kappa=1e2) and
-fp32 does NOT fix it (0.207 — the Gram's small eigenvalues are sigma^2, already
-crushed at fp16 formation; the failure is algorithmic, not roundoff). Dao's
-RESTART is the fix: materialize X = Q X mid-run, refresh R, reset Q — re-anchoring
-restores self-correction. Each restart costs ~1.5r. The placement is autotuned PER
-COEFFICIENT SCHEDULE: the 10-iter _DSV4_COEFFS default needs restarts [4, 6]
-(worst-ratio 0.92 vs champion at kappa 1e2..1e6; any single restart drifts or NaNs
-in fp16); the old 8-iter _PE_COEFFS wanted restart@3 (champion parity to the 4th
-digit, measured RTX PRO 6000). gram_dtype=torch.float32 is kept as a flag but
-measured unnecessary — and it does not rescue bad placements either.
-
-Self-check + local bench: python -m kernels.sm120.newton_schulz_gram
-"""
 import math
 
 import torch
@@ -40,19 +9,8 @@ from kernels.sm120.newton_schulz_symmul import (
     SYMMUL_MIN_DIM, _bmmt_configs, symmul, symmul_axpy, newton_schulz_symmul,
 )
 
-# The Gram algorithm wins iff r = m/n > 1 (FLOP tie at r=1, and the extra kernel
-# launches lose the tie in practice). MEASURED on RTX PRO 6000 (fp16, gram=2048):
-# r=1.0 0.93x + parity 2.1e-2 (loss), r=1.25 0.99x, r=1.5 1.20x, r=1.75 1.24x,
-# r=2 1.27-1.30x, r=2.7 1.65x, r=4 1.81x (2.24x batched) -> knee at 1.5.
 GRAM_MIN_RATIO = 1.5
 
-# Restarts after these iterations (1-based). Autotuned per coefficient schedule on
-# ill-conditioned input (kappa 1e2..1e6): the 10-iter _DSV4_COEFFS default needs TWO
-# re-anchors — [4, 6] scores worst-ratio 0.92 vs the cuBLAS champion (i.e. slightly
-# better), while every single restart either drifts (best [5]: 3.1x) or NaNs in fp16.
-# (The old 8-iter _PE_COEFFS wanted restart@3.) fp32 gram is NOT a fix (measured
-# worse). None/() disables — only safe for well-conditioned input. Re-tune for custom
-# coeffs with autotune_restarts.
 GRAM_RESTART_AT = (4, 6)
 
 
@@ -66,12 +24,6 @@ def _bssm_kernel(
     stride_yb, stride_ym, stride_yn,
     BM: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
 ):
-    """Batched y[b] = S1[b] @ S2[b] for SYMMETRIC, COMMUTING S1/S2 (M x M) -> symmetric y.
-
-    Same triangle+mirror walk as _bmmt_kernel; the only change is two input pointers.
-    Column n of S2 is row n (symmetry), so the B tile loads rows of S2 and tl.dot
-    takes its transpose — no strided column loads.
-    """
     pid = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BM)
@@ -82,7 +34,7 @@ def _bssm_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    if pid_m > pid_n:                                   # lower triangle: mirror of upper
+    if pid_m > pid_n:
         return
 
     s1_ptr += bid * stride_1b
@@ -117,10 +69,6 @@ def _bssm_kernel(
 
 
 def symmul2(S1, S2, out=None):
-    """Batched S1 @ S2 for symmetric commuting inputs (result symmetric) — halved FLOPs.
-
-    (B, M, M) x (B, M, M) -> (B, M, M). Below SYMMUL_MIN_DIM cuBLAS bmm wins -> fall back.
-    """
     B, M, _ = S1.shape
     if M < SYMMUL_MIN_DIM:
         return torch.bmm(S1, S2) if out is None else torch.bmm(S1, S2, out=out)
@@ -139,18 +87,6 @@ def symmul2(S1, S2, out=None):
 
 def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7,
                        gram_dtype=None, restart_at=GRAM_RESTART_AT, force_eager=False):
-    """Polar-Express NS via the Gram recurrence: R <- C^2 R, Q <- C Q, X_out = Q X0.
-
-    Same normalization/orientation/coeffs as the champion. Gates: falls back to
-    newton_schulz_symmul when r = m/n < GRAM_MIN_RATIO (no FLOP win at r~1), which
-    itself falls back to the cuBLAS champion below the gram-dim knee.
-
-    gram_dtype: dtype of the n^3 Gram loop (default ns_dtype; measured NOT a stabilizer).
-    restart_at: 1-based iteration(s) after which to refresh X/R/Q — an int, an iterable
-        of ints ([2, 4] restarts after iterations 2 AND 4), or None/() for no restarts
-        (only safe for well-conditioned input). Default GRAM_RESTART_AT ([4, 6] of 10,
-        autotuned for _DSV4_COEFFS).
-    """
     n, m = G.shape[-2], G.shape[-1]
     r = max(n, m) / min(n, m)
     if min(n, m) < SYMMUL_MIN_DIM or r < GRAM_MIN_RATIO:
@@ -160,7 +96,7 @@ def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7
     squeeze = G.ndim == 2
     X = G.unsqueeze(0) if squeeze else G
     nrm = torch.linalg.vector_norm(X.flatten(1), dim=1, dtype=torch.float32).clamp_min(eps).view(-1, 1, 1)
-    transposed = X.size(1) > X.size(2)                  # iterate the Gram of the SMALLER side
+    transposed = X.size(1) > X.size(2)
     if transposed:
         X = X.transpose(1, 2)
     X = (X.to(ns_dtype) / nrm.to(ns_dtype)).contiguous()
@@ -168,20 +104,20 @@ def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7
     resets = () if not restart_at else (
         (restart_at,) if isinstance(restart_at, int) else tuple(restart_at))
     gdt = gram_dtype or ns_dtype
-    R = symmul(X).to(gdt)                               # R0 = X X^T  (0.5 r)
+    R = symmul(X).to(gdt)
     Q = None
     last = len(coeffs) - 1
     for k, (a, b, c) in enumerate(coeffs):
-        C = symmul_axpy(R, b, c)                        # bR + cR^2   (0.5)
-        C.diagonal(dim1=-2, dim2=-1).add_(a)            # C = aI + bR + cR^2
-        Q = C if Q is None else symmul2(C, Q)           # Q <- C Q    (0.5)
+        C = symmul_axpy(R, b, c)
+        C.diagonal(dim1=-2, dim2=-1).add_(a)
+        Q = C if Q is None else symmul2(C, Q)
         if k != last:
-            R = symmul2(symmul(C), R)                   # R <- C^2 R  (1.0)
+            R = symmul2(symmul(C), R)
         if k + 1 in resets and k != last:
-            X = torch.bmm(Q.to(ns_dtype), X)            # materialize, refresh, reset
+            X = torch.bmm(Q.to(ns_dtype), X)
             R = symmul(X).to(gdt)
             Q = None
-    X = torch.bmm(Q.to(ns_dtype), X)                    # the ONE rectangular apply (r)
+    X = torch.bmm(Q.to(ns_dtype), X)
 
     if transposed:
         X = X.transpose(1, 2)
@@ -191,16 +127,6 @@ def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7
 
 
 class GramNewtonSchulz:
-    """Dao-style callable API (mirrors Dao-AILab/gram-newton-schulz):
-
-        gram_NS = GramNewtonSchulz(ns_coefficients=_DSV4_COEFFS,
-                                   gram_newton_schulz_reset_iterations=[3])
-        Y = gram_NS(X)
-
-    ns_coefficients: list of (a, b, c) per NS iteration. reset_iterations: 1-based
-    iterations immediately after which to restart ([2, 4] = after the 2nd AND 4th).
-    Find placements for custom coefficients with `autotune_restarts`.
-    """
 
     def __init__(self, ns_coefficients=_DSV4_COEFFS,
                  gram_newton_schulz_reset_iterations=GRAM_RESTART_AT,
@@ -220,17 +146,6 @@ class GramNewtonSchulz:
 
 def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1e4, 1e6),
                       ns_dtype=torch.bfloat16, seed=0, verbose=True, bench=True):
-    """Grid-search restart placement(s) for a coefficient set (GPU required).
-
-    Scores every combination of `num_restarts` positions in [1, len(coeffs)-1] on
-    ill-conditioned inputs (log-spaced singular values at each kappa) by the WORST
-    error ratio vs the cuBLAS champion NS running the SAME coefficients — ratio 1.0
-    means the restarts fully restore champion-grade stability (all placements cost
-    the same ~1.5r, so accuracy is the only criterion). Returns the best placement
-    as a list, e.g. [3], ready for GramNewtonSchulz(..., reset_iterations=best).
-    With bench=True also times the winner vs symmul NS and the cuBLAS champion
-    (same coeffs, same shape) and prints the speedups.
-    """
     from itertools import combinations
     n, m = shape
     if min(n, m) < SYMMUL_MIN_DIM or max(n, m) / min(n, m) < GRAM_MIN_RATIO:
@@ -256,7 +171,6 @@ def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1
             out = newton_schulz_gram(X, coeffs, ns_dtype, restart_at=resets)
             e = ((out.double() - truth).norm() / truth.norm()).item()
             errs.append((kappa, e))
-            # NaN/inf must LOSE, not silently win: max(0.0, nan) is 0.0 in Python
             ratio = e / max(e_ref, 1e-12)
             score = max(score, ratio if math.isfinite(ratio) else float("inf"))
         if verbose:
@@ -280,8 +194,7 @@ def autotune_restarts(coeffs, num_restarts=1, shape=(2048, 8192), kappas=(1e2, 1
     return best
 
 
-def _selfcheck_and_bench():                             # pragma: no cover
-    """Parity vs the cuBLAS champion + fp64-SVD ground truth, then do_bench on this GPU."""
+def _selfcheck_and_bench():
     from triton.testing import do_bench
     torch.manual_seed(0)
     dev = "cuda"
@@ -290,14 +203,13 @@ def _selfcheck_and_bench():                             # pragma: no cover
     variants = {
         "champion (cuBLAS)":  lambda X: _newton_schulz_cublas(X),
         "symmul NS":          lambda X: newton_schulz_symmul(X),
-        "gram NS (default)":  lambda X: newton_schulz_gram(X),                   # restarts GRAM_RESTART_AT
+        "gram NS (default)":  lambda X: newton_schulz_gram(X),
         "gram NS no-restart": lambda X: newton_schulz_gram(X, restart_at=()),
         "gram NS fp32-gram":  lambda X: newton_schulz_gram(X, gram_dtype=torch.float32),
     }
     shapes = [(2048, 8192), (2048, 4096), (2048, 2048), (3072, 8192)]
     for n, m in shapes:
         X0 = torch.randn(n, m, device=dev, dtype=torch.float16)
-        # fp64 ground truth: the exact polar factor U V^T
         U, _, Vh = torch.linalg.svd(X0.double(), full_matrices=False)
         truth = (U @ Vh)
         ref = variants["champion (cuBLAS)"](X0)
@@ -312,7 +224,7 @@ def _selfcheck_and_bench():                             # pragma: no cover
                   f"  sv[min/mean/max] {sv.min():.3f}/{sv.mean():.3f}/{sv.max():.3f}")
 
 
-if __name__ == "__main__":                              # pragma: no cover
+if __name__ == "__main__":
     import argparse
     _ap = argparse.ArgumentParser(description="gram NS self-check/bench, or restart autotune")
     _ap.add_argument("--autotune-restarts", action="store_true",

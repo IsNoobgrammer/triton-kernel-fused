@@ -1,100 +1,46 @@
-﻿"""sm120 Muon for Blackwell — FusedMuon defaults to the GRAM-SPACE Newton-Schulz (restarts [4, 6]).
-
-Gram NS (kernels/sm120/newton_schulz_gram.py): every NS iterate is a polynomial in G = X X^T,
-so the loop runs on the n x n Gram (R <- C^2 R, Q <- C Q, ALL products symmetric-halved by the
-symmul kernels) with ONE rectangular apply X = Q X at the end — the five B@X GEMMs are gone.
-Dao-style restarts re-anchor to X mid-run (fp32 alone does NOT stabilize — measured); the placement is autotuned per coefficient schedule: [4, 6] for the 10-iter _DSV4_COEFFS default. Gates: gram needs
-r = m/n >= 1.5 and dim >= 2048, else symmul NS, else cuBLAS — no regime regresses.
-MEASURED (RTX PRO 6000): NS-level 1.81x vs symmul at (2048,8192), 2.24x batched; end-to-end
-step (3 layers d=4096) 118ms vs symmul 145ms vs cuBLAS 190ms, param parity 1.8e-4, peak mem
-696 vs 718MB. `use_gram=False` restores the symmul default described below.
-
-On Blackwell the symmul NS strictly dominates the old pure-cuBLAS path with NO precision tradeoff, so
-it is now the FusedMuon default (the symmetric trick + our foreach/batched-state levers, composed):
-the two SYMMETRIC NS GEMMs (X Xᵀ, A·A) compute one triangle and mirror it -> ~half the GEMM FLOPs.
-
-  FusedMuon            : symmul NS by default. 1.28-1.43x faster than the cuBLAS NS on large matrices
-                         (gram >= 2048), 1.31-3.49x vs torch.compile, beats flash-muon's exact impl
-                         1.10-1.17x, mem <= compiled, scale-invariant 1B->2.6B params.
-  FusedMuon(use_symmul=False) : the pure-cuBLAS champion step (no Triton launched) — for a Triton-free
-                         environment or an exact-reference run.
-  AmalgamatedMuon      : back-compat alias of FusedMuon.
-
-PRECISION IS NOT A TRADEOFF: identical fp16 NS with fp32 accumulate; the symmetric kernel only changes
-float rounding ORDER (triangle+mirror vs full bmm), ~1e-4..1e-3 -> parity 5.9e-3 (< 2e-2 NS tolerance),
-SV ~0.98 (same orthogonalization). It self-gates below the gram knee (min(rows,cols) < SYMMUL_MIN_DIM)
-to the EXACT cuBLAS NS, so small matrices are bit-for-bit the champion. Only the default `ns_batch_elems`
-(8M) differs from sm75 (the Blackwell mem knee). The opt-in CUDA-graph path still uses the cuBLAS NS.
-"""
 import torch
 
-from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS  # noqa: F401
+from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
 from kernels.sm120.newton_schulz_gram import newton_schulz_gram
 from kernels.muon import muon_scaling as _scaling
 
-# Blackwell mem-gated knee (peak<=baseline at both sizes); sm75 uses 4M. Callers can still override.
 NS_BATCH_ELEMS = 8 * 1024 * 1024
 
 
 class FusedMuon(_FusedMuon75):
-    """sm120 FusedMuon — DEFAULTS to gram NS (restarts [4, 6]) -> symmul -> cuBLAS by shape gates.
 
-    use_gram=False falls back to the symmul-default behavior documented below.
-
-    Same foreach + batched same-shape state + Blackwell mem knee (8M) as before, but the two SYMMETRIC
-    NS GEMMs (X Xᵀ, A·A) run on the Triton symmul kernel (compute one triangle, mirror it -> ~half the
-    GEMM FLOPs). Measured: 1.28-1.43x faster than the pure-cuBLAS NS on large matrices (gram >= 2048),
-    1.31-3.49x vs torch.compile, beats flash-muon's exact impl 1.10-1.17x, mem <= compiled, scale-
-    invariant 1B->2.6B params. NO precision tradeoff: identical fp16 / fp32-accumulate NS, parity 5.9e-3
-    (< 2e-2 tol), SV ~0.98; it self-gates to the EXACT cuBLAS champion NS below the gram knee, so small
-    matrices are bit-for-bit unchanged.
-
-    `use_symmul=False` -> the pure-cuBLAS champion step (no Triton kernels launched) for a Triton-free
-    environment or an exact-reference run. With `use_graph=True` the captured body ALSO runs symmul (forced
-    to its eager Triton path, which is CUDA-graph-capturable); the graph is a speed wash on a compute-bound
-    step but lowers peak memory, so symmul-in-graph = symmul speed + the graph's smaller footprint (useful
-    on a memory-constrained GPU). State dict / constructor are identical across all modes.
-    """
-
-    DEFAULT_NS_DTYPE = torch.bfloat16   # Blackwell: native bf16 tensor cores (overrides sm75's fp16)
+    DEFAULT_NS_DTYPE = torch.bfloat16
 
     def __init__(self, *args, use_symmul=True, use_gram=True, gram_restarts=None, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
         self.use_symmul = use_symmul
         self.use_gram = use_gram
-        # restart iteration(s) for the gram NS; None = the tuned default (GRAM_RESTART_AT).
-        # Custom `coeffs` may want their own placement: kernels.sm120.newton_schulz_gram
-        # `autotune_restarts(coeffs)` finds it.
         self.gram_restarts = gram_restarts
 
     def _ns(self, u, force_eager=False):
-        """The NS this optimizer runs: gram (default) -> symmul -> cuBLAS, by shape gates."""
         if self.use_gram:
             kw = {} if self.gram_restarts is None else {"restart_at": self.gram_restarts}
             return newton_schulz_gram(u, self.coeffs, self.ns_dtype, force_eager=force_eager, **kw)
         return newton_schulz_symmul(u, self.coeffs, self.ns_dtype, force_eager=force_eager)
 
     def _polar(self, u):
-        """Orthogonalizer aurora iterates on — the sm120 gram/symmul path (overrides sm75's cuBLAS)."""
         return self._ns(u)
 
     @torch.no_grad()
     def step(self, closure=None):
-        # per-row / aurora / aurora_ema modes always take the eager symmul/gram apply below (not the graph)
         _eager_mode = (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)
                        or _scaling.is_aurora_ema(self.scale_mode))
-        # features the fast loop below doesn't implement -> the sm75 step (correct, cuBLAS NS)
         _sm75_only = self.spectral_wd > 0
         if not self.use_symmul or _sm75_only or (self.use_graph and not _eager_mode):
-            return super().step(closure)                  # pure-cuBLAS champion (or the graph path)
+            return super().step(closure)
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        self._xorth_step += 1                         # eager path owns the increment (super() path counts in sm75)
+        self._xorth_step += 1
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
             if not params:
@@ -102,21 +48,18 @@ class FusedMuon(_FusedMuon75):
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
                                           group["weight_decay"], group["nesterov"])
             plan = self._plan(group, params)
-            # cautious decay needs the orthogonalized update, so it moves to the scatter site below.
-            # See FusedMuon.__init__ in kernels/sm75/muon.py for the rule and why it is not a fix for
-            # the late-anneal collapse. cautious_decay=False keeps this pre-loop form bit-exactly.
             cautious = self.cautious_decay and wd != 0
             if wd != 0 and not cautious:
                 torch._foreach_mul_(params, 1.0 - lr * wd)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
             aurora_ema = _scaling.is_aurora_ema(self.scale_mode)
-            xp = group["xorth_post"]                      # group-scoped cross-expert whiten (see sm75)
-            do_xorth = xp > 0 and self._xorth_step > self.xorth_warmup_steps   # warmup gate
+            xp = group["xorth_post"]
+            do_xorth = xp > 0 and self._xorth_step > self.xorth_warmup_steps
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]
-                v_all = self.state[g["anchor"]].get("scale_v")   # (M,r) EMA state for per-row modes
+                v_all = self.state[g["anchor"]].get("scale_v")
                 alpha = -lr * g["scale"]
                 for members, start, crows in g["chunks"]:
                     mom_c = mom[start:start + crows]
@@ -125,29 +68,27 @@ class FusedMuon(_FusedMuon75):
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
                     mom_c.mul_(momentum).add_(gbuf)
                     u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
-                    if do_xorth and self.xorth_where == "pre":   # PRE-NS: decorrelate momentum, then orthogonalize
-                        if not nesterov:                         # u aliases persistent momentum -> don't corrupt it
+                    if do_xorth and self.xorth_where == "pre":
+                        if not nesterov:
                             u = u.clone()
                         self._whiten_chunk(u, members, r, c, xp)
-                    if aurora:                            # iterative prescale + re-orthogonalize (K gram/symmul solves)
+                    if aurora:
                         out = _scaling.aurora_update(u, self._polar, K=self.aurora_k)
-                    elif aurora_ema:                      # aurora + normuon per-row EMA memory (v1 pre-polar / v2 post)
+                    elif aurora_ema:
                         v_c = v_all[start:start + crows]
                         if self.scale_mode == "aurora_ema_v2":
                             out = _scaling.aurora_ema_v2_update(u, self._polar, v_c, K=self.aurora_k)
                         else:
                             out = _scaling.aurora_ema_update(u, self._polar, v_c)
                     else:
-                        out = self._ns(u)                 # gram NS (default) or symmul NS
-                        if perrow:                        # leverage-aware per-row rescale (scale folded into out)
+                        out = self._ns(u)
+                        if perrow:
                             out = _scaling.apply_perrow(self.scale_mode, out, v_all[start:start + crows])
-                    if do_xorth and self.xorth_where == "post":   # POST-NS: whiten the orthogonalized update
+                    if do_xorth and self.xorth_where == "post":
                         self._whiten_chunk(out, members, r, c, xp)
                     _pl = [p for p, _, _ in members]
                     _ul = [out[o:o + n].reshape(p.shape) for p, o, n in members]
                     if cautious:
-                        # applied delta = (negative alpha) * out, so "delta has p's sign" <=> out*p < 0.
-                        # Uses the PRE-update p, matching decoupled-decay semantics.
                         for _p, _u in zip(_pl, _ul):
                             _p.sub_(_p * ((_u * _p) < 0), alpha=lr * wd)
                     torch._foreach_add_(_pl, _ul,
@@ -155,8 +96,6 @@ class FusedMuon(_FusedMuon75):
         return loss
 
     def _compute(self, work, decay):
-        """The CUDA-graph-captured body (used when use_graph=True). Runs symmul forced to its eager
-        Triton path (capturable) when use_symmul; else defers to the cuBLAS compute."""
         if not self.use_symmul:
             return super()._compute(work, decay)
         for params, f in decay:
@@ -171,12 +110,10 @@ class FusedMuon(_FusedMuon75):
 
 
 class DistributedMuon(_DistributedMuon75):
-    """sm75 DistributedMuon with `ns_batch_elems` defaulting to the Blackwell knee (8M)."""
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
 
 
-# Back-compat alias: FusedMuon now IS the amalgamated (symmul) optimizer on sm120.
 AmalgamatedMuon = FusedMuon
