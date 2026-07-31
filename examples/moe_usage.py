@@ -6,7 +6,7 @@ The router stays in YOUR model — these kernels take the router's top-k indices
 stacked expert weights, and return the combined per-token output. Expert weight layout:
     gate_up_proj : (E, 2*I, H)     # fused gate+up projection per expert
     down_proj    : (E, H, I)       # down projection per expert
-    act_codes    : (E,) int32      # per-expert activation: 0=SiLU, 1=ReLU², 2=Tanh
+    act_codes    : (E,) int32      # per-expert kind: 0=SiLU, 2=NormSiLU, 8=radial; 3/4=±Identity
 """
 import torch
 import torch.nn as nn
@@ -20,10 +20,14 @@ DEV, DT = "cuda", torch.float16
 
 
 def make_experts(E, H, I):
-    """Stacked PolyGLU expert weights + groups-of-3 activation codes [SiLU, ReLU², Tanh, ...]."""
+    """Stacked PolyGLU expert weights + alternating activation codes [SiLU, NormSiLU, ...].
+
+    Radial NormSiLU (code 8) is the strongest activation but needs an act_params tensor carrying
+    its per-expert exponent; these examples stay on the two param-free codes.
+    """
     gate_up_proj = (torch.randn(E, 2 * I, H, device=DEV, dtype=DT) * 0.02).requires_grad_(True)
     down_proj = (torch.randn(E, H, I, device=DEV, dtype=DT) * 0.02).requires_grad_(True)
-    act_codes = torch.tensor([e % 3 for e in range(E)], device=DEV, dtype=torch.int32)  # PolyGLU triples
+    act_codes = torch.tensor([(e % 2) * 2 for e in range(E)], device=DEV, dtype=torch.int32)
     return gate_up_proj, down_proj, act_codes
 
 
@@ -66,7 +70,7 @@ class MoELayer(nn.Module):
         self.gate = nn.Linear(H, E, bias=False)
         self.gate_up_proj = nn.Parameter(torch.randn(E, 2 * I, H) * (H ** -0.5))
         self.down_proj = nn.Parameter(torch.randn(E, H, I) * (I ** -0.5))
-        self.register_buffer("act_codes", torch.tensor([e % 3 for e in range(E)], dtype=torch.int32))
+        self.register_buffer("act_codes", torch.tensor([(e % 2) * 2 for e in range(E)], dtype=torch.int32))
         self.top_k = top_k
 
     def forward(self, x):                                       # x: (B, S, H)

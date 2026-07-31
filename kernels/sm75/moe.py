@@ -885,7 +885,7 @@ class _PerExpertMoE(torch.autograd.Function):
         hidden, wt, gate_up_proj, down_proj = _amp_cast(hidden, wt, gate_up_proj, down_proj)
         N, H = hidden.shape
         E = act_codes.shape[0]                  # total routed experts (GLU + specials)
-        codes = _codes_list(act_codes)              # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
+        codes = _codes_list(act_codes)              # GLU (weight slot e) = 0/2/8; 3 = +Identity, 4 = -Identity
         top_k = idx.shape[1]; dev = hidden.device
         st, sw, order, counts, bounds, counts_t = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
@@ -989,7 +989,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 gu = x_s[s:en] @ gate_up_proj[e].t()                     # GLU expert; weight slot = e
                 # alpha applies to codes 0/2 as act(alpha_e*x) where x is the raw
                 # gate (0/1) or gate/rms(gate) (2/6/7). Gating this on codes[e]==5 silently made the
-                # feature inert for silu/normsilu/normsitu -- alpha stayed exactly 1.0 for a whole
+                # feature inert for silu/normsilu -- alpha stayed exactly 1.0 for a whole
                 # 60-step run while still costing the uniform fast path (ap32 is not None -> per-expert).
                 _has_ap = ap32 is not None
                 it = _glu_fwd(gu, row_act[s:en], code_hint=codes[e],
@@ -1107,9 +1107,9 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_w_s[s:en].copy_(gw)                    # cast+copy in one, no temp
             grad_inter = ge @ down_proj[e]                              # (m,H)@(H,I) -> (m,I)
             torch.mm(ge.t(), it, out=grad_down_proj[e])                 # (H,m)@(m,I) -> (H,I)
-            # mirrors the forward: alpha is live for every GLU code, so d_alpha must be too. The row
-            # kernel writes DG=0 for non-SiTU codes (a per-expert OUTPUT gain is redundant with the
-            # router weight), so gamma simply stays at its init there.
+            # mirrors the forward: alpha is live for every GLU code, so d_alpha must be too. Only
+            # column 0 of act_params is read -- there is no per-expert OUTPUT gain, it would be
+            # redundant with the router weight (g_e*w*f == (g_e*w)*f).
             if want_ap:
                 grad_gate_up, da = _glu_bwd(grad_inter, gate_up_l[e], row_act[s:en],
                                                 code_hint=codes[e], row_alpha=ap32[e, 0:1],
@@ -1132,14 +1132,15 @@ def moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
                    act_params=None):
     """Sorted dispatch + cuBLAS GEMMs + fused PolyGLU activation + weighted scatter, MANUAL backward
     (no autograd-composition glue). Wins at low token counts.
-    act_params: (E,2) fp32 [alpha,gamma] per expert — required iff any act code is 5 (SiTU)."""
+    act_params: (E,) or (E,2) fp32, column 0 = alpha per expert — REQUIRED iff any act code is 8
+    (radial NormSiLU), where alpha carries the exponent logit theta, p = sigmoid(theta)."""
     return _PerExpertMoE.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj,
                                act_codes, act_params)
 
 
 def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params=None):
     """Auto: grouped at >= GROUPED_MIN_TOKENS rows (N*top_k) on Ampere+ (sm_80+) AND only when every
-    expert is a GLU (act_codes in {0,1,2}); else per-expert (which alone supports codes 3/4/5).
+    expert is a param-free GLU (act_codes in {0,2}); else per-expert (which alone supports 3/4/8).
 
     The grouped path's tl.dot GEMMs are catastrophic on Turing (T4, sm_75) — measured ~0.1x vs compiled
     eager — so it is NEVER chosen on sm_<80; per-expert (cuBLAS) wins there. The grouped path also does
@@ -1150,7 +1151,7 @@ def moe(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes
     is in the stack. per-expert is correct on every arch and is itself a large win (T4 ~2.9x; Blackwell
     ~4x fwd+bwd). To use grouped on a mixed stack, fix _GroupedMoE to special-case codes 3/4 first."""
     cap_major = torch.cuda.get_device_capability(hidden.device)[0]
-    glu_only = _code_max(act_codes) <= 2       # codes 3/4 (specials) AND 5 (SiTU) -> per-expert; cached, no per-call sync
+    glu_only = _code_max(act_codes) <= 2       # codes 3/4 (specials) AND 8 (radial, needs act_params) -> per-expert; cached, no per-call sync
     if top_k_indices.numel() >= GROUPED_MIN_TOKENS and cap_major >= 8 and glu_only:
         return moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
     return moe_per_expert(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
@@ -1189,7 +1190,7 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
     N, H = hidden.shape
     twoI = gate_up_proj.shape[1]
     I = twoI // 2
-    codes = _codes_list(act_codes)          # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
+    codes = _codes_list(act_codes)          # GLU (weight slot e) = 0/2/8; 3 = +Identity, 4 = -Identity
     E = len(codes)                       # total routed experts (GLU + specials)
     out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):

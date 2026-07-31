@@ -207,7 +207,7 @@ from kernels.sm75 import moe
 hidden    = torch.randn(16384, 512, device="cuda", dtype=torch.float16)    # (N, H)
 gate_up   = torch.randn(11, 1536, 512, device="cuda", dtype=torch.float16) # (E, 2*I, H) fused gate+up
 down      = torch.randn(11, 512, 768, device="cuda", dtype=torch.float16)  # (E, H, I)
-act_codes = torch.zeros(11, dtype=torch.int32, device="cuda")              # per expert: 0=SiLU 1=ReLU² 2=Tanh
+act_codes = torch.zeros(11, dtype=torch.int32, device="cuda")              # per expert: 0=SiLU 2=NormSiLU 8=radial; 3/4=±Identity
 
 out = moe(hidden, idx, weights, gate_up, down, act_codes)                  # (N, H) combined output
 out.sum().backward()
@@ -230,6 +230,13 @@ python bench.py --compile moe        # PolyGLU MoE
 
 Run on the target GPU — kernel performance is architecture-specific, so numbers from one GPU class do
 not transfer to another.
+
+Correctness has its own suite. `parity_check/` holds the standing numerical gates — each pins one
+feature against an independent eager/autograd reference and exits non-zero on failure:
+
+```bash
+python parity_check/run_all.py       # all gates
+```
 
 ## Contributing
 

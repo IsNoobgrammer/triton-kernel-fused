@@ -16,11 +16,19 @@ kernels/
   __init__.py          # namespace: AVAILABLE_ARCHS + arch_for_capability() (no auto-import)
   sm75/                # Turing / Tesla T4 — the REFERENCE arch (every kernel implemented & tuned here)
     __init__.py        # the public API for this arch
-    cross_entropy.py  xsa.py  router.py  moe.py  muon.py
+    cross_entropy.py  xsa.py  router.py  moe.py  muon.py  manas.py
   sm120/               # Blackwell (RTX PRO 6000 / GB202) — reuses sm75, overrides only what differs
-    __init__.py        # re-exports sm75's kernels
-    cross_entropy.py  xsa.py  router.py  moe.py   # one-line re-exports of sm75
-    muon.py            # the ONE divergence today: ns_batch_elems default 8M (Blackwell mem-gated knee)
+    __init__.py        # re-exports sm75's kernels, overriding the forks below
+    cross_entropy.py  xsa.py               # one-line re-exports of sm75
+    muon.py            # ns_batch_elems default 8M (Blackwell mem-gated knee) + gram-space NS
+    newton_schulz_gram.py  newton_schulz_symmul.py   # the two Blackwell NS backends
+    manas.py           # Manas probe on top of the sm120 Muon (so an A/B can't confound the backend)
+    router.py          # Blackwell-tuned conv router
+    moe.py  moe_grouped.py  moe_fused_glu.py         # cuBLAS grouped path + fused GEMM+GLU epilogue
+parity_check/          # standing numerical gates, one per feature (see below)
+bench.py               # per-kernel benchmarks vs a torch.compile baseline, with a parity check
+scripts/               # env probe/setup + one-off tile tuners
+examples/              # runnable usage examples
 ```
 
 You import a kernel by naming its arch explicitly:
@@ -118,10 +126,26 @@ first, then fuse around it.
 - **Match the surrounding style.** Comment density, naming, and idiom should look like the existing
   kernels in that arch package.
 
+## Parity gates
+
+`parity_check/` holds the standing numerical gates. Each compares a kernel against an independent
+eager/autograd reference and exits non-zero on failure — run them after every kernel change.
+
+```bash
+python parity_check/run_all.py         # everything that runs in this venv
+python parity_check/parity_radial.py   # one gate
+```
+
+A green kernel-level gate is **not** sufficient on its own. Per-expert alpha once shipped completely
+inert behind one: the kernel matched its reference perfectly while the dispatcher silently dropped
+the parameter, so training saw no feature at all. Any gate for a *feature* must also assert that the
+feature changes an end-to-end result — see `parity_radial.py` and `parity_manas_sm120.py`.
+`parity_check/README.md` lists what each gate pins.
+
 ## Pull request checklist
 
 - [ ] Kernel lives in the correct `kernels/sm<XX>/` package and is exported from its `__init__.py`.
-- [ ] Forward output and all gradients pass parity against the eager reference.
+- [ ] Forward output and all gradients pass parity against the eager reference; `run_all.py` is green.
 - [ ] A `bench.py` entry compares against the `torch.compile` baseline and reports parity.
 - [ ] Speed/memory numbers are labelled with GPU class, dtype, and shape, and were measured on that GPU.
 - [ ] The kernel exploits a real structural seam (not a tie with `torch.compile`).

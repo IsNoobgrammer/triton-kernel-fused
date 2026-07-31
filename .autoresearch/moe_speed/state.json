@@ -1,0 +1,53 @@
+{
+ "objective": "tps",
+ "baseline": {
+  "silu": 164.2,
+  "normsilu": 158.6,
+  "radial": 158.2
+ },
+ "best": {
+  "silu": 164.2,
+  "normsilu": 158.6,
+  "radial": 158.9
+ },
+ "run_number": 9,
+ "noise_sigma_k": 0.5,
+ "plateau_counter": 3,
+ "engine_rewards": {
+  "improvement": 0.9
+ },
+ "tried_ideas": [
+  "profile-diagnosis-radial",
+  "drop-ap32-rider-from-uniform (DESIGNED, not applied)",
+  "drop-ap32-rider-from-uniform (APPLIED, DISCARDED: -1k tps, DtoH unmoved)",
+  "cache-act-codes-tolist (kept in tree: harmless, helps all arms, but tps-neutral)",
+  "radial-on-grouped-GEMM (DISCARDED -1.5k)",
+  "num_warps sweep (8 already optimal)",
+  "counts DtoH->HtoD round trip removed (KEPT)",
+  "BLOCK_I=256 exact tiling (neutral e2e)"
+ ],
+ "standing_slices": [
+  "parity_radial",
+  "parity_rowloop",
+  "parity_normed_tiles",
+  "parity_expert_alpha",
+  "parity_specials"
+ ],
+ "stop_target": {
+  "radial": 165.0,
+  "silu": 170.0
+ },
+ "next_action": "UNEXAMINED: the 'other' bucket, 35.4% of CUDA (~1.5s of elementwise kernels). Everything profiled is refuted or tuned. Needs a per-kernel breakdown of 'other' before any more code.",
+ "ceiling_note": "honest downgrade: run 3 showed removing overhead does not auto-convert to tps. 165k from the grouped path alone is NOT assured.",
+ "final": {
+  "radial_mean_n9": 158.9,
+  "radial_best_reading": 159.7,
+  "baseline": 158.1,
+  "delta": "+0.8k (+0.5%)",
+  "target": 160.0,
+  "TARGET_MET": false,
+  "short_by": "~1.1k",
+  "other_bucket_breakdown": "spread across small copies/casts; no single lever >= 1.1k"
+ },
+ "stopped_reason": "target not met; patience exhausted; no remaining lever of sufficient size"
+}

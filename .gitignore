@@ -6,4 +6,10 @@ __pycache__/
 docs/node_modules/
 docs/dist/
 docs/.astro/
-.autoresearch/manas/data/
+
+# Autoresearch scratch: findings (.md/.jsonl/.py) are tracked, generated artifacts are not.
+.autoresearch/**/data/
+.autoresearch/data/
+.autoresearch/plots/
+.autoresearch/**/artifact/
+.autoresearch/**/archive/

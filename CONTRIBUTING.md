@@ -58,10 +58,25 @@ contribution.
 5. Add a `bench_<name>` entry to `bench.py` comparing against the `torch.compile` baseline with a parity
    check, and measure speed on the **target GPU**.
 
+## Parity gates
+
+`parity_check/` holds the standing numerical gates — each compares a kernel against an independent
+eager/autograd reference and exits non-zero on failure. Run them after every kernel change:
+
+```bash
+python parity_check/run_all.py         # everything that runs in this venv
+python parity_check/parity_radial.py   # one gate
+```
+
+A green kernel-level gate is **not** sufficient on its own. Per-expert alpha once shipped completely
+inert behind one: the kernel matched its reference perfectly while the dispatcher silently dropped the
+parameter. Any gate for a *feature* must also assert that the feature changes an end-to-end result —
+see `parity_radial.py` and `parity_manas_sm120.py`. `parity_check/README.md` lists what each gate pins.
+
 ## PR checklist
 
 - [ ] Kernel is in the correct `kernels/sm<XX>/` package and exported from its `__init__.py`.
-- [ ] Forward and all gradients pass parity against eager.
+- [ ] Forward and all gradients pass parity against eager; `python parity_check/run_all.py` is green.
 - [ ] `bench.py` entry compares against the `torch.compile` baseline and reports parity.
 - [ ] Numbers are labelled with GPU class, dtype, and shape, and measured on that GPU.
 - [ ] The kernel exploits a real structural seam (not a tie with `torch.compile`).
