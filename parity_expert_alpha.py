@@ -79,7 +79,7 @@ def end_to_end(dev):
     time because it called _glu_fwd directly. Verified two ways: alpha must MOVE the output, and
     d_alpha must match a central finite difference of the real loss."""
     H, Ei, E, N, K = 512, 768, 4, 256, 2
-    codes_l = [0, 2, 7, 0]
+    codes_l = [0, 2, 2, 0]   # code 7 removed Jul 31 2026 (deleted activation, not a live path)
     print("\nend-to-end moe_per_expert (the plumbing test):")
     g = torch.Generator(device=dev).manual_seed(11)
     rn = lambda *s: torch.randn(*s, generator=g, device=dev, dtype=torch.float32)
