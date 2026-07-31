@@ -79,18 +79,21 @@ def tiles_supported(hidden):
 
 def gemm_supported(hidden, gate_up_proj, codes):
     """Can `fused_gate_up_glu` run this gate_up GEMM at all? Tiling + a single uniform GLU code.
-    True for the RMS-normed codes too -- they just pass act=False and keep `_glu_fwd`. Worth 1.16x
-    over cuBLAS on the gate_up GEMM alone (1.903 -> 1.643 ms at 64 experts / 262k rows)."""
+    True for the RMS-normed codes (2, 8) too -- they just pass act=False and keep the row-fused
+    `_glu_fwd`. Worth 1.16x over cuBLAS on the gate_up GEMM alone (1.903 -> 1.643 ms at 64 experts /
+    262k rows). Code 8 (radial) was MISSING from this list, so radial paid cuBLAS on a GEMM that
+    normsilu got fused -- pure omission, the epilogue is act=False for both and never sees the
+    activation. Codes 1/6/7 deleted Jul 31 2026."""
     I = gate_up_proj.shape[1] // 2
     return (tiles_supported(hidden) and hidden.dtype is torch.bfloat16
             and gate_up_proj.is_contiguous()
             and I % _BN == 0 and gate_up_proj.shape[2] % _BK == 0
-            and len(set(codes)) == 1 and codes[0] in (0, 1, 2, 6, 7))
+            and len(set(codes)) == 1 and codes[0] in (0, 2, 8))
 
 
 def fused_supported(hidden, gate_up_proj, codes):
     """...and can it also fuse the ACTIVATION into that GEMM's epilogue? Only for the pointwise
-    codes. 2/6/7 need a per-row RMS over the gate half, which a tile holding a BN-wide slice cannot
+    codes. 2/8 need a per-row RMS over the gate half, which a tile holding a BN-wide slice cannot
     see; widening BN to span I=768 needs a BM x 1024 fp32 accumulator PAIR (256 KB at BM=32) and
     spills. Measured alternative, rejected: moving the activation into the down-projection GEMM's
     prologue instead. That works -- rms is a per-row scalar, so it is tile-local once known -- but it
@@ -98,7 +101,7 @@ def fused_supported(hidden, gate_up_proj, codes):
     all back (1.636 ms vs 0.815 + 0.773 = 1.588 for the two separate kernels). See
     tune_glu_prologue.py. The normed codes keep row-fused `_glu_fwd`/`_glu_bwd`, already at the HBM
     roofline."""
-    return gemm_supported(hidden, gate_up_proj, codes) and codes[0] in (0, 1)
+    return gemm_supported(hidden, gate_up_proj, codes) and codes[0] == 0
 
 
 def build_tile_map(counts, counts_t, device, bm=None):
