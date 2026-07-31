@@ -520,7 +520,8 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
             "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     ggu = torch.empty_like(gate_up)
-    if I <= _ROWFUSE_MAX_I:
+    looped, BLOCK_I, nw = _row_tiling(I)
+    if not looped:
         if want_act_grads:
             da = torch.empty(M, device=gate_up.device, dtype=torch.float32)
         else:
