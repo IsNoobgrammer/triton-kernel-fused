@@ -43,9 +43,9 @@ def main():
         th = torch.full((MROWS,), theta_v, device=dev, dtype=torch.float32).requires_grad_(True)
         ones = torch.ones(MROWS, device=dev, dtype=torch.float32)
 
-        out_k = M._glu_fwd(gu, row_act, code_hint=CODE, row_alpha=th.detach(), row_gamma=ones)
+        out_k = M._glu_fwd(gu, row_act, code_hint=CODE, row_alpha=th.detach())
         ggu_k, dth_k, _ = M._glu_bwd(go, gu, row_act, code_hint=CODE, row_alpha=th.detach(),
-                                     row_gamma=ones, want_situ_grads=True)
+                                     want_act_grads=True)
 
         ref = eager(gu[:, :I], gu[:, I:], th)
         (ref * go).sum().backward()
@@ -64,7 +64,7 @@ def main():
     row_act = torch.full((MROWS,), CODE, device=dev, dtype=torch.int32)
     zeros = torch.zeros(MROWS, device=dev, dtype=torch.float32)
     ones = torch.ones(MROWS, device=dev, dtype=torch.float32)
-    got = M._glu_fwd(gu, row_act, code_hint=CODE, row_alpha=zeros, row_gamma=ones)
+    got = M._glu_fwd(gu, row_act, code_hint=CODE, row_alpha=zeros)
     gg = gu[:, :I].float()
     r = torch.sqrt(gg.square().mean(-1, keepdim=True) + EPS)
     want = r.sqrt() * F.silu(gg / r) * gu[:, I:].float()

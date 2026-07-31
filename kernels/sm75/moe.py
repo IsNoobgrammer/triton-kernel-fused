@@ -313,6 +313,9 @@ def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, Alpha_ptr,
     tl.store(GradGateUp_ptr + offs_m[:, None] * s_ggu_m + (I + offs_i)[None, :] * s_ggu_i, go * act, mask=mask)
 
 
+_ONES_CACHE = {}          # device -> a big fp32 ones buffer, sliced for the alpha default
+
+
 def _ones(M, device):
     buf = _ONES_CACHE.get(device)
     if buf is None or buf.numel() < M:

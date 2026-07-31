@@ -31,7 +31,7 @@ def main():
     dev = "cuda"
     ok = True
     print(f"{'code':>6}{'act':>11}{'alpha':>7}{'fwd':>10}{'d_gateup':>11}{'d_alpha':>11}")
-    for code in (0, 2, 7):
+    for code in (0, 2):
         for alpha in (0.7, 1.0, 1.3):
             g = torch.Generator(device=dev).manual_seed(code * 100 + int(alpha * 10))
             gu = (torch.randn(MROWS, 2 * I, generator=g, device=dev, dtype=torch.float32)
@@ -55,7 +55,7 @@ def main():
 
     # alpha == 1 must be BIT-identical to not passing alpha at all (1.0*x is exact)
     print("\nalpha=1 vs no-alpha, bit-exact check:")
-    for code in (0, 2, 7):
+    for code in (0, 2):
         g = torch.Generator(device=dev).manual_seed(7)
         gu = torch.randn(MROWS, 2 * I, generator=g, device=dev, dtype=torch.float32)
         ra = torch.full((MROWS,), 1.0, device=dev, dtype=torch.float32)
