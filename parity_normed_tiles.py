@@ -26,7 +26,7 @@ importlib.import_module("kernels.sm120.moe")
 M = importlib.import_module("kernels.sm75.moe")
 
 H, I, E, TOP_K, N = 512, 768, 8, 2, 4096
-CODES = {0: "silu", 2: "normsilu", 8: "radial",
+CODES = {0: "silu", 2: "normsilu",
          # MIXED stacks: `uniform` in moe_per_expert means "no special experts, no act_params",
          # NOT "one code", so 2+7 still takes the batched grouped path. It loses only the fused
          # gate_up GEMM (gemm_supported wants a single code), which measured as a wash anyway.
