@@ -439,6 +439,26 @@ def _glu_bwd_rowloop_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
 _LOOP_BLOCK_I = 1024      # chunk the row walk at this width in the looped kernels
 
 
+def _row_tiling(I):
+    """Single-pass vs looped for a row of width I, and the block/warps to use.
+
+    The single-pass kernel needs BLOCK_I = next_pow2(I), so a non-power-of-2 I masks off the
+    remainder in EVERY program: I=768 rounds to 1024 and wastes 25% of the lanes. When I divides
+    evenly by 256 the LOOPED kernel tiles it exactly (768 = 3x256) with no masked lanes.
+    Measured at I=768, R=8192 (= rows per expert at 64 experts / 262k tok):
+        single-pass BLOCK_I=1024 w8   fwd 13.2us  bwd 24.7us
+        looped      BLOCK_I=256  w4   fwd 13.1us  bwd 23.2us   <- picked
+        looped      BLOCK_I=256  w8   fwd 18.5us  bwd 32.9us   (8 warps on a 256 block is too wide)
+        looped      BLOCK_I=128  w4   fwd 14.4us  bwd 28.8us
+    Returns (looped, BLOCK_I, num_warps)."""
+    if I > _ROWFUSE_MAX_I:
+        return True, _LOOP_BLOCK_I, 8
+    if I % 256 == 0 and (I & (I - 1)) != 0:        # exact 256-tiling beats a masked pow2 block
+        return True, 256, 4
+    b = max(16, triton.next_power_of_2(I))
+    return False, b, (8 if b >= 1024 else 4)
+
+
 def _needs_row(row_act, code_hint, row_alpha):
     """True when this slice needs a ROW REDUCTION (codes 2/8) or per-expert alpha, i.e. when the
     tiled kernels cannot serve it without HBM pre-passes."""
@@ -462,13 +482,13 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
             "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
     out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
-    if I <= _ROWFUSE_MAX_I:
+    looped, BLOCK_I, nw = _row_tiling(I)
+    if not looped:
         if M > 0:
-            BLOCK_I = max(16, triton.next_power_of_2(I))
             _glu_fwd_row_kernel[(M,)](gate_up, row_act, ra, out, I,
                                       gate_up.stride(0), gate_up.stride(1), out.stride(0), out.stride(1),
                                       _ap_stride(row_alpha),
-                                      EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=(8 if BLOCK_I >= 1024 else 4))
+                                      EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=nw)
         return out
     if _needs_row(row_act, code_hint, row_alpha):
         # wide row + a row reduction: loop instead of paying the tiled path's HBM pre-pass
@@ -476,7 +496,7 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
             _glu_fwd_rowloop_kernel[(M,)](gate_up, row_act, ra, out, I,
                                           gate_up.stride(0), gate_up.stride(1),
                                           out.stride(0), out.stride(1), _ap_stride(row_alpha),
-                                          EPS=_NS_EPS, BLOCK_I=_LOOP_BLOCK_I, num_warps=8)
+                                          EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=nw)
         return out
     skip_ns = code_hint is not None and code_hint not in (2, 6, 7, 8)  # 2/6/7/8 need the row RMS
     rms = _ones(M, gate_up.device) if skip_ns else _row_rms(gate_up, row_act, I)
@@ -506,13 +526,12 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
         else:
             da = gate_up                      # dead pointer: WANT_AP=0 compiles the store out
         if M > 0:
-            BLOCK_I = max(16, triton.next_power_of_2(I))
             _glu_bwd_row_kernel[(M,)](grad_out, gate_up, row_act, ra, ggu, da, I,
                                       grad_out.stride(0), grad_out.stride(1),
                                       gate_up.stride(0), gate_up.stride(1), ggu.stride(0), ggu.stride(1),
                                       _ap_stride(row_alpha),
                                       EPS=_NS_EPS, WANT_AP=want_act_grads, BLOCK_I=BLOCK_I,
-                                      num_warps=(8 if BLOCK_I >= 1024 else 4))
+                                      num_warps=nw)
         return (ggu, da) if want_act_grads else ggu
     if _needs_row(row_act, code_hint, row_alpha):
         ggu = torch.empty_like(gate_up)
@@ -526,7 +545,7 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
                                           gate_up.stride(0), gate_up.stride(1),
                                           ggu.stride(0), ggu.stride(1), _ap_stride(row_alpha),
                                           EPS=_NS_EPS, WANT_AP=want_act_grads,
-                                          BLOCK_I=_LOOP_BLOCK_I, num_warps=8)
+                                          BLOCK_I=BLOCK_I, num_warps=nw)
         return (ggu, da) if want_act_grads else ggu
     skip_ns = code_hint is not None and code_hint not in (2, 6, 7, 8)  # 2/6/7/8 need the row RMS
     if skip_ns:
