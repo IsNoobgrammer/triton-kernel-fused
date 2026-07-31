@@ -661,6 +661,30 @@ def _grouped_wgrad(A, B, e_start, e_end, E, N, K):
     return gW
 
 
+_CODES_CACHE = {}
+
+
+def _codes_list(act_codes):
+    """`act_codes.tolist()` is a BLOCKING DtoH, and it is called on every dispatch path before the
+    branch -- 8 MoE layers x 4 micro-batches = 32 host stalls per step for a tensor that is
+    CONSTANT for the whole run (patches sets the act cycle once at startup). Profiling put
+    Memcpy DtoH at 11.2% of total CUDA time, the single largest kernel in the step.
+
+    Keyed on (data_ptr, _version, numel) AND holding a strong reference to the tensor: the strong
+    ref is load-bearing, because without it a freed tensor's data_ptr can be recycled by a
+    different codes tensor with the same numel and version, and we would silently return the wrong
+    activation codes. _version catches in-place edits to a live tensor."""
+    key = (act_codes.data_ptr(), act_codes._version, act_codes.numel())
+    ent = _CODES_CACHE.get(key)
+    if ent is not None and ent[0] is act_codes:
+        return ent[1]
+    v = act_codes.tolist()
+    if len(_CODES_CACHE) > 32:                 # bounded; act cycles per process are few
+        _CODES_CACHE.clear()
+    _CODES_CACHE[key] = (act_codes, v)
+    return v
+
+
 def _sort_by_expert(idx, wt, E):
     ntok, top_k = idx.shape
     flat_t = torch.arange(ntok, device=idx.device).unsqueeze(1).expand_as(idx).flatten()
@@ -838,7 +862,7 @@ class _PerExpertMoE(torch.autograd.Function):
         hidden, wt, gate_up_proj, down_proj = _amp_cast(hidden, wt, gate_up_proj, down_proj)
         N, H = hidden.shape
         E = act_codes.shape[0]                  # total routed experts (GLU + specials)
-        codes = act_codes.tolist()              # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
+        codes = _codes_list(act_codes)              # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
         top_k = idx.shape[1]; dev = hidden.device
         st, sw, order, counts, bounds = _sort_by_expert(idx, wt, E)
         x_s = hidden.index_select(0, st)                                  # (M,H) contiguous gather
@@ -1143,7 +1167,7 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
     N, H = hidden.shape
     twoI = gate_up_proj.shape[1]
     I = twoI // 2
-    codes = act_codes.tolist()          # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
+    codes = _codes_list(act_codes)          # GLU (weight slot e) = 0/1/2/5/6/7; 3 = +Identity, 4 = -Identity
     E = len(codes)                       # total routed experts (GLU + specials)
     out = torch.zeros(N, H, device=hidden.device, dtype=torch.float32)   # fp32 accumulate (MiMo)
     for e in range(E):
