@@ -274,8 +274,7 @@ def _glu_fwd_kernel(GateUp_ptr, Act_ptr, Rms_ptr, Alpha_ptr, Out_ptr, M, I,
     up = tl.load(GateUp_ptr + offs_m[:, None] * s_gu_m + (I + offs_i)[None, :] * s_gu_i, mask=mask, other=0.0).to(tl.float32)
     at = tl.load(Act_ptr + offs_m, mask=mask_m, other=0)[:, None]
     r = tl.load(Rms_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
-    aa = tl.load(Alpha_ptr + offs_m * s_ap, mask=mask_m, other=1.0).to(tl.float32)[:, None]   # 1.0 where at!=5
-    r = tl.load(Rms_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
+    aa = tl.load(Alpha_ptr + offs_m * s_ap, mask=mask_m, other=1.0).to(tl.float32)[:, None]
     gn = gate / r                                        # r == 1 for code 0 (see _row_rms_kernel)
     z = aa * gn
     sig = 1.0 / (1.0 + tl.exp(-z))
@@ -338,19 +337,42 @@ def _ap_stride(row_alpha):
     return 0 if (row_alpha is not None and row_alpha.numel() == 1) else 1
 
 
+def _alpha_tile_gap(row_alpha, I, code_hint):
+    """Why per-expert alpha (and therefore RADIAL) is capped at I <= _ROWFUSE_MAX_I.
+
+    NOT because p is high-dimensional -- p is one scalar per expert and costs a single load. The
+    binding constraint is `r = rms(gate over I)`, a ROW REDUCTION. The row-fused kernel owns a whole
+    row per program and gets r from one in-register tl.sum; above _ROWFUSE_MAX_I the row no longer
+    fits in registers, so the tiled kernels split each row across programs and r must come from the
+    _row_rms pre-pass. That part already works.
+
+    What actually breaks on the tiled path:
+      * FORWARD is fine -- _glu_fwd_kernel applies z = alpha*gn today.
+      * BACKWARD is not: _row_s_kernel builds the coupling S = sum(gu*silu'(g_hat)*g_hat) from
+        sig(gn), NOT from sig(alpha*gn), so S is silently WRONG whenever alpha != 1.
+      * RADIAL additionally needs a SECOND row reduction T = sum(gu*silu(g_hat)) for both its
+        gate coupling (S -> S - p*T) and its dalpha; no such pre-pass exists.
+
+    To lift the cap: teach _row_s_kernel to read alpha, add a _row_t_kernel clone for T, and add
+    the at==8 branches to _glu_fwd_kernel/_glu_bwd_kernel."""
+    if row_alpha is None or I <= _ROWFUSE_MAX_I:
+        return
+    raise NotImplementedError(
+        f"per-expert alpha needs the ROW-FUSED GLU kernels (I <= {_ROWFUSE_MAX_I}); got I={I}. "
+        "The tiled FORWARD already applies alpha; the blocker is that _row_s_kernel computes the "
+        "backward coupling S from sig(gate/r) instead of sig(alpha*gate/r), and radial (code 8) "
+        "also needs a T = sum(gu*silu(ghat)) pre-pass that does not exist. See _alpha_tile_gap. "
+        + ("Code 8 (radial) ALWAYS carries alpha, so radial is capped here too."
+           if code_hint == 8 else ""))
+
+
 def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
     """code_hint: host-side int when EVERY row shares one act code (the per-expert path) — lets
     non-NormSiLU slices skip the _row_rms launch on the tiled fallback path (row-fused path needs
     no pre-pass at all). row_alpha: per-row fp32 scalar -- the input scale for codes 0/2, the
     exponent LOGIT theta for code 8 (p = sigmoid(theta)); None -> 1.0."""
     M, twoI = gate_up.shape; I = twoI // 2
-    if (row_alpha is not None and I > _ROWFUSE_MAX_I
-            and not (code_hint is not None and code_hint == 5)):
-        raise NotImplementedError(
-            "per-expert alpha is implemented in the ROW-FUSED GLU kernels only (I <= "
-            f"{_ROWFUSE_MAX_I}); got I={I}. Implement z=alpha*x in _glu_fwd_kernel/"
-            "_glu_bwd_kernel before using it here. NOTE this also caps RADIAL (code 8), which "
-            "always needs alpha -- radial is usable only up to I=%d." % _ROWFUSE_MAX_I)
+    _alpha_tile_gap(row_alpha, I, code_hint)
     if code_hint == 8 and row_alpha is None:
         raise ValueError(
             "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
@@ -381,13 +403,7 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
     computes grad_gate_up AND the per-row alpha grad in the SAME pass. The tiled path has no alpha
     (row_alpha with I > _ROWFUSE_MAX_I raises), so want_act_grads is row-path only."""
     M, twoI = gate_up.shape; I = twoI // 2
-    if (row_alpha is not None and I > _ROWFUSE_MAX_I
-            and not (code_hint is not None and code_hint == 5)):
-        raise NotImplementedError(
-            "per-expert alpha is implemented in the ROW-FUSED GLU kernels only (I <= "
-            f"{_ROWFUSE_MAX_I}); got I={I}. Implement z=alpha*x in _glu_fwd_kernel/"
-            "_glu_bwd_kernel before using it here. NOTE this also caps RADIAL (code 8), which "
-            "always needs alpha -- radial is usable only up to I=%d." % _ROWFUSE_MAX_I)
+    _alpha_tile_gap(row_alpha, I, code_hint)
     if code_hint == 8 and row_alpha is None:
         raise ValueError(
             "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
