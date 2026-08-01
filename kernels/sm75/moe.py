@@ -690,6 +690,17 @@ class _PerExpertMoE(torch.autograd.Function):
         M_rows = idx.numel()
         row_act = torch.repeat_interleave(act_codes, counts_t, output_size=M_rows).to(torch.int32)
         ap32 = act_params.float().contiguous() if act_params is not None else None
+        ap_shape = None
+        if ap32 is not None:
+            ap_shape = ap32.shape
+            if ap32.ndim == 1:
+                ap32 = ap32[:, None].contiguous()
+            if ap32.shape[0] != E:
+                raise ValueError(
+                    f"act_params has {ap32.shape[0]} rows but act_codes has {E} experts. Rows are "
+                    f"indexed by EXPERT ID, so a stack with special experts needs a row for each of "
+                    f"them too (their value is unused). Pass a full (E,) or (E,2) tensor -- padding "
+                    f"the specials with zeros is fine.")
         gate_up_l = [None] * E; inter_l = [None] * E
         M_tot = st.numel()
         eo_all = torch.empty(M_tot, H, device=dev, dtype=hidden.dtype)
@@ -765,7 +776,7 @@ class _PerExpertMoE(torch.autograd.Function):
                               ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
         ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw
-        ctx.codes = codes; ctx.has_ap = ap32 is not None
+        ctx.codes = codes; ctx.has_ap = ap32 is not None; ctx.ap_shape = ap_shape
         return out.to(hidden.dtype)
 
     @staticmethod
@@ -839,6 +850,8 @@ class _PerExpertMoE(torch.autograd.Function):
         grad_down_proj = torch.zeros_like(down_proj)
         grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
         want_ap = ctx.has_ap and ctx.needs_input_grad[6]
+        # Must match the shape the CALLER passed, not a fixed (E,2): autograd rejects a gradient
+        # whose shape differs from its input, and a (E,) act_params is documented as legal.
         grad_act_params = (torch.zeros(E, 2, device=grad_out.device, dtype=torch.float32)
                            if want_ap else None)
         for e in range(E):
@@ -870,6 +883,8 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_hidden.index_add_(0, st[s:en], grad_gate_up @ gate_up_proj[e])
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
         grad_wt[order] = grad_w_s
+        if grad_act_params is not None and ctx.ap_shape is not None:
+            grad_act_params = grad_act_params[:, 0] if len(ctx.ap_shape) == 1 else                 grad_act_params[:, :ctx.ap_shape[1]]
         return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj, None,
                 grad_act_params)
 
