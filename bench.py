@@ -951,7 +951,16 @@ class _BaselineMuon(torch.optim.Optimizer):
                 buf = st["momentum_buffer"]; buf.mul_(mom).add_(g)
                 u = g.add(buf, alpha=mom) if grp["nesterov"] else buf
                 u = self.ns_fn(u)
-                scale = max(1, p.shape[-2] / p.shape[-1]) ** 0.5
+                # MUST be the same scale convention as FusedMuon or the parity gate below can
+                # never pass. This was `max(1, rows/cols)**0.5` -- Jordan's original Muon scale --
+                # while FusedMuon uses kernels.muon.muon_scaling.scalar_scale ("polar"),
+                # RMS_TARGET*sqrt(max(rows,cols)), the modded-nanogpt convention. On a (512,256)
+                # weight that is 1.4142 vs 4.5255, a fixed 3.2x that the LR absorbs in training but
+                # that shows up here as a permanent 6.2e-02 "parity FAIL". Both updates are the
+                # exact orthogonal polar factor of the momentum (measured cos = 1.000000 for each);
+                # only the constant differed. Import the real one so the gate isolates the FUSION.
+                from kernels.muon.muon_scaling import scalar_scale as _scalar_scale
+                scale = _scalar_scale("polar", p.shape[-2], p.shape[-1])
                 if wd > 0.0:
                     p.data.mul_(1.0 - lr * wd)
                 p.add_(u.to(p.dtype), alpha=-lr * scale)
