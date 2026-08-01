@@ -50,7 +50,7 @@ class FusedMuon(optim.Optimizer):
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
                  spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0, xorth_backend="ns",
                  xorth_ns_iters=18, xorth_ema=0.95, xorth_gate_ref=0.3,
-                 xorth_warmup_steps=0, xorth_where="post", cautious_decay=True):
+                 xorth_warmup_steps=0, xorth_where="post", cautious_decay=False):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay,
                         xorth_post=float(xorth_post))
         super().__init__(params, defaults)
