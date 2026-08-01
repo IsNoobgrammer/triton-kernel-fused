@@ -1063,18 +1063,23 @@ def bench_muon(layers=6):
     # ALGORITHMS and reports the intended difference as a parity FAIL (measured 6.7e-02 on Blackwell,
     # while polar-vs-polar is exactly 0.0). A gate that fails for a designed difference trains people
     # to ignore it.
+    # cautious_decay=False is required too: FusedMuon defaults it TRUE (decay only where the update
+    # pushes |W| up), and _BaselineMuon does plain decoupled decay, so at WD=0.1 the two disagree on
+    # roughly half the coordinates of every tensor. That is a deliberate feature with its own gate
+    # (parity_check/parity_cautious_wd.py), not a fusion bug -- pinning it here lets this line
+    # measure what it says it measures. Aligned on both knobs the delta is 9.5e-07, fp32 round-off.
     df32 = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float32,
-                                             scale_mode="polar"), ref, shapes)
+                                             scale_mode="polar", cautious_decay=False), ref, shapes)
     print(f"  parity  fused-fp32 vs full-fp32 Muon       = {df32:.2e}  {'PASS' if df32 < 1e-4 else 'FAIL'}  (isolates the fusion)")
     # PRECISION fidelity: mixed (fp16 NS) vs the full-fp32 truth — informational (different op, not bit-parity)
     dmix = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16,
-                                             scale_mode="polar"), ref, shapes)
+                                             scale_mode="polar", cautious_decay=False), ref, shapes)
     print(f"  parity  fused-mixed(fp16NS) vs full-fp32    = {dmix:.2e}  (fp16-NS precision diff, informational)")
     # What this arch's DEFAULT scaling actually does vs polar — informational, and the number the
     # line above used to report as a failure.
     ddef = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float32), ref, shapes)
     _sm = FusedMuon([torch.zeros(2, 2, device=DEV, requires_grad=True)], lr=LR).scale_mode
-    print(f"  parity  fused-fp32 default({_sm}) vs polar = {ddef:.2e}  (scale-mode delta, informational)")
+    print(f"  parity  fused-fp32 DEFAULTS({_sm}+cwd) vs ref = {ddef:.2e}  (feature delta, informational)")
     # fp16-NS stability (T4 path): SV mean ~1, NaN-free
     ok = True
     for s in [(512, 512), (256, 512), (1536, 512), (9, 1536, 512), (9, 512, 768)]:
