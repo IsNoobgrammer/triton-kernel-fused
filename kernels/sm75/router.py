@@ -222,8 +222,16 @@ def fused_mlp_router(x, gate_weight, bias, top_k, num_experts,
 
 
 @torch.no_grad()
-def router_bias_update(bias, counts, u):
+def router_bias_update(bias, counts, u, mode="prop"):
+    # "prop": share = counts/sum(counts); bias += u*(mean(share) - share). This is BiBo's balancer
+    # as of Aug 1 2026 -- proportional control on the NORMALIZED share, which has a fixed point and
+    # cannot drift common-mode. "sign" is the older DeepSeek bang-bang rule on RAW counts, kept
+    # because every run before that date used it and u is NOT comparable between the two.
     if u <= 0:
         return
     tpe = counts.detach().float()
-    bias.add_(u * (tpe.mean() - tpe).sign())
+    if mode == "sign":
+        bias.add_(u * (tpe.mean() - tpe).sign())
+        return
+    share = tpe / tpe.sum().clamp_min(1.0)
+    bias.add_(u * (share.mean() - share))
