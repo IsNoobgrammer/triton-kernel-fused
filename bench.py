@@ -1048,12 +1048,24 @@ def bench_muon(layers=6):
         print(f"  parity  fused(quintic,fp32) vs BiBo Muon   = {d:.2e}  {'PASS' if d < 1e-4 else 'FAIL'}  (trusted anchor)")
     else:
         print("  (BiBo Muon unavailable — checkout ../BiBo next to repo for the trusted anchor)")
-    # FUSION correctness: fused-fp32 vs the full-fp32 reference (isolates foreach+baddbmm; fp32 params -> ~1e-6)
-    df32 = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float32), ref, shapes)
+    # FUSION correctness: fused-fp32 vs the full-fp32 reference (isolates foreach+baddbmm; fp32 params -> ~1e-6).
+    # scale_mode="polar" is REQUIRED here, not cosmetic: sm120's FusedMuon defaults to `aurora`, a
+    # deliberately different update scaling, so without pinning it this line compares two different
+    # ALGORITHMS and reports the intended difference as a parity FAIL (measured 6.7e-02 on Blackwell,
+    # while polar-vs-polar is exactly 0.0). A gate that fails for a designed difference trains people
+    # to ignore it.
+    df32 = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float32,
+                                             scale_mode="polar"), ref, shapes)
     print(f"  parity  fused-fp32 vs full-fp32 Muon       = {df32:.2e}  {'PASS' if df32 < 1e-4 else 'FAIL'}  (isolates the fusion)")
     # PRECISION fidelity: mixed (fp16 NS) vs the full-fp32 truth — informational (different op, not bit-parity)
-    dmix = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16), ref, shapes)
+    dmix = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float16,
+                                             scale_mode="polar"), ref, shapes)
     print(f"  parity  fused-mixed(fp16NS) vs full-fp32    = {dmix:.2e}  (fp16-NS precision diff, informational)")
+    # What this arch's DEFAULT scaling actually does vs polar — informational, and the number the
+    # line above used to report as a failure.
+    ddef = _muon_parity(lambda ps: FusedMuon(ps, lr=LR, weight_decay=WD, ns_dtype=torch.float32), ref, shapes)
+    _sm = FusedMuon([torch.zeros(2, 2, device=DEV, requires_grad=True)], lr=LR).scale_mode
+    print(f"  parity  fused-fp32 default({_sm}) vs polar = {ddef:.2e}  (scale-mode delta, informational)")
     # fp16-NS stability (T4 path): SV mean ~1, NaN-free
     ok = True
     for s in [(512, 512), (256, 512), (1536, 512), (9, 1536, 512), (9, 512, 768)]:
