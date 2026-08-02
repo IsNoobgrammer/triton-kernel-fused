@@ -82,22 +82,24 @@ def main():
         tag = f"S{S} W{W} H{H}/{HKV} {'sink' if sink else 'nosink'}"
         print(f"{tag:<28}" + "".join(f"{e:>10.1e}" for e in errs) + ("" if good else "  <-- FAIL"))
 
-    # ---- the band is REALLY enforced (a mask that silently widens still matches nothing above) --
-    # Feed one-hot values so the output reads back exactly which kv positions were attended.
-    print("\nband exactness (output must be zero outside the window):")
-    B, H, S, W = 1, 2, 384, 128
-    q = torch.randn(B, H, S, D, device=DEV)
-    k = torch.randn(B, H, S, D, device=DEV)
-    v = torch.eye(S, device=DEV)[None, None].expand(B, H, S, S).contiguous()[..., :D * 0 + S]
-    # v is (B,H,S,S): row j is the one-hot for kv position j, so out[.., q, j] = attn weight (q, j)
-    out = SWA.swa_attention(q, k, v, None, sliding_window=W, num_key_value_groups=1,
-                            scaling=D ** -0.5)[0]
-    i = torch.arange(S, device=DEV)
-    allowed = (i[:, None] >= i[None, :]) & ((i[:, None] - i[None, :]) < W)
-    leak = out[0, 0].masked_select(~allowed).abs().max().item()
-    mass = out[0, 0].masked_select(allowed).sum().item() / S
-    print(f"  max weight outside band {leak:.2e} (must be ~0), mean in-band mass {mass:.4f} (~1)")
-    ok &= leak < 1e-6 and abs(mass - 1.0) < 1e-3
+    # ---- the band is REALLY enforced ------------------------------------------------------
+    # The fwd parity above already implies this (eager applies causal_band_mask, so a flex mask
+    # that leaked would not match to 2e-7). Confirm it DIRECTLY and cheaply: widen the eager
+    # reference's window by one and require the result to DISAGREE. If flex quietly ignored the
+    # window, both would be full causal attention and this would pass by accident -- so also check
+    # flex@W differs from flex@2W.
+    print("
+band is load-bearing (W and W+1 must give different answers):")
+    q, k, v, _ = _inputs(1, 4, 2, 512, D, 17, grad=False)
+    kw = dict(num_key_value_groups=2, scaling=D ** -0.5)
+    f128 = SWA.swa_attention(q, k, v, None, sliding_window=128, **kw)[0]
+    f129 = SWA.swa_attention(q, k, v, None, sliding_window=129, **kw)[0]
+    f256 = SWA.swa_attention(q, k, v, None, sliding_window=256, **kw)[0]
+    e129 = _eager(q, k, v, None, 129, D ** -0.5, 2)
+    d1, d2, m = rel(f128, f129), rel(f128, f256), rel(f129, e129)
+    print(f"  W128 vs W129 {d1:.2e} (>0), W128 vs W256 {d2:.2e} (>0), "
+          f"flex@129 vs eager@129 {m:.2e} (~0)")
+    ok &= d1 > 1e-4 and d2 > 1e-3 and m < TOL
 
     # ---- the sink must actually DO something, and more sink = less output -----------------------
     print("\nsink is live and monotone (bigger beta -> more mass parked -> smaller output):")
