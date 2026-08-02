@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).parent
-NEEDS_BIBO_VENV = {"parity_bibo.py"}
+NEEDS_BIBO_VENV = {"parity_bibo.py", "parity_xsa_alpha.py"}
 
 
 def main():

@@ -62,7 +62,7 @@ def _row_rms_kernel(GateUp_ptr, Act_ptr, Rms_ptr, I, s_gu_m, s_gu_i,
         g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
         acc += g * g
     rms = tl.sqrt(tl.sum(acc) / I + EPS)
-    tl.store(Rms_ptr + row, tl.where((at == 2) | (at == 8), rms, 1.0))
+    tl.store(Rms_ptr + row, tl.where((at == 2) | (at == 8) | (at == 10), rms, 1.0))
 
 
 @triton.jit
@@ -98,13 +98,14 @@ def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, I,
     at = tl.load(Act_ptr + row)
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
     r = tl.sqrt(tl.sum(gate * gate) / I + EPS)
-    gn = tl.where((at == 2) | (at == 8), gate / r, gate)
-    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    gn = tl.where((at == 2) | (at == 8) | (at == 10), gate / r, gate)
+    p8 = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0,
+                  1.0 / (1.0 + tl.exp(-aa)))
     rp = tl.exp(p8 * tl.log(r))
-    z = tl.where(at == 8, gn, aa * gn)
+    z = tl.where((at == 8) | (at == 10), gn, aa * gn)
     sig = 1.0 / (1.0 + tl.exp(-z))
     f = z * sig
-    act = tl.where(at == 8, rp * f, f)
+    act = tl.where((at == 8) | (at == 10), rp * f, f)
     tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
 
 
@@ -122,27 +123,28 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
     at = tl.load(Act_ptr + row)
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
     r = tl.sqrt(tl.sum(gate * gate) / I + EPS)
-    is_norm = (at == 2) | (at == 8)
+    is_norm = (at == 2) | (at == 8) | (at == 10)
     gn = tl.where(is_norm, gate / r, gate)
-    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    p8 = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0,
+                  1.0 / (1.0 + tl.exp(-aa)))
     lr8 = tl.log(r)
     rp = tl.exp(p8 * lr8)
     rpm1 = tl.exp((p8 - 1.0) * lr8)
-    z = tl.where(at == 8, gn, aa * gn)
+    z = tl.where((at == 8) | (at == 10), gn, aa * gn)
     sig = 1.0 / (1.0 + tl.exp(-z))
     f = z * sig
     df = sig * (1.0 + z * (1.0 - sig))
-    act = tl.where(at == 8, rp * f, f)
+    act = tl.where((at == 8) | (at == 10), rp * f, f)
     gu_ = go * up
     S = tl.sum(tl.where(is_norm, gu_ * df * gn, 0.0))
-    T = tl.sum(tl.where(at == 8, gu_ * f, 0.0))
-    grad_gate = tl.where(at == 8, rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
+    T = tl.sum(tl.where((at == 8) | (at == 10), gu_ * f, 0.0))
+    grad_gate = tl.where((at == 8) | (at == 10), rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
                     tl.where(is_norm, aa * (gu_ * df - (S / I) * gn) / r, aa * gu_ * df))
     tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=msk)
     tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=msk)
     if WANT_AP:
-        da8 = p8 * (1.0 - p8) * rp * lr8 * T
-        tl.store(DA_ptr + row, tl.where(at == 8, da8, tl.sum(gu_ * df * gn)))
+        da8 = tl.where(at == 10, 1.0 - p8 * p8, p8 * (1.0 - p8)) * rp * lr8 * T
+        tl.store(DA_ptr + row, tl.where((at == 8) | (at == 10), da8, tl.sum(gu_ * df * gn)))
 
 
 @triton.jit
@@ -225,14 +227,15 @@ def _glu_fwd_rowloop_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, I,
     row = tl.program_id(0)
     at = tl.load(Act_ptr + row)
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
-    is_norm = (at == 2) | (at == 8)
+    is_norm = (at == 2) | (at == 8) | (at == 10)
     acc = tl.zeros([BLOCK_I], dtype=tl.float32)
     for i0 in range(0, I, BLOCK_I):
         offs = i0 + tl.arange(0, BLOCK_I)
         g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
         acc += g * g
     r = tl.sqrt(tl.sum(acc) / I + EPS)
-    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    p8 = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0,
+                  1.0 / (1.0 + tl.exp(-aa)))
     rp = tl.exp(p8 * tl.log(r))
     for i0 in range(0, I, BLOCK_I):
         offs = i0 + tl.arange(0, BLOCK_I)
@@ -240,9 +243,9 @@ def _glu_fwd_rowloop_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, I,
         g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
         u = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
         gn = tl.where(is_norm, g / r, g)
-        z = tl.where(at == 8, gn, aa * gn)
+        z = tl.where((at == 8) | (at == 10), gn, aa * gn)
         f = z * (1.0 / (1.0 + tl.exp(-z)))
-        act = tl.where(at == 8, rp * f, f)
+        act = tl.where((at == 8) | (at == 10), rp * f, f)
         tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * u).to(Out_ptr.dtype.element_ty), mask=m)
 
 
@@ -254,14 +257,15 @@ def _glu_bwd_rowloop_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
     row = tl.program_id(0)
     at = tl.load(Act_ptr + row)
     aa = tl.load(Alpha_ptr + row * s_ap).to(tl.float32)
-    is_norm = (at == 2) | (at == 8)
+    is_norm = (at == 2) | (at == 8) | (at == 10)
     acc = tl.zeros([BLOCK_I], dtype=tl.float32)
     for i0 in range(0, I, BLOCK_I):
         offs = i0 + tl.arange(0, BLOCK_I)
         g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=offs < I, other=0.0).to(tl.float32)
         acc += g * g
     r = tl.sqrt(tl.sum(acc) / I + EPS)
-    p8 = 1.0 / (1.0 + tl.exp(-aa))
+    p8 = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0,
+                  1.0 / (1.0 + tl.exp(-aa)))
     lr8 = tl.log(r)
     rp = tl.exp(p8 * lr8)
     rpm1 = tl.exp((p8 - 1.0) * lr8)
@@ -274,13 +278,13 @@ def _glu_bwd_rowloop_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
         g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
         u = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
         gn = tl.where(is_norm, g / r, g)
-        z = tl.where(at == 8, gn, aa * gn)
+        z = tl.where((at == 8) | (at == 10), gn, aa * gn)
         sig = 1.0 / (1.0 + tl.exp(-z))
         f = z * sig
         df = sig * (1.0 + z * (1.0 - sig))
         gu_ = go * u
         sa += tl.where(m, gu_ * df * gn, 0.0)
-        tt += tl.where(m & (at == 8), gu_ * f, 0.0)
+        tt += tl.where(m & (at == 8) | (at == 10), gu_ * f, 0.0)
     SA = tl.sum(sa)
     T = tl.sum(tt)
     S = tl.where(is_norm, SA, 0.0)
@@ -291,19 +295,19 @@ def _glu_bwd_rowloop_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
         g = tl.load(GateUp_ptr + row * s_gu_m + offs * s_gu_i, mask=m, other=0.0).to(tl.float32)
         u = tl.load(GateUp_ptr + row * s_gu_m + (I + offs) * s_gu_i, mask=m, other=0.0).to(tl.float32)
         gn = tl.where(is_norm, g / r, g)
-        z = tl.where(at == 8, gn, aa * gn)
+        z = tl.where((at == 8) | (at == 10), gn, aa * gn)
         sig = 1.0 / (1.0 + tl.exp(-z))
         f = z * sig
         df = sig * (1.0 + z * (1.0 - sig))
-        act = tl.where(at == 8, rp * f, f)
+        act = tl.where((at == 8) | (at == 10), rp * f, f)
         gu_ = go * u
-        grad_gate = tl.where(at == 8, rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
+        grad_gate = tl.where((at == 8) | (at == 10), rpm1 * (gu_ * df - (gn / I) * (S - p8 * T)),
                         tl.where(is_norm, aa * (gu_ * df - (S / I) * gn) / r, aa * gu_ * df))
         tl.store(GradGateUp_ptr + row * s_ggu_m + offs * s_ggu_i, grad_gate, mask=m)
         tl.store(GradGateUp_ptr + row * s_ggu_m + (I + offs) * s_ggu_i, go * act, mask=m)
     if WANT_AP:
-        da8 = p8 * (1.0 - p8) * rp * lr8 * T
-        tl.store(DA_ptr + row, tl.where(at == 8, da8, SA))
+        da8 = tl.where(at == 10, 1.0 - p8 * p8, p8 * (1.0 - p8)) * rp * lr8 * T
+        tl.store(DA_ptr + row, tl.where((at == 8) | (at == 10), da8, SA))
 
 
 _LOOP_BLOCK_I = 1024
@@ -328,9 +332,9 @@ def _needs_row(row_act, code_hint, row_alpha):
 
 def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
     M, twoI = gate_up.shape; I = twoI // 2
-    if code_hint == 8 and row_alpha is None:
+    if code_hint in (8, 10) and row_alpha is None:
         raise ValueError(
-            "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
+            "act codes 8/10 (radial NormSiLU, r^p*SiLU(g/r)) require row_alpha -- it carries the "
             "exponent LOGIT theta, p=sigmoid(theta). With alpha absent the kernel would default to "
             "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
@@ -362,9 +366,9 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
 
 def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_act_grads=False):
     M, twoI = gate_up.shape; I = twoI // 2
-    if code_hint == 8 and row_alpha is None:
+    if code_hint in (8, 10) and row_alpha is None:
         raise ValueError(
-            "act code 8 (radial NormSiLU, r^p*SiLU(g/r)) requires row_alpha -- it carries the "
+            "act codes 8/10 (radial NormSiLU, r^p*SiLU(g/r)) require row_alpha -- it carries the "
             "exponent LOGIT theta, p=sigmoid(theta). With alpha absent the kernel would default to "
             "theta=1 => p=0.731 instead of the intended 0.5 init. Pass act_params.")
     ra = _ones(M, gate_up.device) if row_alpha is None else row_alpha
@@ -599,7 +603,7 @@ class _GroupedMoE(torch.autograd.Function):
 
 def moe_grouped(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes):
     if _code_max(act_codes) > 4:
-        raise ValueError("code 8 (radial) unsupported on the grouped path; use moe_per_expert(act_params=...)")
+        raise ValueError("codes 8/10 (radial) unsupported on the grouped path; use moe_per_expert(act_params=...)")
     return _GroupedMoE.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes)
 
 
@@ -609,7 +613,7 @@ def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_
     if torch.cuda.get_device_capability(hidden.device)[0] < 8:
         raise RuntimeError("torch._grouped_mm needs bf16 tensor cores (sm_80+); skipped on this GPU")
     if _code_max(act_codes) > 4:
-        raise ValueError("code 8 (radial) unsupported on the grouped-cublas path; use moe_per_expert(act_params=...)")
+        raise ValueError("codes 8/10 (radial) unsupported on the grouped-cublas path; use moe_per_expert(act_params=...)")
     N, H = hidden.shape
     E = gate_up_proj.shape[0]
     flat_t = torch.arange(N, device=hidden.device).unsqueeze(1).expand_as(top_k_indices).flatten()
@@ -908,13 +912,19 @@ def _act_eager(gate, code, alpha=None):
     a = 1.0 if alpha is None else alpha
     if code == 0:
         return F.silu(a * gate.float()).to(gate.dtype)
-    if code == 8:
+    if code in (8, 10):
         g = gate.float()
         r = torch.sqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
-        pw = torch.sigmoid(alpha if torch.is_tensor(alpha) else torch.tensor(float(a), device=g.device))
+        th = alpha if torch.is_tensor(alpha) else torch.tensor(float(a), device=g.device)
+        # 8: p = sigmoid(theta) in (0,1) -- gain r^p is bounded by [1, r], p->0 IS normsilu.
+        # 10: p = tanh(theta) in (-1,1) -- also admits gain < 1 (r^-1 shrinks high-rms rows), which
+        # code 8 structurally cannot express. Safe here because r is an RMS over I dims and stays
+        # well above 1 (measured min 1.58), so r^-1 has no singularity at these shapes.
+        pw = torch.tanh(th) if code == 10 else torch.sigmoid(th)
         return (r.pow(pw) * F.silu(g / r)).to(gate.dtype)
     if code != 2:
-        raise ValueError(f"unsupported act code {code}; only 0 (silu), 2 (normsilu), 8 (radial) exist")
+        raise ValueError(f"unsupported act code {code}; only 0 (silu), 2 (normsilu), "
+                         f"8 (radial, sigmoid p), 10 (radial, tanh p) exist")
 
     g = gate.float()
     g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NS_EPS)
