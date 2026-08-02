@@ -22,7 +22,7 @@ Most need CUDA (Triton). `parity_manas_sm120.py` runs on CPU.
 | `parity_manas_sm120.py` | sm120 Manas: `gamma=0` is exactly `FusedMuon`, and `gamma>0` actually moves the weights |
 | `parity_radial_tanh.py` | act code 10, radial with `p = tanh(theta)` — the negative-`p` (shrink) branch code 8 cannot express, and `theta=0` being exactly normsilu |
 | `parity_bibo.py` | `fused_router` vs the real `BiBoMoERouter` — needs the BiBo venv, excluded from `run_all` unless `--all` |
-| `parity_ssmax.py` | SSMax `C = s*log(n)` per query position, and that it hands SDPA a **bf16** q rather than promoting to fp32 — needs the BiBo venv |
+| `parity_swa_flex.py` | FlexAttention SWA vs the eager banded core — band exactness at non-block-multiple windows/lengths, all four gradients, and the `sigmoid(lse − beta)` sink identity — needs the BiBo venv |
 | `parity_xsa_alpha.py` | `fused_xsa` vs BiBo's eager `apply_xsa` with the per-head `tanh(alpha)` strength, under GQA and with a *different* alpha per head so a head permutation cannot hide — needs the BiBo venv |
 
 `parity_manas_sm120.py` and `parity_radial.py` both check that the feature **changes an end-to-end
