@@ -88,8 +88,7 @@ def main():
     # reference's window by one and require the result to DISAGREE. If flex quietly ignored the
     # window, both would be full causal attention and this would pass by accident -- so also check
     # flex@W differs from flex@2W.
-    print("
-band is load-bearing (W and W+1 must give different answers):")
+    print("\nband is load-bearing (W and W+1 must give different answers):")
     q, k, v, _ = _inputs(1, 4, 2, 512, D, 17, grad=False)
     kw = dict(num_key_value_groups=2, scaling=D ** -0.5)
     f128 = SWA.swa_attention(q, k, v, None, sliding_window=128, **kw)[0]
