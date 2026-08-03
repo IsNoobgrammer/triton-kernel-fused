@@ -103,16 +103,6 @@ def profile():
           f"forward-only, AR-fused ~{tot['fused'] / 1527 * 100:.1f}%")
 
 
-if __name__ == "__main__":
-    bad = parity()
-    print(f"\n{'PARITY FAIL' if bad else 'PARITY OK'}")
-    bad += gradcheck()
-    print(f"{'GRAD FAIL' if bad else 'GRAD OK'}")
-    if not bad:
-        profile()
-        bwd_profile()
-
-
 def gradcheck():
     """Gradients from the fused kernel must match eager autograd on the K3 reference.
 
