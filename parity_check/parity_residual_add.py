@@ -43,6 +43,14 @@ def _mk(k, dtype, seed=0, strided=False):
     return cast(ar), [cast(s) for s in strms], thetas
 
 
+# In fp32 the "truth" reference IS the eager computation, so eager's error is exactly 0 and the
+# `kernel <= eager` gate degenerates -- only the absolute floor does any work there. Set that floor
+# from fp32 epsilon (1.19e-7) with slack for FMA contraction and add reassociation, which is what
+# the residual (7.3e-8 at k=1 growing to 1.8e-7 at k=4) actually is. For bf16/fp16 the eager error
+# is 1e-3..1e-4 and dominates, so the floor never binds and the relative gate is what grades.
+ATOL = {torch.float32: 1e-6, torch.bfloat16: 1e-7, torch.float16: 1e-7}
+
+
 def _err(a, b):
     d = (a.float() - b.float()).abs().max().item()
     s = b.float().abs().max().item()
@@ -63,7 +71,7 @@ def parity():
             eag = residual_add_reference(ar, pairs, modes).to(dtype)
             ker = fused_residual_add(ar, pairs, modes, out_dtype=dtype)
             e, m = _err(eag, gold), _err(ker, gold)
-            ok = m <= max(e * 1.05, 1e-7)
+            ok = m <= max(e * 1.05, ATOL[dtype])
             bad += not ok
             print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {','.join(modes)[:19]:<20}"
                   f"{e:>11.3e}{m:>11.3e}  {'ok' if ok else '<-- FAIL'}")
@@ -98,7 +106,7 @@ def gradcheck():
                                     ("d stream0", es[0], ks[0], gs[0]),
                                     ("d theta", et, kt, gt)):
                 ee, mm = _err(e_, g_), _err(k_, g_)
-                ok = mm <= max(ee * 1.05, 1e-6)
+                ok = mm <= max(ee * 1.05, ATOL[dtype] * 4)   # d theta reduces T*H terms
                 bad += not ok
                 print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {lbl:<14}"
                       f"{ee:>11.3e}{mm:>11.3e}  {'ok' if ok else '<-- FAIL'}")
