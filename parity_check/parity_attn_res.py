@@ -39,28 +39,44 @@ def _mk(T, N, H, dtype):
 
 
 def parity():
-    print("=== parity vs K3 reference ===")
-    print(f"{'T':>7}{'N':>4}{'H':>6}{'dtype':>10}{'rel err':>12}{'cached sq':>12}")
+    """EVERY dtype is scored against the SAME fp32 eager reference, not against eager at its own
+    precision. Grading a bf16 kernel against a bf16 reference hides shared error -- both could
+    drift from the true answer together and still look clean.
+
+    With bf16 INPUTS the true answer is unreachable: the inputs are already quantized, so there is
+    a floor no implementation can beat. The meaningful claim is therefore not "bf16 == fp32" but
+    "the kernel is no worse than eager at the same input precision" -- it must not ADD error on
+    top of the quantization floor. So each row reports both, and the gate is kernel <= eager.
+    """
+    print("=== parity: every dtype vs the FP32 EAGER reference ===")
+    print(f"{'T':>6}{'N':>4}{'H':>6}{'in dtype':>10}{'kernel err':>12}{'eager err':>12}"
+          f"{'cached sq':>12}{'':>4}")
     bad = 0
-    for dtype in (torch.bfloat16, torch.float32):
+    for dtype in (torch.float32, torch.bfloat16):
         for T, N, H in ((4096, 2, 512), (4096, 5, 512), (16384, 5, 512),
                         (16384, 11, 512), (2048, 4, 1024), (1024, 8, 256)):
-            br, ps, w = _mk(T, N, H, dtype)
-            ref = attn_res_reference(br, ps, w, EPS).float()
-            got = fused_attn_res(br, ps, w, EPS).float()
-            rel = (got - ref).abs().max().item() / ref.abs().max().item()
+            br32, ps32, w = _mk(T, N, H, torch.float32)
+            ref = attn_res_reference(br32, ps32, w, EPS).float()          # ground truth
+            den = ref.abs().max().item()
 
-            # cached block squared-norms must give the identical answer
+            br, ps = br32.to(dtype), ps32.to(dtype)
+            e_err = (attn_res_reference(br, ps, w, EPS).float() - ref).abs().max().item() / den
+            k_err = (fused_attn_res(br, ps, w, EPS).float() - ref).abs().max().item() / den
+
             bsq = torch.zeros(T, N, device=DEV, dtype=torch.float32)
             bsq[:, : N - 1] = br.float().pow(2).sum(-1)
-            got2 = fused_attn_res(br, ps, w, EPS, block_sq_sum=bsq).float()
-            rel2 = (got2 - ref).abs().max().item() / ref.abs().max().item()
+            c_err = (fused_attn_res(br, ps, w, EPS, block_sq_sum=bsq).float()
+                     - ref).abs().max().item() / den
 
-            tol = 3e-2 if dtype is torch.bfloat16 else 1e-5
-            ok = rel < tol and rel2 < tol
+            # kernel must not be worse than eager at the same input precision (5% slack for
+            # reduction-order jitter), and fp32 must actually hit fp32 accuracy.
+            ok = k_err <= max(e_err * 1.05, 1e-6) and c_err <= max(e_err * 1.05, 1e-6)
+            if dtype is torch.float32:
+                ok = ok and k_err < 1e-5
             bad += not ok
-            print(f"{T:>7}{N:>4}{H:>6}{str(dtype).split('.')[-1]:>10}"
-                  f"{rel:>12.2e}{rel2:>12.2e}" + ("" if ok else "   <-- FAIL"))
+            print(f"{T:>6}{N:>4}{H:>6}{str(dtype).split('.')[-1]:>10}"
+                  f"{k_err:>12.2e}{e_err:>12.2e}{c_err:>12.2e}"
+                  + ("   ok" if ok else "   <-- FAIL"))
     return bad
 
 
@@ -112,40 +128,49 @@ def gradcheck():
     """
     from kernels.sm75.attn_res import attn_res
     print()
-    print("=== gradcheck: fused backward vs eager autograd on the reference ===")
-    print(f"{'T':>6}{'N':>4}{'H':>6}{'dtype':>10}{'d_block':>11}{'d_prefix':>11}{'d_w':>11}")
+    print("=== gradcheck: EVERY dtype's gradients vs FP32 EAGER autograd ===")
+    print("    k = fused kernel at that input dtype, e = eager at that input dtype;")
+    print("    both scored against eager autograd in fp32. Gate: kernel <= eager.")
+    print(f"{'T':>6}{'N':>4}{'H':>6}{'in dtype':>10}"
+          f"{'d_block k/e':>22}{'d_prefix k/e':>22}{'d_w k/e':>22}")
     bad = 0
-    for dtype, tol in ((torch.float32, 2e-5), (torch.bfloat16, 4e-2)):
+    for dtype in (torch.float32, torch.bfloat16):
         for T, N, H in ((512, 3, 512), (4096, 5, 512), (16384, 11, 512), (1024, 8, 256)):
             torch.manual_seed(1)
-            br0 = torch.randn(T, N - 1, H, device=DEV, dtype=dtype)
-            ps0 = torch.randn(T, H, device=DEV, dtype=dtype)
-            w0 = (torch.randn(H, device=DEV, dtype=torch.float32) * 0.05)
-            g = torch.randn(T, H, device=DEV, dtype=dtype)
+            br32 = torch.randn(T, N - 1, H, device=DEV, dtype=torch.float32)
+            ps32 = torch.randn(T, H, device=DEV, dtype=torch.float32)
+            w32 = torch.randn(H, device=DEV, dtype=torch.float32) * 0.05
+            g32 = torch.randn(T, H, device=DEV, dtype=torch.float32)
 
-            a = [x.clone().requires_grad_(True) for x in (br0, ps0, w0)]
-            b = [x.clone().requires_grad_(True) for x in (br0, ps0, w0)]
+            def grads(fn, dt):
+                xs = [br32.to(dt).clone().requires_grad_(True),
+                      ps32.to(dt).clone().requires_grad_(True),
+                      w32.clone().requires_grad_(True)]
+                fn(xs[0], xs[1], xs[2], EPS).backward(g32.to(dt))
+                return [x.grad.float() for x in xs]
+
             try:
-                # the REFERENCE is what OOMs here, not the kernel -- it needs several fp32
-                # (T,N,H) copies alive for backward. Skip rather than fail when the box is
-                # busy; the shape is still covered by the kernel side.
-                attn_res_reference(a[0], a[1], a[2], EPS).backward(g)
+                # the eager REFERENCE is what OOMs on a busy box -- it needs several fp32
+                # (T,N,H) copies alive for backward, which is the memory the kernel removes.
+                ref = grads(attn_res_reference, torch.float32)      # ground truth
+                eag = ref if dtype is torch.float32 else grads(attn_res_reference, dtype)
             except torch.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 print(f"{T:>6}{N:>4}{H:>6}{str(dtype).split('.')[-1]:>10}"
-                      f"{'  reference OOM (GPU busy) - skipped':>33}")
+                      f"{'   fp32 reference OOM (GPU busy) - skipped':>40}")
                 continue
-            attn_res(b[0], b[1], b[2], EPS).backward(g)
+            ker = grads(attn_res, dtype)
 
-            errs = []
-            for x, y in zip(a, b):
-                num = (x.grad.float() - y.grad.float()).abs().max().item()
-                den = x.grad.float().abs().max().item() + 1e-12
-                errs.append(num / den)
-            ok = all(e < tol for e in errs)
+            cells, ok = [], True
+            for r, e, k in zip(ref, eag, ker):
+                den = r.abs().max().item() + 1e-12
+                ke = (k - r).abs().max().item() / den
+                ee = (e - r).abs().max().item() / den
+                cells.append(f"{ke:.1e}/{ee:.1e}")
+                ok = ok and ke <= max(ee * 1.05, 2e-5)
             bad += not ok
             print(f"{T:>6}{N:>4}{H:>6}{str(dtype).split('.')[-1]:>10}"
-                  + "".join(f"{e:>11.2e}" for e in errs) + ("" if ok else "   <-- FAIL"))
+                  + "".join(f"{c:>22}" for c in cells) + ("" if ok else "   <-- FAIL"))
     return bad
 
 
