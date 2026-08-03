@@ -43,12 +43,12 @@ def _mk(k, dtype, seed=0, strided=False):
     return cast(ar), [cast(s) for s in strms], thetas
 
 
-# In fp32 the "truth" reference IS the eager computation, so eager's error is exactly 0 and the
-# `kernel <= eager` gate degenerates -- only the absolute floor does any work there. Set that floor
-# from fp32 epsilon (1.19e-7) with slack for FMA contraction and add reassociation, which is what
-# the residual (7.3e-8 at k=1 growing to 1.8e-7 at k=4) actually is. For bf16/fp16 the eager error
-# is 1e-3..1e-4 and dominates, so the floor never binds and the relative gate is what grades.
-ATOL = {torch.float32: 1e-6, torch.bfloat16: 1e-7, torch.float16: 1e-7}
+# TRUTH IS FP64, not fp32 eager. Grading fp32 against an fp32 reference makes eager's error exactly
+# 0 by construction, so `kernel <= eager` degenerates and the verdict collapses onto an arbitrary
+# absolute floor -- which is exactly what made three fp32 rows "fail" on the first run of this file
+# and then invited a threshold tweak. Against fp64 both paths carry a real, comparable error and the
+# relative gate does the grading at every dtype. ATOL is then only a 0/0 guard.
+ATOL = 1e-9
 
 
 def _err(a, b):
@@ -58,7 +58,7 @@ def _err(a, b):
 
 
 def parity():
-    print(f"shape ({T}, {H})   gate: kernel err <= eager err, BOTH vs fp32 eager\n")
+    print(f"shape ({T}, {H})   gate: kernel err <= eager err, BOTH vs FP64 truth\n")
     print(f"{'k':>2} {'dtype':>8} {'modes':<20}{'eager':>11}{'kernel':>11}  verdict")
     print("-" * 68)
     bad = 0
@@ -67,14 +67,55 @@ def parity():
         for dtype in (torch.float32, torch.bfloat16, torch.float16):
             ar, strms, th = _mk(k, dtype, seed=k, strided=True)
             pairs = list(zip(th, strms))
-            gold = residual_add_reference(ar.float(), [(t, s.float()) for t, s in pairs], modes)
+            gold = residual_add_reference(ar.double(), [(t.double(), s.double()) for t, s in pairs], modes)
             eag = residual_add_reference(ar, pairs, modes).to(dtype)
             ker = fused_residual_add(ar, pairs, modes, out_dtype=dtype)
             e, m = _err(eag, gold), _err(ker, gold)
-            ok = m <= max(e * 1.05, ATOL[dtype])
+            ok = m <= max(e * 1.05, ATOL)
             bad += not ok
             print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {','.join(modes)[:19]:<20}"
                   f"{e:>11.3e}{m:>11.3e}  {'ok' if ok else '<-- FAIL'}")
+    return bad
+
+
+def model_mix():
+    """The dtype layout BiBo actually runs, which the uniform-dtype rows above never exercise.
+
+    attn_read is fp32 -- apply_attention_residual promotes, because block_residual is seeded from
+    the fp32 embedding. attn_out is bf16 under autocast. The embedding stream is fp32. Eager then
+    evaluates
+
+        attn_read + _c.to(attn_output.dtype) * attn_output
+
+    which ROUNDS THE LEARNED SCALAR TO BF16 and does the product in bf16 before promoting for the
+    add. The kernel promotes every operand to fp32 and accumulates there, so on this layout it
+    should BEAT eager rather than tie it. If it ever merely ties, the fp32 accumulation was lost.
+    """
+    print()
+    print(f"{'case':<34}{'eager':>11}{'kernel':>11}  verdict")
+    print("-" * 62)
+    bad = 0
+    g = torch.Generator(device=DEV).manual_seed(21)
+    ar = torch.randn(T, H, device=DEV, generator=g)                    # fp32, like attn_read
+    big = torch.randn(T, 3, H, device=DEV, generator=g)
+    emb = big[:, 0]                                                    # fp32, strided view
+    ao = torch.randn(T, H, device=DEV, generator=g).bfloat16()         # bf16, like attn_output
+    tc = torch.randn(1, device=DEV, generator=g)
+    td = torch.randn(1, device=DEV, generator=g)
+    f = {"none": lambda x: x, "2sigmoid": lambda x: 2.0 * torch.sigmoid(x)}
+    for lbl, pairs, modes in (("carry only (fp32 + bf16)", [(tc, ao)], ("none",)),
+                              ("carry + emb (model layout)", [(tc, ao), (td, emb)], ("none", "none")),
+                              ("carry 2sigmoid + emb", [(tc, ao), (td, emb)], ("2sigmoid", "none"))):
+        gold = residual_add_reference(ar.double(), [(t.double(), s.double()) for t, s in pairs], modes)
+        eag = ar
+        for (t, sm), m in zip(pairs, modes):        # verbatim exp/modeling_bibo idiom
+            eag = eag + f[m](t.float()).to(sm.dtype) * sm
+        ker = fused_residual_add(ar, pairs, modes)
+        e, k_ = _err(eag, gold), _err(ker, gold)
+        ok = k_ <= max(e * 1.05, ATOL)
+        bad += not ok
+        note = f"   kernel {e / k_:.0f}x closer" if k_ and e / k_ > 2 else ""
+        print(f"{lbl:<34}{e:>11.3e}{k_:>11.3e}  {'ok' if ok else '<-- FAIL'}{note}")
     return bad
 
 
@@ -89,24 +130,24 @@ def gradcheck():
             dout = torch.randn(T, H, device=DEV, dtype=dtype)
 
             def run(fp32, fused):
-                a = (ar0.float() if fp32 else ar0).detach().clone().requires_grad_(True)
-                ss = [(x.float() if fp32 else x).detach().clone().requires_grad_(True) for x in s0]
-                tt = [x.detach().clone().requires_grad_(True) for x in t0]
+                a = (ar0.double() if fp32 else ar0).detach().clone().requires_grad_(True)
+                ss = [(x.double() if fp32 else x).detach().clone().requires_grad_(True) for x in s0]
+                tt = [(x.double() if fp32 else x).detach().clone().requires_grad_(True) for x in t0]
                 if fused:
                     out = make_mlp_input(a, *[v for p in zip(tt, ss) for v in p], modes=modes)
                 else:
                     out = residual_add_reference(a, list(zip(tt, ss)), modes).to(a.dtype)
-                out.backward((dout.float() if fp32 else dout))
+                out.backward((dout.double() if fp32 else dout))
                 return a.grad, [x.grad for x in ss], torch.stack([x.grad.reshape(()) for x in tt])
 
-            ga, gs, gt = run(True, False)                       # fp32 eager = truth
+            ga, gs, gt = run(True, False)                       # fp64 eager = truth
             ea, es, et = run(False, False)
             ka, ks, kt = run(False, True)
             for lbl, e_, k_, g_ in (("d attn_read", ea, ka, ga),
                                     ("d stream0", es[0], ks[0], gs[0]),
                                     ("d theta", et, kt, gt)):
                 ee, mm = _err(e_, g_), _err(k_, g_)
-                ok = mm <= max(ee * 1.05, ATOL[dtype] * 4)   # d theta reduces T*H terms
+                ok = mm <= max(ee * 1.05, ATOL)
                 bad += not ok
                 print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {lbl:<14}"
                       f"{ee:>11.3e}{mm:>11.3e}  {'ok' if ok else '<-- FAIL'}")
@@ -189,6 +230,6 @@ if __name__ == "__main__":
     elif what == "evict":
         evict()
     else:
-        n = parity() + gradcheck()
+        n = parity() + model_mix() + gradcheck()
         print("\n" + ("PASS" if not n else f"FAIL ({n} checks)"))
         sys.exit(1 if n else 0)
