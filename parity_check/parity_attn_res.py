@@ -143,6 +143,42 @@ def profile():
           f"forward-only, AR-fused ~{tot['fused'] / 1527 * 100:.1f}%")
 
 
+def roofline():
+    """Where does the kernel's time actually go, and how close is it to memory-bound ideal?
+
+    Ideal traffic, per site (bf16 V, fp32 out to match cat promotion):
+      fwd  read br + ps, write out
+      bwd  read br + ps + dout, write dbr + dps + dwp
+    dwp is the (T,H) fp32 partial for the dw reduction -- at one token per program it is written
+    AND read back once, which is pure overhead for a (H,) gradient.
+    """
+    from kernels.sm75.attn_res import attn_res
+    print()
+    print("=== roofline, bf16 in / fp32 out, T=16384 H=512 ===")
+    print(f"{'N':>4}{'fwd ms':>9}{'fwd GB/s':>10}{'bwd ms':>9}{'bwd GB/s':>10}"
+          f"{'dwp share':>11}")
+    T, H = 16384, 512
+    for N in (2, 3, 5, 8, 11):
+        br, ps, w = _mk(T, N, H, torch.bfloat16)
+        t_f = _bench(fused_attn_res, br, ps, w)
+        brg = br.clone().requires_grad_(True)
+        psg = ps.clone().requires_grad_(True)
+        wg = w.clone().requires_grad_(True)
+        g = torch.randn(T, H, device=DEV, dtype=torch.float32)
+        def bwd():
+            for x in (brg, psg, wg):
+                x.grad = None
+            attn_res(brg, psg, wg, EPS).backward(g)
+        t_all = _bench(bwd)
+        t_b = max(t_all - t_f, 1e-6)
+        rd = T * (N - 1) * H * 2 + T * H * 2
+        gb_f = (rd + T * H * 4) / 1e9
+        dwp = T * H * 4 * 2                       # written by the kernel, read by the sum
+        gb_b = (rd + T * H * 4 + T * (N - 1) * H * 2 + T * H * 2 + dwp) / 1e9
+        print(f"{N:>4}{t_f:>8.3f}m{gb_f / (t_f * 1e-3):>10.0f}{t_b:>8.3f}m"
+              f"{gb_b / (t_b * 1e-3):>10.0f}{dwp / 1e9 / gb_b * 100:>10.0f}%")
+
+
 def gradcheck():
     """Gradients from the fused kernel must match eager autograd on the K3 reference.
 
@@ -236,3 +272,4 @@ if __name__ == "__main__":
     if not bad:
         profile()
         bwd_profile()
+        roofline()
