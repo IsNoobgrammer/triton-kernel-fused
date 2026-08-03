@@ -125,7 +125,7 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
 
 @triton.jit
 def _attn_res_bwd(
-    BR, PS, W, DOUT, DBR, DPS, DDOT,
+    BR, PS, W, DOUT, DBR, DPS, DWP,
     T, N, H, eps,
     sbr_t, sbr_n, sbr_h,
     sps_t, sps_h,
@@ -173,7 +173,12 @@ def _attn_res_bwd(
              mask=(mask_n & (~is_last))[:, None] & mask_h[None, :])
     dps = tl.sum(tl.where(is_last[:, None], dv, 0.0), axis=0)
     tl.store(DPS + t * sps_t + offs_h * sps_h, dps, mask=mask_h)
-    tl.store(DDOT + t * N + offs_n, d_dot, mask=mask_n)
+
+    # dw's per-token contribution, reduced HERE in fp32 from the same v and d_dot the rest of the
+    # pass uses. Doing it outside meant casting the fp32 d_dot down to the input dtype to matmul
+    # against block_residual, and in bf16 that made d_w measurably worse than eager (4.4e-3 vs
+    # 3.4e-3 against the fp32 reference) while d_block and d_prefix matched exactly.
+    tl.store(DWP + t * H + offs_h, tl.sum(d_dot[:, None] * v, axis=0), mask=mask_h)
 
 
 class FusedAttnRes(torch.autograd.Function):
@@ -196,9 +201,9 @@ class FusedAttnRes(torch.autograd.Function):
         dout = dout.contiguous()
         dbr = torch.empty_like(br)
         dps = torch.empty_like(ps)
-        ddot = torch.empty(T, N, device=ps.device, dtype=torch.float32)
+        dwp = torch.empty(T, H, device=ps.device, dtype=torch.float32)
         _attn_res_bwd[(T,)](
-            br, ps, w.contiguous().float(), dout, dbr, dps, ddot,
+            br, ps, w.contiguous().float(), dout, dbr, dps, dwp,
             T, N, H, ctx.eps,
             br.stride(0), br.stride(1), br.stride(2),
             ps.stride(0), ps.stride(1),
@@ -206,11 +211,9 @@ class FusedAttnRes(torch.autograd.Function):
             BLOCK_N=triton.next_power_of_2(N), BLOCK_H=triton.next_power_of_2(H),
             num_warps=4,
         )
-        # dw = sum over tokens AND candidates of d_dot_i * v_i. Done here as two small GEMVs
-        # rather than atomics in the kernel: 16384 x 512 atomic adds would dominate the pass.
-        dw = ddot[:, : N - 1].reshape(1, -1).to(br.dtype) @ br.reshape(-1, H)
-        dw = dw.float().squeeze(0) + (ddot[:, N - 1] @ ps.float())
-        return dbr, dps, dw.to(w.dtype), None
+        # Only the cross-token reduction is left, and it is a plain fp32 sum over a (T, H)
+        # partial -- no atomics (16384 x 512 of them would dominate the pass) and no downcast.
+        return dbr, dps, dwp.sum(0).to(w.dtype), None
 
 
 def attn_res(block_residual, prefix_sum, score_weight, eps=1e-6):
