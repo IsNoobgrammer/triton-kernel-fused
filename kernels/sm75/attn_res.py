@@ -39,11 +39,23 @@ import triton.language as tl
 
 __all__ = ["fused_attn_res", "attn_res", "FusedAttnRes", "attn_res_reference"]
 
-# Tokens per backward program. >1 shrinks the dw partial from (T,H) to (T/TILE,H) and amortizes
+# Tokens per backward program. >1 shrinks the dw partial from (T,H) to (T/TILE,H) AND amortizes
 # the (H,) score-weight load, but the loop is UNROLLED, so a large value blows up registers and
-# I-cache -- measured: TILE=32 doubled the N=11 backward (0.490 -> 0.991 ms) while cutting peak
-# memory 520 -> 421 MB. Swept, not guessed; override with BIBO_AR_BWD_TILE.
-_BWD_TILE = int(os.environ.get("BIBO_AR_BWD_TILE", "4"))
+# I-cache. Swept at T=16384 H=512 (ms, and the dwp size it buys):
+#   TILE    dwp     N=3     N=5    N=11
+#      1   33.6   0.204   0.283   0.525
+#      2   16.8   0.189   0.265   0.502   <- best at N=11
+#      4    8.4   0.184   0.262   0.524   <- best at N=3,5
+#     32    1.0   0.234   0.378   1.023   <- unrolling dominates
+# The crossover is the per-token tile size, which grows with N, so pick on N. Override with
+# BIBO_AR_BWD_TILE.
+_BWD_TILE_ENV = os.environ.get("BIBO_AR_BWD_TILE")
+
+
+def _bwd_tile(N):
+    if _BWD_TILE_ENV is not None:
+        return int(_BWD_TILE_ENV)
+    return 4 if N <= 8 else 2
 
 
 @triton.jit
@@ -219,7 +231,7 @@ class FusedAttnRes(torch.autograd.Function):
         dout = dout.contiguous()
         dbr = torch.empty_like(br)
         dps = torch.empty_like(ps)
-        TILE = _BWD_TILE
+        TILE = _bwd_tile(N)
         n_prog = triton.cdiv(T, TILE)
         dwp = torch.empty(n_prog, H, device=ps.device, dtype=torch.float32)
         _attn_res_bwd[(n_prog,)](
