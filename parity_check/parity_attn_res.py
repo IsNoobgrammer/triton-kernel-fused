@@ -273,3 +273,30 @@ if __name__ == "__main__":
         profile()
         bwd_profile()
         roofline()
+        tile_sweep()
+
+
+def tile_sweep():
+    """TILE tokens per backward program: memory/time tradeoff, swept rather than guessed."""
+    import importlib, os as _os
+    import kernels.sm75.attn_res as K
+    print()
+    print("=== backward TILE sweep (dw partial is (T/TILE, H)) ===")
+    print(f"{'TILE':>5}{'dwp MB':>9}" + "".join(f"{'N='+str(n):>10}" for n in (3, 5, 11)))
+    T, H = 16384, 512
+    for tile in (1, 2, 4, 8, 16, 32):
+        _os.environ["BIBO_AR_BWD_TILE"] = str(tile)
+        importlib.reload(K)
+        row = []
+        for N in (3, 5, 11):
+            br, ps, w = _mk(T, N, H, torch.bfloat16)
+            br.requires_grad_(True); ps.requires_grad_(True); w.requires_grad_(True)
+            g = torch.randn(T, H, device=DEV, dtype=torch.float32)
+            def bwd():
+                for x in (br, ps, w):
+                    x.grad = None
+                K.attn_res(br, ps, w, EPS).backward(g)
+            row.append(_bench(bwd))
+        print(f"{tile:>5}{T / tile * H * 4 / 1e6:>9.1f}" + "".join(f"{r:>9.3f}m" for r in row))
+    _os.environ.pop("BIBO_AR_BWD_TILE", None)
+    importlib.reload(K)

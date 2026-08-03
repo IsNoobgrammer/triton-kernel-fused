@@ -31,11 +31,19 @@ throughout, matching the reference's precision policy exactly.
 changes, so its squared norm is the same at every downstream site and every layer, and recomputing
 it 2L+1 times is pure waste. Pass `block_sq_sum` to skip it.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 __all__ = ["fused_attn_res", "attn_res", "FusedAttnRes", "attn_res_reference"]
+
+# Tokens per backward program. >1 shrinks the dw partial from (T,H) to (T/TILE,H) and amortizes
+# the (H,) score-weight load, but the loop is UNROLLED, so a large value blows up registers and
+# I-cache -- measured: TILE=32 doubled the N=11 backward (0.490 -> 0.991 ms) while cutting peak
+# memory 520 -> 421 MB. Swept, not guessed; override with BIBO_AR_BWD_TILE.
+_BWD_TILE = int(os.environ.get("BIBO_AR_BWD_TILE", "4"))
 
 
 @triton.jit
@@ -211,7 +219,7 @@ class FusedAttnRes(torch.autograd.Function):
         dout = dout.contiguous()
         dbr = torch.empty_like(br)
         dps = torch.empty_like(ps)
-        TILE = 32
+        TILE = _BWD_TILE
         n_prog = triton.cdiv(T, TILE)
         dwp = torch.empty(n_prog, H, device=ps.device, dtype=torch.float32)
         _attn_res_bwd[(n_prog,)](
