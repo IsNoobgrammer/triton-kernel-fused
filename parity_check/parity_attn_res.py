@@ -106,5 +106,84 @@ def profile():
 if __name__ == "__main__":
     bad = parity()
     print(f"\n{'PARITY FAIL' if bad else 'PARITY OK'}")
+    bad += gradcheck()
+    print(f"{'GRAD FAIL' if bad else 'GRAD OK'}")
     if not bad:
         profile()
+        bwd_profile()
+
+
+def gradcheck():
+    """Gradients from the fused kernel must match eager autograd on the K3 reference.
+
+    This is the assertion that matters for training: a forward that is right and a backward that
+    is subtly wrong produces a model that trains, looks plausible, and is optimizing something
+    else. Checked in fp64 for exactness and fp32/bf16 at real shapes for the dtypes we run.
+    """
+    from kernels.sm75.attn_res import attn_res
+    print()
+    print("=== gradcheck: fused backward vs eager autograd on the reference ===")
+    print(f"{'T':>6}{'N':>4}{'H':>6}{'dtype':>10}{'d_block':>11}{'d_prefix':>11}{'d_w':>11}")
+    bad = 0
+    for dtype, tol in ((torch.float32, 2e-5), (torch.bfloat16, 4e-2)):
+        for T, N, H in ((512, 3, 512), (4096, 5, 512), (16384, 11, 512), (1024, 8, 256)):
+            torch.manual_seed(1)
+            br0 = torch.randn(T, N - 1, H, device=DEV, dtype=dtype)
+            ps0 = torch.randn(T, H, device=DEV, dtype=dtype)
+            w0 = (torch.randn(H, device=DEV, dtype=torch.float32) * 0.05)
+            g = torch.randn(T, H, device=DEV, dtype=dtype)
+
+            a = [x.clone().requires_grad_(True) for x in (br0, ps0, w0)]
+            b = [x.clone().requires_grad_(True) for x in (br0, ps0, w0)]
+            attn_res_reference(a[0], a[1], a[2], EPS).backward(g)
+            attn_res(b[0], b[1], b[2], EPS).backward(g)
+
+            errs = []
+            for x, y in zip(a, b):
+                num = (x.grad.float() - y.grad.float()).abs().max().item()
+                den = x.grad.float().abs().max().item() + 1e-12
+                errs.append(num / den)
+            ok = all(e < tol for e in errs)
+            bad += not ok
+            print(f"{T:>6}{N:>4}{H:>6}{str(dtype).split('.')[-1]:>10}"
+                  + "".join(f"{e:>11.2e}" for e in errs) + ("" if ok else "   <-- FAIL"))
+    return bad
+
+
+def bwd_profile():
+    from kernels.sm75.attn_res import attn_res
+    print()
+    print("=== fwd+bwd profile, bf16, T=16384 H=512 ===")
+    print(f"{'N':>4}{'K3 naive':>12}{'opt torch':>12}{'fused':>10}{'vs naive':>10}"
+          f"{'peak MB naive':>15}{'peak MB fused':>15}")
+    T, H = 16384, 512
+    for N in (3, 5, 11):
+        def run(fn):
+            br = torch.randn(T, N - 1, H, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+            ps = torch.randn(T, H, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+            w = torch.randn(H, device=DEV, dtype=torch.float32, requires_grad=True)
+            g = torch.randn(T, H, device=DEV, dtype=torch.bfloat16)
+            def step():
+                for x in (br, ps, w):
+                    x.grad = None
+                fn(br, ps, w, EPS).backward(g)
+            torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+            step(); torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() / 1e6
+            return triton.testing.do_bench(step, warmup=20, rep=100), peak
+        t_ref, m_ref = run(attn_res_reference)
+        t_opt, _ = run(_opt_torch)
+        t_fus, m_fus = run(attn_res)
+        print(f"{N:>4}{t_ref:>11.3f}m{t_opt:>11.3f}m{t_fus:>9.3f}m{t_ref / t_fus:>9.2f}x"
+              f"{m_ref:>15.0f}{m_fus:>15.0f}")
+
+
+if __name__ == "__main__":
+    bad = parity()
+    print()
+    print("PARITY FAIL" if bad else "PARITY OK")
+    bad += gradcheck()
+    print(f"{'GRAD FAIL' if bad else 'GRAD OK'}")
+    if not bad:
+        profile()
+        bwd_profile()

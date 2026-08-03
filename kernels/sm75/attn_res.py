@@ -35,7 +35,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fused_attn_res", "attn_res_reference"]
+__all__ = ["fused_attn_res", "attn_res", "FusedAttnRes", "attn_res_reference"]
 
 
 @triton.jit
@@ -121,6 +121,101 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _attn_res_bwd(
+    BR, PS, W, DOUT, DBR, DPS, DDOT,
+    T, N, H, eps,
+    sbr_t, sbr_n, sbr_h,
+    sps_t, sps_h,
+    sdo_t, sdo_h,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Recompute the forward from the SAVED INPUTS, then backprop -- one read of V, no fp32
+    (T,N,H) tensor is ever stored between forward and backward. That is the whole point: the
+    eager path keeps several of them alive per site, which is where AttnRes's memory went."""
+    t = tl.program_id(0)
+    if t >= T:
+        return
+
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_n = offs_n < N
+    mask_h = offs_h < H
+    is_last = offs_n == (N - 1)
+
+    br = tl.load(BR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
+                 mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
+    ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h, mask=mask_h[None, :], other=0.0)
+    v = tl.where(is_last[:, None], ps, br).to(tl.float32)
+    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)
+    dout = tl.load(DOUT + t * sdo_t + offs_h * sdo_h, mask=mask_h, other=0.0).to(tl.float32)
+
+    # ---- recompute forward
+    sq = tl.sum(v * v, axis=1)
+    dot = tl.sum(v * w[None, :], axis=1)
+    inv = tl.rsqrt(sq / H + eps)
+    score = tl.where(mask_n, dot * inv, float("-inf"))
+    p = tl.exp(score - tl.max(score, axis=0))
+    p = p / tl.sum(p, axis=0)
+
+    # ---- backward
+    dp = tl.sum(dout[None, :] * v, axis=1)                 # d out / d p_i
+    ds = p * (dp - tl.sum(p * dp, axis=0))                 # softmax jacobian
+    d_dot = ds * inv
+    dsq = -0.5 * ds * dot * inv * inv * inv / H            # through rsqrt(sq/H + eps)
+
+    dv = p[:, None] * dout[None, :] + d_dot[:, None] * w[None, :] + 2.0 * v * dsq[:, None]
+
+    tl.store(DBR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h, dv,
+             mask=(mask_n & (~is_last))[:, None] & mask_h[None, :])
+    dps = tl.sum(tl.where(is_last[:, None], dv, 0.0), axis=0)
+    tl.store(DPS + t * sps_t + offs_h * sps_h, dps, mask=mask_h)
+    tl.store(DDOT + t * N + offs_n, d_dot, mask=mask_n)
+
+
+class FusedAttnRes(torch.autograd.Function):
+    """Autograd wrapper. Saves ONLY the inputs -- block_residual (already alive and shared across
+    every site of the layer), prefix_sum, and the folded weight -- and recomputes the mix in
+    backward. Nothing of shape (T, N, H) is retained, which is the memory the eager path spends."""
+
+    @staticmethod
+    def forward(ctx, block_residual, prefix_sum, score_weight, eps):
+        out = fused_attn_res(block_residual, prefix_sum, score_weight, eps)
+        ctx.save_for_backward(block_residual, prefix_sum, score_weight)
+        ctx.eps = eps
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        br, ps, w = ctx.saved_tensors
+        T, H = ps.shape
+        N = br.shape[1] + 1
+        dout = dout.contiguous()
+        dbr = torch.empty_like(br)
+        dps = torch.empty_like(ps)
+        ddot = torch.empty(T, N, device=ps.device, dtype=torch.float32)
+        _attn_res_bwd[(T,)](
+            br, ps, w.contiguous().float(), dout, dbr, dps, ddot,
+            T, N, H, ctx.eps,
+            br.stride(0), br.stride(1), br.stride(2),
+            ps.stride(0), ps.stride(1),
+            dout.stride(0), dout.stride(1),
+            BLOCK_N=triton.next_power_of_2(N), BLOCK_H=triton.next_power_of_2(H),
+            num_warps=4,
+        )
+        # dw = sum over tokens AND candidates of d_dot_i * v_i. Done here as two small GEMVs
+        # rather than atomics in the kernel: 16384 x 512 atomic adds would dominate the pass.
+        dw = ddot[:, : N - 1].reshape(1, -1).to(br.dtype) @ br.reshape(-1, H)
+        dw = dw.float().squeeze(0) + (ddot[:, N - 1] @ ps.float())
+        return dbr, dps, dw.to(w.dtype), None
+
+
+def attn_res(block_residual, prefix_sum, score_weight, eps=1e-6):
+    """Differentiable fused AR mix. Drop-in for `apply_attention_residual`."""
+    return FusedAttnRes.apply(block_residual, prefix_sum, score_weight, eps)
 
 
 def attn_res_reference(block_residual, prefix_sum, score_weight, eps=1e-6):
