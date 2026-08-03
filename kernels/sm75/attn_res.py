@@ -105,7 +105,9 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
     N = block_residual.shape[1] + 1
     assert block_residual.shape[0] == T and block_residual.shape[2] == H
     out = torch.empty_like(prefix_sum)
-    BLOCK_N = max(16, triton.next_power_of_2(N))
+    # Size the N tile to N, not to a fixed floor: at N=2 a BLOCK_N of 16 wastes 8x the lanes on
+    # masked padding, and the profile showed exactly that (315 GB/s at N=2 vs 805 at N=8).
+    BLOCK_N = triton.next_power_of_2(N)
     BLOCK_H = triton.next_power_of_2(H)
     _attn_res_fwd[(T,)](
         block_residual, prefix_sum, score_weight.contiguous().float(), out,
