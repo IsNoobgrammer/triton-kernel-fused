@@ -65,7 +65,7 @@ def _attn_res_fwd(
                  mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
     ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h,
                  mask=mask_h[None, :], other=0.0)
-    v = tl.where(is_last[:, None], ps, br).to(tl.float32)
+    v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
 
     w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)
 
@@ -104,7 +104,13 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
     T, H = prefix_sum.shape
     N = block_residual.shape[1] + 1
     assert block_residual.shape[0] == T and block_residual.shape[2] == H
-    out = torch.empty_like(prefix_sum)
+    # MATCH torch.cat's type promotion. Inside the model block_residual is fp32 (it is seeded
+    # from the fp32 embedding) while prefix_sum is bf16, and the reference does
+    # `cat(br, ps).float() ... .to(values.dtype)` -- i.e. it returns the PROMOTED dtype, fp32.
+    # Returning empty_like(prefix_sum) instead silently handed the model a bf16 tensor where
+    # eager gave fp32, which changed every downstream layernorm and residual add.
+    out_dtype = torch.promote_types(block_residual.dtype, prefix_sum.dtype)
+    out = torch.empty(prefix_sum.shape, device=prefix_sum.device, dtype=out_dtype)
     # Size the N tile to N, not to a fixed floor: at N=2 a BLOCK_N of 16 wastes 8x the lanes on
     # masked padding, and the profile showed exactly that (315 GB/s at N=2 vs 805 at N=8).
     BLOCK_N = triton.next_power_of_2(N)
@@ -149,7 +155,7 @@ def _attn_res_bwd(
     br = tl.load(BR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
                  mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
     ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h, mask=mask_h[None, :], other=0.0)
-    v = tl.where(is_last[:, None], ps, br).to(tl.float32)
+    v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
     w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)
     dout = tl.load(DOUT + t * sdo_t + offs_h * sdo_h, mask=mask_h, other=0.0).to(tl.float32)
 

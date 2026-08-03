@@ -80,6 +80,30 @@ def parity():
     return bad
 
 
+def mixed_dtype():
+    """block_residual fp32 + prefix_sum bf16 -- the pair the MODEL actually produces.
+
+    The reference concatenates them, so torch type promotion makes the RESULT fp32. The kernel
+    returned empty_like(prefix_sum) = bf16 and silently changed the model's residual dtype; the
+    standalone parity never caught it because it fed both sides the same dtype.
+    """
+    print()
+    print("=== mixed dtype: block_residual fp32 + prefix_sum bf16 (what the model produces) ===")
+    print(f"{'T':>6}{'N':>4}{'H':>6}{'ref dtype':>12}{'kernel dtype':>14}{'rel err':>11}")
+    bad = 0
+    for T, N, H in ((4096, 5, 512), (16384, 5, 512), (16384, 11, 512)):
+        br32, ps32, w = _mk(T, N, H, torch.float32)
+        br, ps = br32, ps32.to(torch.bfloat16)
+        ref = attn_res_reference(br, ps, w, EPS)
+        got = fused_attn_res(br, ps, w, EPS)
+        rel = (got.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
+        ok = got.dtype == ref.dtype and rel < 1e-5
+        bad += not ok
+        print(f"{T:>6}{N:>4}{H:>6}{str(ref.dtype).split('.')[-1]:>12}"
+              f"{str(got.dtype).split('.')[-1]:>14}{rel:>11.2e}" + ("   ok" if ok else "   <-- FAIL"))
+    return bad
+
+
 def _bench(fn, *a, warmup=10, iters=50):
     for _ in range(warmup):
         fn(*a)
@@ -204,6 +228,7 @@ def bwd_profile():
 
 if __name__ == "__main__":
     bad = parity()
+    bad += mixed_dtype()
     print()
     print("PARITY FAIL" if bad else "PARITY OK")
     bad += gradcheck()
