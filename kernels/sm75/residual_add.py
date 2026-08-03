@@ -220,12 +220,23 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
 
 
 def residual_add_reference(attn_read, pairs, modes):
-    """The eager formula, spelled out. This is what parity grades against, in fp32."""
+    """The eager formula, spelled out. What parity grades against.
+
+    Accumulates at the WIDEST input dtype, floored at fp32 -- never hardcoded to .float(). A fixed
+    fp32 accumulation makes this function unusable as a high-precision reference: passing fp64
+    inputs silently returned an fp32 answer, so fp32 eager scored an error of exactly 0 against its
+    own output and the `kernel <= eager` gate quietly became vacuous at that dtype.
+    """
     f = {"none": lambda x: x, "sigmoid": torch.sigmoid, "tanh": torch.tanh,
          "2sigmoid": lambda x: 2.0 * torch.sigmoid(x), "2tanh": lambda x: 2.0 * torch.tanh(x)}
-    out = attn_read.float()
+    acc = torch.promote_types(attn_read.dtype, torch.float32)
+    for _, s in pairs:
+        acc = torch.promote_types(acc, s.dtype)
+    for t, _ in pairs:
+        acc = torch.promote_types(acc, t.dtype)
+    out = attn_read.to(acc)
     for (theta, s), m in zip(pairs, modes):
-        out = out + f[m](theta.float()).reshape(*([1] * (s.ndim - 1)), -1).squeeze() * s.float()
+        out = out + f[m](theta.to(acc)).reshape(()) * s.to(acc)
     return out
 
 
