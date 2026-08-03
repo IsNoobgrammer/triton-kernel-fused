@@ -1,5 +1,6 @@
 from .cross_entropy import fused_linear_cross_entropy
 from .xsa import fused_xsa, FusedXSA
+from .attn_res import fused_attn_res, attn_res_reference
 from .router import fused_router, router_bias_update, FusedConvRouterCuDNN
 from .moe import moe, moe_per_expert, moe_eager
 from .muon import FusedMuon, DistributedMuon, AmalgamatedMuon, newton_schulz
@@ -11,6 +12,7 @@ from .newton_schulz_gram import (
 __all__ = [
     "fused_linear_cross_entropy",
     "fused_xsa", "FusedXSA",
+    "fused_attn_res", "attn_res_reference",
     "fused_router", "router_bias_update", "FusedConvRouterCuDNN",
     "moe", "moe_per_expert", "moe_eager",
     "FusedMuon", "DistributedMuon", "AmalgamatedMuon", "newton_schulz",
