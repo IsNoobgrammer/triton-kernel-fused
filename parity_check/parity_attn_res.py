@@ -262,20 +262,6 @@ def bwd_profile():
               f"{m_ref:>15.0f}{m_fus:>15.0f}")
 
 
-if __name__ == "__main__":
-    bad = parity()
-    bad += mixed_dtype()
-    print()
-    print("PARITY FAIL" if bad else "PARITY OK")
-    bad += gradcheck()
-    print(f"{'GRAD FAIL' if bad else 'GRAD OK'}")
-    if not bad:
-        profile()
-        bwd_profile()
-        roofline()
-        tile_sweep()
-
-
 def tile_sweep():
     """TILE tokens per backward program: memory/time tradeoff, swept rather than guessed."""
     import importlib, os as _os
@@ -300,3 +286,17 @@ def tile_sweep():
         print(f"{tile:>5}{T / tile * H * 4 / 1e6:>9.1f}" + "".join(f"{r:>9.3f}m" for r in row))
     _os.environ.pop("BIBO_AR_BWD_TILE", None)
     importlib.reload(K)
+
+
+if __name__ == "__main__":
+    bad = parity()
+    bad += mixed_dtype()
+    print()
+    print("PARITY FAIL" if bad else "PARITY OK")
+    bad += gradcheck()
+    print(f"{'GRAD FAIL' if bad else 'GRAD OK'}")
+    if not bad:
+        profile()
+        bwd_profile()
+        roofline()
+        tile_sweep()
