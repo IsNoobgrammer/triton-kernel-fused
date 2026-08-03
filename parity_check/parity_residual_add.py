@@ -50,6 +50,30 @@ def _mk(k, dtype, seed=0, strided=False):
 # relative gate does the grading at every dtype. ATOL is then only a 0/0 guard.
 ATOL = 1e-9
 
+# Per-quantity floors for BACKWARD only, each set from measurement rather than taste.
+#
+# `kernel <= eager` compares two algorithms, and it is the right rule when the difference between
+# them exceeds the rounding floor. d theta is a reduction over T*H = 33.5M fp32 terms, where it
+# does not. A 6-seed sweep of d theta (see the round notes) gave:
+#
+#     k=2 fp32   eager mean 1.02e-07  |  kernel mean 1.90e-07
+#     k=2 bf16   eager mean 1.61e-07  |  kernel mean 1.26e-07     kernel better
+#     k=3 fp32   eager mean 4.10e-07  |  kernel mean 2.92e-07     kernel better
+#     k=3 bf16   eager mean 3.32e-07  |  kernel mean 4.67e-07
+#
+# The kernel wins 10 of 24 individual cases and 2 of 4 configurations; the per-seed ratio swings
+# 0.06x to 16x. The 16x case had eager at 1.456e-08, an order of magnitude BELOW fp32 epsilon,
+# which no 33.5M-term reduction achieves honestly -- it drew a lucky cancellation. Both paths span
+# 1.5e-8 to 1.2e-6 across seeds, so a single-seed comparison grades the seed. 2e-6 is that measured
+# envelope; anything above it is a real regression, anything below is unresolvable.
+#
+# d stream is c * dout, one multiply. Its only extra error against eager is that tl.sigmoid and
+# torch.sigmoid can differ by 1 ULP on the scalar, which then scales the whole tensor -- observed
+# as exactly 2.0x at k=3. A few fp32 eps (1.19e-7) covers that and nothing larger.
+#
+# d attn_read is returned by alias and is exact, so it keeps a zero floor.
+FLOOR = {"d attn_read": ATOL, "d stream0": 5e-7, "d theta": 2e-6}
+
 
 def _err(a, b):
     d = (a.float() - b.float()).abs().max().item()
@@ -147,7 +171,7 @@ def gradcheck():
                                     ("d stream0", es[0], ks[0], gs[0]),
                                     ("d theta", et, kt, gt)):
                 ee, mm = _err(e_, g_), _err(k_, g_)
-                ok = mm <= max(ee * 1.05, ATOL)
+                ok = mm <= max(ee * 1.05, FLOOR[lbl])
                 bad += not ok
                 print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {lbl:<14}"
                       f"{ee:>11.3e}{mm:>11.3e}  {'ok' if ok else '<-- FAIL'}")
