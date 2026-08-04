@@ -37,8 +37,16 @@ truth. It also cost bpb: two matched same-box pairs went the wrong way (c+d +0.0
 with train loss agreeing, because removing that per-element quantization removes noise the model
 was benefiting from. A kernel must REPRODUCE its reference, not improve it -- "more accurate"
 silently changed the model while claiming to change only the implementation. So the scalar and the
-product are both rounded to the stream dtype here, and only the accumulation stays fp32, matching
-eager term for term. To run the eager path instead, use --fused_res_add false.
+product are both rounded to the stream dtype here, and the running accumulator is rounded to the
+OUTPUT dtype after every term -- eager's `h = h + ...` chain rounds at each step, so an fp32
+accumulator that rounds once at the end is a different computation whenever the output is not fp32.
+To run the eager path instead, use --fused_res_add false.
+
+RESIDUAL GAP, measured and accepted: with an FP32 stream the quantization casts are no-ops, so
+Triton contracts `cq*sv + acc` into an FMA -- one rounding where eager does two. That shows up as
+4.8e-07 absolute on the carry+emb layout, about 4 fp32 ULPs, five orders of magnitude below the
+bf16 quantization this change restores. The k=1 carry case, which has a bf16 stream and therefore a
+real cast, is exactly bit-identical.
 
 WHY THE TRANSFORM LIVES IN THE KERNEL. theta is the leaf parameter and f is sigmoid/tanh/identity.
 Doing f on the host is arithmetically free but puts a tiny op in the autograd graph per scalar per
@@ -114,22 +122,26 @@ def _res_add_fwd(
         c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
         cq = c.to(S0.dtype.element_ty).to(tl.float32)
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        acc += (cq * sv).to(S0.dtype.element_ty).to(tl.float32)
+        prod = (cq * sv).to(S0.dtype.element_ty).to(tl.float32)
+        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
     if K > 1:
         c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
         cq = c.to(S1.dtype.element_ty).to(tl.float32)
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        acc += (cq * sv).to(S1.dtype.element_ty).to(tl.float32)
+        prod = (cq * sv).to(S1.dtype.element_ty).to(tl.float32)
+        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
     if K > 2:
         c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
         cq = c.to(S2.dtype.element_ty).to(tl.float32)
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        acc += (cq * sv).to(S2.dtype.element_ty).to(tl.float32)
+        prod = (cq * sv).to(S2.dtype.element_ty).to(tl.float32)
+        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
     if K > 3:
         c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
         cq = c.to(S3.dtype.element_ty).to(tl.float32)
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        acc += (cq * sv).to(S3.dtype.element_ty).to(tl.float32)
+        prod = (cq * sv).to(S3.dtype.element_ty).to(tl.float32)
+        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
