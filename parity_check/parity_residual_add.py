@@ -92,13 +92,18 @@ def parity():
             ar, strms, th = _mk(k, dtype, seed=k, strided=True)
             pairs = list(zip(th, strms))
             gold = residual_add_reference(ar.double(), [(t.double(), s.double()) for t, s in pairs], modes)
-            eag = residual_add_reference(ar, pairs, modes).to(dtype)
-            ker = fused_residual_add(ar, pairs, modes, out_dtype=dtype)
-            e, m = _err(eag, gold), _err(ker, gold)
-            ok = m <= max(e * 1.05, ATOL)
+            fmap = {"none": lambda x: x, "sigmoid": torch.sigmoid, "tanh": torch.tanh,
+                    "2sigmoid": lambda x: 2.0 * torch.sigmoid(x),
+                    "2tanh": lambda x: 2.0 * torch.tanh(x)}
+            eag = ar                                      # eager, term by term, as the model writes it
+            for (t_, s_), m_ in zip(pairs, modes):
+                eag = eag + fmap[m_](t_.float()).to(s_.dtype) * s_
+            ker = fused_residual_add(ar, pairs, modes, out_dtype=eag.dtype)
+            d = (ker.float() - eag.float()).abs().max().item()
+            ok = d == 0.0
             bad += not ok
             print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {','.join(modes)[:19]:<20}"
-                  f"{e:>11.3e}{m:>11.3e}  {'ok' if ok else '<-- FAIL'}")
+                  f"{_err(eag, gold):>11.3e}{d:>13.3e}  {'BIT-IDENT' if ok else '<-- FAIL'}")
     return bad
 
 
@@ -116,8 +121,8 @@ def model_mix():
     should BEAT eager rather than tie it. If it ever merely ties, the fp32 accumulation was lost.
     """
     print()
-    print(f"{'case':<34}{'eager':>11}{'kernel':>11}  verdict")
-    print("-" * 62)
+    print(f"{'case':<34}{'max|kernel-eager|':>18}  verdict")
+    print("-" * 60)
     bad = 0
     g = torch.Generator(device=DEV).manual_seed(21)
     ar = torch.randn(T, H, device=DEV, generator=g)                    # fp32, like attn_read
@@ -130,16 +135,18 @@ def model_mix():
     for lbl, pairs, modes in (("carry only (fp32 + bf16)", [(tc, ao)], ("none",)),
                               ("carry + emb (model layout)", [(tc, ao), (td, emb)], ("none", "none")),
                               ("carry 2sigmoid + emb", [(tc, ao), (td, emb)], ("2sigmoid", "none"))):
-        gold = residual_add_reference(ar.double(), [(t.double(), s.double()) for t, s in pairs], modes)
         eag = ar
         for (t, sm), m in zip(pairs, modes):        # verbatim exp/modeling_bibo idiom
             eag = eag + f[m](t.float()).to(sm.dtype) * sm
         ker = fused_residual_add(ar, pairs, modes)
-        e, k_ = _err(eag, gold), _err(ker, gold)
-        ok = k_ <= max(e * 1.05, ATOL)
+        # THE CONTRACT IS BIT-IDENTICAL, not "no worse". A kernel reproduces its reference; an
+        # earlier version accumulated in fp32, was 30,000x closer to fp64 truth, and cost bpb in two
+        # matched same-box pairs because it removed the per-element bf16 quantization the model was
+        # training with. Any nonzero delta here means the fast path is a different model.
+        d = (ker.float() - eag.float()).abs().max().item()
+        ok = d == 0.0
         bad += not ok
-        note = f"   kernel {e / k_:.0f}x closer" if k_ and e / k_ > 2 else ""
-        print(f"{lbl:<34}{e:>11.3e}{k_:>11.3e}  {'ok' if ok else '<-- FAIL'}{note}")
+        print(f"{lbl:<34}{d:>13.3e}  {'BIT-IDENTICAL' if ok else '<-- FAIL, differs from eager'}")
     return bad
 
 

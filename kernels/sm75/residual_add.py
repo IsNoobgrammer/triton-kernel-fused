@@ -26,6 +26,20 @@ Backward, in the same single pass over the data:
 The theta reduction is the real win. Eager builds `dout * stream_k` (134 MB) and then reduces it;
 here it accumulates in registers during the pass the backward already has to make.
 
+WHY THIS QUANTIZES INSTEAD OF ACCUMULATING IN FP32. Eager evaluates
+
+    attn_read + _c.to(attn_output.dtype) * attn_output
+
+so the scalar is rounded to the STREAM dtype and the product is computed AND STORED there --
+bf16 for attn_out, i.e. 7 mantissa bits on all 134M elements -- before the fp32 add. An earlier
+version of this kernel kept the whole thing in fp32 and was, in isolation, 30,000x closer to fp64
+truth. It also cost bpb: two matched same-box pairs went the wrong way (c+d +0.0037, c-only +0.007)
+with train loss agreeing, because removing that per-element quantization removes noise the model
+was benefiting from. A kernel must REPRODUCE its reference, not improve it -- "more accurate"
+silently changed the model while claiming to change only the implementation. So the scalar and the
+product are both rounded to the stream dtype here, and only the accumulation stays fp32, matching
+eager term for term. To run the eager path instead, use --fused_res_add false.
+
 WHY THE TRANSFORM LIVES IN THE KERNEL. theta is the leaf parameter and f is sigmoid/tanh/identity.
 Doing f on the host is arithmetically free but puts a tiny op in the autograd graph per scalar per
 site per layer, and then the chain rule for d theta needs its own kernel. Taking raw theta and
@@ -98,16 +112,24 @@ def _res_add_fwd(
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
         c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
-        acc += c * _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
+        cq = c.to(S0.dtype.element_ty).to(tl.float32)
+        sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
+        acc += (cq * sv).to(S0.dtype.element_ty).to(tl.float32)
     if K > 1:
         c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
-        acc += c * _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
+        cq = c.to(S1.dtype.element_ty).to(tl.float32)
+        sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
+        acc += (cq * sv).to(S1.dtype.element_ty).to(tl.float32)
     if K > 2:
         c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
-        acc += c * _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
+        cq = c.to(S2.dtype.element_ty).to(tl.float32)
+        sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
+        acc += (cq * sv).to(S2.dtype.element_ty).to(tl.float32)
     if K > 3:
         c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
-        acc += c * _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
+        cq = c.to(S3.dtype.element_ty).to(tl.float32)
+        sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
+        acc += (cq * sv).to(S3.dtype.element_ty).to(tl.float32)
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
@@ -140,6 +162,7 @@ def _res_add_bwd(
 
     if K > 0:
         c, dc = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
+        c = c.to(S0.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
         tl.store(PART + pid * spart + 0, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
         if NEED0:
@@ -147,6 +170,7 @@ def _res_add_bwd(
                      (c * go).to(DS0.dtype.element_ty), mask=mask)
     if K > 1:
         c, dc = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
+        c = c.to(S1.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
         tl.store(PART + pid * spart + 1, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
         if NEED1:
@@ -154,6 +178,7 @@ def _res_add_bwd(
                      (c * go).to(DS1.dtype.element_ty), mask=mask)
     if K > 2:
         c, dc = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
+        c = c.to(S2.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
         tl.store(PART + pid * spart + 2, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
         if NEED2:
@@ -161,6 +186,7 @@ def _res_add_bwd(
                      (c * go).to(DS2.dtype.element_ty), mask=mask)
     if K > 3:
         c, dc = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
+        c = c.to(S3.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
         tl.store(PART + pid * spart + 3, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
         if NEED3:
