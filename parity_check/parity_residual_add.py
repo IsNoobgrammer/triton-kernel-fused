@@ -210,7 +210,14 @@ def model_mix_bwd():
         d1 = (ka - ea).abs().max().item()
         d2 = (ko.float() - eo.float()).abs().max().item()
         d3 = (kt - et).abs().max().item() / max(et.abs().max().item(), 1e-12)
-        ok = d1 == 0.0 and d2 == 0.0 and d3 <= 2e-6
+        # d attn_read and d attn_out must be EXACT -- they feed the rest of the network.
+        # d theta cannot be: with the products correctly rounded to bf16, what remains is REDUCTION
+        # ORDER, torch's tree over 33.5M coarse bf16 values against a two-level block reduction.
+        # Measured 2.5e-03 relative at k=1, falling to 4.8e-04 as more streams average it out. It
+        # touches 10 scalar parameters, is fed to AdamW (which normalises by sqrt(v), so a small
+        # relative error in a scalar gradient barely moves the step), and no ordering choice here
+        # is more "correct" than another. Everything that propagates is bit-exact.
+        ok = d1 == 0.0 and d2 == 0.0 and d3 <= 5e-3
         bad += not ok
         print(f"{lbl:<30}{d1:>13.3e}{d2:>13.3e}{d3:>13.3e}  {'ok' if ok else '<-- FAIL'}")
     return bad
@@ -222,7 +229,11 @@ def gradcheck():
     print("-" * 62)
     bad = 0
     for k, modes in ((2, ("none", "none")), (3, ("sigmoid", "2tanh", "none"))):
-        for dtype in (torch.float32, torch.bfloat16):
+        # FP32 ONLY. This block grades against residual_add_reference, which accumulates in fp32
+        # by construction. The kernel now reproduces the MODEL's eager idiom instead, which rounds
+        # to the stream dtype at every step -- so in bf16 the two references genuinely disagree and
+        # this test would be measuring the wrong target. bf16 is gated by model_mix_bwd().
+        for dtype in (torch.float32,):
             ar0, s0, t0 = _mk(k, dtype, seed=7 + k, strided=True)
             dout = torch.randn(T, H, device=DEV, dtype=dtype)
 
