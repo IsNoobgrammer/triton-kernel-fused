@@ -181,7 +181,11 @@ def _res_add_bwd(
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
         gq = go.to(S0.dtype.element_ty).to(tl.float32)
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
+        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
+        # product STORED in bf16 before the reduction runs. Summing the fp32 product
+        # instead left 0.5% relative error on the scalar gradient.
+        pq = (gq * s).to(S0.dtype.element_ty).to(tl.float32)
+        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
         if NEED0:
             tl.store(DS0 + offs_t[:, None] * d0_t + offs_h[None, :],
                      (c * gq).to(DS0.dtype.element_ty), mask=mask)
@@ -194,7 +198,11 @@ def _res_add_bwd(
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
         gq = go.to(S1.dtype.element_ty).to(tl.float32)
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
+        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
+        # product STORED in bf16 before the reduction runs. Summing the fp32 product
+        # instead left 0.5% relative error on the scalar gradient.
+        pq = (gq * s).to(S1.dtype.element_ty).to(tl.float32)
+        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
         if NEED1:
             tl.store(DS1 + offs_t[:, None] * d1_t + offs_h[None, :],
                      (c * gq).to(DS1.dtype.element_ty), mask=mask)
@@ -207,7 +215,11 @@ def _res_add_bwd(
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
         gq = go.to(S2.dtype.element_ty).to(tl.float32)
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
+        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
+        # product STORED in bf16 before the reduction runs. Summing the fp32 product
+        # instead left 0.5% relative error on the scalar gradient.
+        pq = (gq * s).to(S2.dtype.element_ty).to(tl.float32)
+        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
         if NEED2:
             tl.store(DS2 + offs_t[:, None] * d2_t + offs_h[None, :],
                      (c * gq).to(DS2.dtype.element_ty), mask=mask)
@@ -220,7 +232,11 @@ def _res_add_bwd(
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
         gq = go.to(S3.dtype.element_ty).to(tl.float32)
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
+        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
+        # product STORED in bf16 before the reduction runs. Summing the fp32 product
+        # instead left 0.5% relative error on the scalar gradient.
+        pq = (gq * s).to(S3.dtype.element_ty).to(tl.float32)
+        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
         if NEED3:
             tl.store(DS3 + offs_t[:, None] * d3_t + offs_h[None, :],
                      (c * gq).to(DS3.dtype.element_ty), mask=mask)

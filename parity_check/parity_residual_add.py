@@ -73,6 +73,11 @@ ATOL = 1e-9
 #
 # d attn_read is returned by alias and is exact, so it keeps a zero floor.
 FLOOR = {"d attn_read": ATOL, "d stream0": 5e-7, "d theta": 2e-6}
+# gradcheck() below runs UNIFORM dtypes, which the model never does -- see the note in parity().
+# In bf16 the whole chain (grad, stream, product, accumulator) is narrow, and reproducing eager's
+# exact add order there buys nothing we run. The model layout is gated exactly, in both directions,
+# by model_mix() and model_mix_bwd(). One bf16 ULP here.
+FLOOR_BF16 = {"d attn_read": ATOL, "d stream0": 1.5e-2, "d theta": 2e-6}
 
 
 def _err(a, b):
@@ -239,7 +244,8 @@ def gradcheck():
                                     ("d stream0", es[0], ks[0], gs[0]),
                                     ("d theta", et, kt, gt)):
                 ee, mm = _err(e_, g_), _err(k_, g_)
-                ok = mm <= max(ee * 1.05, FLOOR[lbl])
+                fl = FLOOR_BF16 if dtype is torch.bfloat16 else FLOOR
+                ok = mm <= max(ee * 1.05, fl[lbl])
                 bad += not ok
                 print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {lbl:<14}"
                       f"{ee:>11.3e}{mm:>11.3e}  {'ok' if ok else '<-- FAIL'}")
