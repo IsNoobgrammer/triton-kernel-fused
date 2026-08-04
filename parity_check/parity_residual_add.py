@@ -100,10 +100,17 @@ def parity():
                 eag = eag + fmap[m_](t_.float()).to(s_.dtype) * s_
             ker = fused_residual_add(ar, pairs, modes, out_dtype=eag.dtype)
             d = (ker.float() - eag.float()).abs().max().item()
-            ok = d == 0.0
+            # UNIFORM DTYPE IS NOT A MODEL LAYOUT. BiBo always has attn_read in fp32 (
+            # apply_attention_residual promotes off the fp32 embedding), so these rows exist only
+            # to catch gross breakage, not to hold the bit-identical contract -- that lives in
+            # model_mix(). Tolerance is one ULP of the compute dtype: eager rounds at every add in
+            # the narrow dtype, and reproducing its exact add order there buys nothing we run.
+            ulp = {torch.float32: 2e-6, torch.bfloat16: 1.5e-1, torch.float16: 2e-2}[dtype]
+            ok = d <= ulp
             bad += not ok
             print(f"{k:>2} {str(dtype).replace('torch.',''):>8} {','.join(modes)[:19]:<20}"
-                  f"{_err(eag, gold):>11.3e}{d:>13.3e}  {'BIT-IDENT' if ok else '<-- FAIL'}")
+                  f"{_err(eag, gold):>11.3e}{d:>13.3e}  "
+                  f"{'BIT-IDENT' if d == 0.0 else ('ok (<=1ulp)' if ok else '<-- FAIL')}")
     return bad
 
 
@@ -153,6 +160,54 @@ def model_mix():
         bad += not ok
         verdict = "BIT-IDENTICAL" if d == 0.0 else (f"ok (FMA, <= {lim:g})" if ok else "<-- FAIL")
         print(f"{lbl:<34}{d:>13.3e}  {verdict}")
+    return bad
+
+
+def model_mix_bwd():
+    """Backward on the layout BiBo runs: fp32 attn_read, BF16 attn_out, fp32 embedding.
+
+    gradcheck() below uses uniform dtypes, which the model never does -- so the gradient that
+    actually flows into attention (bf16) was untested against the real forward. d stream is
+    c_q * dout and must match eager's, because a systematically different attention gradient is a
+    different model no matter how good the forward is.
+    """
+    print()
+    print(f"{'case':<30}{'d attn_read':>13}{'d attn_out':>13}{'d theta':>13}  verdict")
+    print("-" * 84)
+    bad = 0
+    g = torch.Generator(device=DEV).manual_seed(33)
+    ar0 = torch.randn(T, H, device=DEV, generator=g)
+    ao0 = torch.randn(T, H, device=DEV, generator=g).bfloat16()
+    emb0 = torch.randn(T, 3, H, device=DEV, generator=g)[:, 0]
+    do = torch.randn(T, H, device=DEV, generator=g)
+    f = {"none": lambda x: x, "2sigmoid": lambda x: 2.0 * torch.sigmoid(x)}
+    for lbl, use_emb, modes in (("carry only", False, ("none",)),
+                                ("carry + emb", True, ("none", "none")),
+                                ("carry 2sigmoid + emb", True, ("2sigmoid", "none"))):
+        def run(fused):
+            a = ar0.detach().clone().requires_grad_(True)
+            ao = ao0.detach().clone().requires_grad_(True)
+            em = emb0.detach().clone().requires_grad_(True)
+            ts = [torch.randn(1, device=DEV).fill_(0.6).requires_grad_(True),
+                  torch.randn(1, device=DEV).fill_(0.4).requires_grad_(True)]
+            strms = [ao, em] if use_emb else [ao]
+            if fused:
+                flat = [v for p in zip(ts[:len(strms)], strms) for v in p]
+                o = make_mlp_input(a, *flat, modes=modes)
+            else:
+                o = a
+                for (t_, s_), m_ in zip(zip(ts, strms), modes):
+                    o = o + f[m_](t_.float()).to(s_.dtype) * s_
+            o.backward(do.to(o.dtype))
+            return a.grad, ao.grad, torch.stack([t.grad.reshape(()) for t in ts[:len(strms)]])
+        ea, eo, et = run(False)
+        ka, ko, kt = run(True)
+        d1 = (ka - ea).abs().max().item()
+        d2 = (ko.float() - eo.float()).abs().max().item()
+        d3 = (kt - et).abs().max().item() / max(et.abs().max().item(), 1e-12)
+        ok = d1 == 0.0 and d2 == 0.0 and d3 <= 2e-6
+        bad += not ok
+        print(f"{lbl:<30}{d1:>13.3e}{d2:>13.3e}{d3:>13.3e}  {'ok' if ok else '<-- FAIL'}")
     return bad
 
 
@@ -267,6 +322,6 @@ if __name__ == "__main__":
     elif what == "evict":
         evict()
     else:
-        n = parity() + model_mix() + gradcheck()
+        n = parity() + model_mix() + model_mix_bwd() + gradcheck()
         print("\n" + ("PASS" if not n else f"FAIL ({n} checks)"))
         sys.exit(1 if n else 0)
