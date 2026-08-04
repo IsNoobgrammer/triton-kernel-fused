@@ -175,35 +175,55 @@ def _res_add_bwd(
     if K > 0:
         c, dc = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
         c = c.to(S0.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
+        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
+        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
+        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
+        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
+        gq = go.to(S0.dtype.element_ty).to(tl.float32)
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
         if NEED0:
             tl.store(DS0 + offs_t[:, None] * d0_t + offs_h[None, :],
-                     (c * go).to(DS0.dtype.element_ty), mask=mask)
+                     (c * gq).to(DS0.dtype.element_ty), mask=mask)
     if K > 1:
         c, dc = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
         c = c.to(S1.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
+        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
+        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
+        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
+        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
+        gq = go.to(S1.dtype.element_ty).to(tl.float32)
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
         if NEED1:
             tl.store(DS1 + offs_t[:, None] * d1_t + offs_h[None, :],
-                     (c * go).to(DS1.dtype.element_ty), mask=mask)
+                     (c * gq).to(DS1.dtype.element_ty), mask=mask)
     if K > 2:
         c, dc = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
         c = c.to(S2.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
+        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
+        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
+        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
+        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
+        gq = go.to(S2.dtype.element_ty).to(tl.float32)
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
         if NEED2:
             tl.store(DS2 + offs_t[:, None] * d2_t + offs_h[None, :],
-                     (c * go).to(DS2.dtype.element_ty), mask=mask)
+                     (c * gq).to(DS2.dtype.element_ty), mask=mask)
     if K > 3:
         c, dc = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
         c = c.to(S3.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
+        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
+        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
+        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
+        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
+        gq = go.to(S3.dtype.element_ty).to(tl.float32)
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(go * s, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(gq * s, axis=1), axis=0) * dc)
         if NEED3:
             tl.store(DS3 + offs_t[:, None] * d3_t + offs_h[None, :],
-                     (c * go).to(DS3.dtype.element_ty), mask=mask)
+                     (c * gq).to(DS3.dtype.element_ty), mask=mask)
 
 
 def _prep(attn_read, pairs):
