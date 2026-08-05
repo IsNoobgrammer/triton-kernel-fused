@@ -410,7 +410,42 @@ def make_mlp_input(attn_read, *pairs, modes=None, persistent=None):
     assert len(modes) == n, f"got {n} streams but {len(modes)} modes"
     for m in modes:
         assert m in MODES, f"unknown mode {m!r}; valid: {sorted(MODES)}"
+    _assert_exact(attn_read, strms)
     if not attn_read.is_cuda:
         return residual_add_reference(attn_read, list(zip(thetas, strms)), modes).to(attn_read.dtype)
     return _ResidualAdd.apply(attn_read, modes, n, tuple(persistent) if persistent else None,
                               *thetas, *strms)
+
+
+def _assert_exact(attn_read, strms):
+    """Refuse any configuration not MEASURED bit-identical to eager.
+
+    This kernel is not exact everywhere, and the inexact cases are not safe to run: 1 ULP flips
+    MoE top-k, which changes the trajectory, not just the digits. Rather than leave that as a
+    comment someone has to find, the unsafe shapes raise.
+
+    Measured max|fused - eager| by (stream / attn_read), with enable_fp_fusion=False:
+        bf16 / bf16   0.000e+00      fp32 / fp32   0.000e+00
+        bf16 / fp32   0.000e+00      fp32 / bf16   4.768e-07   <- FMA survives
+        2 streams, bf16 + fp32       4.768e-07               <- FMA survives
+    The pattern is the FMA: a BF16 stream rounds its product, and that rounding is what blocks
+    contraction. An FP32 stream has no such barrier, and stays exact only when it is the sole
+    stream and attn_read matches it.
+
+    Pass strict=False on the module (RESIDUAL_ADD_STRICT = False) to run the inexact shapes
+    anyway -- for benchmarking or for closing out the FMA work, never for a training arm.
+    """
+    if not RESIDUAL_ADD_STRICT:
+        return
+    dts = {s.dtype for s in strms}
+    if len(strms) == 1 and (torch.bfloat16 in dts or dts == {attn_read.dtype}):
+        return
+    raise ValueError(
+        f"residual_add: {len(strms)} stream(s) of dtype {sorted(str(d) for d in dts)} against "
+        f"attn_read {attn_read.dtype} is NOT bit-identical to eager (FMA contraction, ~1 ULP, "
+        f"enough to flip MoE top-k). Exact shapes: one BF16 stream against any attn_read, or one "
+        f"stream matching attn_read's dtype. Add the extra stream eagerly, or set "
+        f"kernels.sm75.residual_add.RESIDUAL_ADD_STRICT = False if you accept the drift.")
+
+
+RESIDUAL_ADD_STRICT = True
