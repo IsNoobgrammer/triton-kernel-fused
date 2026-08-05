@@ -81,6 +81,23 @@ __all__ = ["fused_attn_res", "attn_res", "FusedAttnRes", "attn_res_reference"]
 # BIBO_AR_BWD_TILE.
 _BWD_TILE_ENV = os.environ.get("BIBO_AR_BWD_TILE")
 
+# Launch shape. Overridable so it can be SWEPT rather than guessed -- num_warps was hardcoded at 4
+# for every N, and at N=2 that is a 2x512 tile spread over 4 warps. Same reasoning as BLOCK_N being
+# sized to N rather than a fixed floor. Not @triton.autotune: this repo has been bitten once by
+# autotuning on a grid-size dimension (the `S` eval stall), and N/H are fixed by the model anyway,
+# so a swept constant is the honest form. Values below are MEASURED, see the table at each site.
+_FWD_WARPS = int(os.environ.get("BIBO_AR_FWD_WARPS", "4"))
+_FWD_STAGES = int(os.environ.get("BIBO_AR_FWD_STAGES", "0"))     # 0 = triton default
+_BWD_WARPS = int(os.environ.get("BIBO_AR_BWD_WARPS", "4"))
+_BWD_STAGES = int(os.environ.get("BIBO_AR_BWD_STAGES", "0"))
+
+
+def _launch_kw(warps, stages):
+    kw = {"num_warps": warps}
+    if stages:
+        kw["num_stages"] = stages
+    return kw
+
 
 def _bwd_tile(N):
     if _BWD_TILE_ENV is not None:
@@ -179,7 +196,7 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
         out.stride(0), out.stride(1),
         HAS_BSQ=block_sq_sum is not None,
         BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
-        num_warps=4,
+        **_launch_kw(_FWD_WARPS, _FWD_STAGES),
     )
     return out
 
@@ -280,7 +297,7 @@ class FusedAttnRes(torch.autograd.Function):
             ps.stride(0), ps.stride(1),
             dout.stride(0), dout.stride(1),
             TILE=TILE, BLOCK_N=triton.next_power_of_2(N),
-            BLOCK_H=triton.next_power_of_2(H), num_warps=4,
+            BLOCK_H=triton.next_power_of_2(H), **_launch_kw(_BWD_WARPS, _BWD_STAGES),
         )
         # Only the cross-token reduction is left, and it is a plain fp32 sum over a (T, H)
         # partial -- no atomics (16384 x 512 of them would dominate the pass) and no downcast.
