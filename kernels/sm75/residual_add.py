@@ -162,7 +162,7 @@ def _res_add_fwd(
     K: tl.constexpr, MODE0: tl.constexpr, MODE1: tl.constexpr,
     MODE2: tl.constexpr, MODE3: tl.constexpr,
     P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr, P3: tl.constexpr,
-    VEC: tl.constexpr,
+    VEC0: tl.constexpr, VEC1: tl.constexpr, VEC2: tl.constexpr, VEC3: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -178,44 +178,44 @@ def _res_add_fwd(
     # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
-        if VEC:
+        if VEC0:
             m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M0).to(tl.float32)
         c, _ = _apply_mode(m, MODE0)
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        acc += (c[None, :] * sv) if VEC else (c * sv)
+        acc += (c[None, :] * sv) if VEC0 else (c * sv)
     if K > 1:
-        if VEC:
+        if VEC1:
             m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M1).to(tl.float32)
         c, _ = _apply_mode(m, MODE1)
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        acc += (c[None, :] * sv) if VEC else (c * sv)
+        acc += (c[None, :] * sv) if VEC1 else (c * sv)
     if K > 2:
-        if VEC:
+        if VEC2:
             m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M2).to(tl.float32)
         c, _ = _apply_mode(m, MODE2)
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        acc += (c[None, :] * sv) if VEC else (c * sv)
+        acc += (c[None, :] * sv) if VEC2 else (c * sv)
     if K > 3:
-        if VEC:
+        if VEC3:
             m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M3).to(tl.float32)
         c, _ = _apply_mode(m, MODE3)
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        acc += (c[None, :] * sv) if VEC else (c * sv)
+        acc += (c[None, :] * sv) if VEC3 else (c * sv)
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
 
 @triton.jit
 def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
-             NEED: tl.constexpr, VEC: tl.constexpr):
+             NEED: tl.constexpr, VEC: tl.constexpr, SLOT: tl.constexpr):
     """One stream's backward: its d theta partial, and d stream where required.
 
     Takes c and s ALREADY LOADED. _ld and _apply_mode are multi-return helpers and Triton only
@@ -236,10 +236,13 @@ def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
     scalar case additionally reduces over H. Same arithmetic, one fewer axis collapsed.
     """
     prod = go.to(tl.float64) * s.to(tl.float64)
+    # SLOT is H when ANY stream in this call is per-channel, else 1. A scalar stream in a
+    # mixed call therefore writes one number into slot 0 of its H-wide row and leaves the rest
+    # untouched -- the host reads element 0 back and never looks at the padding.
     if VEC:
-        tl.store(PART + pid * spart + k * H + offs_h, tl.sum(prod, axis=0), mask=offs_h < H)
+        tl.store(PART + pid * spart + k * SLOT + offs_h, tl.sum(prod, axis=0), mask=offs_h < H)
     else:
-        tl.store(PART + pid * spart + k, tl.sum(tl.sum(prod, axis=1), axis=0))
+        tl.store(PART + pid * spart + k * SLOT, tl.sum(tl.sum(prod, axis=1), axis=0))
     if NEED:
         tl.store(DS + offs_t[:, None] * d_t + offs_h[None, :],
                  ((c[None, :] * go) if VEC else (c * go)).to(DS.dtype.element_ty), mask=mask)
@@ -256,7 +259,8 @@ def _res_add_bwd(
     MODE2: tl.constexpr, MODE3: tl.constexpr,
     NEED0: tl.constexpr, NEED1: tl.constexpr, NEED2: tl.constexpr, NEED3: tl.constexpr,
     P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr, P3: tl.constexpr,
-    VEC: tl.constexpr,
+    VEC0: tl.constexpr, VEC1: tl.constexpr, VEC2: tl.constexpr, VEC3: tl.constexpr,
+    SLOT: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
 ):
     """One pass: writes d stream_k (only where required) and a PER-PROGRAM partial of d theta_k.
@@ -273,37 +277,41 @@ def _res_add_bwd(
     go = _ld(DOUT, offs_t[:, None] * sdo_t + offs_h[None, :], mask, False).to(tl.float32)
 
     if K > 0:
-        if VEC:
+        if VEC0:
             m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M0).to(tl.float32)
         c, _ = _apply_mode(m, MODE0)
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        _bwd_one(c, s, DS0, PART, pid, spart, 0, offs_t, offs_h, d0_t, mask, go, H, NEED0, VEC)
+        _bwd_one(c, s, DS0, PART, pid, spart, 0, offs_t, offs_h, d0_t, mask, go, H,
+                 NEED0, VEC0, SLOT)
     if K > 1:
-        if VEC:
+        if VEC1:
             m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M1).to(tl.float32)
         c, _ = _apply_mode(m, MODE1)
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        _bwd_one(c, s, DS1, PART, pid, spart, 1, offs_t, offs_h, d1_t, mask, go, H, NEED1, VEC)
+        _bwd_one(c, s, DS1, PART, pid, spart, 1, offs_t, offs_h, d1_t, mask, go, H,
+                 NEED1, VEC1, SLOT)
     if K > 2:
-        if VEC:
+        if VEC2:
             m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M2).to(tl.float32)
         c, _ = _apply_mode(m, MODE2)
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        _bwd_one(c, s, DS2, PART, pid, spart, 2, offs_t, offs_h, d2_t, mask, go, H, NEED2, VEC)
+        _bwd_one(c, s, DS2, PART, pid, spart, 2, offs_t, offs_h, d2_t, mask, go, H,
+                 NEED2, VEC2, SLOT)
     if K > 3:
-        if VEC:
+        if VEC3:
             m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M3).to(tl.float32)
         c, _ = _apply_mode(m, MODE3)
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        _bwd_one(c, s, DS3, PART, pid, spart, 3, offs_t, offs_h, d3_t, mask, go, H, NEED3, VEC)
+        _bwd_one(c, s, DS3, PART, pid, spart, 3, offs_t, offs_h, d3_t, mask, go, H,
+                 NEED3, VEC3, SLOT)
 
 
 def _dmode(t, mode):
@@ -390,19 +398,23 @@ BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K 
 # Do not add a claim to this comment without a number.
 
 
-def _vec_flag(thetas, H):
-    """True iff the multipliers are PER-CHANNEL (H,) rather than scalars.
+def _vec_flags(thetas, H):
+    """Per-stream: is this multiplier PER-CHANNEL (H,) or a scalar? -> ([bool]*K, any_vec)
 
-    All or nothing, deliberately. A mixed call -- one scalar stream, one per-channel stream --
-    is representable but nothing needs it, and supporting it would mean a per-stream constexpr
-    and a ragged partial buffer. Refused loudly rather than half-implemented.
+    MIXED IS SUPPORTED, and it is the shipped shape: per-dim carry c with a scalar embedding
+    gain d is one change from the scalar-c champion, where making d per-dim too would be two.
+    An earlier version refused mixed on the grounds that nothing needed it; the c-per-dim + d
+    arm needed it the same week.
+
+    Cost of mixing is the partial buffer: it is sized H per stream whenever ANY stream is
+    per-channel, and a scalar stream then uses only slot 0 of its row. Wasting K*(H-1) fp64 per
+    program beats a ragged layout -- at the board shape that is 8 MB against 134 MB tensors.
     """
     ns = [t.numel() for t in thetas]
-    if all(n == 1 for n in ns):
-        return False
-    assert all(n == H for n in ns), (
-        f"multipliers must be all scalar or all ({H},), got numels {ns}")
-    return True
+    for n in ns:
+        assert n == 1 or n == H, f"multiplier must be scalar or ({H},), got numel {n}"
+    flags = [n != 1 for n in ns]
+    return flags, any(flags)
 
 
 def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
@@ -418,7 +430,8 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
     pad_s = streams + [streams[0]] * (MAX_STREAMS - K)
     pad_st = strides + [0] * (MAX_STREAMS - K)
     thetas = [t.reshape(()) if t.numel() == 1 else t for t, _ in pairs]
-    vec = _vec_flag(thetas, H)
+    vflag, _ = _vec_flags(thetas, H)
+    vflag = vflag + [False] * (MAX_STREAMS - K)
     pad_m = thetas + [thetas[0]] * (MAX_STREAMS - K)
     mode_i = [MODES[m] for m in modes] + [0] * (MAX_STREAMS - K)
     pz = [bool(x) for x in (persistent or [False] * K)] + [False] * (MAX_STREAMS - K)
@@ -426,7 +439,8 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
     _res_add_fwd[grid](
         ar, *pad_s, *pad_m, out, T, H, sar, *pad_st, out.stride(0),
         K=K, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
-        P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3], VEC=vec,
+        P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
+        VEC0=vflag[0], VEC1=vflag[1], VEC2=vflag[2], VEC3=vflag[3],
         BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
     )
     return out.view(attn_read.shape[:-1] + (H,))
@@ -483,11 +497,13 @@ class _ResidualAdd(torch.autograd.Function):
         # ~T/BLOCK_T entries -- 8192 at the board shape -- and doing THAT in fp32 is where a long
         # accumulation actually degrades. fp64 here costs one tiny buffer and removes it.
         th_v = [t.reshape(()) if t.numel() == 1 else t for t in thetas]
-        vec = _vec_flag(th_v, H)
-        # (grid, K) of scalars, or (grid, K, H) when theta is per-channel -- d theta then reduces
-        # over tokens only, so each program owns a full (K, H) row instead of K numbers.
-        part = torch.empty((grid[0], max(n, 1) * (H if vec else 1)),
-                           device=do.device, dtype=torch.float64)
+        vflag, any_vec = _vec_flags(th_v, H)
+        slot = H if any_vec else 1
+        vpad = vflag + [False] * (MAX_STREAMS - n)
+        # (grid, K) of scalars, or (grid, K, H) when ANY theta is per-channel -- that theta
+        # reduces over tokens only, so it needs a full row. A scalar stream in a mixed call uses
+        # slot 0 of its row and the rest is padding the host never reads.
+        part = torch.empty((grid[0], max(n, 1) * slot), device=do.device, dtype=torch.float64)
         pad_s = streams + [streams[0]] * (MAX_STREAMS - n)
         pad_st = strides + [0] * (MAX_STREAMS - n)
         pad_ds = [d if d is not None else streams[0] for d in ds] + [streams[0]] * (MAX_STREAMS - n)
@@ -501,7 +517,8 @@ class _ResidualAdd(torch.autograd.Function):
             do.stride(0), *pad_st, *pad_dst, part.stride(0),
             K=n, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
             NEED0=needc[0], NEED1=needc[1], NEED2=needc[2], NEED3=needc[3],
-            P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3], VEC=vec,
+            P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
+            VEC0=vpad[0], VEC1=vpad[1], VEC2=vpad[2], VEC3=vpad[3], SLOT=slot,
             BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
             )
         # d theta = dc/dtheta * sum(dout * stream), the whole chain kept in FP64 and rounded once
@@ -511,8 +528,7 @@ class _ResidualAdd(torch.autograd.Function):
         # AFTER the reduction (it is a constant factor, so this is the same value in exact
         # arithmetic, but it keeps the one rounding at the very end instead of per-program).
         dtheta = part.sum(0)                                   # fp64, ~8k partials
-        if vec:
-            dtheta = dtheta.view(max(n, 1), H)                 # (K, H), one row per stream
+        dtheta = dtheta.view(max(n, 1), slot)                  # (K, 1) or (K, H)
         outs = [None, None, None]
         # d attn_read IS dout. Return it by alias -- the identity add costs a whole 134 MB copy
         # if written out, and autograd is happy with a view.
@@ -525,7 +541,9 @@ class _ResidualAdd(torch.autograd.Function):
             # reshape(()) only when theta IS a scalar -- forcing it on an (H,) vector would
             # raise, and silently taking element 0 would be worse.
             _t = thetas[i].detach().double()
-            g = dtheta[i] * _dmode(_t.reshape(()) if _t.numel() == 1 else _t, ctx.modes[i])
+            # a scalar stream in a mixed call parked its one number in slot 0 of an H-wide row
+            _dt = dtheta[i] if vflag[i] else dtheta[i, 0]
+            g = _dt * _dmode(_t.reshape(()) if _t.numel() == 1 else _t, ctx.modes[i])
             grads.append(g.reshape(thetas[i].shape).to(thetas[i].dtype))
         grads += [(ds[i].view(strms[i].shape) if need[i] else None) for i in range(n)]
         return (outs[0], None, None, None, *grads)

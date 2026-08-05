@@ -78,13 +78,16 @@ def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda", per_dim=Fals
     # per_dim: theta is (H,) instead of (1,). Not a constant vector -- a constant would pass even
     # if the kernel silently broadcast element 0, which is the bug this case exists to catch. The
     # base value is perturbed per channel so every lane must be read from its own address.
-    if per_dim:
-        thetas = [(torch.full((H,), v, device=device, dtype=torch.float32)
-                   + 0.1 * torch.arange(H, device=device, dtype=torch.float32) / H)
-                  for v in (0.6, -0.4, 1.3, 0.2)[:len(s_dts)]]
-    else:
-        thetas = [torch.full((1,), v, device=device, dtype=torch.float32)
-                  for v in (0.6, -0.4, 1.3, 0.2)[:len(s_dts)]]
+    # per_dim may be a bool (all streams) or a per-stream list, so a MIXED call can be graded --
+    # that is the shipped shape for c-per-dim + scalar d.
+    _pd = per_dim if isinstance(per_dim, (list, tuple)) else [bool(per_dim)] * len(s_dts)
+    thetas = []
+    for v, pd in zip((0.6, -0.4, 1.3, 0.2)[:len(s_dts)], _pd):
+        if pd:
+            thetas.append(torch.full((H,), v, device=device, dtype=torch.float32)
+                          + 0.1 * torch.arange(H, device=device, dtype=torch.float32) / H)
+        else:
+            thetas.append(torch.full((1,), v, device=device, dtype=torch.float32))
     out_dt = ar_dt
     for d in s_dts:
         out_dt = torch.promote_types(out_dt, d)
@@ -162,6 +165,10 @@ def _all_cases():
     # loads a vector per stream. K=1 is the shipped shape (carry alone); K=2 covers carry+emb.
     for k in (1, 2):
         yield f"K{k} all-bf16 PER-DIM", bf, [bf] * k, ["none"] * k, True
+    # MIXED: per-dim carry + SCALAR emb gain. This is the c-per-dim + d arm exactly, and it is
+    # the case the old all-or-nothing guard refused outright.
+    yield "K2 MIXED perdim c + scalar d", bf, [bf] * 2, ["none"] * 2, [True, False]
+    yield "K2 MIXED scalar c + perdim d", bf, [bf] * 2, ["none"] * 2, [False, True]
 
 
 def _bounded_spot_check():
