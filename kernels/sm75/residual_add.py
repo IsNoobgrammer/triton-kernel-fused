@@ -114,18 +114,17 @@ def _apply_mode(theta, MODE: tl.constexpr):
 
 
 @triton.jit
-def _mul(M, offs_h, H, MODE: tl.constexpr, VEC: tl.constexpr):
-    """The stream multiplier, scalar or PER-CHANNEL.
+def _ldm(M, offs_h, H, VEC: tl.constexpr):
+    """The raw multiplier: one scalar, or an (H,) vector when it is PER-CHANNEL.
 
-    VEC=1 loads an (H,) vector so each hidden channel gets its own coefficient. The transform in
-    _apply_mode is elementwise, so a bounded mode works unchanged on the vector.
+    Deliberately does NOT call _apply_mode. Triton inlines a multi-return helper at depth 1 only
+    -- _ld and _apply_mode are both called straight from a kernel body for that reason -- and
+    nesting _apply_mode one level deeper here failed to compile with no inner diagnostic.
+    So: load here, transform at the call site, every multi-return helper stays at depth 1.
     """
     if VEC:
-        m = tl.load(M + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-    else:
-        m = tl.load(M).to(tl.float32)
-    c, _ = _apply_mode(m, MODE)
-    return c
+        return tl.load(M + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+    return tl.load(M).to(tl.float32)
 
 
 @triton.jit
@@ -152,19 +151,19 @@ def _res_add_fwd(
     # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
-        c = _mul(M0, offs_h, H, MODE0, VEC)
+        c, _ = _apply_mode(_ldm(M0, offs_h, H, VEC), MODE0)
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 1:
-        c = _mul(M1, offs_h, H, MODE1, VEC)
+        c, _ = _apply_mode(_ldm(M1, offs_h, H, VEC), MODE1)
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 2:
-        c = _mul(M2, offs_h, H, MODE2, VEC)
+        c, _ = _apply_mode(_ldm(M2, offs_h, H, VEC), MODE2)
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 3:
-        c = _mul(M3, offs_h, H, MODE3, VEC)
+        c, _ = _apply_mode(_ldm(M3, offs_h, H, VEC), MODE3)
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
 
@@ -172,12 +171,14 @@ def _res_add_fwd(
 
 
 @triton.jit
-def _bwd_one(S, M, DS, PART, pid, spart, k, offs_t, offs_h, s_t, d_t, mask, go, H,
-             MODE: tl.constexpr, NEED: tl.constexpr, P: tl.constexpr, VEC: tl.constexpr):
+def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
+             NEED: tl.constexpr, VEC: tl.constexpr):
     """One stream's backward: its d theta partial, and d stream where required.
 
+    Takes c and s ALREADY LOADED. _ld and _apply_mode are multi-return helpers and Triton only
+    inlines those at depth 1, so they are called from the kernel body and the results passed in.
     The four unrolled call sites were identical apart from indices and carried the same two
-    comments four times, which is why they now live here once.
+    comments four times, which is why the reasoning now lives here once.
 
     dout arrives cast to the STREAM dtype, not full fp32: the product node c*stream is stored in
     the stream dtype, so the gradient reaching it is quantized there first. Feeding fp32 dout
@@ -191,8 +192,6 @@ def _bwd_one(S, M, DS, PART, pid, spart, k, offs_t, offs_h, s_t, d_t, mask, go, 
     VEC: theta is per-channel, so d theta is (H,) and the reduction runs over TOKENS ONLY. The
     scalar case additionally reduces over H. Same arithmetic, one fewer axis collapsed.
     """
-    c = _mul(M, offs_h, H, MODE, VEC)
-    s = _ld(S, offs_t[:, None] * s_t + offs_h[None, :], mask, P).to(tl.float32)
     prod = go.to(tl.float64) * s.to(tl.float64)
     if VEC:
         tl.store(PART + pid * spart + k * H + offs_h, tl.sum(prod, axis=0), mask=offs_h < H)
@@ -231,17 +230,21 @@ def _res_add_bwd(
     go = _ld(DOUT, offs_t[:, None] * sdo_t + offs_h[None, :], mask, False).to(tl.float32)
 
     if K > 0:
-        _bwd_one(S0, M0, DS0, PART, pid, spart, 0, offs_t, offs_h, s0_t, d0_t, mask, go, H,
-                 MODE0, NEED0, P0, VEC)
+        c, _ = _apply_mode(_ldm(M0, offs_h, H, VEC), MODE0)
+        s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
+        _bwd_one(c, s, DS0, PART, pid, spart, 0, offs_t, offs_h, d0_t, mask, go, H, NEED0, VEC)
     if K > 1:
-        _bwd_one(S1, M1, DS1, PART, pid, spart, 1, offs_t, offs_h, s1_t, d1_t, mask, go, H,
-                 MODE1, NEED1, P1, VEC)
+        c, _ = _apply_mode(_ldm(M1, offs_h, H, VEC), MODE1)
+        s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
+        _bwd_one(c, s, DS1, PART, pid, spart, 1, offs_t, offs_h, d1_t, mask, go, H, NEED1, VEC)
     if K > 2:
-        _bwd_one(S2, M2, DS2, PART, pid, spart, 2, offs_t, offs_h, s2_t, d2_t, mask, go, H,
-                 MODE2, NEED2, P2, VEC)
+        c, _ = _apply_mode(_ldm(M2, offs_h, H, VEC), MODE2)
+        s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
+        _bwd_one(c, s, DS2, PART, pid, spart, 2, offs_t, offs_h, d2_t, mask, go, H, NEED2, VEC)
     if K > 3:
-        _bwd_one(S3, M3, DS3, PART, pid, spart, 3, offs_t, offs_h, s3_t, d3_t, mask, go, H,
-                 MODE3, NEED3, P3, VEC)
+        c, _ = _apply_mode(_ldm(M3, offs_h, H, VEC), MODE3)
+        s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
+        _bwd_one(c, s, DS3, PART, pid, spart, 3, offs_t, offs_h, d3_t, mask, go, H, NEED3, VEC)
 
 
 def _dmode(t, mode):
