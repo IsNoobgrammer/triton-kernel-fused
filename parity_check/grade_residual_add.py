@@ -103,41 +103,57 @@ def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda"):
     return fwd, bwd
 
 
+_SHORT = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
+_MODE_CYCLE = ["none", "2sigmoid", "tanh", "sigmoid", "2tanh"]
+
+
+def _all_cases():
+    """EXHAUSTIVE over dtype assignments -- attn_read and every stream vary independently.
+
+    A single hand-picked pairing per stream count is how the last contract shipped a kernel that
+    was exact on the one layout anyone tested and 1 ULP off on the neighbouring one. There is no
+    reason to guess which combination breaks: enumerate them.
+
+    {bf16, fp32, fp16} exhaustively for K=1,2 (3^2 + 3^3 = 36 configs) and {bf16, fp32} for
+    K=3,4 (2^4 + 2^5 = 48), so every (attn_read, stream_0..k) assignment the model could ever
+    produce is measured. Modes cycle so all five transforms are exercised across the sweep.
+    """
+    bf, f32, f16 = torch.bfloat16, torch.float32, torch.float16
+    for pool, ks in (((bf, f32, f16), (1, 2)), ((bf, f32), (3, 4))):
+        for k in ks:
+            for combo in itertools.product(pool, repeat=k + 1):
+                ar_dt, s_dts = combo[0], list(combo[1:])
+                modes = [_MODE_CYCLE[(i + len(s_dts)) % len(_MODE_CYCLE)] for i in range(k)]
+                name = f"K{k} ar={_SHORT[ar_dt]} s=" + "+".join(_SHORT[d] for d in s_dts)
+                yield name, ar_dt, s_dts, modes
+
+
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
-    bf, f32 = torch.bfloat16, torch.float32
-    cases = [
-        ("1s bf16 / ar fp32   (the carry path)", f32, [bf], ["none"]),
-        ("1s fp32 / ar fp32   (fp32 training)",  f32, [f32], ["none"]),
-        ("1s bf16 / ar bf16",                    bf,  [bf], ["none"]),
-        ("1s fp32 / ar bf16   (mixed)",          bf,  [f32], ["none"]),
-        ("2s bf16+fp32 / ar fp32 (carry+emb)",   f32, [bf, f32], ["none", "none"]),
-        ("2s bf16+bf16 / ar fp32",               f32, [bf, bf], ["none", "none"]),
-        ("2s bounded 2sigmoid+2tanh",            f32, [bf, f32], ["2sigmoid", "2tanh"]),
-        ("1s fp32 bounded sigmoid",              f32, [f32], ["sigmoid"]),
-    ]
-    print(f"{'case':40s} {'quantity':10s} {'kernel':>10s} {'eager':>10s} {'ratio':>8s}")
-    worst = 0.0
-    fails = []
+    cases = list(_all_cases())
+    print(f"grading {len(cases)} dtype configurations x 4 quantities "
+          f"= {len(cases) * 4} measurements against fp64\n")
+    print(f"{'case':34s} {'quantity':10s} {'kernel':>10s} {'eager':>10s} {'ratio':>8s}")
+    worst, worst_name = 0.0, ""
+    fails, n_meas = [], 0
     for name, ar_dt, s_dts, modes in cases:
         fwd, bwd = _case(ar_dt, s_dts, modes)
-        rows = [("forward", fwd)] + list(bwd.items())
-        for q, (ke, ee) in rows:
+        for q, (ke, ee) in [("forward", fwd)] + list(bwd.items()):
+            n_meas += 1
             ratio = ke / ee if ee > 0 else (0.0 if ke == 0 else float("inf"))
-            worst = max(worst, ratio)
-            flag = ""
+            if ratio > worst:
+                worst, worst_name = ratio, f"{name}/{q}"
             if ke > ee:
-                flag = "  <-- WORSE THAN EAGER"
                 fails.append((name, q, ke, ee))
-            print(f"{name:40s} {q:10s} {ke:10.3e} {ee:10.3e} {ratio:8.2f}{flag}")
-    print()
+                print(f"{name:34s} {q:10s} {ke:10.3e} {ee:10.3e} {ratio:8.2f}"
+                      f"  <-- WORSE THAN EAGER")
+    print(f"\n{n_meas} measurements over {len(cases)} configs")
     if fails:
-        print(f"FAIL: kernel is worse than eager on {len(fails)} measurement(s)")
+        print(f"FAIL: kernel worse than eager on {len(fails)}:")
         for n, q, ke, ee in fails:
             print(f"   {n} / {q}: kernel {ke:.3e} vs eager {ee:.3e}")
         raise SystemExit(1)
-    print(f"PASS: kernel <= eager against fp64 on every quantity "
-          f"(worst kernel/eager ratio {worst:.3f})")
+    print(f"PASS: kernel <= eager on all {n_meas}; worst ratio {worst:.4f} ({worst_name})")
 
 
 if __name__ == "__main__":
