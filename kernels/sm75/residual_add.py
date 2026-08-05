@@ -109,8 +109,15 @@ def _sigmoid(x):
     NOT the tanh identity. 2*sigmoid(x) == 1 + tanh(x/2) is exact algebra and libdevice.tanh is
     the accurate one this file already switched to elsewhere, so it looked like the obvious fix --
     measured 5.611e-06 max / 2.630e-07 mean, i.e. 5x WORSE on the mean than what it replaced.
+
+    FP64, then round once. libdevice alone still left the kernel 1.08x behind eager, because
+    torch's fp32 sigmoid is simply better than anything cheap here. Evaluating in fp64 stops the
+    contest instead of trying to win it narrowly: the contract is "at least as close as eager",
+    and this is unconditionally closer. It is free -- theta is ONE scalar or ONE (H,) vector per
+    program against a (BLOCK_T, H) tile of streamed data, and this kernel is memory-bound.
     """
-    return 1.0 / (1.0 + libdevice.exp(-x))
+    xd = x.to(tl.float64)
+    return (1.0 / (1.0 + libdevice.exp(-xd))).to(tl.float32)
 
 
 @triton.jit
