@@ -26,7 +26,21 @@ Everything above is a reduction over H followed by a reduction over N, so it all
 
 V is read once from HBM in its native dtype and the output is written once.
 
-ACCUMULATION IS FP64, and the contract is ACCURACY, not bit-identity: graded by
+ACCUMULATION IS FP32, and that is a THROUGHPUT decision made against measurement, not a
+precision policy. fp64 accumulation here is monotonically more accurate (54/54 vs eager) but
+7-13x SLOWER -- 1.48 ms vs 18.71 ms at N=5, T=65536 -- because unlike residual_add this kernel
+holds a live (BLOCK_N x BLOCK_H) tile across two reductions and a softmax, and the backward
+unrolls TILE=4 tokens on top of that. In fp64 the tile doubles to 32 KB per program and occupancy
+collapses. End-to-end that cost 12.7% of training throughput (154.7k -> 135.0k tps).
+
+What fp32 gives up, measured in the PRODUCTION layout (block_residual fp32, prefix_sum bf16):
+    N=2  0.85 / 0.77   N=3  0.80 / 0.81   N=4  1.12 / 1.06
+    N=5  1.04 / 0.93   N=8  0.84 / 0.96          (kernel/eager mean err, spread 1 / 1e4)
+So it is better than eager at most N and up to 12% worse at N=4-5, all at the ~2e-8 fp32 floor.
+A hybrid (fp32 tile, fp64 score/softmax) was also measured: 6/54 worse instead of 14/54, but
+5.70 ms at N=5 -- 4x the cost for a partial gain. Rejected.
+
+The old contract was ACCURACY, not bit-identity: graded by
 parity_check/grade_attn_res.py against fp64 truth, the kernel must be at least as close as eager
 in every dtype layout. It used to accumulate in fp32 "matching the reference's precision policy
 exactly", and under that policy it was measurably WORSE than eager on 14 of 54 configs (worst
@@ -106,15 +120,15 @@ def _attn_res_fwd(
     # both kernels are memory-bound, so the arithmetic hides behind the loads. It matters more
     # here: candidate RMS spans ~0.04 (raw embedding) to ~426 (prefix sum) in the real model,
     # four orders of magnitude summed inside one softmax weighting.
-    v = tl.where(is_last[:, None], ps.to(tl.float64), br.to(tl.float64))
+    v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
 
-    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float64)
+    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)
 
     # ---- scores: RMS and dot product from the SAME registers, one reduction pass each
     dot = tl.sum(v * w[None, :], axis=1)
     if HAS_BSQ:
         # squared norms of committed blocks are constant -- caller cached them
-        bsq = tl.load(BSQ + t * N + offs_n, mask=mask_n & (~is_last), other=0.0).to(tl.float64)
+        bsq = tl.load(BSQ + t * N + offs_n, mask=mask_n & (~is_last), other=0.0).to(tl.float32)
         psq = tl.sum(tl.where(is_last[:, None], v * v, 0.0), axis=1)
         sq = tl.where(is_last, psq, bsq)
     else:
@@ -198,8 +212,8 @@ def _attn_res_bwd(
 
     # FP64 throughout, same reasoning as the forward. acc_dw in particular is a reduction over the
     # whole TILE of tokens, so it is the one most exposed to fp32 accumulation drift.
-    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float64)   # once per TILE, not per token
-    acc_dw = tl.zeros([BLOCK_H], dtype=tl.float64)
+    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)   # once per TILE, not per token
+    acc_dw = tl.zeros([BLOCK_H], dtype=tl.float32)
 
     for k in tl.static_range(TILE):
         t = pid * TILE + k
@@ -208,8 +222,8 @@ def _attn_res_bwd(
                          mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
             ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h,
                          mask=mask_h[None, :], other=0.0)
-            v = tl.where(is_last[:, None], ps.to(tl.float64), br.to(tl.float64))
-            dout = tl.load(DOUT + t * sdo_t + offs_h * sdo_h, mask=mask_h, other=0.0).to(tl.float64)
+            v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
+            dout = tl.load(DOUT + t * sdo_t + offs_h * sdo_h, mask=mask_h, other=0.0).to(tl.float32)
 
             sq = tl.sum(v * v, axis=1)
             dot = tl.sum(v * w[None, :], axis=1)
