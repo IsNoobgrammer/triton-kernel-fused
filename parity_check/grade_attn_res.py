@@ -6,17 +6,21 @@ The mix is a softmax over N block candidates, scored on RMS-normalised keys, app
     scores  = (k * score_weight).sum(-1)          -> (T, N)
     out     = softmax(scores) @ v                 -> (T, H)
 
-Two things make this harder to get right than the residual add, and both are graded here:
+BF16 IN, FP32 SCORES, BF16 OUT -- and that is the only configuration graded. block_residual and
+prefix_sum are both bf16 (--attn_res_fp32_stream false); the kernel widens to fp32 for the RMS,
+the dot product, the softmax and the mixture; the store rounds back to bf16. Eager does the same,
+so the two agree on 99.98% of elements with identical error against fp64.
 
-  MIXED DTYPES ARE THE NORM. Under --attn_res_fp32_stream block_residual is fp32 while prefix_sum
-  is bf16 under autocast, and they are concatenated. Every (block_residual, prefix_sum) dtype pair
-  is enumerated rather than assumed.
+The dtype sweep this file used to run ({bf16,fp32,fp16} x both operands) policed a MIXED stack
+where an fp32 stream met a bf16 one inside one kernel. Going uniformly bf16 dissolved that
+problem rather than solving it, so the sweep now grades configurations nothing runs. What remains
+is the axis that is still real:
 
   THE MIX IS ILL-CONDITIONED BY CONSTRUCTION. Candidate RMS spans ~0.04 (the raw embedding) to
   ~426 (the prefix sum) in the real model -- four orders of magnitude inside one softmax-weighted
   sum. That is exactly the regime where fp32 accumulation quietly loses digits, and it is what
   broke d_theta in residual_add. `spread` below reproduces it deliberately instead of grading on
-  well-scaled random data that would hide it.
+  well-scaled random data that would hide it. N (2, 4, 8) covers block sizes 1 and 3 at 10 layers.
 
     python -m parity_check.grade_attn_res
 """
@@ -68,11 +72,14 @@ def _case(br_dt, ps_dt, N, T=512, H=512, spread=1.0, seed=0, eps=1e-6, device="c
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
     bf, f32, f16 = torch.bfloat16, torch.float32, torch.float16
+    # BF16 EVERYWHERE. block_residual and prefix_sum are both bf16 in the shipped config
+    # (--attn_res_fp32_stream false), the kernel scores and softmaxes in fp32 internally, and the
+    # output goes back to bf16. The old 9-way dtype product policed a mixed stack that no longer
+    # exists. N and the magnitude spread stay -- those are real axes, dtype no longer is.
     cases = []
-    for br_dt, ps_dt in itertools.product((bf, f32, f16), repeat=2):
-        for N in (2, 4, 8):
-            for spread in (1.0, 1e4):
-                cases.append((br_dt, ps_dt, N, spread))
+    for N in (2, 4, 8):
+        for spread in (1.0, 1e4):
+            cases.append((bf, bf, N, spread))
     short = {bf: "bf16", f32: "fp32", f16: "fp16"}
     print(f"grading {len(cases)} configs x 2 statistics against fp64\n")
     mu_r, mx_r, fails = [], [], []

@@ -1,12 +1,16 @@
 """Grade residual_add against FP64 TRUTH. The kernel must be at least as close as eager, always.
 
-This replaces the bit-identity gate. Bit-identity meant reproducing eager's precision loss, which
-encodes autocast's rounding as the specification -- an fp32 run has no bf16 rounding anywhere, so a
-kernel tuned to bf16-eager is tuned to an artifact and can be silently wrong at an untested dtype.
+BF16 IN, BF16 OUT, FP32 ACCUMULATION -- the shipped stack, and the only one graded. Truth is the
+same formula in float64; kernel and eager are both scored against it, forward and backward, and
+the kernel FAILS if it is worse on any measured quantity.
 
-Truth is the same formula evaluated in float64 from float64 copies of the inputs. Both the kernel
-and eager are scored by relative error against it, forward and backward, and the kernel FAILS if
-it is worse than eager on any measured quantity in any layout.
+History worth keeping, because it explains why this file is smaller than it was: the gate used to
+be BIT-IDENTITY with eager, which meant reproducing eager's precision loss on purpose. That was
+replaced by an 84-config fp64 accuracy sweep, which found three real bugs (a cancelling tanh, an
+ill-conditioned d_theta reduction, an FMA asymmetry). Then the stream went bf16 end to end, and
+most of what the sweep policed stopped existing -- with bf16 on both sides the kernel and eager
+round to the same 8-bit grid and agree on 99.98% of elements. The bugs were real; the matrix that
+found them now grades configurations nothing runs.
 
     python -m parity_check.grade_residual_add
 """
@@ -127,29 +131,22 @@ _SHORT = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
 
 
 def _all_cases():
-    """EXHAUSTIVE over dtype assignments -- attn_read and every stream vary independently.
+    """BF16 EVERYWHERE -- the shipped configuration, and now the only one graded.
 
-    A single hand-picked pairing per stream count is how the last contract shipped a kernel that
-    was exact on the one layout anyone tested and 1 ULP off on the neighbouring one. There is no
-    reason to guess which combination breaks: enumerate them.
+    The stack is bf16 end to end: residual stream, AttnRes streams, attention out, MLP out. The
+    kernel loads bf16, accumulates fp32, and stores bf16. So does eager. Both round to the same
+    8-mantissa-bit grid, and they agree on 99.98% of elements with identical error against fp64.
 
-    {bf16, fp32, fp16} exhaustively for K=1,2 (3^2 + 3^3 = 36 configs) and {bf16, fp32} for
-    K=3,4 (2^4 + 2^5 = 48), so every (attn_read, stream_0..k) assignment the model could produce
-    is measured.
-
-    MODE IS FIXED AT "none". The bounded transforms (sigmoid/tanh/2sigmoid/2tanh) are not on any
-    live arm -- every AttnRes run uses carry_scale=unbounded, and 2sigmoid bounding was refuted
-    experimentally -- so grading them here only inflates the matrix. They are still exercised, but
-    in _bounded_spot_check() below rather than crossed against 84 dtype configs: leaving a code
-    path with zero coverage is how the 2*sigmoid(2x)-1 tanh survived in the first place.
+    The old 84-config sweep over {bf16, fp32, fp16} x K=1..4 existed to police a MIXED-precision
+    stack, where an fp32 stream met a bf16 one inside the same kernel and the rounding order
+    mattered. That is what produced the FMA hunt, the fp64 accumulators and the monotonicity
+    contest. Going uniformly bf16 dissolves that problem rather than solving it, so the matrix
+    that policed it is dead weight -- it graded configurations nothing runs. Kept: K=1..4, because
+    stream COUNT is still a real axis (carry alone vs carry+emb).
     """
-    bf, f32, f16 = torch.bfloat16, torch.float32, torch.float16
-    for pool, ks in (((bf, f32, f16), (1, 2)), ((bf, f32), (3, 4))):
-        for k in ks:
-            for combo in itertools.product(pool, repeat=k + 1):
-                ar_dt, s_dts = combo[0], list(combo[1:])
-                name = f"K{k} ar={_SHORT[ar_dt]} s=" + "+".join(_SHORT[d] for d in s_dts)
-                yield name, ar_dt, s_dts, ["none"] * k
+    bf = torch.bfloat16
+    for k in (1, 2, 3, 4):
+        yield f"K{k} all-bf16", bf, [bf] * k, ["none"] * k
 
 
 def _bounded_spot_check():

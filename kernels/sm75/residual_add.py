@@ -128,30 +128,29 @@ def _res_add_fwd(
     offs_h = tl.arange(0, BLOCK_H)
     mask = (offs_t[:, None] < T) & (offs_h[None, :] < H)
 
-    # FP64 accumulator. Measured free: 0.64 ms either way at the board shape, because this
-    # kernel is memory-bound and the fp64 arithmetic hides entirely behind the traffic. It
-    # buys strict monotonicity -- with fp32 the worst MAX ratio was 1.1450 (FMA rounds the
-    # other way on individual elements); with fp64 it is 1.0000, i.e. the kernel is never
-    # worse than eager on ANY of the 352 measurements, on mean OR max.
-    acc = _ld(AR, offs_t[:, None] * sar_t + offs_h[None, :], mask, False).to(tl.float64)
+    # FP32 accumulator. The stack is BF16 end to end now, so the store rounds to 8 mantissa
+    # bits regardless and an fp64 accumulator buys nothing observable. (It was fp64 while the
+    # stream was fp32 and the kernel had to beat eager against fp64 truth; that contest is moot
+    # once both sides round to bf16 -- measured 99.98% exact agreement with eager at bf16 in/out.)
+    acc = _ld(AR, offs_t[:, None] * sar_t + offs_h[None, :], mask, False).to(tl.float32)
     # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
         c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
-        sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float64)
-        acc += c.to(tl.float64) * sv
+        sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
+        acc += c * sv
     if K > 1:
         c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
-        sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float64)
-        acc += c.to(tl.float64) * sv
+        sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
+        acc += c * sv
     if K > 2:
         c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
-        sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float64)
-        acc += c.to(tl.float64) * sv
+        sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
+        acc += c * sv
     if K > 3:
         c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
-        sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float64)
-        acc += c.to(tl.float64) * sv
+        sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
+        acc += c * sv
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
