@@ -266,6 +266,18 @@ def _prep(attn_read, pairs):
 
 BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K stream tiles
 
+# enable_fp_fusion=False on BOTH launches, and it is a correctness flag here, not a tuning knob.
+# Triton contracts `acc + cq*sv` into a single FMA, which rounds ONCE; eager rounds twice (product,
+# then sum). That is 1 fp32 ULP, and it is invisible on a BF16 stream only because `.to(bf16)` on
+# the product is a real rounding op that blocks the contraction. On an FP32 stream that cast is a
+# no-op, nothing blocks the FMA, and the kernel lands exactly on torch.addcmul instead of eager.
+#
+# 1 ULP is not negligible in this model: --attn_res_fp32_stream makes block_residual FP32, so the
+# EMBEDDING stream takes the fp32 path, and MoE top-k turns 2.4e-07 into 1.76e-01 of hidden-state
+# divergence over 10 layers by flipping expert picks. That is why carry-only gated at 0.00e+00
+# while carry+emb failed -- not a multi-stream bug, a per-stream-dtype one.
+# Measured: 2.384e-07 -> 0.000e+00 with the flag. See test_res_add_gpu.gate_emb_gain in BiBo.
+
 
 def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
     """Forward only. `pairs` = [(theta, stream), ...]; see make_mlp_input for the autograd version."""
@@ -289,6 +301,7 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
         K=K, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
         P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
         BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
+        enable_fp_fusion=False,
     )
     return out.view(attn_read.shape[:-1] + (H,))
 
@@ -353,6 +366,7 @@ class _ResidualAdd(torch.autograd.Function):
             NEED0=needc[0], NEED1=needc[1], NEED2=needc[2], NEED3=needc[3],
             P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
             BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
+            enable_fp_fusion=False,
         )
         dtheta = part.sum(0)
         outs = [None, None, None]
