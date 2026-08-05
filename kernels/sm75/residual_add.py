@@ -114,6 +114,21 @@ def _apply_mode(theta, MODE: tl.constexpr):
 
 
 @triton.jit
+def _mul(M, offs_h, H, MODE: tl.constexpr, VEC: tl.constexpr):
+    """The stream multiplier, scalar or PER-CHANNEL.
+
+    VEC=1 loads an (H,) vector so each hidden channel gets its own coefficient. The transform in
+    _apply_mode is elementwise, so a bounded mode works unchanged on the vector.
+    """
+    if VEC:
+        m = tl.load(M + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+    else:
+        m = tl.load(M).to(tl.float32)
+    c, _ = _apply_mode(m, MODE)
+    return c
+
+
+@triton.jit
 def _res_add_fwd(
     AR, S0, S1, S2, S3, M0, M1, M2, M3, OUT,
     T, H,
@@ -121,6 +136,7 @@ def _res_add_fwd(
     K: tl.constexpr, MODE0: tl.constexpr, MODE1: tl.constexpr,
     MODE2: tl.constexpr, MODE3: tl.constexpr,
     P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr, P3: tl.constexpr,
+    VEC: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -136,23 +152,55 @@ def _res_add_fwd(
     # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
-        c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
+        c = _mul(M0, offs_h, H, MODE0, VEC)
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        acc += c * sv
+        acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 1:
-        c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
+        c = _mul(M1, offs_h, H, MODE1, VEC)
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        acc += c * sv
+        acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 2:
-        c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
+        c = _mul(M2, offs_h, H, MODE2, VEC)
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        acc += c * sv
+        acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 3:
-        c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
+        c = _mul(M3, offs_h, H, MODE3, VEC)
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        acc += c * sv
+        acc += (c[None, :] * sv) if VEC else (c * sv)
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _bwd_one(S, M, DS, PART, pid, spart, k, offs_t, offs_h, s_t, d_t, mask, go, H,
+             MODE: tl.constexpr, NEED: tl.constexpr, P: tl.constexpr, VEC: tl.constexpr):
+    """One stream's backward: its d theta partial, and d stream where required.
+
+    The four unrolled call sites were identical apart from indices and carried the same two
+    comments four times, which is why they now live here once.
+
+    dout arrives cast to the STREAM dtype, not full fp32: the product node c*stream is stored in
+    the stream dtype, so the gradient reaching it is quantized there first. Feeding fp32 dout
+    instead is a systematically different gradient -- measured 1 bf16 ULP on d attn_out and 0.76%
+    RELATIVE on d theta, on the real model layout.
+
+    Eager's d theta is (grad_p * stream).sum() with the product STORED in bf16 before the
+    reduction; summing the fp32 product instead left 0.5% relative error on the scalar gradient.
+    Hence the fp64 product here and the fp64 partial.
+
+    VEC: theta is per-channel, so d theta is (H,) and the reduction runs over TOKENS ONLY. The
+    scalar case additionally reduces over H. Same arithmetic, one fewer axis collapsed.
+    """
+    c = _mul(M, offs_h, H, MODE, VEC)
+    s = _ld(S, offs_t[:, None] * s_t + offs_h[None, :], mask, P).to(tl.float32)
+    prod = go.to(tl.float64) * s.to(tl.float64)
+    if VEC:
+        tl.store(PART + pid * spart + k * H + offs_h, tl.sum(prod, axis=0), mask=offs_h < H)
+    else:
+        tl.store(PART + pid * spart + k, tl.sum(tl.sum(prod, axis=1), axis=0))
+    if NEED:
+        tl.store(DS + offs_t[:, None] * d_t + offs_h[None, :],
+                 ((c[None, :] * go) if VEC else (c * go)).to(DS.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -166,6 +214,7 @@ def _res_add_bwd(
     MODE2: tl.constexpr, MODE3: tl.constexpr,
     NEED0: tl.constexpr, NEED1: tl.constexpr, NEED2: tl.constexpr, NEED3: tl.constexpr,
     P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr, P3: tl.constexpr,
+    VEC: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
 ):
     """One pass: writes d stream_k (only where required) and a PER-PROGRAM partial of d theta_k.
@@ -182,65 +231,17 @@ def _res_add_bwd(
     go = _ld(DOUT, offs_t[:, None] * sdo_t + offs_h[None, :], mask, False).to(tl.float32)
 
     if K > 0:
-        c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
-        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
-        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
-        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
-        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
-        # product STORED in bf16 before the reduction runs. Summing the fp32 product
-        # instead left 0.5% relative error on the scalar gradient.
-        tl.store(PART + pid * spart + 0,
-                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
-        if NEED0:
-            tl.store(DS0 + offs_t[:, None] * d0_t + offs_h[None, :],
-                     (c * go).to(DS0.dtype.element_ty), mask=mask)
+        _bwd_one(S0, M0, DS0, PART, pid, spart, 0, offs_t, offs_h, s0_t, d0_t, mask, go, H,
+                 MODE0, NEED0, P0, VEC)
     if K > 1:
-        c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
-        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
-        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
-        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
-        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
-        # product STORED in bf16 before the reduction runs. Summing the fp32 product
-        # instead left 0.5% relative error on the scalar gradient.
-        tl.store(PART + pid * spart + 1,
-                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
-        if NEED1:
-            tl.store(DS1 + offs_t[:, None] * d1_t + offs_h[None, :],
-                     (c * go).to(DS1.dtype.element_ty), mask=mask)
+        _bwd_one(S1, M1, DS1, PART, pid, spart, 1, offs_t, offs_h, s1_t, d1_t, mask, go, H,
+                 MODE1, NEED1, P1, VEC)
     if K > 2:
-        c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
-        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
-        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
-        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
-        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
-        # product STORED in bf16 before the reduction runs. Summing the fp32 product
-        # instead left 0.5% relative error on the scalar gradient.
-        tl.store(PART + pid * spart + 2,
-                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
-        if NEED2:
-            tl.store(DS2 + offs_t[:, None] * d2_t + offs_h[None, :],
-                     (c * go).to(DS2.dtype.element_ty), mask=mask)
+        _bwd_one(S2, M2, DS2, PART, pid, spart, 2, offs_t, offs_h, s2_t, d2_t, mask, go, H,
+                 MODE2, NEED2, P2, VEC)
     if K > 3:
-        c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
-        # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
-        # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
-        # dout instead is a systematically different gradient: measured 1 bf16 ULP on
-        # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
-        # product STORED in bf16 before the reduction runs. Summing the fp32 product
-        # instead left 0.5% relative error on the scalar gradient.
-        tl.store(PART + pid * spart + 3,
-                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
-        if NEED3:
-            tl.store(DS3 + offs_t[:, None] * d3_t + offs_h[None, :],
-                     (c * go).to(DS3.dtype.element_ty), mask=mask)
+        _bwd_one(S3, M3, DS3, PART, pid, spart, 3, offs_t, offs_h, s3_t, d3_t, mask, go, H,
+                 MODE3, NEED3, P3, VEC)
 
 
 def _dmode(t, mode):
@@ -327,6 +328,21 @@ BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K 
 # Do not add a claim to this comment without a number.
 
 
+def _vec_flag(thetas, H):
+    """True iff the multipliers are PER-CHANNEL (H,) rather than scalars.
+
+    All or nothing, deliberately. A mixed call -- one scalar stream, one per-channel stream --
+    is representable but nothing needs it, and supporting it would mean a per-stream constexpr
+    and a ragged partial buffer. Refused loudly rather than half-implemented.
+    """
+    ns = [t.numel() for t in thetas]
+    if all(n == 1 for n in ns):
+        return False
+    assert all(n == H for n in ns), (
+        f"multipliers must be all scalar or all ({H},), got numels {ns}")
+    return True
+
+
 def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
     """Forward only. `pairs` = [(theta, stream), ...]; see make_mlp_input for the autograd version."""
     K = len(pairs)
@@ -340,6 +356,7 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
     pad_s = streams + [streams[0]] * (MAX_STREAMS - K)
     pad_st = strides + [0] * (MAX_STREAMS - K)
     thetas = [t.reshape(()) if t.numel() == 1 else t for t, _ in pairs]
+    vec = _vec_flag(thetas, H)
     pad_m = thetas + [thetas[0]] * (MAX_STREAMS - K)
     mode_i = [MODES[m] for m in modes] + [0] * (MAX_STREAMS - K)
     pz = [bool(x) for x in (persistent or [False] * K)] + [False] * (MAX_STREAMS - K)
@@ -347,7 +364,7 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
     _res_add_fwd[grid](
         ar, *pad_s, *pad_m, out, T, H, sar, *pad_st, out.stride(0),
         K=K, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
-        P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
+        P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3], VEC=vec,
         BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
     )
     return out.view(attn_read.shape[:-1] + (H,))
@@ -370,7 +387,10 @@ def residual_add_reference(attn_read, pairs, modes):
         acc = torch.promote_types(acc, t.dtype)
     out = attn_read.to(acc)
     for (theta, s), m in zip(pairs, modes):
-        out = out + f[m](theta.to(acc)).reshape(()) * s.to(acc)
+        # reshape(()) for a scalar theta, left as (H,) for a per-channel one so it broadcasts
+        # over the trailing hidden axis.
+        _c = f[m](theta.to(acc))
+        out = out + (_c.reshape(()) if _c.numel() == 1 else _c) * s.to(acc)
     return out
 
 
@@ -400,13 +420,17 @@ class _ResidualAdd(torch.autograd.Function):
         # within-tile error is O(log 4096) ULP, not O(4096)); the cross-program sum then runs over
         # ~T/BLOCK_T entries -- 8192 at the board shape -- and doing THAT in fp32 is where a long
         # accumulation actually degrades. fp64 here costs one tiny buffer and removes it.
-        part = torch.empty((grid[0], max(n, 1)), device=do.device, dtype=torch.float64)
+        th_v = [t.reshape(()) if t.numel() == 1 else t for t in thetas]
+        vec = _vec_flag(th_v, H)
+        # (grid, K) of scalars, or (grid, K, H) when theta is per-channel -- d theta then reduces
+        # over tokens only, so each program owns a full (K, H) row instead of K numbers.
+        part = torch.empty((grid[0], max(n, 1) * (H if vec else 1)),
+                           device=do.device, dtype=torch.float64)
         pad_s = streams + [streams[0]] * (MAX_STREAMS - n)
         pad_st = strides + [0] * (MAX_STREAMS - n)
         pad_ds = [d if d is not None else streams[0] for d in ds] + [streams[0]] * (MAX_STREAMS - n)
         pad_dst = [(d.stride(0) if d is not None else 0) for d in ds] + [0] * (MAX_STREAMS - n)
-        th = [t.reshape(()) if t.numel() == 1 else t for t in thetas]
-        pad_m = th + [th[0]] * (MAX_STREAMS - n)
+        pad_m = th_v + [th_v[0]] * (MAX_STREAMS - n)
         mode_i = [MODES[m] for m in modes] + [0] * (MAX_STREAMS - n)
         needc = [bool(x) for x in need] + [False] * (MAX_STREAMS - n)
         pz = [bool(x) for x in (ctx.persistent or [False] * n)] + [False] * (MAX_STREAMS - n)
@@ -415,7 +439,7 @@ class _ResidualAdd(torch.autograd.Function):
             do.stride(0), *pad_st, *pad_dst, part.stride(0),
             K=n, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
             NEED0=needc[0], NEED1=needc[1], NEED2=needc[2], NEED3=needc[3],
-            P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
+            P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3], VEC=vec,
             BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
             )
         # d theta = dc/dtheta * sum(dout * stream), the whole chain kept in FP64 and rounded once
@@ -425,6 +449,8 @@ class _ResidualAdd(torch.autograd.Function):
         # AFTER the reduction (it is a constant factor, so this is the same value in exact
         # arithmetic, but it keeps the one rounding at the very end instead of per-program).
         dtheta = part.sum(0)                                   # fp64, ~8k partials
+        if vec:
+            dtheta = dtheta.view(max(n, 1), H)                 # (K, H), one row per stream
         outs = [None, None, None]
         # d attn_read IS dout. Return it by alias -- the identity add costs a whole 134 MB copy
         # if written out, and autograd is happy with a view.
@@ -434,7 +460,10 @@ class _ResidualAdd(torch.autograd.Function):
             if not thetas[i].requires_grad:
                 grads.append(None)
                 continue
-            g = dtheta[i] * _dmode(thetas[i].detach().double().reshape(()), ctx.modes[i])
+            # reshape(()) only when theta IS a scalar -- forcing it on an (H,) vector would
+            # raise, and silently taking element 0 would be worse.
+            _t = thetas[i].detach().double()
+            g = dtheta[i] * _dmode(_t.reshape(()) if _t.numel() == 1 else _t, ctx.modes[i])
             grads.append(g.reshape(thetas[i].shape).to(thetas[i].dtype))
         grads += [(ds[i].view(strms[i].shape) if need[i] else None) for i in range(n)]
         return (outs[0], None, None, None, *grads)

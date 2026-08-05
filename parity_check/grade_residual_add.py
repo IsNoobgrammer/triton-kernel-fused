@@ -71,12 +71,20 @@ def _relerr(x, truth):
     return d.mean().item() / den, d.max().item() / den
 
 
-def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda"):
+def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda", per_dim=False):
     torch.manual_seed(seed)
     ar = torch.randn(T, H, device=device, dtype=ar_dt)
     strms = [torch.randn(T, H, device=device, dtype=d) for d in s_dts]
-    thetas = [torch.full((1,), v, device=device, dtype=torch.float32)
-              for v in (0.6, -0.4, 1.3, 0.2)[:len(s_dts)]]
+    # per_dim: theta is (H,) instead of (1,). Not a constant vector -- a constant would pass even
+    # if the kernel silently broadcast element 0, which is the bug this case exists to catch. The
+    # base value is perturbed per channel so every lane must be read from its own address.
+    if per_dim:
+        thetas = [(torch.full((H,), v, device=device, dtype=torch.float32)
+                   + 0.1 * torch.arange(H, device=device, dtype=torch.float32) / H)
+                  for v in (0.6, -0.4, 1.3, 0.2)[:len(s_dts)]]
+    else:
+        thetas = [torch.full((1,), v, device=device, dtype=torch.float32)
+                  for v in (0.6, -0.4, 1.3, 0.2)[:len(s_dts)]]
     out_dt = ar_dt
     for d in s_dts:
         out_dt = torch.promote_types(out_dt, d)
@@ -111,10 +119,13 @@ def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda"):
     t_dar = wd
     t_ds, t_dth = [], []
     for th, s, m in zip(thetas, strms, modes):
-        td = th.double().reshape(()).clone().requires_grad_(True)
+        # per-channel theta reduces over TOKENS only, so the closed form differs by which axes
+        # the sum collapses. reshape(()) would raise on an (H,) theta.
+        _v = th.double().reshape(()) if th.numel() == 1 else th.double()
+        td = _v.clone().requires_grad_(True)
         c = MODES[m](td)
         t_ds.append(_f64(c.detach() * wd, "truth d_stream"))
-        (c * (wd * _f64(s.double(), "truth stream")).sum()).backward()
+        (c * (wd * _f64(s.double(), "truth stream"))).sum().backward()
         t_dth.append(_f64(td.grad, "truth d_theta"))
 
     bwd = {
@@ -146,7 +157,11 @@ def _all_cases():
     """
     bf = torch.bfloat16
     for k in (1, 2, 3, 4):
-        yield f"K{k} all-bf16", bf, [bf] * k, ["none"] * k
+        yield f"K{k} all-bf16", bf, [bf] * k, ["none"] * k, False
+    # PER-CHANNEL theta: (H,) instead of (1,), so d theta reduces over tokens only and the kernel
+    # loads a vector per stream. K=1 is the shipped shape (carry alone); K=2 covers carry+emb.
+    for k in (1, 2):
+        yield f"K{k} all-bf16 PER-DIM", bf, [bf] * k, ["none"] * k, True
 
 
 def _bounded_spot_check():
@@ -154,7 +169,9 @@ def _bounded_spot_check():
     everywhere, where the transform's own error is not hidden under bf16 quantization)."""
     f32 = torch.float32
     for m in ("sigmoid", "2sigmoid", "tanh", "2tanh"):
-        yield f"bounded {m} (fp32/fp32)", f32, [f32], [m]
+        yield f"bounded {m} (fp32/fp32)", f32, [f32], [m], False
+    # one bounded case per-dim: _apply_mode runs elementwise, and that is worth one check
+    yield "bounded 2sigmoid PER-DIM", f32, [f32], ["2sigmoid"], True
 
 
 def main():
@@ -167,8 +184,8 @@ def main():
     worst_mean, worst_mean_name = 0.0, ""
     worst_max, worst_max_name = 0.0, ""
     fails, n_meas = [], 0
-    for name, ar_dt, s_dts, modes in cases:
-        fwd, bwd = _case(ar_dt, s_dts, modes)
+    for name, ar_dt, s_dts, modes, per_dim in cases:
+        fwd, bwd = _case(ar_dt, s_dts, modes, per_dim=per_dim)
         for q, ((k_mu, k_mx), (e_mu, e_mx)) in [("forward", fwd)] + list(bwd.items()):
             n_meas += 1
             r_mu = k_mu / e_mu if e_mu > 0 else (0.0 if k_mu == 0 else float("inf"))
