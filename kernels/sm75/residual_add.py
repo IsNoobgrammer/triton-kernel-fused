@@ -114,20 +114,6 @@ def _apply_mode(theta, MODE: tl.constexpr):
 
 
 @triton.jit
-def _ldm(M, offs_h, H, VEC: tl.constexpr):
-    """The raw multiplier: one scalar, or an (H,) vector when it is PER-CHANNEL.
-
-    Deliberately does NOT call _apply_mode. Triton inlines a multi-return helper at depth 1 only
-    -- _ld and _apply_mode are both called straight from a kernel body for that reason -- and
-    nesting _apply_mode one level deeper here failed to compile with no inner diagnostic.
-    So: load here, transform at the call site, every multi-return helper stays at depth 1.
-    """
-    if VEC:
-        return tl.load(M + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-    return tl.load(M).to(tl.float32)
-
-
-@triton.jit
 def _res_add_fwd(
     AR, S0, S1, S2, S3, M0, M1, M2, M3, OUT,
     T, H,
@@ -151,19 +137,35 @@ def _res_add_fwd(
     # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
-        c, _ = _apply_mode(_ldm(M0, offs_h, H, VEC), MODE0)
+        if VEC:
+            m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M0).to(tl.float32)
+        c, _ = _apply_mode(m, MODE0)
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 1:
-        c, _ = _apply_mode(_ldm(M1, offs_h, H, VEC), MODE1)
+        if VEC:
+            m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M1).to(tl.float32)
+        c, _ = _apply_mode(m, MODE1)
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 2:
-        c, _ = _apply_mode(_ldm(M2, offs_h, H, VEC), MODE2)
+        if VEC:
+            m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M2).to(tl.float32)
+        c, _ = _apply_mode(m, MODE2)
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
     if K > 3:
-        c, _ = _apply_mode(_ldm(M3, offs_h, H, VEC), MODE3)
+        if VEC:
+            m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M3).to(tl.float32)
+        c, _ = _apply_mode(m, MODE3)
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
         acc += (c[None, :] * sv) if VEC else (c * sv)
 
@@ -230,19 +232,35 @@ def _res_add_bwd(
     go = _ld(DOUT, offs_t[:, None] * sdo_t + offs_h[None, :], mask, False).to(tl.float32)
 
     if K > 0:
-        c, _ = _apply_mode(_ldm(M0, offs_h, H, VEC), MODE0)
+        if VEC:
+            m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M0).to(tl.float32)
+        c, _ = _apply_mode(m, MODE0)
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
         _bwd_one(c, s, DS0, PART, pid, spart, 0, offs_t, offs_h, d0_t, mask, go, H, NEED0, VEC)
     if K > 1:
-        c, _ = _apply_mode(_ldm(M1, offs_h, H, VEC), MODE1)
+        if VEC:
+            m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M1).to(tl.float32)
+        c, _ = _apply_mode(m, MODE1)
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
         _bwd_one(c, s, DS1, PART, pid, spart, 1, offs_t, offs_h, d1_t, mask, go, H, NEED1, VEC)
     if K > 2:
-        c, _ = _apply_mode(_ldm(M2, offs_h, H, VEC), MODE2)
+        if VEC:
+            m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M2).to(tl.float32)
+        c, _ = _apply_mode(m, MODE2)
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
         _bwd_one(c, s, DS2, PART, pid, spart, 2, offs_t, offs_h, d2_t, mask, go, H, NEED2, VEC)
     if K > 3:
-        c, _ = _apply_mode(_ldm(M3, offs_h, H, VEC), MODE3)
+        if VEC:
+            m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+        else:
+            m = tl.load(M3).to(tl.float32)
+        c, _ = _apply_mode(m, MODE3)
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
         _bwd_one(c, s, DS3, PART, pid, spart, 3, offs_t, offs_h, d3_t, mask, go, H, NEED3, VEC)
 
