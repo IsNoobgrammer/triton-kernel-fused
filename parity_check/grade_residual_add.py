@@ -34,14 +34,23 @@ def _eager(ar, thetas, strms, modes, out_dt):
     return h.to(out_dt)
 
 
+def _f64(t, what):
+    """Ground truth must be FLOAT64, and nothing else. `.float()` is float32 -- using it here
+    would quietly grade an fp32 kernel against an fp32 reference and call the agreement accuracy.
+    Asserted rather than trusted, because it is invisible when wrong."""
+    assert t.dtype == torch.float64, f"{what} is {t.dtype}, must be float64"
+    return t
+
+
 def _truth(ar, thetas, strms, modes):
-    h = ar.double()
+    h = _f64(ar.double(), "truth attn_read")
     for th, s, m in zip(thetas, strms, modes):
-        h = h + MODES[m](th.double()) * s.double()
-    return h
+        h = h + _f64(MODES[m](th.double()), "truth theta") * _f64(s.double(), "truth stream")
+    return _f64(h, "truth forward")
 
 
 def _relerr(x, truth):
+    _f64(truth, "relerr reference")
     num = (x.double() - truth).abs().max().item()
     den = truth.abs().max().item()
     return num / max(den, 1e-300)
@@ -83,15 +92,15 @@ def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda"):
                                                 modes=tuple(modes)))
     ge = grads(lambda a, th, ss: _eager(a, th, ss, modes, out_dt))
     # truth for the backward: closed form. d ar = w ; d s_k = c_k * w ; d th_k = dc_k * sum(w*s_k)
-    wd = w.double()   # the SAME tensor both paths received
+    wd = _f64(w.double(), "truth dout")   # the SAME tensor both paths received
     t_dar = wd
     t_ds, t_dth = [], []
     for th, s, m in zip(thetas, strms, modes):
         td = th.double().reshape(()).clone().requires_grad_(True)
         c = MODES[m](td)
-        t_ds.append((c.detach() * wd))
-        (c * (wd * s.double()).sum()).backward()
-        t_dth.append(td.grad)
+        t_ds.append(_f64(c.detach() * wd, "truth d_stream"))
+        (c * (wd * _f64(s.double(), "truth stream")).sum()).backward()
+        t_dth.append(_f64(td.grad, "truth d_theta"))
 
     bwd = {
         "d_ar": (_relerr(gk[0], t_dar), _relerr(ge[0], t_dar)),
@@ -104,7 +113,6 @@ def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda"):
 
 
 _SHORT = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
-_MODE_CYCLE = ["none", "2sigmoid", "tanh", "sigmoid", "2tanh"]
 
 
 def _all_cases():
@@ -115,24 +123,38 @@ def _all_cases():
     reason to guess which combination breaks: enumerate them.
 
     {bf16, fp32, fp16} exhaustively for K=1,2 (3^2 + 3^3 = 36 configs) and {bf16, fp32} for
-    K=3,4 (2^4 + 2^5 = 48), so every (attn_read, stream_0..k) assignment the model could ever
-    produce is measured. Modes cycle so all five transforms are exercised across the sweep.
+    K=3,4 (2^4 + 2^5 = 48), so every (attn_read, stream_0..k) assignment the model could produce
+    is measured.
+
+    MODE IS FIXED AT "none". The bounded transforms (sigmoid/tanh/2sigmoid/2tanh) are not on any
+    live arm -- every AttnRes run uses carry_scale=unbounded, and 2sigmoid bounding was refuted
+    experimentally -- so grading them here only inflates the matrix. They are still exercised, but
+    in _bounded_spot_check() below rather than crossed against 84 dtype configs: leaving a code
+    path with zero coverage is how the 2*sigmoid(2x)-1 tanh survived in the first place.
     """
     bf, f32, f16 = torch.bfloat16, torch.float32, torch.float16
     for pool, ks in (((bf, f32, f16), (1, 2)), ((bf, f32), (3, 4))):
         for k in ks:
             for combo in itertools.product(pool, repeat=k + 1):
                 ar_dt, s_dts = combo[0], list(combo[1:])
-                modes = [_MODE_CYCLE[(i + len(s_dts)) % len(_MODE_CYCLE)] for i in range(k)]
                 name = f"K{k} ar={_SHORT[ar_dt]} s=" + "+".join(_SHORT[d] for d in s_dts)
-                yield name, ar_dt, s_dts, modes
+                yield name, ar_dt, s_dts, ["none"] * k
+
+
+def _bounded_spot_check():
+    """One case per bounded mode, at the layout most likely to expose a bad transform (fp32
+    everywhere, where the transform's own error is not hidden under bf16 quantization)."""
+    f32 = torch.float32
+    for m in ("sigmoid", "2sigmoid", "tanh", "2tanh"):
+        yield f"bounded {m} (fp32/fp32)", f32, [f32], [m]
 
 
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
-    cases = list(_all_cases())
-    print(f"grading {len(cases)} dtype configurations x 4 quantities "
-          f"= {len(cases) * 4} measurements against fp64\n")
+    cases = list(_all_cases()) + list(_bounded_spot_check())
+    print(f"grading {len(cases)} configurations x 4 quantities "
+          f"= {len(cases) * 4} measurements against fp64 "
+          f"({len(list(_all_cases()))} dtype configs at mode=none, 4 bounded spot checks)\n")
     print(f"{'case':34s} {'quantity':10s} {'kernel':>10s} {'eager':>10s} {'ratio':>8s}")
     worst, worst_name = 0.0, ""
     fails, n_meas = [], 0
