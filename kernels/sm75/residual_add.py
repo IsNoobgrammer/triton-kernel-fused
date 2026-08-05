@@ -91,9 +91,19 @@ def _ld(P, off, mask, PERSIST: tl.constexpr):
 
 @triton.jit
 def _apply_mode(theta, MODE: tl.constexpr):
-    """f(theta) and f'(theta), together, because backward always needs both."""
+    """f(theta) and f'(theta), together, because backward always needs both.
+
+    Every branch must return the SAME TYPES: Triton unifies a function's return signature across
+    all its return statements, even though MODE is constexpr and only one branch is ever taken.
+    With a scalar theta a bare `1.0` matched the other branches' scalars, but once theta became a
+    PER-CHANNEL (H,) vector it did not -- branch 0 returned (tensor, float) while branch 1
+    returned (tensor, tensor), and the call site failed to compile with no inner diagnostic.
+    `theta * 0.0 + 1.0` carries theta's shape either way; it is dead code in this file (every
+    caller does `c, _ = ...`, and the chain rule for d theta is applied host-side after the
+    reduction) so it costs nothing after DCE.
+    """
     if MODE == 0:
-        return theta, 1.0
+        return theta, theta * 0.0 + 1.0
     if MODE == 1:
         s = tl.sigmoid(theta)
         return s, s * (1.0 - s)
