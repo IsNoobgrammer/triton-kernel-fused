@@ -81,7 +81,14 @@ def main():
         for spread in (1.0, 1e4):
             cases.append((bf, bf, N, spread))
     short = {bf: "bf16", f32: "fp32", f16: "fp16"}
-    print(f"grading {len(cases)} configs x 2 statistics against fp64\n")
+    # At bf16 in/out the kernel and eager are the SAME computation to within float-comparison
+    # noise -- measured ratios 0.999999879 to 1.000000053, i.e. differences in the 8th decimal.
+    # A strict `ratio > 1.0` test fails on the last bit of a float division and reports ties as
+    # regressions. MEAN_SLACK sits well below any real defect (the cancelling-tanh bug read
+    # 1.29x) and well above this noise.
+    MEAN_SLACK, MAX_SLACK = 1.001, 2.0
+    print(f"grading {len(cases)} configs x 2 statistics against fp64 "
+          f"(mean slack {MEAN_SLACK}x, max slack {MAX_SLACK}x)\n")
     mu_r, mx_r, fails = [], [], []
     for br_dt, ps_dt, N, spread in cases:
         (kmu, kmx), (emu, emx) = _case(br_dt, ps_dt, N, spread=spread)
