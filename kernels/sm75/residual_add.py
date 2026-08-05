@@ -290,8 +290,23 @@ BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K 
 # models, not the same model computed two ways. Any comparison must hold the path fixed across
 # arms. It does NOT affect an AttnRes-off baseline, which never enters this code.
 #
-# Every accuracy claim here is MEASURED by parity_check/parity_residual_add.py against fp64, in
-# bf16 and fp32, forward and backward. Do not add a claim to this comment without a number.
+# MEASURED by parity_check/grade_residual_add.py, 32 quantities across 8 layouts, relative error
+# against fp64 truth. Kernel is never worse than eager; worst kernel/eager ratio is 1.000 (a tie).
+#   1s bf16 / ar fp32 (the carry path)  fwd 4.5e-08 vs 2.4e-03   d_theta 1.6e-07 vs 9.7e-04
+#   1s fp32 / ar fp32 (fp32 training)   fwd 4.5e-08 vs 5.7e-08   d_theta 2.7e-08 vs 1.8e-07
+#   1s bf16 / ar bf16                   fwd 3.0e-03 vs 5.4e-03   d_theta 6.3e-09 vs 3.3e-04
+#   2s bf16+fp32 (carry+emb)            fwd 6.8e-08 vs 2.0e-03   d_theta 1.6e-07 vs 9.7e-04
+# d_ar and d_stream tie with eager where eager is already exact, and beat it ~2x where it is not.
+#
+# FMA: enable_fp_fusion is left ON, and that was MEASURED, not assumed. Against fp64, on vs off:
+#   1s fp32 / ar fp32   4.529e-08 vs 5.700e-08   FMA better (and off == eager exactly)
+#   1s fp32 / ar bf16   identical
+#   2s bf16+fp32        identical
+#   1s bf16 / ar fp32   identical
+# So FMA helps in exactly one layout -- single fp32 stream, fp32 attn_read, where it replaces two
+# roundings with one -- and is neutral everywhere else. Never worse.
+#
+# Do not add a claim to this comment without a number.
 
 
 def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
