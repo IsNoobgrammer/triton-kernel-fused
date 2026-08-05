@@ -34,6 +34,15 @@ exactly", and under that policy it was measurably WORSE than eager on 14 of 54 c
 is fp32 because of autocast, not because fp32 is right, and an fp32 training run has no bf16
 rounding for the policy to match. fp64 is affordable because this kernel is memory-bound.
 
+MEASURED (54 configs: every block_residual x prefix_sum dtype pair over {bf16,fp32,fp16}, N in
+{2,4,8}, and a 1e4 magnitude spread across candidates to reproduce the real embedding-vs-prefix
+range). Relative error against fp64 truth, kernel / eager:
+    MEAN  54 better, 0 worse, median ratio 0.1181   (~8x more accurate typically)
+    MAX   42 better, 12 tie, 0 worse, median 0.0335
+Strictly monotone -- never worse than eager on either statistic, in any layout.
+And FASTER, fwd+bwd at T=65536 H=512:  N=4  8.56 ms vs 15.25 ms (1.78x)
+                                       N=8 16.63 ms vs 29.17 ms (1.75x)
+
 `sq_sum` can optionally be supplied for the block rows: a committed block representative never
 changes, so its squared norm is the same at every downstream site and every layer, and recomputing
 it 2L+1 times is pure waste. Pass `block_sq_sum` to skip it.
