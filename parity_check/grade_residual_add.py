@@ -14,7 +14,7 @@ import itertools
 
 import torch
 
-from ._paths import add_repo_root  # noqa: F401
+from . import _paths  # noqa: F401
 from kernels.sm75.residual_add import make_mlp_input
 
 MODES = {"none": lambda t: t,
