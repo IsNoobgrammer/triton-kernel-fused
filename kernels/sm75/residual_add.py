@@ -65,6 +65,7 @@ there is nothing to search; and autotuning on a grid-size dimension has already 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 __all__ = ["make_mlp_input", "fused_residual_add", "residual_add_reference", "MODES"]
 
@@ -95,13 +96,18 @@ def _apply_mode(theta, MODE: tl.constexpr):
         s = tl.sigmoid(theta)
         return s, s * (1.0 - s)
     if MODE == 2:
-        t = (2.0 * tl.sigmoid(2.0 * theta)) - 1.0      # tanh; tl.math.tanh is not on every arch
+        # libdevice.tanh, NOT 2*sigmoid(2x)-1. The identity is exact in real arithmetic and
+        # catastrophic in fp32: at small theta it evaluates 2*0.5 - 1, cancelling away the
+        # mantissa. Measured against fp64 on linspace(-3, 3): 2*sigmoid(2x)-1 gives 8.139e-05
+        # max relative error, libdevice.tanh gives 1.511e-07 -- identical to torch.tanh. The
+        # exhaustive dtype grade caught this as d_stream (= c*dout) coming out 1.29x WORSE than
+        # eager on every tanh case; nothing else in the kernel was at fault.
+        t = libdevice.tanh(theta)
         return t, 1.0 - t * t
     if MODE == 3:
         s = tl.sigmoid(theta)
         return 2.0 * s, 2.0 * s * (1.0 - s)
-    s = tl.sigmoid(2.0 * theta)
-    t = (2.0 * s) - 1.0
+    t = libdevice.tanh(theta)
     return 2.0 * t, 2.0 * (1.0 - t * t)
 
 
