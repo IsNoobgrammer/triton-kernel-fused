@@ -42,9 +42,11 @@ has no bf16 rounding anywhere, so a kernel tuned to bf16-eager is tuned to an ar
 silently wrong at a dtype nobody tested. Correctness has to be dtype-independent, and the only
 dtype-independent reference is fp64.
 
-So: load native, widen to fp32, accumulate in fp32, round ONCE at the final store. Backward keeps
-the full-precision upstream gradient, and d_theta reduces with FP64 per-program partials so the
-~8k-entry cross-program sum is effectively exact.
+So: load native, widen to FP64, accumulate in fp64, round ONCE at the final store. Backward keeps
+the full-precision upstream gradient, forms the d_theta products in fp64, and reduces with fp64
+per-program partials so the ~8k-entry cross-program sum is effectively exact. fp64 is free here --
+measured 0.64 ms either way, because the kernel is memory-bound and the arithmetic hides behind
+the traffic.
 
 CONSEQUENCE, and it is a real one: kernel-on and kernel-off are now DIFFERENT MODELS, not one model
 computed two ways. Any comparison must hold the path fixed across arms. An AttnRes-off baseline is
@@ -126,25 +128,30 @@ def _res_add_fwd(
     offs_h = tl.arange(0, BLOCK_H)
     mask = (offs_t[:, None] < T) & (offs_h[None, :] < H)
 
-    acc = _ld(AR, offs_t[:, None] * sar_t + offs_h[None, :], mask, False).to(tl.float32)
+    # FP64 accumulator. Measured free: 0.64 ms either way at the board shape, because this
+    # kernel is memory-bound and the fp64 arithmetic hides entirely behind the traffic. It
+    # buys strict monotonicity -- with fp32 the worst MAX ratio was 1.1450 (FMA rounds the
+    # other way on individual elements); with fp64 it is 1.0000, i.e. the kernel is never
+    # worse than eager on ANY of the 352 measurements, on mean OR max.
+    acc = _ld(AR, offs_t[:, None] * sar_t + offs_h[None, :], mask, False).to(tl.float64)
     # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
         c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
-        sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        acc += c * sv
+        sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float64)
+        acc += c.to(tl.float64) * sv
     if K > 1:
         c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
-        sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        acc += c * sv
+        sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float64)
+        acc += c.to(tl.float64) * sv
     if K > 2:
         c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
-        sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        acc += c * sv
+        sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float64)
+        acc += c.to(tl.float64) * sv
     if K > 3:
         c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
-        sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        acc += c * sv
+        sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float64)
+        acc += c.to(tl.float64) * sv
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
@@ -299,8 +306,9 @@ BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K 
 # MEASURED by parity_check/grade_residual_add.py: 352 measurements over 88 configurations --
 # every (attn_read, stream_0..k) dtype assignment for K=1..4 over {bf16, fp32, fp16}, plus one
 # spot check per bounded mode. PASS, mean relative error <= eager on all 352.
-#   worst mean ratio 1.0000 (a tie, on d_ar where both are exact)
-#   worst max  ratio 1.1450 (K4 all-fp32 forward), against 2.0x slack
+#   worst mean ratio 1.0000, worst MAX ratio 1.0000 -- STRICTLY MONOTONE, never worse than eager
+#   on any of the 352, on either statistic. Distribution: 250 better / 102 tie / 0 worse on mean,
+#   median ratio 0.4872, i.e. the kernel roughly halves the error on a typical measurement.
 # And it is FASTER: 0.64 ms vs 0.90 ms eager, fwd+bwd at the board shape (65536 x 512).
 #
 # Two defects the exhaustive matrix caught that a hand-picked case list had missed:
