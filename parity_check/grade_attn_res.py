@@ -38,12 +38,17 @@ def _f64(t, what):
     return t
 
 
-def _truth(br, ps, w, eps):
+def _truth(br, ps, w, eps, score_mode=0):
     """fp64 throughout. NOT .float() -- that is fp32 and would grade fp32 against fp32."""
     v = torch.cat((_f64(br.double(), "truth br"), _f64(ps.double(), "truth ps").unsqueeze(1)), 1)
     k = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
     scores = (k * _f64(w.double(), "truth w")).sum(-1)
-    return _f64(torch.matmul(scores.softmax(-1).unsqueeze(1), v).squeeze(1), "truth out")
+    if score_mode == 0:
+        probs = scores.softmax(-1)
+    else:
+        sp = torch.sigmoid(scores)
+        probs = sp / sp.sum(-1, keepdim=True).clamp_min(1e-30)
+    return _f64(torch.matmul(_f64(probs, "truth probs").unsqueeze(1), v).squeeze(1), "truth out")
 
 
 def _relerr(x, truth):
@@ -53,7 +58,8 @@ def _relerr(x, truth):
     return d.mean().item() / den, d.max().item() / den
 
 
-def _case(br_dt, ps_dt, N, T=512, H=512, spread=1.0, seed=0, eps=1e-6, device="cuda"):
+def _case(br_dt, ps_dt, N, T=512, H=512, spread=1.0, seed=0, eps=1e-6, device="cuda",
+          score_mode=0):
     torch.manual_seed(seed)
     # spread > 1 gives each candidate its own magnitude scale, geometric from 1 to `spread`.
     # spread=1e4 reproduces the model's embedding-vs-prefix-sum range.
@@ -63,9 +69,9 @@ def _case(br_dt, ps_dt, N, T=512, H=512, spread=1.0, seed=0, eps=1e-6, device="c
     br, ps = br.to(br_dt), ps.to(ps_dt)
     w = torch.randn(H, device=device, dtype=torch.float32)
 
-    tr = _truth(br, ps, w, eps)
-    k = attn_res(br, ps, w, eps)
-    e = attn_res_reference(br, ps, w, eps)
+    tr = _truth(br, ps, w, eps, score_mode)
+    k = attn_res(br, ps, w, eps, score_mode)
+    e = attn_res_reference(br, ps, w, eps, score_mode)
     return _relerr(k, tr), _relerr(e, tr)
 
 
@@ -76,10 +82,14 @@ def main():
     # (--attn_res_fp32_stream false), the kernel scores and softmaxes in fp32 internally, and the
     # output goes back to bf16. The old 9-way dtype product policed a mixed stack that no longer
     # exists. N and the magnitude spread stay -- those are real axes, dtype no longer is.
+    # Both score modes: 0 = softmax (every arm before Aug 5), 1 = sigmoid/sum. Mode 1 keeps the
+    # convex-combination property -- the weights still sum to 1 -- so the ill-conditioning that
+    # `spread` reproduces applies to it identically and it gets the same grid, not a token case.
     cases = []
-    for N in (2, 4, 8):
-        for spread in (1.0, 1e4):
-            cases.append((bf, bf, N, spread))
+    for mode in (0, 1):
+        for N in (2, 4, 8):
+            for spread in (1.0, 1e4):
+                cases.append((bf, bf, N, spread, mode))
     short = {bf: "bf16", f32: "fp32", f16: "fp16"}
     # At bf16 in/out the kernel and eager are the SAME computation to within float-comparison
     # noise -- measured ratios 0.999999879 to 1.000000053, i.e. differences in the 8th decimal.
@@ -90,13 +100,14 @@ def main():
     print(f"grading {len(cases)} configs x 2 statistics against fp64 "
           f"(mean slack {MEAN_SLACK}x, max slack {MAX_SLACK}x)\n")
     mu_r, mx_r, fails = [], [], []
-    for br_dt, ps_dt, N, spread in cases:
-        (kmu, kmx), (emu, emx) = _case(br_dt, ps_dt, N, spread=spread)
+    for br_dt, ps_dt, N, spread, mode in cases:
+        (kmu, kmx), (emu, emx) = _case(br_dt, ps_dt, N, spread=spread, score_mode=mode)
         rmu = kmu / emu if emu > 0 else 1.0
         rmx = kmx / emx if emx > 0 else 1.0
         mu_r.append(rmu)
         mx_r.append(rmx)
-        name = f"br={short[br_dt]} ps={short[ps_dt]} N={N} spread={spread:g}"
+        name = (f"{'softmax' if mode == 0 else 'signorm'} br={short[br_dt]} "
+                f"ps={short[ps_dt]} N={N} spread={spread:g}")
         if rmu > MEAN_SLACK or rmx > MAX_SLACK:
             fails.append((name, kmu, emu, rmu, kmx, emx, rmx))
             print(f"  {name:38s} mean {kmu:.3e}/{emu:.3e}={rmu:5.2f}x  "
