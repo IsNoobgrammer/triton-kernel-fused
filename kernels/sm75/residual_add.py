@@ -173,7 +173,7 @@ def _res_add_bwd(
     go = _ld(DOUT, offs_t[:, None] * sdo_t + offs_h[None, :], mask, False).to(tl.float32)
 
     if K > 0:
-        c, dc = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
+        c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
         c = c.to(S0.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
@@ -185,12 +185,12 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         pq = (gq * s).to(S0.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(pq, axis=1), axis=0))
         if NEED0:
             tl.store(DS0 + offs_t[:, None] * d0_t + offs_h[None, :],
                      (c * gq).to(DS0.dtype.element_ty), mask=mask)
     if K > 1:
-        c, dc = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
+        c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
         c = c.to(S1.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
@@ -202,12 +202,12 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         pq = (gq * s).to(S1.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(pq, axis=1), axis=0))
         if NEED1:
             tl.store(DS1 + offs_t[:, None] * d1_t + offs_h[None, :],
                      (c * gq).to(DS1.dtype.element_ty), mask=mask)
     if K > 2:
-        c, dc = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
+        c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
         c = c.to(S2.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
@@ -219,12 +219,12 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         pq = (gq * s).to(S2.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(pq, axis=1), axis=0))
         if NEED2:
             tl.store(DS2 + offs_t[:, None] * d2_t + offs_h[None, :],
                      (c * gq).to(DS2.dtype.element_ty), mask=mask)
     if K > 3:
-        c, dc = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
+        c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
         c = c.to(S3.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
@@ -236,10 +236,27 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         pq = (gq * s).to(S3.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(pq, axis=1), axis=0) * dc)
+        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(pq, axis=1), axis=0))
         if NEED3:
             tl.store(DS3 + offs_t[:, None] * d3_t + offs_h[None, :],
                      (c * gq).to(DS3.dtype.element_ty), mask=mask)
+
+
+def _dmode(t, mode):
+    """dc/dtheta in torch, matching what autograd produces for the eager spelling of each mode.
+
+    Lives on the torch side, not in the kernel, because it must be applied AFTER the reduction
+    has been rounded to the stream dtype -- see the note in _ResidualAdd.backward.
+    """
+    if mode == "none":
+        return torch.ones_like(t)
+    if mode in ("sigmoid", "2sigmoid"):
+        s = torch.sigmoid(t)
+        return (2.0 if mode == "2sigmoid" else 1.0) * s * (1.0 - s)
+    if mode in ("tanh", "2tanh"):
+        h = torch.tanh(t)
+        return (2.0 if mode == "2tanh" else 1.0) * (1.0 - h * h)
+    raise ValueError(f"unknown mode {mode!r}")
 
 
 def _prep(attn_read, pairs):
@@ -381,13 +398,29 @@ class _ResidualAdd(torch.autograd.Function):
             BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
             enable_fp_fusion=False,
         )
+        # Eager's d theta is round_to_STREAM_DTYPE( sum(grad_p * stream) ), and ONLY THEN scaled
+        # by dc/dtheta. The reduction lives at the c*stream product node, whose dtype is the
+        # stream's, so the sum comes back quantized; the chain-rule factor is applied afterwards
+        # in fp32 and un-quantizes it. Both halves have to be in that order:
+        #   - the kernel used to fold dc into each program's partial sum, so dc was applied
+        #     BEFORE the cross-program add instead of after;
+        #   - and nothing ever rounded, so the kernel returned a full-precision fp32 sum.
+        # Net effect was a kernel MORE ACCURATE than its reference -- the exact failure mode that
+        # cost real bpb the first time. Measured on carry_scale=unbounded, rounding here alone
+        # reproduces eager's scalar gradient in 12/12 shape x seed cases.
         dtheta = part.sum(0)
         outs = [None, None, None]
         # d attn_read IS dout. Return it by alias -- the identity add costs a whole 134 MB copy
         # if written out, and autograd is happy with a view.
         outs[0] = dout if attn_read.requires_grad else None
-        grads = [(dtheta[i].reshape(thetas[i].shape) if thetas[i].requires_grad else None)
-                 for i in range(n)]
+        grads = []
+        for i in range(n):
+            if not thetas[i].requires_grad:
+                grads.append(None)
+                continue
+            g = dtheta[i].to(strms[i].dtype).to(torch.float32) * _dmode(
+                thetas[i].detach().float().reshape(()), ctx.modes[i])
+            grads.append(g.reshape(thetas[i].shape).to(thetas[i].dtype))
         grads += [(ds[i].view(strms[i].shape) if need[i] else None) for i in range(n)]
         return (outs[0], None, None, None, *grads)
 
