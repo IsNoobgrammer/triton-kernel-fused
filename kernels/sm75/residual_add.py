@@ -276,7 +276,20 @@ BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K 
 # EMBEDDING stream takes the fp32 path, and MoE top-k turns 2.4e-07 into 1.76e-01 of hidden-state
 # divergence over 10 layers by flipping expert picks. That is why carry-only gated at 0.00e+00
 # while carry+emb failed -- not a multi-stream bug, a per-stream-dtype one.
-# Measured: 2.384e-07 -> 0.000e+00 with the flag. See test_res_add_gpu.gate_emb_gain in BiBo.
+#
+# PARTIAL FIX -- do not read this flag as "the kernel is now bit-exact". Measured after it, on
+# (stream / attn_read), max|fused - eager|:
+#     bf16 / bf16   1.562e-02 -> 0.000e+00
+#     bf16 / fp32   0.000e+00 -> 0.000e+00
+#     fp32 / fp32   4.768e-07 -> 0.000e+00
+#     fp32 / bf16   4.768e-07 -> 4.768e-07   STILL FUSED
+#     2-stream bf16 + fp32 (the production layout)  -> 4.768e-07   STILL FUSED
+# The survivors are exactly the MIXED-dtype specializations, and the residual is confirmed to be
+# FMA (kernel == torch.addcmul to the bit). Not a stale Triton cache -- verified with the cache
+# cleared. So enable_fp_fusion is not reaching ptxas for those specializations, or ptxas is
+# contracting independently (-fmad defaults to true and is a separate knob from LLVM fp-contract).
+# UNTIL THIS IS CLOSED: any arm with an embedding stream runs --fused_res_add false. See
+# [[two-stream-res-add-broken]] and test_res_add_gpu.gate_emb_gain in BiBo.
 
 
 def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
