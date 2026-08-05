@@ -63,24 +63,27 @@ def _case(ar_dt, s_dts, modes, T=512, H=512, seed=0, device="cuda"):
     t = _truth(ar, thetas, strms, modes)
     fwd = (_relerr(k, t), _relerr(e, t))
 
-    # ---- backward. Same upstream gradient for every path, and a non-uniform one so d_theta is a
-    # real reduction rather than a constant times a sum.
+    # ---- backward. The upstream gradient is handed in DIRECTLY, already in the output dtype, so
+    # both paths see bit-identical dout and truth can be computed from that same tensor. Going
+    # through `(out.float()*w).sum()` instead would let autograd quantize w to the output dtype
+    # on its way in, while truth still used the fp32 w -- a common error injected into both sides
+    # that swamps the thing being measured. It made the all-bf16 d_theta look 1.34x worse than
+    # eager when the real cause was the reference, not the kernel.
     torch.manual_seed(seed + 1)
-    w = torch.randn(T, H, device=device, dtype=torch.float32)
+    w = torch.randn(T, H, device=device, dtype=out_dt)
 
     def grads(fn):
         a = ar.clone().requires_grad_(True)
         ss = [s.clone().requires_grad_(True) for s in strms]
         th = [t_.clone().requires_grad_(True) for t_ in thetas]
-        out = fn(a, th, ss)
-        (out.float() * w).sum().backward()
+        fn(a, th, ss).backward(gradient=w)
         return a.grad, [s.grad for s in ss], [t_.grad for t_ in th]
 
     gk = grads(lambda a, th, ss: make_mlp_input(a, *itertools.chain(*zip(th, ss)),
                                                 modes=tuple(modes)))
     ge = grads(lambda a, th, ss: _eager(a, th, ss, modes, out_dt))
     # truth for the backward: closed form. d ar = w ; d s_k = c_k * w ; d th_k = dc_k * sum(w*s_k)
-    wd = w.double()
+    wd = w.double()   # the SAME tensor both paths received
     t_dar = wd
     t_ds, t_dth = [], []
     for th, s, m in zip(thetas, strms, modes):

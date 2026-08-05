@@ -26,27 +26,32 @@ Backward, in the same single pass over the data:
 The theta reduction is the real win. Eager builds `dout * stream_k` (134 MB) and then reduces it;
 here it accumulates in registers during the pass the backward already has to make.
 
-WHY THIS QUANTIZES INSTEAD OF ACCUMULATING IN FP32. Eager evaluates
+ACCURACY IS THE CONTRACT, NOT BIT-IDENTITY. Graded against FP64 truth by
+parity_check/grade_residual_add.py, this kernel must be at least as close as eager in EVERY dtype
+layout, forward and backward. It is deliberately not bit-identical to eager.
+
+This reverses an earlier decision, on purpose. Eager evaluates
 
     attn_read + _c.to(attn_output.dtype) * attn_output
 
-so the scalar is rounded to the STREAM dtype and the product is computed AND STORED there --
-bf16 for attn_out, i.e. 7 mantissa bits on all 134M elements -- before the fp32 add. An earlier
-version of this kernel kept the whole thing in fp32 and was, in isolation, 30,000x closer to fp64
-truth. It also cost bpb: two matched same-box pairs went the wrong way (c+d +0.0037, c-only +0.007)
-with train loss agreeing, because removing that per-element quantization removes noise the model
-was benefiting from. A kernel must REPRODUCE its reference, not improve it -- "more accurate"
-silently changed the model while claiming to change only the implementation. So the scalar and the
-product are both rounded to the stream dtype here, and the running accumulator is rounded to the
-OUTPUT dtype after every term -- eager's `h = h + ...` chain rounds at each step, so an fp32
-accumulator that rounds once at the end is a different computation whenever the output is not fp32.
-To run the eager path instead, use --fused_res_add false.
+so the scalar is rounded to the STREAM dtype and the product is computed AND STORED there -- bf16
+for attn_out, 7 mantissa bits on all 134M elements -- before the fp32 add. The kernel used to
+reproduce that loss deliberately, so that kernel-on and kernel-off were the same model. The problem
+with that contract is that it treats AUTOCAST's rounding as the specification: an fp32 training run
+has no bf16 rounding anywhere, so a kernel tuned to bf16-eager is tuned to an artifact and can be
+silently wrong at a dtype nobody tested. Correctness has to be dtype-independent, and the only
+dtype-independent reference is fp64.
 
-RESIDUAL GAP, measured and accepted: with an FP32 stream the quantization casts are no-ops, so
-Triton contracts `cq*sv + acc` into an FMA -- one rounding where eager does two. That shows up as
-4.8e-07 absolute on the carry+emb layout, about 4 fp32 ULPs, five orders of magnitude below the
-bf16 quantization this change restores. The k=1 carry case, which has a bf16 stream and therefore a
-real cast, is exactly bit-identical.
+So: load native, widen to fp32, accumulate in fp32, round ONCE at the final store. Backward keeps
+the full-precision upstream gradient, and d_theta reduces with FP64 per-program partials so the
+~8k-entry cross-program sum is effectively exact.
+
+CONSEQUENCE, and it is a real one: kernel-on and kernel-off are now DIFFERENT MODELS, not one model
+computed two ways. Any comparison must hold the path fixed across arms. An AttnRes-off baseline is
+unaffected -- it never enters this file. Historical note: the previous "more accurate" version was
+blamed for two same-box regressions (c+d +0.0037, c-only +0.007). Those arms also went through the
+multi-stream path, which was separately found to be FMA-contracted and inexact, so that attribution
+is not clean and should not be used as evidence against this contract.
 
 WHY THE TRANSFORM LIVES IN THE KERNEL. theta is the leaf parameter and f is sigmoid/tanh/identity.
 Doing f on the host is arithmetically free but puts a tiny op in the autograd graph per scalar per
@@ -420,42 +425,10 @@ def make_mlp_input(attn_read, *pairs, modes=None, persistent=None):
     assert len(modes) == n, f"got {n} streams but {len(modes)} modes"
     for m in modes:
         assert m in MODES, f"unknown mode {m!r}; valid: {sorted(MODES)}"
-    _assert_exact(attn_read, strms)
     if not attn_read.is_cuda:
         return residual_add_reference(attn_read, list(zip(thetas, strms)), modes).to(attn_read.dtype)
     return _ResidualAdd.apply(attn_read, modes, n, tuple(persistent) if persistent else None,
                               *thetas, *strms)
 
 
-def _assert_exact(attn_read, strms):
-    """Refuse any configuration not MEASURED bit-identical to eager.
 
-    This kernel is not exact everywhere, and the inexact cases are not safe to run: 1 ULP flips
-    MoE top-k, which changes the trajectory, not just the digits. Rather than leave that as a
-    comment someone has to find, the unsafe shapes raise.
-
-    Measured max|fused - eager| by (stream / attn_read), with enable_fp_fusion=False:
-        bf16 / bf16   0.000e+00      fp32 / fp32   0.000e+00
-        bf16 / fp32   0.000e+00      fp32 / bf16   4.768e-07   <- FMA survives
-        2 streams, bf16 + fp32       4.768e-07               <- FMA survives
-    The pattern is the FMA: a BF16 stream rounds its product, and that rounding is what blocks
-    contraction. An FP32 stream has no such barrier, and stays exact only when it is the sole
-    stream and attn_read matches it.
-
-    Pass strict=False on the module (RESIDUAL_ADD_STRICT = False) to run the inexact shapes
-    anyway -- for benchmarking or for closing out the FMA work, never for a training arm.
-    """
-    if not RESIDUAL_ADD_STRICT:
-        return
-    dts = {s.dtype for s in strms}
-    if len(strms) == 1 and (torch.bfloat16 in dts or dts == {attn_read.dtype}):
-        return
-    raise ValueError(
-        f"residual_add: {len(strms)} stream(s) of dtype {sorted(str(d) for d in dts)} against "
-        f"attn_read {attn_read.dtype} is NOT bit-identical to eager (FMA contraction, ~1 ULP, "
-        f"enough to flip MoE top-k). Exact shapes: one BF16 stream against any attn_read, or one "
-        f"stream matching attn_read's dtype. Add the extra stream eagerly, or set "
-        f"kernels.sm75.residual_add.RESIDUAL_ADD_STRICT = False if you accept the drift.")
-
-
-RESIDUAL_ADD_STRICT = True
