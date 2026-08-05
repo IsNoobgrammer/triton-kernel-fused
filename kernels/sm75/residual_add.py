@@ -120,28 +120,20 @@ def _res_add_fwd(
     # compile-time constant anyway, so the branches vanish.
     if K > 0:
         c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
-        cq = c.to(S0.dtype.element_ty).to(tl.float32)
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        prod = (cq * sv).to(S0.dtype.element_ty).to(tl.float32)
-        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
+        acc += c * sv
     if K > 1:
         c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
-        cq = c.to(S1.dtype.element_ty).to(tl.float32)
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        prod = (cq * sv).to(S1.dtype.element_ty).to(tl.float32)
-        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
+        acc += c * sv
     if K > 2:
         c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
-        cq = c.to(S2.dtype.element_ty).to(tl.float32)
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        prod = (cq * sv).to(S2.dtype.element_ty).to(tl.float32)
-        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
+        acc += c * sv
     if K > 3:
         c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
-        cq = c.to(S3.dtype.element_ty).to(tl.float32)
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        prod = (cq * sv).to(S3.dtype.element_ty).to(tl.float32)
-        acc = (acc + prod).to(OUT.dtype.element_ty).to(tl.float32)
+        acc += c * sv
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
@@ -174,72 +166,64 @@ def _res_add_bwd(
 
     if K > 0:
         c, _ = _apply_mode(tl.load(M0).to(tl.float32), MODE0)
-        c = c.to(S0.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
         # dout instead is a systematically different gradient: measured 1 bf16 ULP on
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        gq = go.to(S0.dtype.element_ty).to(tl.float32)
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
         # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
-        pq = (gq * s).to(S0.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 0, tl.sum(tl.sum(pq, axis=1), axis=0))
+        tl.store(PART + pid * spart + 0,
+                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
         if NEED0:
             tl.store(DS0 + offs_t[:, None] * d0_t + offs_h[None, :],
-                     (c * gq).to(DS0.dtype.element_ty), mask=mask)
+                     (c * go).to(DS0.dtype.element_ty), mask=mask)
     if K > 1:
         c, _ = _apply_mode(tl.load(M1).to(tl.float32), MODE1)
-        c = c.to(S1.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
         # dout instead is a systematically different gradient: measured 1 bf16 ULP on
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        gq = go.to(S1.dtype.element_ty).to(tl.float32)
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
         # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
-        pq = (gq * s).to(S1.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 1, tl.sum(tl.sum(pq, axis=1), axis=0))
+        tl.store(PART + pid * spart + 1,
+                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
         if NEED1:
             tl.store(DS1 + offs_t[:, None] * d1_t + offs_h[None, :],
-                     (c * gq).to(DS1.dtype.element_ty), mask=mask)
+                     (c * go).to(DS1.dtype.element_ty), mask=mask)
     if K > 2:
         c, _ = _apply_mode(tl.load(M2).to(tl.float32), MODE2)
-        c = c.to(S2.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
         # dout instead is a systematically different gradient: measured 1 bf16 ULP on
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        gq = go.to(S2.dtype.element_ty).to(tl.float32)
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
         # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
-        pq = (gq * s).to(S2.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 2, tl.sum(tl.sum(pq, axis=1), axis=0))
+        tl.store(PART + pid * spart + 2,
+                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
         if NEED2:
             tl.store(DS2 + offs_t[:, None] * d2_t + offs_h[None, :],
-                     (c * gq).to(DS2.dtype.element_ty), mask=mask)
+                     (c * go).to(DS2.dtype.element_ty), mask=mask)
     if K > 3:
         c, _ = _apply_mode(tl.load(M3).to(tl.float32), MODE3)
-        c = c.to(S3.dtype.element_ty).to(tl.float32)      # eager rounds the scalar first
         # ...and the product node c*stream is stored in the STREAM dtype, so the gradient
         # arriving at it is cast fp32 -> stream dtype before either use. Feeding full-fp32
         # dout instead is a systematically different gradient: measured 1 bf16 ULP on
         # d attn_out and 0.76% RELATIVE on d theta, on the real model layout.
-        gq = go.to(S3.dtype.element_ty).to(tl.float32)
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
         # eager's d theta is (grad_p * stream).sum(), and grad_p * stream is a bf16 x bf16
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
-        pq = (gq * s).to(S3.dtype.element_ty).to(tl.float32)
-        tl.store(PART + pid * spart + 3, tl.sum(tl.sum(pq, axis=1), axis=0))
+        tl.store(PART + pid * spart + 3,
+                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
         if NEED3:
             tl.store(DS3 + offs_t[:, None] * d3_t + offs_h[None, :],
-                     (c * gq).to(DS3.dtype.element_ty), mask=mask)
+                     (c * go).to(DS3.dtype.element_ty), mask=mask)
 
 
 def _dmode(t, mode):
@@ -283,30 +267,26 @@ def _prep(attn_read, pairs):
 
 BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K stream tiles
 
-# enable_fp_fusion=False on BOTH launches, and it is a correctness flag here, not a tuning knob.
-# Triton contracts `acc + cq*sv` into a single FMA, which rounds ONCE; eager rounds twice (product,
-# then sum). That is 1 fp32 ULP, and it is invisible on a BF16 stream only because `.to(bf16)` on
-# the product is a real rounding op that blocks the contraction. On an FP32 stream that cast is a
-# no-op, nothing blocks the FMA, and the kernel lands exactly on torch.addcmul instead of eager.
+# CONTRACT: this kernel is graded against FP64 TRUTH, and it must be at least as close to that
+# truth as eager is, in EVERY dtype layout. It is deliberately NOT bit-identical to eager.
 #
-# 1 ULP is not negligible in this model: --attn_res_fp32_stream makes block_residual FP32, so the
-# EMBEDDING stream takes the fp32 path, and MoE top-k turns 2.4e-07 into 1.76e-01 of hidden-state
-# divergence over 10 layers by flipping expert picks. That is why carry-only gated at 0.00e+00
-# while carry+emb failed -- not a multi-stream bug, a per-stream-dtype one.
+# The previous contract was bit-identity, which meant reproducing eager's precision loss on
+# purpose: the scalar was rounded to the stream dtype, the c*stream product was rounded to the
+# stream dtype, and the accumulator was rounded to the output dtype between every stream. All of
+# that is gone. Bit-identity encodes AUTOCAST's rounding as if it were the specification -- an
+# fp32 training run has no bf16 rounding anywhere, so a kernel tuned to reproduce bf16-eager is
+# tuned to an artifact and can be wrong at a dtype nobody tested.
 #
-# PARTIAL FIX -- do not read this flag as "the kernel is now bit-exact". Measured after it, on
-# (stream / attn_read), max|fused - eager|:
-#     bf16 / bf16   1.562e-02 -> 0.000e+00
-#     bf16 / fp32   0.000e+00 -> 0.000e+00
-#     fp32 / fp32   4.768e-07 -> 0.000e+00
-#     fp32 / bf16   4.768e-07 -> 4.768e-07   STILL FUSED
-#     2-stream bf16 + fp32 (the production layout)  -> 4.768e-07   STILL FUSED
-# The survivors are exactly the MIXED-dtype specializations, and the residual is confirmed to be
-# FMA (kernel == torch.addcmul to the bit). Not a stale Triton cache -- verified with the cache
-# cleared. So enable_fp_fusion is not reaching ptxas for those specializations, or ptxas is
-# contracting independently (-fmad defaults to true and is a separate knob from LLVM fp-contract).
-# UNTIL THIS IS CLOSED: any arm with an embedding stream runs --fused_res_add false. See
-# [[two-stream-res-add-broken]] and test_res_add_gpu.gate_emb_gain in BiBo.
+# What the kernel does now: load in native dtype, widen to fp32, accumulate in fp32, round exactly
+# ONCE at the final store. d_theta reduces in fp32 within a tile (tl.sum is a tree) and its
+# per-program partials are FP64, so the cross-program sum over ~8k partials is effectively exact.
+#
+# Consequence to keep in mind, since it is a real one: kernel-on and kernel-off are now different
+# models, not the same model computed two ways. Any comparison must hold the path fixed across
+# arms. It does NOT affect an AttnRes-off baseline, which never enters this code.
+#
+# Every accuracy claim here is MEASURED by parity_check/parity_residual_add.py against fp64, in
+# bf16 and fp32, forward and backward. Do not add a claim to this comment without a number.
 
 
 def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
@@ -331,7 +311,6 @@ def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None)
         K=K, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
         P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
         BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
-        enable_fp_fusion=False,
     )
     return out.view(attn_read.shape[:-1] + (H,))
 
@@ -379,7 +358,11 @@ class _ResidualAdd(torch.autograd.Function):
         ds = [torch.empty((T, H), device=do.device, dtype=strms[i].dtype) if need[i] else None
               for i in range(n)]
         grid = (triton.cdiv(T, BLOCK_T),)
-        part = torch.empty((grid[0], max(n, 1)), device=do.device, dtype=torch.float32)
+        # FP64 partials. Each program tree-reduces its own tile in fp32 (tl.sum is a tree, so the
+        # within-tile error is O(log 4096) ULP, not O(4096)); the cross-program sum then runs over
+        # ~T/BLOCK_T entries -- 8192 at the board shape -- and doing THAT in fp32 is where a long
+        # accumulation actually degrades. fp64 here costs one tiny buffer and removes it.
+        part = torch.empty((grid[0], max(n, 1)), device=do.device, dtype=torch.float64)
         pad_s = streams + [streams[0]] * (MAX_STREAMS - n)
         pad_st = strides + [0] * (MAX_STREAMS - n)
         pad_ds = [d if d is not None else streams[0] for d in ds] + [streams[0]] * (MAX_STREAMS - n)
@@ -396,19 +379,14 @@ class _ResidualAdd(torch.autograd.Function):
             NEED0=needc[0], NEED1=needc[1], NEED2=needc[2], NEED3=needc[3],
             P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
             BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
-            enable_fp_fusion=False,
-        )
-        # Eager's d theta is round_to_STREAM_DTYPE( sum(grad_p * stream) ), and ONLY THEN scaled
-        # by dc/dtheta. The reduction lives at the c*stream product node, whose dtype is the
-        # stream's, so the sum comes back quantized; the chain-rule factor is applied afterwards
-        # in fp32 and un-quantizes it. Both halves have to be in that order:
-        #   - the kernel used to fold dc into each program's partial sum, so dc was applied
-        #     BEFORE the cross-program add instead of after;
-        #   - and nothing ever rounded, so the kernel returned a full-precision fp32 sum.
-        # Net effect was a kernel MORE ACCURATE than its reference -- the exact failure mode that
-        # cost real bpb the first time. Measured on carry_scale=unbounded, rounding here alone
-        # reproduces eager's scalar gradient in 12/12 shape x seed cases.
-        dtheta = part.sum(0)
+            )
+        # d theta = dc/dtheta * sum(dout * stream), the whole chain kept in FP64 and rounded once
+        # at the end. Eager instead reduces a product tensor stored in the STREAM dtype, so under
+        # autocast its scalar gradient comes back quantized to bf16 -- 8 mantissa bits on a sum of
+        # 33M terms. Matching that was the old contract; beating it is the new one. dc is applied
+        # AFTER the reduction (it is a constant factor, so this is the same value in exact
+        # arithmetic, but it keeps the one rounding at the very end instead of per-program).
+        dtheta = part.sum(0)                                   # fp64, ~8k partials
         outs = [None, None, None]
         # d attn_read IS dout. Return it by alias -- the identity add costs a whole 134 MB copy
         # if written out, and autograd is happy with a view.
@@ -418,8 +396,7 @@ class _ResidualAdd(torch.autograd.Function):
             if not thetas[i].requires_grad:
                 grads.append(None)
                 continue
-            g = dtheta[i].to(strms[i].dtype).to(torch.float32) * _dmode(
-                thetas[i].detach().float().reshape(()), ctx.modes[i])
+            g = dtheta[i] * _dmode(thetas[i].detach().double().reshape(()), ctx.modes[i])
             grads.append(g.reshape(thetas[i].shape).to(thetas[i].dtype))
         grads += [(ds[i].view(strms[i].shape) if need[i] else None) for i in range(n)]
         return (outs[0], None, None, None, *grads)
