@@ -24,8 +24,15 @@ Everything above is a reduction over H followed by a reduction over N, so it all
   * the softmax runs across N in registers;
   * the weighted sum reuses the already-loaded tile.
 
-V is read once from HBM in its native dtype and the output is written once. Accumulation is fp32
-throughout, matching the reference's precision policy exactly.
+V is read once from HBM in its native dtype and the output is written once.
+
+ACCUMULATION IS FP64, and the contract is ACCURACY, not bit-identity: graded by
+parity_check/grade_attn_res.py against fp64 truth, the kernel must be at least as close as eager
+in every dtype layout. It used to accumulate in fp32 "matching the reference's precision policy
+exactly", and under that policy it was measurably WORSE than eager on 14 of 54 configs (worst
+1.46x on mean). Matching a reference's precision is not the same as being correct -- the reference
+is fp32 because of autocast, not because fp32 is right, and an fp32 training run has no bf16
+rounding for the policy to match. fp64 is affordable because this kernel is memory-bound.
 
 `sq_sum` can optionally be supplied for the block rows: a committed block representative never
 changes, so its squared norm is the same at every downstream site and every layer, and recomputing
@@ -85,15 +92,20 @@ def _attn_res_fwd(
                  mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
     ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h,
                  mask=mask_h[None, :], other=0.0)
-    v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
+    # FP64 for the whole mix. The reference is fp32 (`vf = v.float()`), so this is strictly
+    # tighter, and it is the same change that made residual_add monotone at no measured cost --
+    # both kernels are memory-bound, so the arithmetic hides behind the loads. It matters more
+    # here: candidate RMS spans ~0.04 (raw embedding) to ~426 (prefix sum) in the real model,
+    # four orders of magnitude summed inside one softmax weighting.
+    v = tl.where(is_last[:, None], ps.to(tl.float64), br.to(tl.float64))
 
-    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)
+    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float64)
 
     # ---- scores: RMS and dot product from the SAME registers, one reduction pass each
     dot = tl.sum(v * w[None, :], axis=1)
     if HAS_BSQ:
         # squared norms of committed blocks are constant -- caller cached them
-        bsq = tl.load(BSQ + t * N + offs_n, mask=mask_n & (~is_last), other=0.0)
+        bsq = tl.load(BSQ + t * N + offs_n, mask=mask_n & (~is_last), other=0.0).to(tl.float64)
         psq = tl.sum(tl.where(is_last[:, None], v * v, 0.0), axis=1)
         sq = tl.where(is_last, psq, bsq)
     else:
@@ -107,7 +119,7 @@ def _attn_res_fwd(
 
     # ---- weighted sum, reusing the loaded tile
     out = tl.sum(p[:, None] * v, axis=0)
-    tl.store(OUT + t * sout_t + offs_h * sout_h, out, mask=mask_h)
+    tl.store(OUT + t * sout_t + offs_h * sout_h, out.to(OUT.dtype.element_ty), mask=mask_h)
 
 
 def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_sum=None):
@@ -175,8 +187,10 @@ def _attn_res_bwd(
     mask_h = offs_h < H
     is_last = offs_n == (N - 1)
 
-    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)   # once per TILE, not per token
-    acc_dw = tl.zeros([BLOCK_H], dtype=tl.float32)
+    # FP64 throughout, same reasoning as the forward. acc_dw in particular is a reduction over the
+    # whole TILE of tokens, so it is the one most exposed to fp32 accumulation drift.
+    w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float64)   # once per TILE, not per token
+    acc_dw = tl.zeros([BLOCK_H], dtype=tl.float64)
 
     for k in tl.static_range(TILE):
         t = pid * TILE + k
@@ -185,8 +199,8 @@ def _attn_res_bwd(
                          mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
             ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h,
                          mask=mask_h[None, :], other=0.0)
-            v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
-            dout = tl.load(DOUT + t * sdo_t + offs_h * sdo_h, mask=mask_h, other=0.0).to(tl.float32)
+            v = tl.where(is_last[:, None], ps.to(tl.float64), br.to(tl.float64))
+            dout = tl.load(DOUT + t * sdo_t + offs_h * sdo_h, mask=mask_h, other=0.0).to(tl.float64)
 
             sq = tl.sum(v * v, axis=1)
             dot = tl.sum(v * w[None, :], axis=1)
@@ -202,13 +216,15 @@ def _attn_res_bwd(
 
             dv = p[:, None] * dout[None, :] + d_dot[:, None] * w[None, :] + 2.0 * v * dsq[:, None]
 
-            tl.store(DBR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h, dv,
+            tl.store(DBR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
+                     dv.to(DBR.dtype.element_ty),
                      mask=(mask_n & (~is_last))[:, None] & mask_h[None, :])
             tl.store(DPS + t * sps_t + offs_h * sps_h,
-                     tl.sum(tl.where(is_last[:, None], dv, 0.0), axis=0), mask=mask_h)
+                     tl.sum(tl.where(is_last[:, None], dv, 0.0), axis=0).to(DPS.dtype.element_ty),
+                     mask=mask_h)
             acc_dw += tl.sum(d_dot[:, None] * v, axis=0)
 
-    tl.store(DWP + pid * H + offs_h, acc_dw, mask=mask_h)
+    tl.store(DWP + pid * H + offs_h, acc_dw.to(DWP.dtype.element_ty), mask=mask_h)
 
 
 class FusedAttnRes(torch.autograd.Function):
