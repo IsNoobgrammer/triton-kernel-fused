@@ -296,13 +296,18 @@ BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K 
 # models, not the same model computed two ways. Any comparison must hold the path fixed across
 # arms. It does NOT affect an AttnRes-off baseline, which never enters this code.
 #
-# MEASURED by parity_check/grade_residual_add.py, 32 quantities across 8 layouts, relative error
-# against fp64 truth. Kernel is never worse than eager; worst kernel/eager ratio is 1.000 (a tie).
-#   1s bf16 / ar fp32 (the carry path)  fwd 4.5e-08 vs 2.4e-03   d_theta 1.6e-07 vs 9.7e-04
-#   1s fp32 / ar fp32 (fp32 training)   fwd 4.5e-08 vs 5.7e-08   d_theta 2.7e-08 vs 1.8e-07
-#   1s bf16 / ar bf16                   fwd 3.0e-03 vs 5.4e-03   d_theta 6.3e-09 vs 3.3e-04
-#   2s bf16+fp32 (carry+emb)            fwd 6.8e-08 vs 2.0e-03   d_theta 1.6e-07 vs 9.7e-04
-# d_ar and d_stream tie with eager where eager is already exact, and beat it ~2x where it is not.
+# MEASURED by parity_check/grade_residual_add.py: 352 measurements over 88 configurations --
+# every (attn_read, stream_0..k) dtype assignment for K=1..4 over {bf16, fp32, fp16}, plus one
+# spot check per bounded mode. PASS, mean relative error <= eager on all 352.
+#   worst mean ratio 1.0000 (a tie, on d_ar where both are exact)
+#   worst max  ratio 1.1450 (K4 all-fp32 forward), against 2.0x slack
+# And it is FASTER: 0.64 ms vs 0.90 ms eager, fwd+bwd at the board shape (65536 x 512).
+#
+# Two defects the exhaustive matrix caught that a hand-picked case list had missed:
+#   tanh as 2*sigmoid(2x)-1   cancels near zero, 8.1e-05 vs libdevice.tanh's 1.5e-07
+#   d_theta in fp32           the reduction is ill-conditioned (result ~512, sum|terms| ~200000,
+#                             condition ~400), so fp32 products lost to eager in 8/10 seeds.
+#                             fp64 products -> 10/10 and ~75x better than eager.
 #
 # FMA: enable_fp_fusion is left ON, and that was MEASURED, not assumed. Against fp64, on vs off:
 #   1s fp32 / ar fp32   4.529e-08 vs 5.700e-08   FMA better (and off == eager exactly)
