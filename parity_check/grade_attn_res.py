@@ -75,6 +75,46 @@ def _case(br_dt, ps_dt, N, T=512, H=512, spread=1.0, seed=0, eps=1e-6, device="c
     return _relerr(k, tr), _relerr(e, tr)
 
 
+def _grade_backward(N=4, T=256, H=256, spread=1e4, seed=3, eps=1e-6, device="cuda"):
+    """Kernel gradients vs the eager reference, per score mode.
+
+    The forward grid above cannot catch a wrong backward -- a bad prefactor trains badly and
+    silently. signorm's is NOT the same as softmax's: dp_i/dx_k is p_k(delta_ik - p_i) for
+    softmax but (s_k(1-s_k)/S)(delta_ik - p_i) for signorm, and that factor was derived by hand.
+    fp64 inputs so the reference is a real target and neither side is measuring bf16 rounding.
+    """
+    print("\nbackward, kernel vs eager reference (fp64 inputs):")
+    worst = 0.0
+    for mode in (0, 1):
+        torch.manual_seed(seed)
+        scales = torch.logspace(0, torch.log10(torch.tensor(float(spread))).item(), N,
+                                device=device)
+        br0 = (torch.randn(T, N - 1, H, device=device, dtype=torch.float64)
+               * scales[:N - 1].view(1, -1, 1))
+        ps0 = torch.randn(T, H, device=device, dtype=torch.float64) * scales[-1]
+        w0 = torch.randn(H, device=device, dtype=torch.float32)
+        gout = torch.randn(T, H, device=device, dtype=torch.float64)
+
+        def grads(fn):
+            br = br0.clone().requires_grad_(True)
+            ps = ps0.clone().requires_grad_(True)
+            w = w0.clone().requires_grad_(True)
+            fn(br, ps, w, eps, mode).backward(gradient=gout)
+            return br.grad, ps.grad, w.grad
+
+        gk = grads(attn_res)
+        ge = grads(attn_res_reference)
+        for nm, a, b in zip(("d_br", "d_ps", "d_w"), gk, ge):
+            den = max(b.abs().max().item(), 1e-300)
+            r = (a - b).abs().max().item() / den
+            worst = max(worst, r)
+            print(f"  {'softmax' if mode == 0 else 'signorm'} {nm:5s} rel {r:.3e}")
+    # Kernel and reference differ only in accumulation order here, so this is a rounding-level
+    # check, not a tolerance to tune. A wrong prefactor lands at O(1), not O(1e-6).
+    assert worst < 1e-5, f"backward disagrees with the reference at {worst:.3e} -- check the mode"
+    print(f"  backward OK, worst {worst:.3e}")
+
+
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
     bf, f32, f16 = torch.bfloat16, torch.float32, torch.float16
@@ -120,7 +160,9 @@ def main():
     if fails:
         print(f"\nFAIL on {len(fails)} configs")
         raise SystemExit(1)
-    print("\nPASS: attn_res kernel <= eager against fp64 on every config")
+    print("\nforward PASS: attn_res kernel <= eager against fp64 on every config")
+    _grade_backward()
+    print("PASS")
 
 
 if __name__ == "__main__":
