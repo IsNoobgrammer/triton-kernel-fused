@@ -90,7 +90,7 @@ def main():
         mu_r.append(rmu)
         mx_r.append(rmx)
         name = f"br={short[br_dt]} ps={short[ps_dt]} N={N} spread={spread:g}"
-        if rmu > 1.0 or rmx > 2.0:
+        if rmu > MEAN_SLACK or rmx > MAX_SLACK:
             fails.append((name, kmu, emu, rmu, kmx, emx, rmx))
             print(f"  {name:38s} mean {kmu:.3e}/{emu:.3e}={rmu:5.2f}x  "
                   f"max {kmx:.3e}/{emx:.3e}={rmx:5.2f}x  <-- WORSE")
