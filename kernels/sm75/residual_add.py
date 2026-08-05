@@ -186,7 +186,7 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         tl.store(PART + pid * spart + 0,
-                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
+                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
         if NEED0:
             tl.store(DS0 + offs_t[:, None] * d0_t + offs_h[None, :],
                      (c * go).to(DS0.dtype.element_ty), mask=mask)
@@ -201,7 +201,7 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         tl.store(PART + pid * spart + 1,
-                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
+                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
         if NEED1:
             tl.store(DS1 + offs_t[:, None] * d1_t + offs_h[None, :],
                      (c * go).to(DS1.dtype.element_ty), mask=mask)
@@ -216,7 +216,7 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         tl.store(PART + pid * spart + 2,
-                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
+                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
         if NEED2:
             tl.store(DS2 + offs_t[:, None] * d2_t + offs_h[None, :],
                      (c * go).to(DS2.dtype.element_ty), mask=mask)
@@ -231,7 +231,7 @@ def _res_add_bwd(
         # product STORED in bf16 before the reduction runs. Summing the fp32 product
         # instead left 0.5% relative error on the scalar gradient.
         tl.store(PART + pid * spart + 3,
-                 tl.sum(tl.sum(go * s, axis=1), axis=0).to(tl.float64))
+                 tl.sum(tl.sum(go.to(tl.float64) * s.to(tl.float64), axis=1), axis=0))
         if NEED3:
             tl.store(DS3 + offs_t[:, None] * d3_t + offs_h[None, :],
                      (c * go).to(DS3.dtype.element_ty), mask=mask)
