@@ -105,6 +105,42 @@ def _bwd_tile(N):
     return 4 if N <= 8 else 2
 
 
+def _eff_topk(topk, N):
+    """TOPK the kernel should actually compile with. `topk >= N` selects every candidate, i.e. it
+    IS the dense path -- compiling the selection anyway would burn TOPK-1 reductions per token to
+    produce a mask of all ones. At block_size=1 that is layers 0-4 paying for nothing."""
+    return int(topk) if 0 < int(topk) < N else 0
+
+
+@triton.jit
+def _topk_sel(score, is_last, mask_n, TOPK: tl.constexpr):
+    """Boolean lane mask: the TOPK highest scores, with the prefix-sum row FORCED IN.
+
+    No sort. BLOCK_N is 16 at the largest N this model reaches, so TOPK-1 rounds of
+    max-then-erase is cheaper than any ordering network, and it is a register reduction either
+    way. `key` is `score` with the prefix-sum lane raised to +inf, which both guarantees its
+    selection and makes it consume one of the TOPK slots -- top-6 means the live stream plus the
+    best 5 committed blocks, not 6 blocks alongside it.
+
+    WHY THE LIVE STREAM IS NOT ALLOWED TO LOSE: rows 0..N-2 are frozen block representatives, but
+    row N-1 is the prefix sum, the only candidate carrying THIS layer's attention output. Dropping
+    it does not down-weight attention, it disconnects it -- the layer contributes nothing to the
+    depth read and receives no gradient through this path for that token. That is a
+    discontinuity in the loss surface, not a soft preference, and it costs one `where` to remove.
+
+    N <= TOPK falls out for free: every real lane gets erased before the rounds run out, so
+    `kth` lands at -inf and the mask degenerates to `mask_n`. Exact score ties erase together,
+    which can select slightly MORE than TOPK -- the permissive direction, and correct on a tie.
+    """
+    key = tl.where(is_last, float("inf"), score)      # masked lanes are already -inf
+    cur = key
+    for _ in tl.static_range(TOPK - 1):
+        m = tl.max(cur, axis=0)
+        cur = tl.where(cur == m, float("-inf"), cur)
+    kth = tl.max(cur, axis=0)
+    return mask_n & (key >= kth)
+
+
 @triton.jit
 def _attn_res_fwd(
     BR, PS, W, OUT, BSQ,
@@ -114,6 +150,7 @@ def _attn_res_fwd(
     sout_t, sout_h,
     HAS_BSQ: tl.constexpr,
     SCORE_MODE: tl.constexpr,
+    TOPK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
@@ -154,6 +191,15 @@ def _attn_res_fwd(
     score = dot * tl.rsqrt(sq / H + eps)
     score = tl.where(mask_n, score, float("-inf"))
 
+    # ---- SPARSE DEPTH: keep only the TOPK candidates, renormalize over those. Dropping the
+    # losers to -inf is all it takes: softmax sends exp(-inf) to 0 and sigmoid(-inf) to 0, so the
+    # normalizer below rebuilds itself over the survivors with no other change. The weights still
+    # sum to 1 -- this is a convex combination on a TOPK-face of the simplex, not off it.
+    live = mask_n
+    if TOPK > 0:
+        live = _topk_sel(score, is_last, mask_n, TOPK)
+        score = tl.where(live, score, float("-inf"))
+
     # ---- weights over DEPTH, in registers
     if SCORE_MODE == 0:
         p = tl.exp(score - tl.max(score, axis=0))
@@ -167,7 +213,7 @@ def _attn_res_fwd(
         # when every score is large and positive, where softmax would still separate them.
         # Masked lanes hold -inf, and sigmoid(-inf) is 0, so they drop out of both the numerator
         # and the sum on their own -- the `where` is belt and braces.
-        sp = tl.where(mask_n, tl.sigmoid(score), 0.0)
+        sp = tl.where(live, tl.sigmoid(score), 0.0)
         p = sp / tl.maximum(tl.sum(sp, axis=0), 1e-30)
 
     # ---- weighted sum, reusing the loaded tile
@@ -176,7 +222,7 @@ def _attn_res_fwd(
 
 
 def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_sum=None,
-                   score_mode=0):
+                   score_mode=0, topk=0):
     """Depth-attention mix over [block_residual..., prefix_sum].
 
     block_residual : (T, N-1, H)  committed block representatives
@@ -184,6 +230,8 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
     score_weight   : (H,)         norm.weight * proj.weight, folded by the caller
     block_sq_sum   : (T, N) or None -- cached sum(v^2) for the block rows (last column unused)
     score_mode     : 0 = softmax (K3 default, every arm before Aug 5), 1 = sigmoid/sum
+    topk           : 0 = dense (mix over all N). k > 0 = mix over the k highest-scoring
+                     candidates only, prefix_sum always among them. No-op where k >= N.
 
     Returns (T, H) in prefix_sum's dtype. Forward only; see FusedAttnRes for autograd.
     """
@@ -210,7 +258,7 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
         prefix_sum.stride(0), prefix_sum.stride(1),
         out.stride(0), out.stride(1),
         HAS_BSQ=block_sq_sum is not None, SCORE_MODE=score_mode,
-        BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
+        TOPK=_eff_topk(topk, N), BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
         **_launch_kw(_FWD_WARPS, _FWD_STAGES),
     )
     return out
@@ -224,6 +272,7 @@ def _attn_res_bwd(
     sps_t, sps_h,
     sdo_t, sdo_h,
     SCORE_MODE: tl.constexpr,
+    TOPK: tl.constexpr,
     TILE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -262,15 +311,25 @@ def _attn_res_bwd(
             dot = tl.sum(v * w[None, :], axis=1)
             inv = tl.rsqrt(sq / H + eps)
             score = tl.where(mask_n, dot * inv, float("-inf"))
+            # Selection is PIECEWISE CONSTANT in the scores, so it contributes no gradient of its
+            # own -- the derivative is that of the dense mix restricted to the selected face.
+            # Re-deriving it here rather than saving a mask keeps backward's contract with forward:
+            # both recompute from the same saved inputs, so they cannot disagree about who won.
+            live = mask_n
+            if TOPK > 0:
+                live = _topk_sel(score, is_last, mask_n, TOPK)
+                score = tl.where(live, score, float("-inf"))
             # `pref` is the ONLY thing the score mode changes downstream. For softmax
             # dp_i/dx_k = p_k(delta_ik - p_i); for sigmoid/sum it is (s_k(1-s_k)/S)(delta_ik - p_i).
             # The bracket (dp - sum(p*dp)) is identical, so both modes share every line below.
+            # Unselected lanes need no special case either: softmax sends exp(-inf) to p=0, and
+            # signorm's `live` where sends sp=0, so pref=0 and ds=0 -- dv is exactly zero there.
             if SCORE_MODE == 0:
                 p = tl.exp(score - tl.max(score, axis=0))
                 p = p / tl.sum(p, axis=0)
                 pref = p
             else:
-                sp = tl.where(mask_n, tl.sigmoid(score), 0.0)
+                sp = tl.where(live, tl.sigmoid(score), 0.0)
                 ssum = tl.maximum(tl.sum(sp, axis=0), 1e-30)
                 p = sp / ssum
                 pref = sp * (1.0 - sp) / ssum
@@ -299,12 +358,13 @@ class FusedAttnRes(torch.autograd.Function):
     backward. Nothing of shape (T, N, H) is retained, which is the memory the eager path spends."""
 
     @staticmethod
-    def forward(ctx, block_residual, prefix_sum, score_weight, eps, score_mode=0):
+    def forward(ctx, block_residual, prefix_sum, score_weight, eps, score_mode=0, topk=0):
         out = fused_attn_res(block_residual, prefix_sum, score_weight, eps,
-                             score_mode=score_mode)
+                             score_mode=score_mode, topk=topk)
         ctx.save_for_backward(block_residual, prefix_sum, score_weight)
         ctx.eps = eps
         ctx.score_mode = score_mode
+        ctx.topk = topk
         return out
 
     @staticmethod
@@ -324,30 +384,45 @@ class FusedAttnRes(torch.autograd.Function):
             br.stride(0), br.stride(1), br.stride(2),
             ps.stride(0), ps.stride(1),
             dout.stride(0), dout.stride(1),
-            SCORE_MODE=ctx.score_mode,
+            SCORE_MODE=ctx.score_mode, TOPK=_eff_topk(ctx.topk, N),
             TILE=TILE, BLOCK_N=triton.next_power_of_2(N),
             BLOCK_H=triton.next_power_of_2(H), **_launch_kw(_BWD_WARPS, _BWD_STAGES),
         )
         # Only the cross-token reduction is left, and it is a plain fp32 sum over a (T, H)
         # partial -- no atomics (16384 x 512 of them would dominate the pass) and no downcast.
-        return dbr, dps, dwp.sum(0).to(w.dtype), None, None
+        return dbr, dps, dwp.sum(0).to(w.dtype), None, None, None
 
 
-def attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, score_mode=0):
+def attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, score_mode=0, topk=0):
     """Differentiable fused AR mix. Drop-in for `apply_attention_residual`.
 
     score_mode 0 = softmax, 1 = sigmoid(x_i)/sum_j sigmoid(x_j).
+    topk       0 = dense; k > 0 mixes only the k best-scoring candidates (prefix_sum forced in).
     """
-    return FusedAttnRes.apply(block_residual, prefix_sum, score_weight, eps, score_mode)
+    return FusedAttnRes.apply(block_residual, prefix_sum, score_weight, eps, score_mode, topk)
 
 
-def attn_res_reference(block_residual, prefix_sum, score_weight, eps=1e-6, score_mode=0):
+def _topk_mask_reference(scores, topk):
+    """-inf everything outside the top `topk`, last column forced in. Mirrors `_topk_sel`,
+    including its tie behaviour: `<` keeps every candidate equal to the k-th, so an exact tie
+    selects slightly more than k rather than breaking it arbitrarily."""
+    n = scores.shape[-1]
+    if not topk or topk >= n:
+        return scores
+    key = scores.clone()
+    key[..., -1] = float("inf")
+    kth = key.topk(topk, dim=-1).values[..., -1:]
+    return scores.masked_fill(key < kth, float("-inf"))
+
+
+def attn_res_reference(block_residual, prefix_sum, score_weight, eps=1e-6, score_mode=0, topk=0):
     """K3's `_apply_attn_res`, verbatim in shape and precision. Numerics target."""
     v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     vf = v.float()
     var = vf.pow(2).mean(-1, keepdim=True)
     k = vf * torch.rsqrt(var + eps)
     scores = (k * score_weight.float()).sum(-1)
+    scores = _topk_mask_reference(scores, topk)
     if score_mode == 0:
         probs = scores.softmax(-1)
     else:
