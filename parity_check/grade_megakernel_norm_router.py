@@ -47,7 +47,25 @@ def grade(T=8192, H=512, E=64, K=6, seed=0, eps=1e-6):
     hnE, idxE, wE, rstdE = norm_router_reference(x, nw, rw, bias, K, eps)
     mapE = _mapping(idxE, wE, E)
 
-    # ---- contender B: the megakernel
+    # ---- contender B: TODAY'S STACK = liger RMSNorm + eager router. The model patches
+    # {liger_norm, liger_rope, moe, xsa} -- there is NO router patch, so the router is plain
+    # PyTorch and only the norm is accelerated. This is the bar the megakernel must beat.
+    try:
+        from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+        hnL = LigerRMSNormFunction.apply(x, nw, eps, 0.0, "llama", True)
+        scL = torch.sigmoid((hnL @ rw).float())
+        selL = scL + bias
+        _, idxL = torch.topk(selL, K, dim=-1, sorted=False)
+        idxL, _ = torch.sort(idxL, dim=-1)
+        wL = scL.gather(-1, idxL)
+        wL = wL / (wL.sum(-1, keepdim=True) + 1e-20)
+        mapL = _mapping(idxL, wL, E)
+        have_liger = True
+    except Exception as e:
+        print(f"[liger unavailable: {type(e).__name__}: {str(e)[:60]}]")
+        hnL, mapL, have_liger = hnE, mapE, False
+
+    # ---- contender C: the megakernel
     hnK, idxK, wK, rstdK, cntK = norm_router_forward(x, nw, rw, bias, K, eps, write_hn=True)
     mapK = _mapping(idxK, wK, E)
 

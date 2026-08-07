@@ -31,7 +31,8 @@ import triton.language as tl
 @triton.jit
 def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
                      T, H: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
-                     EPS: tl.constexpr, BLOCK_T: tl.constexpr, WRITE_HN: tl.constexpr):
+                     EPS: tl.constexpr, BLOCK_T: tl.constexpr, WRITE_HN: tl.constexpr,
+                     ROUTER_FP32: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     m_r = rows < T
@@ -56,8 +57,18 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
 
     # ---- router logits. eager casts the projection output to fp32 BEFORE the sigmoid; matching
     # that matters because sigmoid saturates and a bf16 logit quantises the score it produces.
+    #
+    # ROUTER_FP32 does the projection in true IEEE fp32 rather than on bf16 tensor cores. This is
+    # THE lever on selection flips: top-k over `scores + bias` is decided by near-ties, and a bf16
+    # mantissa on the logits is what makes two nearly-equal experts swap order versus exact
+    # arithmetic. It is nearly free -- the projection is [T,512]x[512,64], 4.3 GFLOP at T=65536,
+    # against the ~2 TFLOP of the expert GEMMs it feeds.
     rw = tl.load(RW + h_off[:, None] * E + e_off[None, :]).to(tl.float32)
-    logits = tl.dot(hn.to(RW.dtype.element_ty), rw.to(RW.dtype.element_ty), out_dtype=tl.float32)
+    if ROUTER_FP32:
+        logits = tl.dot(hn, rw, out_dtype=tl.float32, input_precision="ieee")
+    else:
+        logits = tl.dot(hn.to(RW.dtype.element_ty), rw.to(RW.dtype.element_ty),
+                        out_dtype=tl.float32)
     scores = tl.sigmoid(logits)
     bias = tl.load(B + e_off).to(tl.float32)
     sel = scores + bias[None, :]
@@ -96,7 +107,7 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
 
 
 def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
-                        out_dtype=torch.bfloat16, block_t=32, write_hn=False):
+                        out_dtype=torch.bfloat16, block_t=32, write_hn=False, router_fp32=True):
     """x [T,H] -> (h_norm|None, idx [T,K] int32, weights [T,K] fp32, rstd [T] fp32, counts [E] int32).
 
     `write_hn=False` by default: the expert phase recomputes the norm from x while gathering, so
@@ -122,7 +133,8 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
     # keyed on a grid dim cost a 4.1x eval stall once already)
     grid = (triton.cdiv(T, block_t),)
     _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd, counts,
-                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, WRITE_HN=write_hn)
+                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, WRITE_HN=write_hn,
+                           ROUTER_FP32=router_fp32)
     return (hn if write_hn else None), idx, wgt, rstd, counts
 
 
