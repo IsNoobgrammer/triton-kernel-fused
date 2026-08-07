@@ -181,3 +181,50 @@ def norm_router_reference(x, norm_weight, router_weight, bias, top_k, eps=1e-6, 
     w = scores.gather(-1, idx)
     w = w / (w.sum(-1, keepdim=True) + 1e-20)
     return hn, idx.to(torch.int32), w, rstd.squeeze(-1)
+
+
+@triton.jit
+def _rmsnorm_bwd(X, DHN, NW, RSTD, DX, DNW, T,
+                 H: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):
+    """Fused RMSNorm backward. Replaces five unfused [T,H] fp32 elementwise passes (~670 MB of
+    traffic at T=65536, H=512) with one pass that keeps x, dy and the reduction in registers."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    m_r = rows < T
+    rstd = tl.load(RSTD + rows, mask=m_r, other=0.0).to(tl.float32)
+
+    # pass 1: the row reduction sum(dy * x), dy = d_hn * nw
+    acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for h0 in tl.range(0, H, BLOCK_H):
+        hc = h0 + tl.arange(0, BLOCK_H)
+        m_h = hc < H
+        m = m_r[:, None] & m_h[None, :]
+        x = tl.load(X + rows[:, None] * H + hc[None, :], mask=m, other=0.0).to(tl.float32)
+        dh = tl.load(DHN + rows[:, None] * H + hc[None, :], mask=m, other=0.0).to(tl.float32)
+        nw = tl.load(NW + hc, mask=m_h, other=0.0).to(tl.float32)
+        acc += tl.sum(dh * nw[None, :] * x, axis=1)
+
+    # pass 2: d_x, and a block-local d_nw reduced before touching global memory
+    c = acc * rstd * rstd * rstd / H
+    for h0 in tl.range(0, H, BLOCK_H):
+        hc = h0 + tl.arange(0, BLOCK_H)
+        m_h = hc < H
+        m = m_r[:, None] & m_h[None, :]
+        x = tl.load(X + rows[:, None] * H + hc[None, :], mask=m, other=0.0).to(tl.float32)
+        dh = tl.load(DHN + rows[:, None] * H + hc[None, :], mask=m, other=0.0).to(tl.float32)
+        nw = tl.load(NW + hc, mask=m_h, other=0.0).to(tl.float32)
+        dx = rstd[:, None] * dh * nw[None, :] - c[:, None] * x
+        tl.store(DX + rows[:, None] * H + hc[None, :], dx.to(DX.dtype.element_ty), mask=m)
+        # d_nw accumulates over ALL tokens, so it must be atomic; reduce within the block first
+        tl.atomic_add(DNW + hc, tl.sum(tl.where(m, dh * x * rstd[:, None], 0.0), axis=0), mask=m_h)
+
+
+def rmsnorm_backward(x, d_hn, nw, rstd, block_t=32, block_h=128):
+    """-> (d_x [T,H] same dtype as x, d_nw [H] fp32)."""
+    T, H = x.shape
+    dx = torch.empty_like(x)
+    # zeroed: atomic_add accumulates and a reused buffer would keep summing
+    dnw = torch.zeros(H, device=x.device, dtype=torch.float32)
+    _rmsnorm_bwd[(triton.cdiv(T, block_t),)](x, d_hn, nw, rstd, dx, dnw, T,
+                                             H=H, BLOCK_T=block_t, BLOCK_H=block_h)
+    return dx, dnw

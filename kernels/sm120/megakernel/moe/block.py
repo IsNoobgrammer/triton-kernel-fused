@@ -14,7 +14,7 @@ indices are reused, and only the differentiable path (scores -> gathered weights
 """
 import torch
 
-from .norm_router import norm_router_forward
+from .norm_router import norm_router_forward, rmsnorm_backward
 
 
 class _NormRouter(torch.autograd.Function):
@@ -55,16 +55,11 @@ class _NormRouter(torch.autograd.Function):
         d_hn = g_hn + dl @ rw.t()                             # router's contribution to d hn
         d_rw = hn.t() @ dl
 
-        # ---- rmsnorm, analytic. y = x * rstd, hn = y * nw.
-        #   d_nw = sum_t d_hn * y
-        #   d_x  = rstd * (d_hn*nw) - (rstd^3 / H) * x * sum(d_hn*nw * x)
-        xf = x.float()
-        y = xf * rstd[:, None]
-        dh = d_hn.float()
-        d_nw = (dh * y).sum(0)
-        dy = dh * nw.float()
-        d_x = rstd[:, None] * dy - (rstd[:, None] ** 3 / H) * xf * (dy * xf).sum(-1, keepdim=True)
-        return d_x.to(x.dtype), d_nw, d_rw, None, None, None
+        # ---- rmsnorm backward, FUSED. The PyTorch form built five [T,H] fp32 temporaries
+        # (~670 MB of traffic at T=65536) against liger's single 0.280 ms kernel -- that was the
+        # whole remaining regression after the recompute was removed.
+        d_x, d_nw = rmsnorm_backward(x, d_hn, nw, rstd)
+        return d_x, d_nw, d_rw, None, None, None
 
 
 def megakernel_block(x, w, codes, top_k=6, eps=1e-6):
