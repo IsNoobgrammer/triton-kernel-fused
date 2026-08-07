@@ -29,7 +29,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
+def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS, SSUM,
                      T, H: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
                      EPS: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
                      WRITE_HN: tl.constexpr, ROUTER_FP32: tl.constexpr):
@@ -106,6 +106,9 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
         acc_sum += tl.sum(tl.where(hit, scores, 0.0), axis=1)
 
     # ---- emit in ascending expert order, and sum-normalise with eager's exact epsilon.
+    # S is stored so the BACKWARD can recover the raw scores as w_k*S instead of
+    # recomputing sigmoid(hn @ rw) -- a full [T,H]x[H,E] matmul the forward already did.
+    tl.store(SSUM + rows, acc_sum, mask=m_r)
     inv = 1.0 / (acc_sum + 1e-20)
     rank = tl.cumsum(chosen.to(tl.int32), axis=1) - 1              # 0..K-1 among selected
     for k in tl.static_range(K):
@@ -146,13 +149,14 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
     # zeroed every call: atomic_add accumulates, so a reused buffer would keep counting. Output
     # tensors that are atomically accumulated into MUST be reset -- that has bitten this repo.
     counts = torch.zeros((E,), device=x.device, dtype=torch.int32)
+    ssum = torch.empty((T,), device=x.device, dtype=torch.float32)
     # grid keyed on T only; T is a grid dim so it must never be an autotune key (a stale cache
     # keyed on a grid dim cost a 4.1x eval stall once already)
     grid = (triton.cdiv(T, block_t),)
-    _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd, counts,
+    _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd, counts, ssum,
                            T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, BLOCK_H=block_h,
                            WRITE_HN=write_hn, ROUTER_FP32=router_fp32)
-    return (hn if write_hn else None), idx, wgt, rstd, counts
+    return (hn if write_hn else None), idx, wgt, rstd, counts, ssum
 
 
 def norm_router_reference(x, norm_weight, router_weight, bias, top_k, eps=1e-6, dtype=None):

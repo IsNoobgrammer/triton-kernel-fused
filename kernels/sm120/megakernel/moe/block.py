@@ -20,19 +20,19 @@ from .norm_router import norm_router_forward
 class _NormRouter(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, nw, rw, bias, top_k, eps):
-        hn, idx, wgt, rstd, counts = norm_router_forward(
+        hn, idx, wgt, rstd, counts, ssum = norm_router_forward(
             x, nw, rw, bias, top_k, eps, write_hn=True)
         # hn and rstd are SAVED, not recomputed. Candidate 1 rebuilt the whole norm+router graph
         # in PyTorch and paid +3.1 ms for it -- the forward was a tie and the backward regressed by
         # exactly that amount, which is what identified the recompute as the regression.
-        ctx.save_for_backward(x, nw, rw, idx, rstd, hn, wgt)
+        ctx.save_for_backward(x, nw, rw, idx, rstd, hn, wgt, ssum)
         ctx.eps = eps
         ctx.mark_non_differentiable(idx)
         return hn, idx, wgt
 
     @staticmethod
     def backward(ctx, g_hn, g_idx, g_wgt):
-        x, nw, rw, idx, rstd, hn, wgt = ctx.saved_tensors
+        x, nw, rw, idx, rstd, hn, wgt, ssum = ctx.saved_tensors
         H = x.shape[-1]
         idxl = idx.long()
 
@@ -42,9 +42,10 @@ class _NormRouter(torch.autograd.Function):
         s_sel = wgt.float()                                   # already normalised: w_j
         gw = g_wgt.float()
         dot = (gw * s_sel).sum(-1, keepdim=True)              # sum_j g_j w_j
-        # recover S from the saved normalised weights and the raw sigmoid at the selected experts
-        scores_sel = torch.sigmoid((hn @ rw).float()).gather(-1, idxl)
-        S = scores_sel.sum(-1, keepdim=True) + 1e-20
+        # s_k = w_k * S. S is saved by the forward, so this costs a multiply instead of the
+        # [T,H]x[H,E] matmul + sigmoid that recomputing the scores would need.
+        S = ssum[:, None] + 1e-20
+        scores_sel = s_sel * S
         d_s = (gw - dot) / S                                  # d/d scores_sel
         d_logit_sel = d_s * scores_sel * (1.0 - scores_sel)   # through the sigmoid
         d_logits = torch.zeros(x.shape[0], rw.shape[1], device=x.device, dtype=torch.float32)
