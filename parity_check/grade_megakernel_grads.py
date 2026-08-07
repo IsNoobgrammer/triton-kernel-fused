@@ -33,6 +33,31 @@ def eager_fwd(x, nw, rw, bias, dtype=None):
     return hn, idx, w / (w.sum(-1, keepdim=True) + 1e-20)
 
 
+def grade_fp32_master(T=1024, seed=0):
+    """The REAL model layout: bf16 activations, fp32 master weights, narrowed by autocast.
+
+    The bf16-weight grade below cannot see this case, and that gap shipped a backward that passed
+    every forward AND backward check here and then died on the first `loss.backward()` of a training
+    run -- `dl @ rw.t()` with a bf16 dl and an fp32 rw. A kernel is only graded once it is graded on
+    the dtype layout the model actually has.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(T, H, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    nw = (torch.randn(H, device=DEV, dtype=torch.float32) * 0.1 + 1.0).requires_grad_(True)
+    rw = (torch.randn(H, E, device=DEV, dtype=torch.float32) * 0.02).requires_grad_(True)
+    bias = torch.randn(E, device=DEV, dtype=torch.float32) * 0.05
+    with torch.autocast("cuda", torch.bfloat16):
+        hn, idx, w = _NormRouter.apply(x, nw, rw, bias, K, EPS)
+    (hn.float().sum() + w.sum()).backward()
+    for name, t, p in (("d_x", x.grad, x), ("d_norm_weight", nw.grad, nw),
+                       ("d_router_weight", rw.grad, rw)):
+        assert t is not None, f"{name} is None -- no gradient reached the parameter"
+        assert t.dtype == p.dtype, f"{name} dtype {t.dtype} != parameter dtype {p.dtype}"
+        assert torch.isfinite(t).all(), f"{name} has non-finite entries"
+    print(f"  fp32-master layout (bf16 acts, fp32 weights, autocast): backward OK, "
+          f"dtypes match, all finite  [T={T}]")
+
+
 def grade(T=4096, seed=0):
     torch.manual_seed(seed)
     x0 = torch.randn(T, H, device=DEV, dtype=torch.bfloat16)
@@ -82,3 +107,5 @@ def grade(T=4096, seed=0):
 
 if __name__ == "__main__":
     grade()
+    print()
+    grade_fp32_master()
