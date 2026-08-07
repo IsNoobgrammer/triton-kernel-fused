@@ -29,9 +29,9 @@ import triton.language as tl
 
 
 @triton.jit
-def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD,
+def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
                      T, H: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
-                     EPS: tl.constexpr, BLOCK_T: tl.constexpr):
+                     EPS: tl.constexpr, BLOCK_T: tl.constexpr, WRITE_HN: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     m_r = rows < T
@@ -44,7 +44,14 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD,
     rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / H + EPS)
     nw = tl.load(NW + h_off).to(tl.float32)
     hn = x * rstd[:, None] * nw[None, :]
-    tl.store(HN + rows[:, None] * H + h_off[None, :], hn.to(HN.dtype.element_ty), mask=m_r[:, None])
+    # h_norm is NOT written in the megakernel path. The expert phase reads tokens permuted by
+    # expert, so it gathers the raw x rows and re-applies rstd*nw inline -- one multiply, since
+    # rstd is saved. Materializing h_norm would cost a 67 MB write here and a 67 MB read there,
+    # which is the exact round-trip this fusion exists to remove. WRITE_HN=True is for parity
+    # testing against the eager reference only.
+    if WRITE_HN:
+        tl.store(HN + rows[:, None] * H + h_off[None, :], hn.to(HN.dtype.element_ty),
+                 mask=m_r[:, None])
     tl.store(RSTD + rows, rstd, mask=m_r)
 
     # ---- router logits. eager casts the projection output to fp32 BEFORE the sigmoid; matching
@@ -81,10 +88,20 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD,
         tl.store(IDX + rows * K + k, idx_k.to(IDX.dtype.element_ty), mask=m_r)
         tl.store(WGT + rows * K + k, w_k.to(WGT.dtype.element_ty), mask=m_r)
 
+    # ---- per-expert counts for the tile map. Accumulate a BLOCK-LOCAL histogram first, then do
+    # E atomics per block instead of K per token: at T=65536, K=6 that is 131k atomics on 64
+    # counters rather than 393k, on the same 64 contended addresses.
+    hist = tl.sum(tl.where(m_r[:, None], chosen.to(tl.int32), 0), axis=0)
+    tl.atomic_add(COUNTS + e_off, hist)
+
 
 def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
-                        out_dtype=torch.bfloat16, block_t=32):
-    """x [T,H] -> (h_norm [T,H], idx [T,K] int32, weights [T,K] fp32, rstd [T] fp32)."""
+                        out_dtype=torch.bfloat16, block_t=32, write_hn=False):
+    """x [T,H] -> (h_norm|None, idx [T,K] int32, weights [T,K] fp32, rstd [T] fp32, counts [E] int32).
+
+    `write_hn=False` by default: the expert phase recomputes the norm from x while gathering, so
+    materializing h_norm is pure wasted bandwidth. Set True only to grade against eager.
+    """
     assert x.ndim == 2, f"expected [T,H], got {tuple(x.shape)}"
     T, H = x.shape
     E = router_weight.shape[1]
@@ -94,16 +111,19 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
     assert H & (H - 1) == 0, f"H={H} must be a power of two for the block load"
     assert E & (E - 1) == 0, f"E={E} must be a power of two for the block load"
 
-    hn = torch.empty((T, H), device=x.device, dtype=out_dtype)
+    hn = torch.empty((T, H), device=x.device, dtype=out_dtype) if write_hn else x  # dummy ptr
     idx = torch.empty((T, top_k), device=x.device, dtype=torch.int32)
     wgt = torch.empty((T, top_k), device=x.device, dtype=torch.float32)
     rstd = torch.empty((T,), device=x.device, dtype=torch.float32)
+    # zeroed every call: atomic_add accumulates, so a reused buffer would keep counting. Output
+    # tensors that are atomically accumulated into MUST be reset -- that has bitten this repo.
+    counts = torch.zeros((E,), device=x.device, dtype=torch.int32)
     # grid keyed on T only; T is a grid dim so it must never be an autotune key (a stale cache
     # keyed on a grid dim cost a 4.1x eval stall once already)
     grid = (triton.cdiv(T, block_t),)
-    _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd,
-                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t)
-    return hn, idx, wgt, rstd
+    _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd, counts,
+                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, WRITE_HN=write_hn)
+    return (hn if write_hn else None), idx, wgt, rstd, counts
 
 
 def norm_router_reference(x, norm_weight, router_weight, bias, top_k, eps=1e-6, dtype=None):

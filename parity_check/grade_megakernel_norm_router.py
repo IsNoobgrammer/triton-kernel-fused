@@ -48,7 +48,7 @@ def grade(T=8192, H=512, E=64, K=6, seed=0, eps=1e-6):
     mapE = _mapping(idxE, wE, E)
 
     # ---- contender B: the megakernel
-    hnK, idxK, wK, rstdK = norm_router_forward(x, nw, rw, bias, K, eps)
+    hnK, idxK, wK, rstdK, cntK = norm_router_forward(x, nw, rw, bias, K, eps, write_hn=True)
     mapK = _mapping(idxK, wK, E)
 
     def err(a, b):
@@ -83,6 +83,15 @@ def grade(T=8192, H=512, E=64, K=6, seed=0, eps=1e-6):
     assert torch.allclose(s, torch.ones_like(s), atol=1e-3), \
         f"kernel weights do not sum to 1: min {s.min():.6f} max {s.max():.6f}"
     print("kernel weights sum to 1 per token: OK")
+
+    # per-expert counts must match a bincount of the indices exactly, and total T*K. This is the
+    # tile map's input: a wrong count silently drops or duplicates tokens in the grouped GEMM.
+    ref_cnt = torch.bincount(idxK.reshape(-1).long(), minlength=E).to(torch.int32)
+    assert torch.equal(cntK, ref_cnt), (
+        f"counts mismatch: max delta {(cntK.long()-ref_cnt.long()).abs().max().item()}")
+    assert cntK.sum().item() == T * K, f"counts sum {cntK.sum().item()} != T*K {T*K}"
+    print(f"per-expert counts exact (sum {cntK.sum().item()} = T*K, "
+          f"min {cntK.min().item()} max {cntK.max().item()}): OK")
     return dict(eager=err(mapE, map64)[0], kernel=err(mapK, map64)[0], flips=flips)
 
 
