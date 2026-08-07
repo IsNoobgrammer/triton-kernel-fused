@@ -48,11 +48,16 @@ def grade(T=4096, seed=0):
         nw = nw0.to(torch.float64 if dt == torch.float64 else torch.float32).detach().requires_grad_(True)
         rw = rw0.to(dt).detach().requires_grad_(True)
         hn, idx, w = fn(x, nw, rw, bias.to(nw.dtype))
+        # rw gets NO gradient from the hn branch -- only the router path touches it, so .grad is
+        # None there rather than zero. Both branches are accumulated because the real block feeds
+        # gradients back through hn AND through the routing weights.
+        z = lambda t, like: torch.zeros_like(like) if t is None else t.clone()
         (hn * g_hn.to(hn.dtype)).sum().backward(retain_graph=True)
-        gx1, gn1, gr1 = x.grad.clone(), nw.grad.clone(), rw.grad.clone()
+        g1 = (z(x.grad, x), z(nw.grad, nw), z(rw.grad, rw))
         x.grad = nw.grad = rw.grad = None
         (w * g_w.to(w.dtype)).sum().backward()
-        return (gx1 + x.grad, gn1 + nw.grad, gr1 + rw.grad)
+        g2 = (z(x.grad, x), z(nw.grad, nw), z(rw.grad, rw))
+        return tuple(a + b for a, b in zip(g1, g2))
 
     ref = run(lambda x, nw, rw, b: eager_fwd(x, nw, rw, b, torch.float64), torch.float64)
     eag = run(lambda x, nw, rw, b: eager_fwd(x, nw, rw, b), torch.bfloat16)
