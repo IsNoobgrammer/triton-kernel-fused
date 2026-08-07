@@ -115,7 +115,10 @@ def score(block_fn, name, shapes, seed=0, acc_tokens=2048):
     rows = []
     for B, S in shapes:
         T = B * S
-        x = torch.randn(T, H, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+        # SEEDED per shape. Unseeded, out_err moved 5.7e-02 -> 5.4e-02 between two runs of the
+        # SAME code, making the accuracy objective pure noise. Timing is unaffected either way.
+        gx = torch.Generator(device=DEV).manual_seed(1234 + B * 100003 + S)
+        x = torch.randn(T, H, device=DEV, dtype=torch.bfloat16, generator=gx).requires_grad_(True)
         fn = lambda t: block_fn(t, w, codes)
         try:
             f_ms, _ = time_block(fn, x, bwd=False)
