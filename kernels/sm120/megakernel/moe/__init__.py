@@ -16,5 +16,6 @@ Design constraints fixed up front:
   eager, so a numerics change is visible rather than assumed.
 """
 from .norm_router import norm_router_forward, norm_router_reference
+from .block import megakernel_block
 
-__all__ = ["norm_router_forward", "norm_router_reference"]
+__all__ = ["norm_router_forward", "norm_router_reference", "megakernel_block"]
