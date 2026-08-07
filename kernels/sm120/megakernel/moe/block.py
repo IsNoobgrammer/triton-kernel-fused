@@ -71,16 +71,17 @@ class _NormRouter(torch.autograd.Function):
         return d_x, d_nw, d_rw, None, None, None
 
 
-def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_idx=False):
+def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_routing=False):
     """Signature matches bench.eval_mlp_block.baseline_block so the frozen eval can score both.
 
     `act_params` carries radial's exponent logit (`radial_theta`). Act code 8 RAISES without it, so
     a training patch running radial MUST pass it -- the frozen eval never did, which is why this
     argument did not exist until the kernel was wired into a real model.
 
-    `return_idx=True` also hands back the top-k selection. The MoE layer's load-balancing bias
-    update is driven from those indices and they are produced HERE and nowhere else, so dropping
-    them silently disables balancing -- a change that shows up as a quality regression, not an error.
+    `return_routing=True` also hands back (idx, weights). Both the load-balancing bias update and
+    the router diagnostics (top1 weight, router entropy, balance entropy) are driven from these and
+    they are produced HERE and nowhere else, so dropping them silently disables balancing and blanks
+    the diagnostics -- changes that surface as a quality regression, not an error.
 
     Both default off, so the frozen eval's single-tensor contract is untouched.
     """
@@ -96,4 +97,4 @@ def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_idx
     tw = wgt.to(hn.dtype) if grouped else wgt.float()
     out = (moe(hn, idx.long(), tw, w["gu"], w["dn"], codes) if grouped else
            moe_per_expert(hn, idx.long(), tw, w["gu"], w["dn"], codes, act_params=act_params))
-    return (out, idx) if return_idx else out
+    return (out, idx, tw) if return_routing else out
