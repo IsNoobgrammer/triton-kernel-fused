@@ -127,12 +127,21 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
 
 
 def norm_router_reference(x, norm_weight, router_weight, bias, top_k, eps=1e-6, dtype=None):
-    """Eager reference. Pass dtype=torch.float64 for the ground truth the kernel is graded against."""
+    """Eager reference, matching src/modeling/norm.py::BiBoRMSNorm and ffn/router.py EXACTLY.
+
+    The ordering is load-bearing and easy to get wrong: BiBoRMSNorm upcasts to fp32, takes the
+    variance and rsqrt in fp32, then casts back to the INPUT dtype and only then multiplies by the
+    weight. Writing it as one fp32 expression makes the reference more accurate than the model and
+    turns this grader into a comparison against a strawman.
+
+    Pass dtype=torch.float64 for the ground truth.
+    """
     dt = dtype or x.dtype
-    xf = x.to(dt)
+    xf = x.to(torch.float32) if dt != torch.float64 else x.to(torch.float64)
     rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    hn = xf * rstd * norm_weight.to(dt)
-    scores = torch.sigmoid(hn @ router_weight.to(dt))
+    hn = (xf * rstd).to(dt) * norm_weight.to(dt)      # cast BEFORE the weight multiply
+    scores = torch.sigmoid((hn @ router_weight.to(dt)).float() if dt != torch.float64
+                           else hn @ router_weight.to(dt))
     sel = scores + bias.to(dt)
     _, idx = torch.topk(sel, top_k, dim=-1, sorted=False)
     idx, _ = torch.sort(idx, dim=-1)                    # ascending, to match the kernel's order
