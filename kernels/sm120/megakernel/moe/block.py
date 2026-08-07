@@ -22,33 +22,48 @@ class _NormRouter(torch.autograd.Function):
     def forward(ctx, x, nw, rw, bias, top_k, eps):
         hn, idx, wgt, rstd, counts = norm_router_forward(
             x, nw, rw, bias, top_k, eps, write_hn=True)
-        ctx.save_for_backward(x, nw, rw, idx)
-        ctx.top_k, ctx.eps = top_k, eps
+        # hn and rstd are SAVED, not recomputed. Candidate 1 rebuilt the whole norm+router graph
+        # in PyTorch and paid +3.1 ms for it -- the forward was a tie and the backward regressed by
+        # exactly that amount, which is what identified the recompute as the regression.
+        ctx.save_for_backward(x, nw, rw, idx, rstd, hn, wgt)
+        ctx.eps = eps
         ctx.mark_non_differentiable(idx)
         return hn, idx, wgt
 
     @staticmethod
     def backward(ctx, g_hn, g_idx, g_wgt):
-        x, nw, rw, idx = ctx.saved_tensors
-        with torch.enable_grad():
-            xd = x.detach().requires_grad_(True)
-            nwd = nw.detach().requires_grad_(True)
-            rwd = rw.detach().requires_grad_(True)
-            f = xd.float()
-            # full recompute, INCLUDING rstd: it depends on x, and reusing the saved value would
-            # drop d(rstd)/dx and give a wrong gradient that no shape check would catch
-            # cast AFTER the weight multiply. Casting first promotes back to fp32 (bf16 * fp32
-            # weight -> fp32) and the router matmul then gets fp32 @ bf16. Liger returns the
-            # input dtype, and the forward Triton kernel emits bf16, so the recompute must match.
-            hn = ((f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + ctx.eps)) * nwd).to(x.dtype)
-            scores = torch.sigmoid((hn @ rwd).float())
-            # idx is REUSED, never recomputed -- re-running the selection would apply the
-            # load-balancing bias a second time
-            w = scores.gather(-1, idx.long())
-            w = w / (w.sum(-1, keepdim=True) + 1e-20)
-            gx, gnw, grw = torch.autograd.grad(
-                [hn, w], [xd, nwd, rwd], [g_hn, g_wgt], allow_unused=True)
-        return gx, gnw, grw, None, None, None
+        x, nw, rw, idx, rstd, hn, wgt = ctx.saved_tensors
+        H = x.shape[-1]
+        idxl = idx.long()
+
+        # ---- router. w_k = s_k / S, so ds_k = (g_k - sum_j g_j w_j) / S. The sum over the
+        # SELECTED experts only; scores at unselected experts get no gradient because they never
+        # entered the output.
+        s_sel = wgt.float()                                   # already normalised: w_j
+        gw = g_wgt.float()
+        dot = (gw * s_sel).sum(-1, keepdim=True)              # sum_j g_j w_j
+        # recover S from the saved normalised weights and the raw sigmoid at the selected experts
+        scores_sel = torch.sigmoid((hn @ rw).float()).gather(-1, idxl)
+        S = scores_sel.sum(-1, keepdim=True) + 1e-20
+        d_s = (gw - dot) / S                                  # d/d scores_sel
+        d_logit_sel = d_s * scores_sel * (1.0 - scores_sel)   # through the sigmoid
+        d_logits = torch.zeros(x.shape[0], rw.shape[1], device=x.device, dtype=torch.float32)
+        d_logits.scatter_(1, idxl, d_logit_sel)
+
+        dl = d_logits.to(x.dtype)
+        d_hn = g_hn + dl @ rw.t()                             # router's contribution to d hn
+        d_rw = hn.t() @ dl
+
+        # ---- rmsnorm, analytic. y = x * rstd, hn = y * nw.
+        #   d_nw = sum_t d_hn * y
+        #   d_x  = rstd * (d_hn*nw) - (rstd^3 / H) * x * sum(d_hn*nw * x)
+        xf = x.float()
+        y = xf * rstd[:, None]
+        dh = d_hn.float()
+        d_nw = (dh * y).sum(0)
+        dy = dh * nw.float()
+        d_x = rstd[:, None] * dy - (rstd[:, None] ** 3 / H) * xf * (dy * xf).sum(-1, keepdim=True)
+        return d_x.to(x.dtype), d_nw, d_rw, None, None, None
 
 
 def megakernel_block(x, w, codes, top_k=6, eps=1e-6):
