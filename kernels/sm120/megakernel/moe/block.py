@@ -12,6 +12,8 @@ What the backward must NEVER do is re-run the ROUTER's selection: the load-balan
 mutated by `.add_()` outside the optimizer and must fire exactly once per step. The saved top-k
 indices are reused, and only the differentiable path (scores -> gathered weights) is rebuilt.
 """
+import os
+
 import torch
 
 from .norm_router import norm_router_forward, rmsnorm_backward
@@ -64,6 +66,10 @@ class _NormRouter(torch.autograd.Function):
 
 def megakernel_block(x, w, codes, top_k=6, eps=1e-6):
     """Signature matches bench.eval_mlp_block.baseline_block so the frozen eval can score both."""
-    from kernels.sm120.moe import moe_per_expert
+    # moe() dispatches to the GROUPED path when it can; moe_per_expert always takes the
+    # per-expert loop, whose backward is ~119 separate cuBLAS dW launches plus 73 split-K
+    # reductions -- 3.96 ms, 23% of the lap, and the largest remaining inefficiency.
+    from kernels.sm120.moe import moe, moe_per_expert
     hn, idx, wgt = _NormRouter.apply(x, w["nw"], w["rw"], w["bias"], top_k, eps)
-    return moe_per_expert(hn, idx.long(), wgt.float(), w["gu"], w["dn"], codes)
+    fn = moe if os.environ.get("MK_GROUPED", "1") == "1" else moe_per_expert
+    return fn(hn, idx.long(), wgt.float(), w["gu"], w["dn"], codes)
