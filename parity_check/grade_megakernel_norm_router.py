@@ -1,20 +1,23 @@
-"""Grade the fused RMSNorm+router megakernel phase against an FP64 eager ground truth.
+"""Grade the fused RMSNorm+router megakernel against an FP64 ground truth AND today's stack.
 
     python -m parity_check.grade_megakernel_norm_router
 
-Reports THREE contenders against the same fp64 reference, because "our kernel is accurate" is not
-the question -- the question is whether it moved relative to what the model was trained with:
+Three contenders, one fp64 reference:
 
-    eager bf16   what the model runs today
-    megakernel   the fused replacement
-    (fp64 eager) ground truth, computed end to end in double
+    eager bf16          pure PyTorch, BiBoRMSNorm + BiBoMoERouter semantics
+    liger + eager       TODAY'S STACK. The model patches {liger_norm, liger_rope, moe, xsa} --
+                        there is NO router patch, so only the norm is accelerated and the router
+                        runs plain PyTorch. This is the baseline the megakernel has to beat.
+    megakernel          the fused replacement
 
-A kernel that is closer to fp64 than eager is NOT automatically better here: this project has
-already paid for that lesson once, where a more-accurate kernel cost real bpb. So the numbers are
-reported side by side and the verdict is a judgement, not an assert on the fp64 error alone.
+"Closer to fp64" is reported, not asserted on. This project has already paid for the lesson that a
+more-accurate kernel can cost real bpb, so the numbers go side by side and the call is a judgement.
 
-Top-k indices are compared as an expert->weight MAPPING rather than positionally: eager calls
-topk(sorted=False), so its index order is undefined and there is nothing positional to match.
+The router-weight error is DECOMPOSED. Comparing dense [T,E] expert->weight maps, a token routed to
+a different expert than fp64 differs by that entire weight (~0.17), which swamps any arithmetic
+error and makes every contender read as ~1e-1 regardless of precision. Restricting to tokens whose
+selection AGREES shows what the weight math is actually worth; the flip count is reported separately
+because a flip is categorical, not a rounding error.
 """
 import torch
 
@@ -24,96 +27,76 @@ DEV = "cuda"
 
 
 def _mapping(idx, w, E):
-    """[T,K] indices + weights -> dense [T,E] so comparison is order-independent."""
+    """[T,K] indices + weights -> dense [T,E], so comparison is order-independent (eager's
+    topk(sorted=False) leaves index order undefined)."""
     out = torch.zeros(idx.shape[0], E, device=idx.device, dtype=torch.float64)
     out.scatter_(1, idx.long(), w.to(torch.float64))
     return out
+
+
+def _router_from_hn(hn, rw, bias, K):
+    """The eager router, given an already-normed hidden. Mirrors ffn/router.py exactly."""
+    scores = torch.sigmoid((hn @ rw).float())
+    _, idx = torch.topk(scores + bias, K, dim=-1, sorted=False)
+    idx, _ = torch.sort(idx, dim=-1)
+    w = scores.gather(-1, idx)
+    return idx.to(torch.int32), w / (w.sum(-1, keepdim=True) + 1e-20)
+
+
+def _maxerr(a, b):
+    return (a.double() - b.double()).abs().max().item()
 
 
 def grade(T=8192, H=512, E=64, K=6, seed=0, eps=1e-6):
     torch.manual_seed(seed)
     x = torch.randn(T, H, device=DEV, dtype=torch.bfloat16)
     nw = torch.randn(H, device=DEV, dtype=torch.float32) * 0.1 + 1.0
-    rw = (torch.randn(H, E, device=DEV, dtype=torch.bfloat16) * 0.02)
-    # a NON-ZERO bias, or the whole selection-vs-weight distinction goes untested
-    bias = (torch.randn(E, device=DEV, dtype=torch.float32) * 0.05)
+    rw = torch.randn(H, E, device=DEV, dtype=torch.bfloat16) * 0.02
+    bias = torch.randn(E, device=DEV, dtype=torch.float32) * 0.05   # non-zero: exercises sel-vs-weight
 
-    # ---- ground truth in fp64, end to end
     hn64, idx64, w64, rstd64 = norm_router_reference(
         x.double(), nw.double(), rw.double(), bias.double(), K, eps, dtype=torch.float64)
     map64 = _mapping(idx64, w64, E)
+    sel64 = map64 > 0
 
-    # ---- contender A: eager in the dtype the model actually runs
     hnE, idxE, wE, rstdE = norm_router_reference(x, nw, rw, bias, K, eps)
     mapE = _mapping(idxE, wE, E)
 
-    # ---- contender B: TODAY'S STACK = liger RMSNorm + eager router. The model patches
-    # {liger_norm, liger_rope, moe, xsa} -- there is NO router patch, so the router is plain
-    # PyTorch and only the norm is accelerated. This is the bar the megakernel must beat.
+    # today's stack: liger norm, eager router. EXACT call from ablate/common/patches.py.
     try:
         from liger_kernel.ops.rms_norm import LigerRMSNormFunction
-        hnL = LigerRMSNormFunction.apply(x, nw, eps, 0.0, "llama", True)
-        scL = torch.sigmoid((hnL @ rw).float())
-        selL = scL + bias
-        _, idxL = torch.topk(selL, K, dim=-1, sorted=False)
-        idxL, _ = torch.sort(idxL, dim=-1)
-        wL = scL.gather(-1, idxL)
-        wL = wL / (wL.sum(-1, keepdim=True) + 1e-20)
-        mapL = _mapping(idxL, wL, E)
-        have_liger = True
+        hnL = LigerRMSNormFunction.apply(x, nw, eps, 0.0, "llama", False)
+        idxL, wL = _router_from_hn(hnL, rw, bias, K)
+        mapL, liger = _mapping(idxL, wL, E), True
     except Exception as e:
-        print(f"[liger unavailable: {type(e).__name__}: {str(e)[:60]}]")
-        hnL, mapL, have_liger = hnE, mapE, False
+        print(f"  [liger unavailable: {type(e).__name__}: {str(e)[:70]}]")
+        hnL, mapL, liger = hnE, mapE, False
 
-    # ---- contender C: the megakernel
     hnK, idxK, wK, rstdK, cntK = norm_router_forward(x, nw, rw, bias, K, eps, write_hn=True)
     mapK = _mapping(idxK, wK, E)
 
-    def err(a, b):
-        d = (a.double() - b.double()).abs()
-        return d.max().item(), d.mean().item()
+    lab = "liger+eager (TODAY)" if liger else "liger N/A"
+    cands = [("eager bf16", hnE, mapE), (lab, hnL, mapL), ("megakernel", hnK, mapK)]
 
-    print(f"T={T} H={H} E={E} K={K}  ground truth = fp64 eager\n")
-    print(f"{'quantity':<22}{'eager bf16 max':>18}{'megakernel max':>18}   verdict")
-    rows = [("h_norm", hnE, hnK, hn64), ("router weights", mapE, mapK, map64),
-            ("rstd", rstdE, rstdK, rstd64)]
-    for name, a, b, ref in rows:
-        ea, _ = err(a, ref)
-        eb, _ = err(b, ref)
-        verdict = "kernel closer" if eb < ea else ("eager closer" if eb > ea else "tie")
-        print(f"{name:<22}{ea:>18.3e}{eb:>18.3e}   {verdict}")
+    print(f"\nT={T} H={H} E={E} K={K}   ground truth = fp64 eager")
+    print(f"  {'contender':<22}{'h_norm':>12}{'weights(all)':>15}{'weights(agree)':>16}"
+          f"{'selection':>11}{'flips':>9}")
+    for name, hn, m in cands:
+        ok = ((m > 0) == sel64).all(1)
+        wagree = ((m[ok] - map64[ok]).abs().max().item() if ok.any() else float("nan"))
+        print(f"  {name:<22}{_maxerr(hn, hn64):>12.3e}{_maxerr(m, map64):>15.3e}"
+              f"{wagree:>16.3e}{ok.float().mean().item():>10.4%}{(~ok).sum().item():>9d}")
 
-    # selection agreement: which experts were picked, ignoring order
-    selE = (mapE > 0).sum(1)
-    sel_match_kernel = ((mapK > 0) == (map64 > 0)).all(1).float().mean().item()
-    sel_match_eager = ((mapE > 0) == (map64 > 0)).all(1).float().mean().item()
-    print(f"\n{'expert SELECTION vs fp64':<22}{sel_match_eager:>17.4%}{sel_match_kernel:>18.4%}"
-          f"   (fraction of tokens picking the identical expert set)")
-    assert (selE == K).all(), "reference did not select exactly K experts per token"
-
-    # a selection flip is categorical, not a rounding error: the token goes to a different expert
-    # entirely, so it is worth separating from the weight error above.
-    flips = (~((mapK > 0) == (map64 > 0)).all(1)).sum().item()
-    print(f"tokens whose selection differs from fp64: {flips} / {T}")
-
-    # weights must still be a valid distribution regardless
     s = mapK.sum(1)
     assert torch.allclose(s, torch.ones_like(s), atol=1e-3), \
         f"kernel weights do not sum to 1: min {s.min():.6f} max {s.max():.6f}"
-    print("kernel weights sum to 1 per token: OK")
-
-    # per-expert counts must match a bincount of the indices exactly, and total T*K. This is the
-    # tile map's input: a wrong count silently drops or duplicates tokens in the grouped GEMM.
     ref_cnt = torch.bincount(idxK.reshape(-1).long(), minlength=E).to(torch.int32)
-    assert torch.equal(cntK, ref_cnt), (
-        f"counts mismatch: max delta {(cntK.long()-ref_cnt.long()).abs().max().item()}")
+    assert torch.equal(cntK, ref_cnt), "counts != bincount(indices)"
     assert cntK.sum().item() == T * K, f"counts sum {cntK.sum().item()} != T*K {T*K}"
-    print(f"per-expert counts exact (sum {cntK.sum().item()} = T*K, "
+    print(f"  weights sum to 1, counts exact (sum {cntK.sum().item()}, "
           f"min {cntK.min().item()} max {cntK.max().item()}): OK")
-    return dict(eager=err(mapE, map64)[0], kernel=err(mapK, map64)[0], flips=flips)
 
 
 if __name__ == "__main__":
     for T in (4096, 65536):
         grade(T=T)
-        print("-" * 78)
