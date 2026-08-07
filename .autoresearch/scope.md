@@ -1,44 +1,91 @@
-# Scope: lowest kappa at r=1 per NS-iteration budget (Round: kappa-pareto)
+# Scope contract — MoE MLP-block megakernel
+
+Frozen 2026-08-08. Re-read at the start of every iteration. The watchdog checks drift against this.
 
 ## Real goal
-Square (r=1) weight matrices are the main case (attention QKVO). Current default (dsv4_10 + aurora_k1,
-10 NS iters) leaves kappa ~40-470 at r=1. Exact kappa 1 costs 20 iters (dsv4_10 + aurora_k2). Goal:
-push the kappa-vs-iterations Pareto front — the lowest kappa at r=1 for the fewest NS iterations.
+
+Make the **whole MLP block** faster in real training, not a faster microbenchmark of one phase.
+User's framing: *"it's the whole block you have to consider — like F1, in some sectors you may lose
+time but overall the lap should be season best."* A candidate that speeds up norm+router while
+slowing the expert GEMMs is a LOSS if the block total does not improve.
+
+Secondary but real: be closer to fp64 than today's stack. Today the model routes ~1.7% of tokens to
+different experts than exact arithmetic would choose (1,133 of 65,536 per micro-batch).
+
+## Artifact (what changes)
+
+`kernels/sm120/megakernel/moe/**` — the fused block and its custom `autograd.Function`, including a
+hand-written fused backward. Nothing else.
 
 ## Frozen eval
-.autoresearch/eval_kappa.py — deterministic. Input matrices: n=2048 square Gaussian, row-skew
-decay in {0, 2}, OPTIMIZATION seeds {0,1,2}, HELD-OUT seeds {10,11,12} (promotion only).
-Metric: kappa = smax/smin via fp64 Gram eigh of the fp16-pipeline output (prod dtype).
-SCORE = geomean kappa at r=1 decay=2. Cost = total NS iterations (quintic step = 1; O(n^2) row/col
-ops = free). Standing slice: r=2 decay=2 seed 0 must keep kappa <= 1.05, dead% = 0.
 
-## Definition of done
-kappa <= 3 at budget <= 12 iters on held-out (beats today: budget-16 pe8+k2 = 3.45), r=2 slice clean.
-Stretch: kappa <= 1.1 at budget <= 12. Hard stop: 25 loop iterations or user stop.
+`bench/eval_mlp_block.py`. Scores a block implementation and returns, per shape:
 
-## In-scope knobs
-- Coefficient schedules (incl. a minimax/PE-style per-iteration solver for the TRUE square floor
-  l0 ~ 2.5e-6..5e-5, or the post-prescale floor ~5e-4).
-- Prescale / interstage row ops (aurora-like), sinkhorn pre-norm, polar splits (K polars, different
-  per-polar schedules — restart effect real: 2x10 -> 1.00 where 1x20-tail -> 6.6).
-- Anything O(n^2) between polars is free.
+    fwd_ms, fwdbwd_ms, peak_gb, out_maxerr_vs_fp64, flips_vs_fp64
+
+Baseline = liger RMSNorm + eager router + `kernels.sm120.moe.moe`, i.e. the stack the model runs
+today (patch list is `{liger_norm, liger_rope, moe, xsa}` — there is no router patch).
+
+**The eval is READ-ONLY once frozen.** Changing it to make a number look better is the cardinal sin.
+
+## Objectives
+
+1. **PRIMARY** — block `fwd+bwd_ms`, lower is better. This is the lap time.
+2. **PRIMARY** — block `fwd_ms`, lower is better.
+3. **SECOND OBJECTIVE (not a gate)** — `out_maxerr_vs_fp64` and `flips_vs_fp64`, lower is better.
+   Keep a Pareto archive over (speed, accuracy); do not collapse to one.
+4. Tiebreak — `peak_gb`, lower is better. The custom backward should free ~17 GB by recomputing
+   `gate_up` instead of saving it; that memory is only worth something if it converts to speed.
+
+## Splits
+
+- Optimization set: `(B,S) = (32,1024), (64,1024)` — the shapes training actually uses.
+- Held-out: `(B,S) = (32,2048), (16,4096)` — never tuned against; promotion is judged here.
+- Standing slices (regression trip-wires): `flips_vs_fp64` must not exceed today's stack; per-expert
+  counts must equal `bincount(indices)` and sum to `T*K`.
+
+## Constraints / invariants
+
+- **One activation per build**, chosen at compile time: radial NormSiLU OR SiLU, never both, no
+  polyglu. The backward hardcodes one derivative rather than branching.
+- **The router's load-balancing bias update is a side effect that must fire exactly once per step.**
+  The backward MUST reuse the saved top-k indices and never re-run the router — recomputing would
+  apply the balancing twice and silently double the balancing rate.
+- Model dtype bf16, sm120 (RTX PRO 6000 Blackwell, 97 GB). fp32 master weights.
+- Router semantics are fixed by `src/modeling/ffn/router.py`: sigmoid on fp32 logits, bias steers
+  SELECTION ONLY, weights gathered from UNBIASED scores, sum-norm with `+1e-20`.
 
 ## Out of scope
-- Touching the eval. Promoting to repo default before the T4/VM training verdict.
-- fp32-only tricks (prod is fp16 NS). Full fp64 SVD anywhere in the loop (3050: fp64 = 1/64 rate).
 
-## Prior art (do NOT re-tread)
-- sink alone: not an orthogonalizer (r=1 floor ~2070, decay-invariant; L>2 useless). sink on top of
-  aurora/prescale: redundant. sink+pe8 ~= plain pe8 at r=1.
-- Constant-tuple sweeps lose to schedules. KJ f(1)=0.70 -> band [0.68,1.13]; pinned (2,-1.5,0.5)
-  locks it. Best pinned constant (2.5,-2.5,1.0) reached only 8.28@15it.
-- PE-8 (l0=1e-3) r=1 decay2 fp32: 5160. dsv4_10: 446. +aurora_k1: 40 (fp16 36). +aurora_k2 (20it): 1.00.
-- Root cause: hard edge x0 ~ 4.8e-5 (decay0) / 2.5e-6 (decay2); each iter lifts smin <= a.
-- fp32 not a stabilizer. gram backend == cuBLAS numerics (restarts [4,6]); eval uses plain cuBLAS NS.
-- aurora rownorm prescale lifts the polar-input floor to ~4.8e-4 at r=1.
+- Changing model architecture, expert count, top-k, or the activation choice.
+- Multi-GPU / expert parallelism. Cursor's Mixture-of-Kittens solves an all-to-all communication
+  problem across 72 GPUs; we have 64 experts on ONE device and none of that applies.
+- Touching the eval, the attention path, or the training loop.
 
-## Baselines (opt seeds, fp16, to beat at each budget)
-Fill from run 0: dsv4_10+rownorm (B=10), pe8+rownorm x2 (B=16), dsv4_10 x2 rownorm (B=20), dsv4_12.
+## Prior art — measured this session, do NOT re-derive
+
+| Finding | Number |
+|---|---|
+| Block forward baseline @T=65536 | liger 0.050 + router 0.235 + moe() 4.255 = **4.541 ms** |
+| `moe()` share of the block | **94%** — and it is already the output of a dedicated speed round |
+| Fusing norm+router only | 1.21x on that sub-block = **1.01x on the block** |
+| Ceiling if everything except the expert GEMMs were free | **1.07x** |
+| `h_norm` round-trip cost | 0.002 ms (1%), NOT the 134 MB claimed |
+| Megakernel routing accuracy | **0 flips** vs 1,133 for today's stack; weights 3,400x closer |
+| Attention (unrelated, closed) | 3.7% of a step — a custom flash kernel buys 1.04x, not worth it |
+| FA3/FA4 wheels | sm90a / sm100 only — cannot target sm120 |
+
+**Three times this session a benchmark measured MY OWN reference instead of the model's real path**
+(a dense attention mask, a bf16 rstd, an eager norm standing in for Liger). Every eval number must
+come from the code the model actually runs. Check the patch list, not the assumption.
+
+## Definition of done
+
+Stop when the held-out shapes show **>= 1.10x on block fwd+bwd with accuracy no worse than today's
+stack**, or on any external stopping condition (patience 3, max 30 iterations, budget, user stop,
+Goodhart trip-wire). A tie inside the noise floor is reported as a tie, not a win.
 
 ## Resources
-Local RTX 3050. BiBo venv via ../BiBo/.venv. Eval ~1 min. Watchdog: ScheduleWakeup ~30 min.
+
+Single RTX PRO 6000 Blackwell on the marimo box, currently idle. The box has died mid-session
+before; state lives on disk here, not in conversation.
