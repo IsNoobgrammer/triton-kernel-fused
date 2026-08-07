@@ -31,44 +31,60 @@ import triton.language as tl
 @triton.jit
 def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
                      T, H: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
-                     EPS: tl.constexpr, BLOCK_T: tl.constexpr, WRITE_HN: tl.constexpr,
-                     ROUTER_FP32: tl.constexpr):
+                     EPS: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
+                     WRITE_HN: tl.constexpr, ROUTER_FP32: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     m_r = rows < T
-    h_off = tl.arange(0, H)
     e_off = tl.arange(0, E)
 
-    # ---- RMSNorm. fp32 accumulate: the sum of squares over H=512 in bf16 loses ~3 bits and the
-    # reciprocal sqrt amplifies it straight into every downstream logit.
-    x = tl.load(X + rows[:, None] * H + h_off[None, :], mask=m_r[:, None], other=0.0).to(tl.float32)
-    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / H + EPS)
-    nw = tl.load(NW + h_off).to(tl.float32)
-    hn = x * rstd[:, None] * nw[None, :]
-    # h_norm is NOT written in the megakernel path. The expert phase reads tokens permuted by
-    # expert, so it gathers the raw x rows and re-applies rstd*nw inline -- one multiply, since
-    # rstd is saved. Materializing h_norm would cost a 67 MB write here and a 67 MB read there,
-    # which is the exact round-trip this fusion exists to remove. WRITE_HN=True is for parity
-    # testing against the eager reference only.
-    if WRITE_HN:
-        tl.store(HN + rows[:, None] * H + h_off[None, :], hn.to(HN.dtype.element_ty),
-                 mask=m_r[:, None])
+    # H is TILED, not loaded whole. In fp32 the router weight alone is H*E*4 = 131 KB at H=512,
+    # E=64, over the 101 KB shared-memory limit, so holding [H,E] resident is impossible once the
+    # projection runs in fp32. Two passes over x instead: one to accumulate the sum of squares,
+    # one to build hn and the logits chunk by chunk. x re-reads hit L2, which is far cheaper than
+    # dropping the projection back to bf16.
+    ss = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for h0 in tl.range(0, H, BLOCK_H):
+        hc = h0 + tl.arange(0, BLOCK_H)
+        xc = tl.load(X + rows[:, None] * H + hc[None, :],
+                     mask=m_r[:, None] & (hc[None, :] < H), other=0.0).to(tl.float32)
+        ss += tl.sum(xc * xc, axis=1)
+    # fp32 accumulate: the sum of squares over H in bf16 loses ~3 bits and the reciprocal sqrt
+    # amplifies it straight into every downstream logit.
+    rstd = 1.0 / tl.sqrt(ss / H + EPS)
     tl.store(RSTD + rows, rstd, mask=m_r)
 
-    # ---- router logits. eager casts the projection output to fp32 BEFORE the sigmoid; matching
-    # that matters because sigmoid saturates and a bf16 logit quantises the score it produces.
+    # ---- router logits, accumulated over H tiles. eager casts the projection output to fp32
+    # BEFORE the sigmoid; matching that matters because sigmoid saturates and a bf16 logit
+    # quantises the score it produces.
     #
     # ROUTER_FP32 does the projection in true IEEE fp32 rather than on bf16 tensor cores. This is
     # THE lever on selection flips: top-k over `scores + bias` is decided by near-ties, and a bf16
     # mantissa on the logits is what makes two nearly-equal experts swap order versus exact
     # arithmetic. It is nearly free -- the projection is [T,512]x[512,64], 4.3 GFLOP at T=65536,
     # against the ~2 TFLOP of the expert GEMMs it feeds.
-    rw = tl.load(RW + h_off[:, None] * E + e_off[None, :]).to(tl.float32)
-    if ROUTER_FP32:
-        logits = tl.dot(hn, rw, out_dtype=tl.float32, input_precision="ieee")
-    else:
-        logits = tl.dot(hn.to(RW.dtype.element_ty), rw.to(RW.dtype.element_ty),
-                        out_dtype=tl.float32)
+    logits = tl.zeros([BLOCK_T, E], dtype=tl.float32)
+    for h0 in tl.range(0, H, BLOCK_H):
+        hc = h0 + tl.arange(0, BLOCK_H)
+        m_h = hc < H
+        xc = tl.load(X + rows[:, None] * H + hc[None, :],
+                     mask=m_r[:, None] & m_h[None, :], other=0.0).to(tl.float32)
+        nwc = tl.load(NW + hc, mask=m_h, other=0.0).to(tl.float32)
+        hnc = xc * rstd[:, None] * nwc[None, :]
+        # h_norm is NOT written in the megakernel path: the expert phase gathers raw x rows
+        # permuted by expert and re-applies rstd*nw inline. Writing it would cost a 67 MB store
+        # here and a 67 MB load there -- the exact round-trip this fusion removes. WRITE_HN is
+        # for grading against eager only.
+        if WRITE_HN:
+            tl.store(HN + rows[:, None] * H + hc[None, :], hnc.to(HN.dtype.element_ty),
+                     mask=m_r[:, None] & m_h[None, :])
+        rwc = tl.load(RW + hc[:, None] * E + e_off[None, :], mask=m_h[:, None], other=0.0)
+        if ROUTER_FP32:
+            logits += tl.dot(hnc, rwc.to(tl.float32), out_dtype=tl.float32,
+                             input_precision="ieee")
+        else:
+            logits += tl.dot(hnc.to(RW.dtype.element_ty), rwc.to(RW.dtype.element_ty),
+                             out_dtype=tl.float32)
     scores = tl.sigmoid(logits)
     bias = tl.load(B + e_off).to(tl.float32)
     sel = scores + bias[None, :]
@@ -107,7 +123,8 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS,
 
 
 def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
-                        out_dtype=torch.bfloat16, block_t=32, write_hn=False, router_fp32=True):
+                        out_dtype=torch.bfloat16, block_t=32, block_h=128, write_hn=False,
+                        router_fp32=True):
     """x [T,H] -> (h_norm|None, idx [T,K] int32, weights [T,K] fp32, rstd [T] fp32, counts [E] int32).
 
     `write_hn=False` by default: the expert phase recomputes the norm from x while gathering, so
@@ -133,8 +150,8 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
     # keyed on a grid dim cost a 4.1x eval stall once already)
     grid = (triton.cdiv(T, block_t),)
     _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd, counts,
-                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, WRITE_HN=write_hn,
-                           ROUTER_FP32=router_fp32)
+                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, BLOCK_H=block_h,
+                           WRITE_HN=write_hn, ROUTER_FP32=router_fp32)
     return (hn if write_hn else None), idx, wgt, rstd, counts
 
 
