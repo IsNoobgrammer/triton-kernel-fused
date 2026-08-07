@@ -37,7 +37,10 @@ class _NormRouter(torch.autograd.Function):
             f = xd.float()
             # full recompute, INCLUDING rstd: it depends on x, and reusing the saved value would
             # drop d(rstd)/dx and give a wrong gradient that no shape check would catch
-            hn = (f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + ctx.eps)).to(x.dtype) * nwd
+            # cast AFTER the weight multiply. Casting first promotes back to fp32 (bf16 * fp32
+            # weight -> fp32) and the router matmul then gets fp32 @ bf16. Liger returns the
+            # input dtype, and the forward Triton kernel emits bf16, so the recompute must match.
+            hn = ((f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + ctx.eps)) * nwd).to(x.dtype)
             scores = torch.sigmoid((hn @ rwd).float())
             # idx is REUSED, never recomputed -- re-running the selection would apply the
             # load-balancing bias a second time
