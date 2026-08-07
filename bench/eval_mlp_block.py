@@ -40,21 +40,27 @@ def make_weights(seed=0):
         nw=torch.randn(H, device=DEV, dtype=torch.float32, generator=g) * 0.1 + 1.0,
         rw=torch.randn(H, E, device=DEV, dtype=torch.bfloat16, generator=g) * 0.02,
         bias=torch.randn(E, device=DEV, dtype=torch.float32, generator=g) * 0.05,
-        gu=torch.randn(E, H, 2 * I, device=DEV, dtype=torch.bfloat16, generator=g) * 0.02,
-        dn=torch.randn(E, I, H, device=DEV, dtype=torch.bfloat16, generator=g) * 0.02,
+        # LAYOUTS ARE (E, 2I, H) and (E, H, I) -- taken from the probe in patches.py, not guessed.
+        # Transposing them does not raise: it returns an invalid gradient and then an illegal
+        # memory access several shapes later.
+        gu=torch.randn(E, 2 * I, H, device=DEV, dtype=torch.bfloat16, generator=g) * 0.02,
+        dn=torch.randn(E, H, I, device=DEV, dtype=torch.bfloat16, generator=g) * 0.02,
     )
 
 
 def baseline_block(x, w, codes):
     """liger RMSNorm -> eager router -> moe() kernel. What the model runs today."""
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
-    from kernels.sm120.moe import moe
+    # moe_per_expert, NOT moe(): BIBO_MOE_DISPATCH defaults to per_expert and the
+    # grouped path was measured a wash on real steps.
+    from kernels.sm120.moe import moe_per_expert
     hn = LigerRMSNormFunction.apply(x, w["nw"], EPS, 0.0, "llama", False)
     scores = torch.sigmoid((hn @ w["rw"]).float())
     _, idx = torch.topk(scores + w["bias"], K, dim=-1, sorted=False)
     tw = scores.gather(-1, idx)
-    tw = (tw / (tw.sum(-1, keepdim=True) + 1e-20)).to(x.dtype)
-    return moe(hn, idx.int(), tw, w["gu"], w["dn"], codes)
+    # the router returns long indices and fp32 weights; match it exactly
+    tw = tw / (tw.sum(-1, keepdim=True) + 1e-20)
+    return moe_per_expert(hn, idx.long(), tw.float(), w["gu"], w["dn"], codes)
 
 
 def reference_fp64(x, w):
@@ -73,10 +79,10 @@ def reference_fp64(x, w):
         e = idx[:, k]
         for ex in e.unique():
             m = e == ex
-            g = hn[m] @ gu64[ex]
+            g = hn[m] @ gu64[ex].T      # (E,2I,H) layout
             gate, up = g[:, :I], g[:, I:]
             act = torch.nn.functional.silu(gate) * up
-            out[m] += (act @ dn64[ex]) * tw[m, k : k + 1]
+            out[m] += (act @ dn64[ex].T) * tw[m, k : k + 1]   # (E,H,I) layout
     return out, idx
 
 
