@@ -72,7 +72,10 @@ def grade(T=8192, H=512, E=64, K=6, seed=0, eps=1e-6):
         print(f"  [liger unavailable: {type(e).__name__}: {str(e)[:70]}]")
         hnL, mapL, liger = hnE, mapE, False
 
-    hnK, idxK, wK, rstdK, cntK = norm_router_forward(x, nw, rw, bias, K, eps, write_hn=True)
+    # index rather than unpack: this line silently went stale once already when the forward grew an
+    # `ssum` output, and a positional unpack breaks on every future addition
+    _out = norm_router_forward(x, nw, rw, bias, K, eps, write_hn=True)
+    hnK, idxK, wK = _out[0], _out[1], _out[2]
     mapK = _mapping(idxK, wK, E)
 
     lab = "liger+eager (TODAY)" if liger else "liger N/A"

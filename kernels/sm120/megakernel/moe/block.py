@@ -21,19 +21,21 @@ from .norm_router import norm_router_forward, rmsnorm_backward
 
 class _NormRouter(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, nw, rw, bias, top_k, eps):
-        hn, idx, wgt, rstd, counts, ssum = norm_router_forward(
-            x, nw, rw, bias, top_k, eps, write_hn=True)
+    def forward(ctx, x, nw, rw, bias, top_k, eps, want_gap=False):
+        hn, idx, wgt, rstd, counts, ssum, gap = norm_router_forward(
+            x, nw, rw, bias, top_k, eps, write_hn=True, write_gap=want_gap)
         # hn and rstd are SAVED, not recomputed. Candidate 1 rebuilt the whole norm+router graph
         # in PyTorch and paid +3.1 ms for it -- the forward was a tie and the backward regressed by
         # exactly that amount, which is what identified the recompute as the regression.
         ctx.save_for_backward(x, nw, rw, idx, rstd, hn, wgt, ssum)
         ctx.eps = eps
         ctx.mark_non_differentiable(idx)
-        return hn, idx, wgt
+        if gap is not None:
+            ctx.mark_non_differentiable(gap)
+        return hn, idx, wgt, gap
 
     @staticmethod
-    def backward(ctx, g_hn, g_idx, g_wgt):
+    def backward(ctx, g_hn, g_idx, g_wgt, g_gap):
         x, nw, rw, idx, rstd, hn, wgt, ssum = ctx.saved_tensors
         H = x.shape[-1]
         idxl = idx.long()
@@ -68,28 +70,30 @@ class _NormRouter(torch.autograd.Function):
         # (~670 MB of traffic at T=65536) against liger's single 0.280 ms kernel -- that was the
         # whole remaining regression after the recompute was removed.
         d_x, d_nw = rmsnorm_backward(x, d_hn, nw, rstd)
-        return d_x, d_nw, d_rw, None, None, None
+        return d_x, d_nw, d_rw, None, None, None, None
 
 
-def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_routing=False):
+def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_routing=False,
+                     want_gap=False):
     """Signature matches bench.eval_mlp_block.baseline_block so the frozen eval can score both.
 
     `act_params` carries radial's exponent logit (`radial_theta`). Act code 8 RAISES without it, so
     a training patch running radial MUST pass it -- the frozen eval never did, which is why this
     argument did not exist until the kernel was wired into a real model.
 
-    `return_routing=True` also hands back (idx, weights). Both the load-balancing bias update and
-    the router diagnostics (top1 weight, router entropy, balance entropy) are driven from these and
-    they are produced HERE and nowhere else, so dropping them silently disables balancing and blanks
-    the diagnostics -- changes that surface as a quality regression, not an error.
+    `return_routing=True` also hands back (idx, weights, gap). Both the load-balancing bias update
+    and the router diagnostics (top1 weight, router entropy, balance entropy, boundary gap) are
+    driven from these and they are produced HERE and nowhere else, so dropping them silently
+    disables balancing and blanks the diagnostics -- changes that surface as a quality regression,
+    not an error. `gap` is None unless `want_gap=True`.
 
-    Both default off, so the frozen eval's single-tensor contract is untouched.
+    All default off, so the frozen eval's single-tensor contract is untouched.
     """
     # moe() dispatches to the GROUPED path when it can; moe_per_expert always takes the
     # per-expert loop, whose backward is ~119 separate cuBLAS dW launches plus 73 split-K
     # reductions -- 3.96 ms, 23% of the lap, and the largest remaining inefficiency.
     from kernels.sm120.moe import moe, moe_per_expert
-    hn, idx, wgt = _NormRouter.apply(x, w["nw"], w["rw"], w["bias"], top_k, eps)
+    hn, idx, wgt, gap = _NormRouter.apply(x, w["nw"], w["rw"], w["bias"], top_k, eps, want_gap)
     # the grouped path takes neither act_params nor act codes > 4, so radial can never reach it
     grouped = os.environ.get("MK_GROUPED", "1") == "1" and act_params is None
     # the grouped path index_add_s into a bf16 buffer and rejects fp32 weights;
@@ -97,4 +101,4 @@ def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_rou
     tw = wgt.to(hn.dtype) if grouped else wgt.float()
     out = (moe(hn, idx.long(), tw, w["gu"], w["dn"], codes) if grouped else
            moe_per_expert(hn, idx.long(), tw, w["gu"], w["dn"], codes, act_params=act_params))
-    return (out, idx, tw) if return_routing else out
+    return (out, idx, tw, gap) if return_routing else out

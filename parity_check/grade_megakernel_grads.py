@@ -47,7 +47,7 @@ def grade_fp32_master(T=1024, seed=0):
     rw = (torch.randn(H, E, device=DEV, dtype=torch.float32) * 0.02).requires_grad_(True)
     bias = torch.randn(E, device=DEV, dtype=torch.float32) * 0.05
     with torch.autocast("cuda", torch.bfloat16):
-        hn, idx, w = _NormRouter.apply(x, nw, rw, bias, K, EPS)
+        hn, idx, w, _gap = _NormRouter.apply(x, nw, rw, bias, K, EPS)
     (hn.float().sum() + w.sum()).backward()
     for name, t, p in (("d_x", x.grad, x), ("d_norm_weight", nw.grad, nw),
                        ("d_router_weight", rw.grad, rw)):
@@ -86,7 +86,7 @@ def grade(T=4096, seed=0):
 
     ref = run(lambda x, nw, rw, b: eager_fwd(x, nw, rw, b, torch.float64), torch.float64)
     eag = run(lambda x, nw, rw, b: eager_fwd(x, nw, rw, b), torch.bfloat16)
-    mk = run(lambda x, nw, rw, b: _NormRouter.apply(x, nw, rw, b, K, EPS), torch.bfloat16)
+    mk = run(lambda x, nw, rw, b: _NormRouter.apply(x, nw, rw, b, K, EPS)[:3], torch.bfloat16)
 
     print(f"T={T} H={H} E={E} K={K}   ground truth = fp64 eager\n")
     print(f"  {'gradient':<18}{'eager bf16 max':>18}{'megakernel max':>18}   verdict")

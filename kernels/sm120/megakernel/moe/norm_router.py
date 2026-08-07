@@ -29,10 +29,11 @@ import triton.language as tl
 
 
 @triton.jit
-def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS, SSUM,
+def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS, SSUM, GAP,
                      T, H: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
                      EPS: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
-                     WRITE_HN: tl.constexpr, ROUTER_FP32: tl.constexpr):
+                     WRITE_HN: tl.constexpr, ROUTER_FP32: tl.constexpr,
+                     WRITE_GAP: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     m_r = rows < T
@@ -89,6 +90,26 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS, SSUM,
     bias = tl.load(B + e_off).to(tl.float32)
     sel = scores + bias[None, :]
 
+    # ---- selection-boundary gap: rank-K minus rank-(K+1) over the UNBIASED scores, matching
+    # BiBoMoERouter._probe_gap. This is a SEPARATE reduction from the top-k below, which ranks
+    # `sel = scores + bias`. With a non-zero balancing bias the two orderings differ, so the gap
+    # cannot be recovered from the emitted weights -- it has to be computed here or not at all.
+    # Gated because it costs K+1 extra passes over E and only a training diagnostic reads it.
+    if WRITE_GAP:
+        cur_g = scores
+        neg_g = float("-inf")
+        kth = tl.zeros([BLOCK_T], dtype=tl.float32)
+        kp1 = tl.zeros([BLOCK_T], dtype=tl.float32)
+        for j in tl.static_range(K + 1):
+            best_g = tl.max(cur_g, axis=1)
+            if j == K - 1:
+                kth = best_g
+            if j == K:
+                kp1 = best_g
+            first_g = tl.argmax((cur_g == best_g[:, None]).to(tl.int32), axis=1)
+            cur_g = tl.where(e_off[None, :] == first_g[:, None], neg_g, cur_g)
+        tl.store(GAP + rows, kth - kp1, mask=m_r)
+
     # ---- top-k by repeated arg-max over E. E is small (64) so K linear passes beat a sort.
     # Ties break toward the LOWER expert index, deterministically -- eager's sorted=False makes no
     # promise here, so we pick a rule and keep it.
@@ -127,11 +148,16 @@ def _norm_router_fwd(X, NW, RW, B, HN, IDX, WGT, RSTD, COUNTS, SSUM,
 
 def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
                         out_dtype=torch.bfloat16, block_t=32, block_h=128, write_hn=False,
-                        router_fp32=True):
-    """x [T,H] -> (h_norm|None, idx [T,K] int32, weights [T,K] fp32, rstd [T] fp32, counts [E] int32).
+                        router_fp32=True, write_gap=False):
+    """x [T,H] -> (h_norm|None, idx [T,K] int32, weights [T,K] fp32, rstd [T] fp32, counts [E] int32,
+    ssum [T] fp32, gap [T] fp32|None).
 
     `write_hn=False` by default: the expert phase recomputes the norm from x while gathering, so
     materializing h_norm is pure wasted bandwidth. Set True only to grade against eager.
+
+    `write_gap=True` additionally emits the per-token rank-K vs rank-(K+1) score gap that
+    BiBoMoERouter._probe_gap produces. Off by default: it costs K+1 extra reductions over E and
+    nothing but a training diagnostic consumes it.
     """
     assert x.ndim == 2, f"expected [T,H], got {tuple(x.shape)}"
     T, H = x.shape
@@ -150,13 +176,17 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
     # tensors that are atomically accumulated into MUST be reset -- that has bitten this repo.
     counts = torch.zeros((E,), device=x.device, dtype=torch.int32)
     ssum = torch.empty((T,), device=x.device, dtype=torch.float32)
+    # the gap probe needs a rank-(K+1) score, so it is only meaningful when an unselected expert
+    # exists -- mirroring eager's `self.top_k < self.num_routed_experts` guard
+    want_gap = write_gap and top_k < E
+    gap = torch.empty((T,), device=x.device, dtype=torch.float32) if want_gap else x  # dummy ptr
     # grid keyed on T only; T is a grid dim so it must never be an autotune key (a stale cache
     # keyed on a grid dim cost a 4.1x eval stall once already)
     grid = (triton.cdiv(T, block_t),)
     _norm_router_fwd[grid](x, norm_weight, router_weight, bias, hn, idx, wgt, rstd, counts, ssum,
-                           T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, BLOCK_H=block_h,
-                           WRITE_HN=write_hn, ROUTER_FP32=router_fp32)
-    return (hn if write_hn else None), idx, wgt, rstd, counts, ssum
+                           gap, T, H=H, E=E, K=top_k, EPS=eps, BLOCK_T=block_t, BLOCK_H=block_h,
+                           WRITE_HN=write_hn, ROUTER_FP32=router_fp32, WRITE_GAP=want_gap)
+    return (hn if write_hn else None), idx, wgt, rstd, counts, ssum, (gap if want_gap else None)
 
 
 def norm_router_reference(x, norm_weight, router_weight, bias, top_k, eps=1e-6, dtype=None):
