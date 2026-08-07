@@ -71,5 +71,8 @@ def megakernel_block(x, w, codes, top_k=6, eps=1e-6):
     # reductions -- 3.96 ms, 23% of the lap, and the largest remaining inefficiency.
     from kernels.sm120.moe import moe, moe_per_expert
     hn, idx, wgt = _NormRouter.apply(x, w["nw"], w["rw"], w["bias"], top_k, eps)
-    fn = moe if os.environ.get("MK_GROUPED", "1") == "1" else moe_per_expert
-    return fn(hn, idx.long(), wgt.float(), w["gu"], w["dn"], codes)
+    grouped = os.environ.get("MK_GROUPED", "1") == "1"
+    # the grouped path index_add_s into a bf16 buffer and rejects fp32 weights;
+    # per_expert takes fp32, which is what the model's router emits
+    tw = wgt.to(hn.dtype) if grouped else wgt.float()
+    return (moe if grouped else moe_per_expert)(hn, idx.long(), tw, w["gu"], w["dn"], codes)
