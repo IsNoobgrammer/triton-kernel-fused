@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -680,6 +682,23 @@ def _combine_bwd(grad_out, eo, w, tok):
     return grad_eo, grad_w
 
 
+def _ap_grad_from_rows(da, row_expert, E, ap_shape, device):
+    """Per-ROW d(theta) -> per-EXPERT, in the shape the caller passed act_params in.
+
+    The batched paths compute one theta gradient per row because theta is broadcast per row; the
+    parameter is per expert, so the rows belonging to each expert must be summed. Returning the
+    caller's shape matters: autograd rejects a gradient whose shape differs from its input, and a
+    1-D (E,) act_params is documented as legal.
+    """
+    per_e = torch.zeros(E, device=device, dtype=torch.float32).index_add_(
+        0, row_expert, da.reshape(-1).float())
+    if len(ap_shape) == 1:
+        return per_e
+    g = torch.zeros(E, 2, device=device, dtype=torch.float32)
+    g[:, 0] = per_e
+    return g[:, :ap_shape[1]]
+
+
 class _PerExpertMoE(torch.autograd.Function):
 
     @staticmethod
@@ -709,7 +728,26 @@ class _PerExpertMoE(torch.autograd.Function):
         M_tot = st.numel()
         eo_all = torch.empty(M_tot, H, device=dev, dtype=hidden.dtype)
         sw_eff = sw
-        uniform = all(c <= 2 or c >= 6 for c in codes) and ap32 is None
+        # `and ap32 is None` USED TO BE HERE and was the whole cost of radial NormSiLU. Codes 8/10
+        # already satisfy `c >= 6`, so the only thing dropping radial off the batched grouped-mm
+        # path was carrying a per-expert theta at all -- which sent the entire MoE into the
+        # per-expert Python loop below: ~380 small cuBLAS launches per layer per step instead of a
+        # handful of batched ones, measured at ~10k tok/s. The activation arithmetic was never the
+        # cost; the code-path switch was. _glu_fwd/_glu_bwd already implement 8/10 with a PER-ROW
+        # theta, so all that was missing is building that row vector.
+        # BIBO_MOE_FORCE_LOOP=1 restores the pre-change behaviour (per-expert Python loop). It is
+        # the reference arm for parity_check/parity_radial_fastpath.py -- comparing the new path
+        # against a rewritten reference proves nothing, so the old path stays reachable.
+        uniform = (all(c <= 2 or c >= 6 for c in codes)
+                   and os.environ.get("BIBO_MOE_FORCE_LOOP") != "1")
+        # theta per ROW, laid out exactly like row_act so the batched GLU kernels can index it
+        row_alpha = row_expert = None
+        if ap32 is not None:
+            row_alpha = torch.repeat_interleave(ap32[:, 0].contiguous(), counts_t,
+                                                output_size=M_rows)
+            # which expert each row came from, so the backward can scatter d(theta) back per expert
+            row_expert = torch.repeat_interleave(torch.arange(E, device=dev), counts_t,
+                                                 output_size=M_rows)
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
@@ -722,7 +760,10 @@ class _PerExpertMoE(torch.autograd.Function):
             gu_all = it_all = None
             if tile_map_gg is not None and _FUSED_GLU.gemm_supported(x_s, gate_up_proj, codes):
                 tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
-                act = _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes)
+                # the GEMM+GLU fusion has no theta argument, so it must not apply the activation
+                # when one exists -- the GEMM half is still used, only the act is deferred to
+                # _glu_fwd, which does take row_alpha
+                act = _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes) and ap32 is None
                 gu_all, it_all = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
                                                               want_gu=True, act=act)
                 if act:
@@ -732,7 +773,7 @@ class _PerExpertMoE(torch.autograd.Function):
             if gu_all is None:
                 gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
             if it_all is None:
-                it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
+                it_all = _glu_fwd(gu_all, row_act, code_hint=hint, row_alpha=row_alpha)
             eo_all = None
             if tile_map_gg is not None:
                 eo_all = _FUSED_GLU.grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
@@ -748,7 +789,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 if en > s:
                     torch.mm(x_s[s:en], gate_up_proj[e].t(), out=gu_all[s:en])
             hint = codes[0] if len(set(codes)) == 1 else None
-            it_all = _glu_fwd(gu_all, row_act, code_hint=hint)
+            it_all = _glu_fwd(gu_all, row_act, code_hint=hint, row_alpha=row_alpha)
             for e in range(E):
                 s, en = bounds[e], bounds[e + 1]
                 if en > s:
@@ -781,6 +822,7 @@ class _PerExpertMoE(torch.autograd.Function):
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
         ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw
         ctx.codes = codes; ctx.has_ap = ap32 is not None; ctx.ap_shape = ap_shape
+        ctx.row_alpha = row_alpha; ctx.row_expert = row_expert
         return out.to(hidden.dtype)
 
     @staticmethod
@@ -793,6 +835,8 @@ class _PerExpertMoE(torch.autograd.Function):
         if ctx.offs is not None:
             gu_all, it_all = gate_up_l, inter_l
             offs = ctx.offs
+            want_ap = ctx.has_ap and ctx.needs_input_grad[6]
+            grad_ap = None
             ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)
             grad_down_proj = torch._grouped_mm(ge_all.t(), it_all, offs=offs)
             hint = codes[0] if len(set(codes)) == 1 else None
@@ -804,7 +848,17 @@ class _PerExpertMoE(torch.autograd.Function):
                               if ctx.tile_map_gg is not None else None)
                 if grad_inter is None:
                     grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
-                grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
+                # row_alpha is REQUIRED here for codes 8/10. Omitting it would not error -- the
+                # kernel would default theta to 1 (p=0.731) and, worse, theta would receive no
+                # gradient at all, silently training radial with a frozen exponent.
+                if want_ap:
+                    grad_gate_up, _da = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
+                                                 row_alpha=ctx.row_alpha, want_act_grads=True)
+                    grad_ap = _ap_grad_from_rows(_da, ctx.row_expert, E, ctx.ap_shape,
+                                                 grad_out.device)
+                else:
+                    grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
+                                            row_alpha=ctx.row_alpha)
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
             grad_hidden = None
             if ctx.tile_map_gg is not None:
@@ -819,7 +873,7 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
             grad_wt[order] = gw_all.to(grad_out.dtype)
             return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,
-                    None, None)
+                    None, grad_ap)
         if ctx.uniform:
             gu_all, it_all = gate_up_l, inter_l
             Icols = it_all.shape[1]
@@ -835,7 +889,15 @@ class _PerExpertMoE(torch.autograd.Function):
                 torch.mm(ge_all[s:en], down_proj[e], out=grad_inter[s:en])
                 torch.mm(ge_all[s:en].t(), it_all[s:en], out=grad_down_proj[e])
             hint = codes[0] if len(set(codes)) == 1 else None
-            grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint)
+            want_ap = ctx.has_ap and ctx.needs_input_grad[6]
+            grad_ap = None
+            if want_ap:
+                grad_gate_up, _da = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
+                                             row_alpha=ctx.row_alpha, want_act_grads=True)
+                grad_ap = _ap_grad_from_rows(_da, ctx.row_expert, E, ctx.ap_shape, grad_out.device)
+            else:
+                grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
+                                        row_alpha=ctx.row_alpha)
             grad_x = torch.empty(M, H, device=grad_out.device, dtype=grad_out.dtype)
             for e in range(E):
                 s, en = bounds[e], bounds[e + 1]
@@ -848,7 +910,7 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
             grad_wt[order] = grad_w_s
             return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,
-                    None, None)
+                    None, grad_ap)
         grad_w_s = torch.zeros(M, device=grad_out.device, dtype=grad_out.dtype)
         grad_gate_up_proj = torch.zeros_like(gate_up_proj)
         grad_down_proj = torch.zeros_like(down_proj)
