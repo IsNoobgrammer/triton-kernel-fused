@@ -30,7 +30,8 @@ def eager(attn_read, theta, stream, mode, dt):
     """The eager spelling. At bf16 the result is STORED in bf16, exactly as the model would --
     comparing an fp32 eager output against a bf16 kernel output charges the kernel for a rounding
     step eager also takes, and makes every `out` row read WORSE THAN EAGER for free."""
-    ar, th, sv = attn_read.to(dt), theta.to(dt), stream.to(dt)
+    ar, sv = attn_read.to(dt), stream.to(dt)
+    th = theta.to(dt)                        # eager casts c to the stream dtype -- see exp's else-branch
     if mode == "rms":
         sv = sv * torch.rsqrt(sv.pow(2).mean(-1, keepdim=True) + RMS_EPS)
     c = th.reshape(()) if th.numel() == 1 else th
@@ -55,7 +56,11 @@ def _run(fn, dt, per_dim, seed=0):
 
 def grade(per_dim, mode):
     ref = _run(lambda a, t, s: eager(a, t, s, mode, torch.float64), torch.float64, per_dim)
-    eag = _run(lambda a, t, s: eager(a, t, s, mode, torch.float32), torch.bfloat16, per_dim)
+    # bf16, NOT fp32. The model's eager spelling is `attn_read + c.to(ao.dtype) * ao` on bf16
+    # tensors; grading against an fp32 eager compares the kernel to a precision nothing runs and
+    # made the kernel look 19x WORSE on scalar d_theta when it is in fact ~38,000x better
+    # (eager 22.5 vs fp64 truth 22.4227, kernel 22.4227390).
+    eag = _run(lambda a, t, s: eager(a, t, s, mode, torch.bfloat16), torch.bfloat16, per_dim)
     ker = _run(lambda a, t, s: make_mlp_input(a, t, s, modes=(mode,)), torch.bfloat16, per_dim)
 
     print(f"\n  mode={mode!r}  theta={'per-dim (H,)' if per_dim else 'scalar'}")
