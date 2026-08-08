@@ -257,7 +257,7 @@ def grouped_gemm_scatter(a, b_enk, tok, tile_map, n_rows_out):
 #   phase 1  per n-tile: gate GEMM -> store to GU, accumulate sum(g^2)      (r needs all of I)
 #   phase 2  per n-tile: up GEMM, reload gate from GU (L2-hot), apply, store
 # Same GEMM FLOPs as before; the 1.8 GB DRAM round trip becomes an L2 re-read of the gate.
-_RBM, _RBN, _RBK, _RWARPS, _RSTAGES = 16, 1024, 64, 8, 2
+_RBM, _RBN, _RBK, _RWARPS, _RSTAGES = 16, 1024, 32, 8, 1
 
 
 @triton.jit
@@ -286,14 +286,22 @@ def _gate_up_radial_kernel(X, W, GU, IT, TE, TS, TM, ALPHA,
     mask = mask_m[:, None] & mask_n[None, :]
     Wb = W + e.to(tl.int64) * (2 * I * H)
 
+    # TWO k-loops, not one. A single loop needs both weight tiles resident, and at BN=1024 that
+    # is 2 x BK x BN x 2 bytes of shared memory -- 264 KB against a 101 KB limit, which is exactly
+    # how the one-loop version failed. Split, only one weight tile is live at a time, and `ag`
+    # stays in REGISTERS across both loops, so r still needs no reload. X is re-read, but it is
+    # BM x H and tiny next to the weights.
     ag = tl.zeros((BM, BN), tl.float32)
-    au = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, H, BK):
         rk = k0 + tl.arange(0, BK)
         x = tl.load(X + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
         wg = tl.load(Wb + rn[:, None] * H + rk[None, :], mask=mask_n[:, None], other=0.0)
-        wu = tl.load(Wb + (I + rn[:, None]) * H + rk[None, :], mask=mask_n[:, None], other=0.0)
         ag = tl.dot(x, tl.trans(wg), ag)
+    au = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, H, BK):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
+        wu = tl.load(Wb + (I + rn[:, None]) * H + rk[None, :], mask=mask_n[:, None], other=0.0)
         au = tl.dot(x, tl.trans(wu), au)
 
     # r over the FULL gate row -- masked lanes contributed 0 and must not count toward the mean
