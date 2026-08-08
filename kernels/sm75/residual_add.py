@@ -114,8 +114,14 @@ def _rms_scale(s, H, MODE: tl.constexpr):
     diagnostic. That exact trap already cost this file once, on _apply_mode's per-channel theta.
     """
     if MODE == 1:
+        # sum of squares in fp32, reciprocal-sqrt in FP64, rounded once. 1/tl.sqrt at fp32 left
+        # the SCALAR d_theta 19x behind eager (2.011e-06 vs 1.038e-07): that gradient reduces
+        # T*H products, so a systematic bias in the per-row normaliser accumulates over ~2M
+        # terms while the per-channel case, reducing only over tokens, stayed clean and hid it.
+        # This is the same "evaluate in fp64, stop trying to win narrowly" fix the removed
+        # _sigmoid documented -- one value per ROW against a (BLOCK_T, H) tile, so it is free.
         ms = tl.sum(s * s, axis=1) / H
-        return (1.0 / tl.sqrt(ms + _RMS_EPS))[:, None]
+        return (1.0 / libdevice.sqrt((ms + _RMS_EPS).to(tl.float64))).to(tl.float32)[:, None]
     # DERIVED FROM s, not a literal: both branches must return the same SHAPE, and a bare
     # tl.zeros([1,1]) fails to unify against the (BLOCK_T,1) above with no inner diagnostic.
     # `sum(s*0)` carries the row count without needing BLOCK_T passed in.
