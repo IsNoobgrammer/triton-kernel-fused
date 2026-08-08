@@ -73,16 +73,21 @@ def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, RBLOCK: tl.constexpr,
     # EVEN: H == RBLOCK and T divides XBLOCK, so nothing can fall off either edge and every
     # access is unmasked. Inductor emits `tl.load(..., None)` for exactly this reason; carrying
     # predication on the hot path was 38% of the forward gap.
+    # `other` may not be passed alongside mask=None, so the LOADS branch, not just the mask.
     if EVEN:
         mask = None
-        rm = None
+        s = tl.load(S + xs * H + r).to(tl.float32)
+        ar = tl.load(AR + xs * H + r).to(tl.float32)
     else:
         mask = (xs < T) & (r < H)
-        rm = r < H
-    s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
-    ar = tl.load(AR + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+        s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+        ar = tl.load(AR + xs * H + r, mask=mask, other=0.0).to(tl.float32)
     if VEC:
-        c = tl.load(M + r, mask=rm, other=0.0, eviction_policy="evict_last").to(tl.float32)
+        if EVEN:
+            c = tl.load(M + r, eviction_policy="evict_last").to(tl.float32)
+        else:
+            c = tl.load(M + r, mask=r < H, other=0.0,
+                        eviction_policy="evict_last").to(tl.float32)
     else:
         c = tl.load(M).to(tl.float32)
     if MODE == 1:
@@ -110,7 +115,11 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr,
     r = tl.arange(0, RBLOCK)[None, :]
     rm = None if EVEN else r < H
     if VEC:
-        c = tl.load(M + r, mask=rm, other=0.0, eviction_policy="evict_last").to(tl.float32)
+        if EVEN:
+            c = tl.load(M + r, eviction_policy="evict_last").to(tl.float32)
+        else:
+            c = tl.load(M + r, mask=rm, other=0.0,
+                        eviction_policy="evict_last").to(tl.float32)
     else:
         c = tl.load(M).to(tl.float32)
     acc = tl.zeros([RBLOCK], tl.float32)[None, :]
@@ -120,13 +129,15 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr,
         if EVEN:
             xm = None
             mask = None
+            go = tl.load(DO + xs * H + r).to(tl.float32)
+            s = tl.load(S + xs * H + r).to(tl.float32)
         else:
             xm = xs < T
             mask = xm & (r < H)
-        go = tl.load(DO + xs * H + r, mask=mask, other=0.0).to(tl.float32)
-        s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+            go = tl.load(DO + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+            s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
         if MODE == 1:
-            rstd = tl.load(RSTD + xs, mask=xm, other=0.0)
+            rstd = tl.load(RSTD + xs) if EVEN else tl.load(RSTD + xs, mask=xm, other=0.0)
             sn = s * rstd
         else:
             sn = s
