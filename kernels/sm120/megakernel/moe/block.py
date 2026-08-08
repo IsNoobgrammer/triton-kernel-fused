@@ -94,8 +94,14 @@ def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_rou
     # reductions -- 3.96 ms, 23% of the lap, and the largest remaining inefficiency.
     from kernels.sm120.moe import moe, moe_per_expert
     hn, idx, wgt, gap = _NormRouter.apply(x, w["nw"], w["rw"], w["bias"], top_k, eps, want_gap)
-    # the grouped path takes neither act_params nor act codes > 4, so radial can never reach it
-    grouped = os.environ.get("MK_GROUPED", "1") == "1" and act_params is None
+    # PER_EXPERT BY DEFAULT, matching BIBO_MOE_DISPATCH and therefore the radial baseline.
+    #
+    # This used to default to grouped, and the condition below is `act_params is None` -- which is
+    # true exactly when the activation is SiLU. So flipping --act radial -> silu silently also
+    # flipped the expert kernel, and an activation A/B would have measured two changes at once with
+    # throughput moving for the wrong reason. Grouped is a measured WASH on real steps anyway
+    # (205.1k vs 205.6k tok/s), so there is nothing to give up. MK_GROUPED=1 still opts in.
+    grouped = os.environ.get("MK_GROUPED", "0") == "1" and act_params is None
     # the grouped path index_add_s into a bf16 buffer and rejects fp32 weights;
     # per_expert takes fp32, which is what the model's router emits
     tw = wgt.to(hn.dtype) if grouped else wgt.float()
