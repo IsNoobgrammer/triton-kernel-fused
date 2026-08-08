@@ -28,7 +28,9 @@ import torch
 from kernels.sm75.moe import moe_per_expert
 
 DEV = "cuda"
-H, I, E, K, N = 512, 768, 8, 2, 4096
+# BiBo's real MoE geometry: hidden 512, moe_intermediate 768, 64 routed experts, top-6.
+# Small-E shapes can route every expert down a different branch than the model does.
+H, I, E, K, N = 512, 768, 64, 6, 16384
 
 
 def _inputs(seed=0, dtype=torch.bfloat16):
@@ -54,10 +56,12 @@ def _run(force_loop):
         d = dn.detach().requires_grad_(True)
         t = theta.detach().requires_grad_(True)
         out = moe_per_expert(h, idx, wt, g, d, codes, act_params=t)
+        import kernels.sm75.moe as _m
+        path = _m._LAST_PATH
         torch.manual_seed(1234)                       # same upstream grad for both paths
         out.backward(torch.randn_like(out) * 0.01)
         return (out.detach(), h.grad.detach(), g.grad.detach(), d.grad.detach(),
-                None if t.grad is None else t.grad.detach())
+                None if t.grad is None else t.grad.detach()), path
     finally:
         if prev is None:
             os.environ.pop("BIBO_MOE_FORCE_LOOP", None)
@@ -66,10 +70,16 @@ def _run(force_loop):
 
 
 def main():
-    ref = _run(force_loop=True)
-    cand = _run(force_loop=False)
+    ref, ref_path = _run(force_loop=True)
+    cand, cand_path = _run(force_loop=False)
     names = ("out", "d_hidden", "d_gate_up", "d_down", "d_theta")
-    print(f"N={N} H={H} I={I} E={E} K={K}  radial (act code 8)\n")
+    print(f"N={N} H={H} I={I} E={E} K={K}  radial (act code 8)")
+    print(f"  reference path = {ref_path!r}   candidate path = {cand_path!r}\n")
+    # If both arms took the same branch the comparison is vacuous and would pass no matter how
+    # broken the new path is. Assert the split before reading a single number.
+    assert ref_path == "loop", f"reference did NOT take the per-expert loop (got {ref_path!r})"
+    assert cand_path in ("gmm", "uniform"), \
+        f"candidate did NOT take a batched path (got {cand_path!r}) -- parity below is meaningless"
     print(f"  {'tensor':<12}{'max |diff|':>14}{'rel L2':>12}   verdict")
     ok = True
     for nm, a, b in zip(names, ref, cand):

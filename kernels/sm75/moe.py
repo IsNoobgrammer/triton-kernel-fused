@@ -8,6 +8,7 @@ import triton.language as tl
 __all__ = ["moe", "moe_per_expert", "moe_grouped", "moe_grouped_cublas", "moe_eager",
            "BatchedGLU", "GROUPED_MIN_TOKENS"]
 
+_LAST_PATH = None          # "gmm" | "uniform" | "loop" -- set by _PerExpertMoE.forward, read by tests
 GROUPED_MIN_TOKENS = 4096
 SCHED_BLOCK_M = 64
 _NS_EPS = 1e-6
@@ -750,6 +751,11 @@ class _PerExpertMoE(torch.autograd.Function):
                                                  output_size=M_rows)
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
+        # which branch ran, for tests. A parity check that cannot prove the candidate took the NEW
+        # path passes trivially when both arms fall down the same one -- that exact failure has
+        # already shipped here once (kernel parity green while the feature was inert).
+        global _LAST_PATH
+        _LAST_PATH = "gmm" if use_gmm else ("uniform" if uniform else "loop")
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
         tile_map = None; tile_map_gg = None; tile_map_bw = None
         if use_gmm:
