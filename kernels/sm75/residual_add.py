@@ -43,35 +43,63 @@ MODES = {"none": 0, "rms": 1}
 RMS_EPS = 1e-6
 _RMS_EPS = tl.constexpr(1e-6)          # a plain global is unreadable from @triton.jit
 
-_XBLOCK = 8                            # rows per program; H is the persistent axis
 _NPROG = 1024                          # backward grid: ~SM count x a few, so PART stays ~2 MB
 
+# Autotuned, not hardcoded. The first rewrite copied XBLOCK=8/num_warps=4 from the old tiled
+# kernel and ran 38% behind Inductor on the forward for that reason alone -- Inductor's
+# persistent_reduction heuristic picks both per shape.
+#
+# key=("H",) ONLY. H is a true shape constant; T is the GRID dimension, and keying an autotuner
+# on a grid dim has already cost this repo a 4.1x eval stall when a stale cache entry was reused
+# across sequence lengths.
+_MAX_XBLOCK = 16
+_CFGS = [triton.Config({"XBLOCK": b}, num_warps=w, num_stages=st)
+         for b in (1, 2, 4, 8, _MAX_XBLOCK) for w in (2, 4, 8) for st in (1, 2)]
 
+
+def _even(T, H, rb):
+    """Can EVERY autotune config run unmasked? XBLOCK is chosen by the autotuner, so this must
+    hold for the largest of them, not just the one that happens to win."""
+    return H == rb and T % _MAX_XBLOCK == 0
+
+
+@triton.autotune(configs=_CFGS, key=("H",))
 @triton.jit
-def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, XBLOCK: tl.constexpr,
-                RBLOCK: tl.constexpr, VEC: tl.constexpr, MODE: tl.constexpr):
+def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, RBLOCK: tl.constexpr,
+                VEC: tl.constexpr, MODE: tl.constexpr, EVEN: tl.constexpr,
+                XBLOCK: tl.constexpr):
     xs = (tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK))[:, None]
     r = tl.arange(0, RBLOCK)[None, :]
-    xm, rm = xs < T, r < H
-    mask = xm & rm
+    # EVEN: H == RBLOCK and T divides XBLOCK, so nothing can fall off either edge and every
+    # access is unmasked. Inductor emits `tl.load(..., None)` for exactly this reason; carrying
+    # predication on the hot path was 38% of the forward gap.
+    if EVEN:
+        mask = None
+        rm = None
+    else:
+        mask = (xs < T) & (r < H)
+        rm = r < H
     s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
     ar = tl.load(AR + xs * H + r, mask=mask, other=0.0).to(tl.float32)
     if VEC:
-        c = tl.load(M + r, mask=rm, other=0.0).to(tl.float32)
+        c = tl.load(M + r, mask=rm, other=0.0, eviction_policy="evict_last").to(tl.float32)
     else:
         c = tl.load(M).to(tl.float32)
     if MODE == 1:
         ms = tl.sum(s * s, axis=1)[:, None] / H
         rstd = libdevice.rsqrt(ms + _RMS_EPS)
-        tl.store(RSTD + xs, rstd, mask=xm)      # saved: the backward must not recompute this
+        # saved: the backward must not recompute this
+        tl.store(RSTD + xs, rstd, mask=None if EVEN else (xs < T))
         s = s * rstd
     tl.store(OUT + xs * H + r, (ar + c * s).to(OUT.dtype.element_ty), mask=mask)
 
 
+@triton.autotune(configs=_CFGS, key=("H",))
 @triton.jit
-def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr, XBLOCK: tl.constexpr,
+def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr,
                 RBLOCK: tl.constexpr, VEC: tl.constexpr, MODE: tl.constexpr,
-                NEED_DS: tl.constexpr, NPROG: tl.constexpr):
+                NEED_DS: tl.constexpr, NPROG: tl.constexpr, EVEN: tl.constexpr,
+                XBLOCK: tl.constexpr):
     """Grid-stride over rows; d_theta lives in registers for the whole walk.
 
     d_theta is accumulated PER CHANNEL even when theta is a scalar -- the scalar is then one more
@@ -80,17 +108,21 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr, XBLOCK: tl.constex
     """
     pid = tl.program_id(0)
     r = tl.arange(0, RBLOCK)[None, :]
-    rm = r < H
+    rm = None if EVEN else r < H
     if VEC:
-        c = tl.load(M + r, mask=rm, other=0.0).to(tl.float32)
+        c = tl.load(M + r, mask=rm, other=0.0, eviction_policy="evict_last").to(tl.float32)
     else:
         c = tl.load(M).to(tl.float32)
     acc = tl.zeros([RBLOCK], tl.float32)[None, :]
 
     for x0 in tl.range(pid * XBLOCK, T, NPROG * XBLOCK):
         xs = (x0 + tl.arange(0, XBLOCK))[:, None]
-        xm = xs < T
-        mask = xm & rm
+        if EVEN:
+            xm = None
+            mask = None
+        else:
+            xm = xs < T
+            mask = xm & (r < H)
         go = tl.load(DO + xs * H + r, mask=mask, other=0.0).to(tl.float32)
         s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
         if MODE == 1:
@@ -98,8 +130,12 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr, XBLOCK: tl.constex
             sn = s * rstd
         else:
             sn = s
-        # d theta is taken against what c actually multiplies -- the NORMALISED stream under "rms"
-        acc += tl.sum(tl.where(mask, go * sn, 0.0), axis=0)[None, :]
+        # d theta is taken against what c actually multiplies -- the NORMALISED stream under "rms".
+        # No tl.where when EVEN: out-of-range lanes cannot exist, and the select was on the hot path.
+        if EVEN:
+            acc += tl.sum(go * sn, axis=0)[None, :]
+        else:
+            acc += tl.sum(tl.where(mask, go * sn, 0.0), axis=0)[None, :]
         if NEED_DS:
             g = c * go
             if MODE == 1:
@@ -109,7 +145,7 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr, XBLOCK: tl.constex
                 g = (g - sn * (tl.sum(g * sn, axis=1)[:, None] / H)) * rstd
             tl.store(DS + xs * H + r, g.to(DS.dtype.element_ty), mask=mask)
 
-    tl.store(PART + pid * H + r, acc, mask=rm)
+    tl.store(PART + pid * H + r, acc, mask=rm)   # rm is None when EVEN
 
 
 def residual_add_reference(attn_read, theta, stream, mode="none"):
@@ -145,9 +181,9 @@ class _ResidualAdd(torch.autograd.Function):
         rstd = (torch.empty(T, device=ar.device, dtype=torch.float32)
                 if mode == "rms" else ar)                      # dummy ptr when unused
         rb = triton.next_power_of_2(H)
-        _fwd_kernel[(triton.cdiv(T, _XBLOCK),)](
-            ar, sv, theta, out, rstd, T, H=H, XBLOCK=_XBLOCK, RBLOCK=rb,
-            VEC=vec, MODE=MODES[mode], num_warps=4)
+        _fwd_kernel[lambda meta: (triton.cdiv(T, meta["XBLOCK"]),)](
+            ar, sv, theta, out, rstd, T, H=H, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb))
         ctx.save_for_backward(sv, theta, rstd)
         ctx.mode, ctx.vec, ctx.H, ctx.T = mode, vec, H, T
         ctx.shape = attn_read.shape
@@ -163,8 +199,9 @@ class _ResidualAdd(torch.autograd.Function):
         part = torch.empty((_NPROG, H), device=do.device, dtype=torch.float32)
         rb = triton.next_power_of_2(H)
         _bwd_kernel[(_NPROG,)](
-            do, sv, theta, rstd, ds, part, T, H=H, XBLOCK=_XBLOCK, RBLOCK=rb,
-            VEC=vec, MODE=MODES[mode], NEED_DS=need_ds, NPROG=_NPROG, num_warps=4)
+            do, sv, theta, rstd, ds, part, T, H=H, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], NEED_DS=need_ds, NPROG=_NPROG,
+            EVEN=_even(T, H, rb))
         # (NPROG, H) -> theta's shape. NPROG is ~1k, so fp32 partials are ample here; the old
         # kernel reduced 8192 rows and needed fp64 to stay accurate over that many terms.
         d_theta = None
