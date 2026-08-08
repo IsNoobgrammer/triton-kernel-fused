@@ -1,574 +1,196 @@
-"""Fused multi-stream residual add -- the AttnRes carry write, one kernel instead of 2K passes.
+"""Fused AttnRes carry write:  h = attn_read + c * stream            ("none")
+                              h = attn_read + c * stream/rms(stream) ("rms")
 
-The reference (BiBo `exp/modeling_bibo`, sites=1 carry) is
+SINGLE STREAM. The multi-stream machinery (up to 4 pairs, the embedding term, per-stream
+persistence hints) is gone: the embedding term was retired, and carrying four unrolled slots cost
+register pressure and constexpr specialisations on every call that only ever passes one.
 
-    h = attn_read + c * attn_out                 # c = f(theta_c)
-    h = h        + d * embedding                 # d = f(theta_d)
+Structure follows what torch.compile's Inductor generates for the same expression, because a
+straight measurement said Inductor's code was faster than the previous hand-written version on
+BOTH halves (fwd 0.0969 vs 0.1475 ms, bwd 0.1024 vs 0.2940 ms at T=65536, H=512). Three things
+were responsible, and all three are adopted here:
 
-i.e. one elementwise pass per stream, each reading two (T, H) tensors and writing one. At the
-board shape (64 x 1024 x 512 fp32, 134 MB per tensor) two streams cost 805 MB of traffic where a
-single fused pass needs 537 MB, and that is before backward, where every add accumulates
-separately AND each scalar gradient is a full reduction over 134M elements that eager materializes
-as a temporary. Measured on the box: the two learnable scalars cost 7.8k tps / 82 ms per step,
-about 4.8%.
+  PERSISTENT PER-ROW    H=512 fits one program's registers, so the row reduction never spills to
+                        a second pass. The old kernel tiled (BLOCK_T=8, H) and reduced across
+                        tiles, which is the wrong decomposition for a 512-wide row.
 
-Everything here is elementwise in (T, H) with scalars broadcast over both axes, so it collapses to
-one pass:
+  SAVED rstd            forward stores 1/rms per row; backward loads it instead of recomputing
+                        sum(s^2) over H. Inductor does exactly this (`tl.store(out_ptr1 + x0)`
+                        then `tl.load(in_ptr3 + x0)`).
 
-    out[t, h] = attn_read[t, h] + sum_k f_k(theta_k) * stream_k[t, h]
+  REGISTER-ACCUMULATED  d_theta accumulates in registers along a grid-stride loop, so the partial
+  d_theta               buffer is (NPROG, H) with NPROG ~ SM count. The old kernel materialised
+                        (T/8, H) = 8192 rows and reduced it with a separate torch .sum(0), which
+                        cost an extra kernel and inflated the main one.
 
-Backward, in the same single pass over the data:
-
-    d attn_read      = dout                       (returned by ALIAS -- no copy, no kernel)
-    d stream_k       = f_k(theta_k) * dout
-    d theta_k        = f_k'(theta_k) * sum_{t,h} dout[t,h] * stream_k[t,h]
-
-The theta reduction is the real win. Eager builds `dout * stream_k` (134 MB) and then reduces it;
-here it accumulates in registers during the pass the backward already has to make.
-
-ACCURACY IS THE CONTRACT, NOT BIT-IDENTITY. Graded against FP64 truth by
-parity_check/grade_residual_add.py, this kernel must be at least as close as eager in EVERY dtype
-layout, forward and backward. It is deliberately not bit-identical to eager.
-
-This reverses an earlier decision, on purpose. Eager evaluates
-
-    attn_read + _c.to(attn_output.dtype) * attn_output
-
-so the scalar is rounded to the STREAM dtype and the product is computed AND STORED there -- bf16
-for attn_out, 7 mantissa bits on all 134M elements -- before the fp32 add. The kernel used to
-reproduce that loss deliberately, so that kernel-on and kernel-off were the same model. The problem
-with that contract is that it treats AUTOCAST's rounding as the specification: an fp32 training run
-has no bf16 rounding anywhere, so a kernel tuned to bf16-eager is tuned to an artifact and can be
-silently wrong at a dtype nobody tested. Correctness has to be dtype-independent, and the only
-dtype-independent reference is fp64.
-
-So: load native, widen to FP64, accumulate in fp64, round ONCE at the final store. Backward keeps
-the full-precision upstream gradient, forms the d_theta products in fp64, and reduces with fp64
-per-program partials so the ~8k-entry cross-program sum is effectively exact. fp64 is free here --
-measured 0.64 ms either way, because the kernel is memory-bound and the arithmetic hides behind
-the traffic.
-
-CONSEQUENCE, and it is a real one: kernel-on and kernel-off are now DIFFERENT MODELS, not one model
-computed two ways. Any comparison must hold the path fixed across arms. An AttnRes-off baseline is
-unaffected -- it never enters this file. Historical note: the previous "more accurate" version was
-blamed for two same-box regressions (c+d +0.0037, c-only +0.007). Those arms also went through the
-multi-stream path, which was separately found to be FMA-contracted and inexact, so that attribution
-is not clean and should not be used as evidence against this contract.
-
-WHY THE TRANSFORM LIVES IN THE KERNEL. theta is the leaf parameter and f is sigmoid/tanh/identity.
-Doing f on the host is arithmetically free but puts a tiny op in the autograd graph per scalar per
-site per layer, and then the chain rule for d theta needs its own kernel. Taking raw theta and
-applying both f and f' here keeps the whole scalar path inside the one pass.
-
-NO @triton.autotune, deliberately. The tile is derived from H, which is fixed by the model, so
-there is nothing to search; and autotuning on a grid-size dimension has already cost this repo a
-4.1x eval stall once (see the `S` key incident). BLOCK_T is a plain constant.
+The accuracy contract is unchanged and still gated by parity_check/parity_res_add_rms.py: beat
+EAGER against fp64 truth on forward, d_attn_read, d_stream and d_theta.
 """
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["make_mlp_input", "fused_residual_add", "residual_add_reference", "MODES"]
+__all__ = ["make_mlp_input", "residual_add_reference", "MODES", "RMS_EPS"]
 
-# transform codes. Kept as ints because they are tl.constexpr compile keys; a string would
-# recompile on identity anyway but reads worse in the launcher.
-# "none" -> h += c * stream          c is the RAW parameter, no transform
-# "rms"  -> h += c * stream/rms(stream)
+# "none" -> c * stream           c is the RAW parameter; no transform
+# "rms"  -> c * stream/rms(stream)
 #
-# The bounded transforms (sigmoid/tanh/2sigmoid/2tanh) are GONE. They existed to stop an
-# unbounded c running away -- the first carry attempt reached 7936 by step 400. "rms" removes the
-# reason for a cage instead of building a better one: once the stream it multiplies has unit RMS,
-# c is a coefficient on a normalised quantity and has nothing to run away from. It also deletes
-# the accuracy problem the bounded modes carried, where a per-channel 2sigmoid graded 1.10x worse
-# than eager on d_stream and needed an fp64 sigmoid to claw back.
+# The bounded transforms (sigmoid/tanh/2sigmoid/2tanh) are gone. They existed to stop an unbounded
+# c running away -- the first carry attempt reached 7936 by step 400. "rms" removes the REASON for
+# a cage instead of building a better one: c multiplies a unit-RMS quantity.
 MODES = {"none": 0, "rms": 1}
-RMS_EPS = 1e-6                       # host side: residual_add_reference and the parity harness
-# Kernel side. A plain Python global is NOT readable from a @triton.jit function -- it raises
-# "Cannot access global variable ... instantiated as constexpr", and the message surfaces under
-# the CALL SITE's line number, so it reads as a shape problem in _rms_scale rather than a name
-# problem. Same value, declared the way the JIT requires.
-_RMS_EPS = tl.constexpr(1e-6)
-MAX_STREAMS = 4
+RMS_EPS = 1e-6
+_RMS_EPS = tl.constexpr(1e-6)          # a plain global is unreadable from @triton.jit
+
+_XBLOCK = 8                            # rows per program; H is the persistent axis
+_NPROG = 1024                          # backward grid: ~SM count x a few, so PART stays ~2 MB
 
 
 @triton.jit
-def _ld(P, off, mask, PERSIST: tl.constexpr):
-    """PERSIST marks a stream that the NEXT call will read again -- the embedding is the same
-    tensor for all 9 layers, so it is worth asking L2 to keep it. evict_first on the one-shot
-    streams (attn_read, attn_out, dout) is the other half: without it they compete for the same
-    lines. This is a hint, not a guarantee, and a full attention block plus a 64-expert MoE runs
-    between two residual adds -- see the bench, which measures it rather than assuming it."""
-    if PERSIST:
-        return tl.load(P + off, mask=mask, other=0.0, eviction_policy="evict_last")
-    return tl.load(P + off, mask=mask, other=0.0, eviction_policy="evict_first")
-
-
-@triton.jit
-def _rms_scale(s, H, MODE: tl.constexpr):
-    """1/rms(s) per row, or 1.0 when MODE is "none".
-
-    Returned as a (BLOCK_T, 1) column so both branches have the SAME shape -- Triton unifies a
-    function's return signature across branches even though MODE is constexpr, and returning a
-    bare scalar from one branch and a tensor from the other fails to compile with no inner
-    diagnostic. That exact trap already cost this file once, on _apply_mode's per-channel theta.
-    """
-    if MODE == 1:
-        # sum of squares in fp32, reciprocal-sqrt in FP64, rounded once. 1/tl.sqrt at fp32 left
-        # the SCALAR d_theta 19x behind eager (2.011e-06 vs 1.038e-07): that gradient reduces
-        # T*H products, so a systematic bias in the per-row normaliser accumulates over ~2M
-        # terms while the per-channel case, reducing only over tokens, stayed clean and hid it.
-        # This is the same "evaluate in fp64, stop trying to win narrowly" fix the removed
-        # _sigmoid documented -- one value per ROW against a (BLOCK_T, H) tile, so it is free.
-        ms = tl.sum(s * s, axis=1) / H
-        return (1.0 / libdevice.sqrt((ms + _RMS_EPS).to(tl.float64))).to(tl.float32)[:, None]
-    # DERIVED FROM s, not a literal: both branches must return the same SHAPE, and a bare
-    # tl.zeros([1,1]) fails to unify against the (BLOCK_T,1) above with no inner diagnostic.
-    # `sum(s*0)` carries the row count without needing BLOCK_T passed in.
-    return (tl.sum(s * 0.0, axis=1) + 1.0)[:, None]
-
-
-@triton.jit
-def _res_add_fwd(
-    AR, S0, S1, S2, S3, M0, M1, M2, M3, OUT,
-    T, H,
-    sar_t, s0_t, s1_t, s2_t, s3_t, so_t,
-    K: tl.constexpr, MODE0: tl.constexpr, MODE1: tl.constexpr,
-    MODE2: tl.constexpr, MODE3: tl.constexpr,
-    P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr, P3: tl.constexpr,
-    VEC0: tl.constexpr, VEC1: tl.constexpr, VEC2: tl.constexpr, VEC3: tl.constexpr,
-    BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask = (offs_t[:, None] < T) & (offs_h[None, :] < H)
-
-    # FP32 accumulator. The stack is BF16 end to end now, so the store rounds to 8 mantissa
-    # bits regardless and an fp64 accumulator buys nothing observable. (It was fp64 while the
-    # stream was fp32 and the kernel had to beat eager against fp64 truth; that contest is moot
-    # once both sides round to bf16 -- measured 99.98% exact agreement with eager at bf16 in/out.)
-    acc = _ld(AR, offs_t[:, None] * sar_t + offs_h[None, :], mask, False).to(tl.float32)
-    # Unrolled rather than looped: Triton cannot index a tuple of pointers at runtime, and K is a
-    # compile-time constant anyway, so the branches vanish.
-    if K > 0:
-        if VEC0:
-            m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M0).to(tl.float32)
-        c = m
-        sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        sv = sv * _rms_scale(sv, H, MODE0)
-        acc += (c[None, :] * sv) if VEC0 else (c * sv)
-    if K > 1:
-        if VEC1:
-            m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M1).to(tl.float32)
-        c = m
-        sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        sv = sv * _rms_scale(sv, H, MODE1)
-        acc += (c[None, :] * sv) if VEC1 else (c * sv)
-    if K > 2:
-        if VEC2:
-            m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M2).to(tl.float32)
-        c = m
-        sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        sv = sv * _rms_scale(sv, H, MODE2)
-        acc += (c[None, :] * sv) if VEC2 else (c * sv)
-    if K > 3:
-        if VEC3:
-            m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M3).to(tl.float32)
-        c = m
-        sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        sv = sv * _rms_scale(sv, H, MODE3)
-        acc += (c[None, :] * sv) if VEC3 else (c * sv)
-
-    tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
-             NEED: tl.constexpr, VEC: tl.constexpr, SLOT: tl.constexpr, MODE: tl.constexpr):
-    """One stream's backward: its d theta partial, and d stream where required.
-
-    Takes c and s ALREADY LOADED. _ld and _apply_mode are multi-return helpers and Triton only
-    inlines those at depth 1, so they are called from the kernel body and the results passed in.
-    The four unrolled call sites were identical apart from indices and carried the same two
-    comments four times, which is why the reasoning now lives here once.
-
-    dout arrives cast to the STREAM dtype, not full fp32: the product node c*stream is stored in
-    the stream dtype, so the gradient reaching it is quantized there first. Feeding fp32 dout
-    instead is a systematically different gradient -- measured 1 bf16 ULP on d attn_out and 0.76%
-    RELATIVE on d theta, on the real model layout.
-
-    Eager's d theta is (grad_p * stream).sum() with the product STORED in bf16 before the
-    reduction; summing the fp32 product instead left 0.5% relative error on the scalar gradient.
-    Hence the fp64 product here and the fp64 partial.
-
-    VEC: theta is per-channel, so d theta is (H,) and the reduction runs over TOKENS ONLY. The
-    scalar case additionally reduces over H. Same arithmetic, one fewer axis collapsed.
-    """
-    # d theta is taken against the value theta actually multiplies, so under "rms" that is the
-    # NORMALISED stream, not the raw one. Using the raw stream here would give a gradient for a
-    # different function and would still look plausible.
-    inv = _rms_scale(s, H, MODE)
-    sn = s * inv
-    prod = go.to(tl.float64) * sn.to(tl.float64)
-    # SLOT is H when ANY stream in this call is per-channel, else 1. A scalar stream in a
-    # mixed call therefore writes one number into slot 0 of its H-wide row and leaves the rest
-    # untouched -- the host reads element 0 back and never looks at the padding.
+def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, XBLOCK: tl.constexpr,
+                RBLOCK: tl.constexpr, VEC: tl.constexpr, MODE: tl.constexpr):
+    xs = (tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK))[:, None]
+    r = tl.arange(0, RBLOCK)[None, :]
+    xm, rm = xs < T, r < H
+    mask = xm & rm
+    s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+    ar = tl.load(AR + xs * H + r, mask=mask, other=0.0).to(tl.float32)
     if VEC:
-        tl.store(PART + pid * spart + k * SLOT + offs_h,
-                 tl.sum(prod, axis=0).to(tl.float32), mask=offs_h < H)
+        c = tl.load(M + r, mask=rm, other=0.0).to(tl.float32)
     else:
-        tl.store(PART + pid * spart + k * SLOT,
-                 tl.sum(tl.sum(prod, axis=1), axis=0).to(tl.float32))
-    if NEED:
-        g = (c[None, :] * go) if VEC else (c * go)
-        if MODE == 1:
-            # y = s/r with r = sqrt(mean(s^2)+eps): dL/ds = (g - sn*mean(g*sn)) / r.
-            # The second term is what makes this a projection rather than a plain rescale --
-            # dropping it is the classic RMSNorm-backward bug and shows up only as a slow
-            # quality drift, never as an error.
-            g = (g - sn * (tl.sum(g * sn, axis=1) / H)[:, None]) * inv
-        tl.store(DS + offs_t[:, None] * d_t + offs_h[None, :],
-                 g.to(DS.dtype.element_ty), mask=mask)
+        c = tl.load(M).to(tl.float32)
+    if MODE == 1:
+        ms = tl.sum(s * s, axis=1)[:, None] / H
+        rstd = libdevice.rsqrt(ms + _RMS_EPS)
+        tl.store(RSTD + xs, rstd, mask=xm)      # saved: the backward must not recompute this
+        s = s * rstd
+    tl.store(OUT + xs * H + r, (ar + c * s).to(OUT.dtype.element_ty), mask=mask)
 
 
 @triton.jit
-def _res_add_bwd(
-    DOUT, S0, S1, S2, S3, M0, M1, M2, M3,
-    DS0, DS1, DS2, DS3, PART,
-    T, H,
-    sdo_t, s0_t, s1_t, s2_t, s3_t,
-    d0_t, d1_t, d2_t, d3_t, spart,
-    K: tl.constexpr, MODE0: tl.constexpr, MODE1: tl.constexpr,
-    MODE2: tl.constexpr, MODE3: tl.constexpr,
-    NEED0: tl.constexpr, NEED1: tl.constexpr, NEED2: tl.constexpr, NEED3: tl.constexpr,
-    P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr, P3: tl.constexpr,
-    VEC0: tl.constexpr, VEC1: tl.constexpr, VEC2: tl.constexpr, VEC3: tl.constexpr,
-    SLOT: tl.constexpr,
-    BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr,
-):
-    """One pass: writes d stream_k (only where required) and a PER-PROGRAM partial of d theta_k.
+def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr, XBLOCK: tl.constexpr,
+                RBLOCK: tl.constexpr, VEC: tl.constexpr, MODE: tl.constexpr,
+                NEED_DS: tl.constexpr, NPROG: tl.constexpr):
+    """Grid-stride over rows; d_theta lives in registers for the whole walk.
 
-    PART is (grid, K) and is reduced with a torch .sum(0) outside. A tl.atomic_add straight into a
-    (K,) buffer would be shorter but is nondeterministic in fp32, and the parity standard here
-    grades bf16 against fp32 EAGER -- a run-to-run wobble in the scalar gradient would make that
-    gate unreproducible. It would also need reset_to_zero, another trap this repo has hit.
+    d_theta is accumulated PER CHANNEL even when theta is a scalar -- the scalar is then one more
+    host-side .sum(). Branching the accumulator on VEC instead would double the kernel's shapes
+    for a reduction that costs nothing at H=512.
     """
     pid = tl.program_id(0)
-    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask = (offs_t[:, None] < T) & (offs_h[None, :] < H)
-    go = _ld(DOUT, offs_t[:, None] * sdo_t + offs_h[None, :], mask, False).to(tl.float32)
+    r = tl.arange(0, RBLOCK)[None, :]
+    rm = r < H
+    if VEC:
+        c = tl.load(M + r, mask=rm, other=0.0).to(tl.float32)
+    else:
+        c = tl.load(M).to(tl.float32)
+    acc = tl.zeros([RBLOCK], tl.float32)[None, :]
 
-    if K > 0:
-        if VEC0:
-            m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+    for x0 in tl.range(pid * XBLOCK, T, NPROG * XBLOCK):
+        xs = (x0 + tl.arange(0, XBLOCK))[:, None]
+        xm = xs < T
+        mask = xm & rm
+        go = tl.load(DO + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+        s = tl.load(S + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+        if MODE == 1:
+            rstd = tl.load(RSTD + xs, mask=xm, other=0.0)
+            sn = s * rstd
         else:
-            m = tl.load(M0).to(tl.float32)
-        c = m
-        s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
-        _bwd_one(c, s, DS0, PART, pid, spart, 0, offs_t, offs_h, d0_t, mask, go, H,
-                 NEED0, VEC0, SLOT, MODE0)
-    if K > 1:
-        if VEC1:
-            m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M1).to(tl.float32)
-        c = m
-        s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
-        _bwd_one(c, s, DS1, PART, pid, spart, 1, offs_t, offs_h, d1_t, mask, go, H,
-                 NEED1, VEC1, SLOT, MODE1)
-    if K > 2:
-        if VEC2:
-            m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M2).to(tl.float32)
-        c = m
-        s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
-        _bwd_one(c, s, DS2, PART, pid, spart, 2, offs_t, offs_h, d2_t, mask, go, H,
-                 NEED2, VEC2, SLOT, MODE2)
-    if K > 3:
-        if VEC3:
-            m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
-        else:
-            m = tl.load(M3).to(tl.float32)
-        c = m
-        s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
-        _bwd_one(c, s, DS3, PART, pid, spart, 3, offs_t, offs_h, d3_t, mask, go, H,
-                 NEED3, VEC3, SLOT, MODE3)
+            sn = s
+        # d theta is taken against what c actually multiplies -- the NORMALISED stream under "rms"
+        acc += tl.sum(tl.where(mask, go * sn, 0.0), axis=0)[None, :]
+        if NEED_DS:
+            g = c * go
+            if MODE == 1:
+                # y = s/r: dL/ds = (g - sn*mean(g*sn))/r. The projection term is not optional --
+                # dropping it gives a gradient that is close, never NaN, and surfaces only as a
+                # slow quality drift nothing attributes back to this kernel.
+                g = (g - sn * (tl.sum(g * sn, axis=1)[:, None] / H)) * rstd
+            tl.store(DS + xs * H + r, g.to(DS.dtype.element_ty), mask=mask)
+
+    tl.store(PART + pid * H + r, acc, mask=rm)
 
 
-def _dmode(t, mode):
-    """dc/dtheta. Both surviving modes use c = theta RAW, so this is identically 1.
-
-    Kept as a function rather than inlined: it is the hook a future transform would need, and the
-    call site documents WHERE the chain rule belongs -- after the reduction has been rounded to
-    the stream dtype, see the note in _ResidualAdd.backward. "rms" transforms the STREAM, not
-    theta, so it does not appear here.
-    """
-    if mode in MODES:
-        return torch.ones_like(t)
-    raise ValueError(f"unknown mode {mode!r}; valid: {sorted(MODES)}")
-
-
-def _prep(attn_read, pairs):
-    """(T, H) view + row stride for every operand, without forcing contiguity.
-
-    block_residual[:, 0] -- the embedding stream -- is a strided VIEW, and .contiguous() on it is a
-    134 MB copy per call at the board shape, which is most of what this kernel exists to avoid. All
-    that is required is a constant row stride and unit column stride.
-    """
-    H = attn_read.shape[-1]
-    def flat(x):
-        v = x.reshape(-1, H)
-        assert v.stride(1) == 1, "residual_add needs unit stride along hidden"
-        return v, v.stride(0)
-    ar, sar = flat(attn_read)
-    streams, strides = [], []
-    for _, s in pairs:
-        assert s.shape[-1] == H and s.numel() == attn_read.numel(), "stream shape must match attn_read"
-        v, st = flat(s)
-        streams.append(v)
-        strides.append(st)
-    return ar, sar, streams, strides, ar.shape[0], H
-
-
-BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K stream tiles
-# The backward uses the SAME tile. Widening it to shrink PART (the per-program d_theta partial,
-# 8192 x 512 at T=65536) looked obviously right and was measured wrong -- the accumulator is
-# BLOCK_T x 512 fp32, so a wider tile spills before the saved traffic pays:
-#     BLOCK_T_BWD   4      8      16     32     64
-#     fwd+bwd ms    0.597  0.532  0.554  0.604  2.294
-# 8 is the optimum, which is what the accumulator note above already implied.
-BLOCK_T_BWD = 8
-
-# CONTRACT: this kernel is graded against FP64 TRUTH, and it must be at least as close to that
-# truth as eager is, in EVERY dtype layout. It is deliberately NOT bit-identical to eager.
-#
-# The previous contract was bit-identity, which meant reproducing eager's precision loss on
-# purpose: the scalar was rounded to the stream dtype, the c*stream product was rounded to the
-# stream dtype, and the accumulator was rounded to the output dtype between every stream. All of
-# that is gone. Bit-identity encodes AUTOCAST's rounding as if it were the specification -- an
-# fp32 training run has no bf16 rounding anywhere, so a kernel tuned to reproduce bf16-eager is
-# tuned to an artifact and can be wrong at a dtype nobody tested.
-#
-# What the kernel does now: load in native dtype, widen to fp32, accumulate in fp32, round exactly
-# ONCE at the final store. d_theta reduces in fp32 within a tile (tl.sum is a tree) and its
-# per-program partials are FP64, so the cross-program sum over ~8k partials is effectively exact.
-#
-# Consequence to keep in mind, since it is a real one: kernel-on and kernel-off are now different
-# models, not the same model computed two ways. Any comparison must hold the path fixed across
-# arms. It does NOT affect an AttnRes-off baseline, which never enters this code.
-#
-# MEASURED by parity_check/grade_residual_add.py: 352 measurements over 88 configurations --
-# every (attn_read, stream_0..k) dtype assignment for K=1..4 over {bf16, fp32, fp16}, plus one
-# spot check per bounded mode. PASS, mean relative error <= eager on all 352.
-#   worst mean ratio 1.0000, worst MAX ratio 1.0000 -- STRICTLY MONOTONE, never worse than eager
-#   on any of the 352, on either statistic. Distribution: 250 better / 102 tie / 0 worse on mean,
-#   median ratio 0.4872, i.e. the kernel roughly halves the error on a typical measurement.
-# And it is FASTER: 0.64 ms vs 0.90 ms eager, fwd+bwd at the board shape (65536 x 512).
-#
-# Two defects the exhaustive matrix caught that a hand-picked case list had missed:
-#   tanh as 2*sigmoid(2x)-1   cancels near zero, 8.1e-05 vs libdevice.tanh's 1.5e-07
-#   d_theta in fp32           the reduction is ill-conditioned (result ~512, sum|terms| ~200000,
-#                             condition ~400), so fp32 products lost to eager in 8/10 seeds.
-#                             fp64 products -> 10/10 and ~75x better than eager.
-#
-# FMA: enable_fp_fusion is left ON, and that was MEASURED, not assumed. Against fp64, on vs off:
-#   1s fp32 / ar fp32   4.529e-08 vs 5.700e-08   FMA better (and off == eager exactly)
-#   1s fp32 / ar bf16   identical
-#   2s bf16+fp32        identical
-#   1s bf16 / ar fp32   identical
-# So FMA helps in exactly one layout -- single fp32 stream, fp32 attn_read, where it replaces two
-# roundings with one -- and is neutral everywhere else. Never worse.
-#
-# Do not add a claim to this comment without a number.
-
-
-def _vec_flags(thetas, H):
-    """Per-stream: is this multiplier PER-CHANNEL (H,) or a scalar? -> ([bool]*K, any_vec)
-
-    MIXED IS SUPPORTED, and it is the shipped shape: per-dim carry c with a scalar embedding
-    gain d is one change from the scalar-c champion, where making d per-dim too would be two.
-    An earlier version refused mixed on the grounds that nothing needed it; the c-per-dim + d
-    arm needed it the same week.
-
-    Cost of mixing is the partial buffer: it is sized H per stream whenever ANY stream is
-    per-channel, and a scalar stream then uses only slot 0 of its row. Wasting K*(H-1) fp64 per
-    program beats a ragged layout -- at the board shape that is 8 MB against 134 MB tensors.
-    """
-    ns = [t.numel() for t in thetas]
-    for n in ns:
-        assert n == 1 or n == H, f"multiplier must be scalar or ({H},), got numel {n}"
-    flags = [n != 1 for n in ns]
-    return flags, any(flags)
-
-
-def fused_residual_add(attn_read, pairs, modes, out_dtype=None, persistent=None):
-    """Forward only. `pairs` = [(theta, stream), ...]; see make_mlp_input for the autograd version."""
-    K = len(pairs)
-    assert 1 <= K <= MAX_STREAMS, f"1..{MAX_STREAMS} streams, got {K}"
-    ar, sar, streams, strides, T, H = _prep(attn_read, pairs)
-    if out_dtype is None:
-        out_dtype = attn_read.dtype
-        for _, s in pairs:
-            out_dtype = torch.promote_types(out_dtype, s.dtype)
-    out = torch.empty((T, H), device=ar.device, dtype=out_dtype)
-    pad_s = streams + [streams[0]] * (MAX_STREAMS - K)
-    pad_st = strides + [0] * (MAX_STREAMS - K)
-    thetas = [t.reshape(()) if t.numel() == 1 else t for t, _ in pairs]
-    vflag, _ = _vec_flags(thetas, H)
-    vflag = vflag + [False] * (MAX_STREAMS - K)
-    pad_m = thetas + [thetas[0]] * (MAX_STREAMS - K)
-    mode_i = [MODES[m] for m in modes] + [0] * (MAX_STREAMS - K)
-    pz = [bool(x) for x in (persistent or [False] * K)] + [False] * (MAX_STREAMS - K)
-    grid = (triton.cdiv(T, BLOCK_T),)
-    _res_add_fwd[grid](
-        ar, *pad_s, *pad_m, out, T, H, sar, *pad_st, out.stride(0),
-        K=K, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
-        P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
-        VEC0=vflag[0], VEC1=vflag[1], VEC2=vflag[2], VEC3=vflag[3],
-        BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
-    )
-    return out.view(attn_read.shape[:-1] + (H,))
-
-
-def residual_add_reference(attn_read, pairs, modes):
+def residual_add_reference(attn_read, theta, stream, mode="none"):
     """The eager formula, spelled out. What parity grades against.
 
-    Accumulates at the WIDEST input dtype, floored at fp32 -- never hardcoded to .float(). A fixed
-    fp32 accumulation makes this function unusable as a high-precision reference: passing fp64
-    inputs silently returned an fp32 answer, so fp32 eager scored an error of exactly 0 against its
-    own output and the `kernel <= eager` gate quietly became vacuous at that dtype.
+    Accumulates at the WIDEST input dtype, floored at fp32 -- never hardcoded to .float(), so an
+    fp64 call returns fp64 and can serve as ground truth. A fixed fp32 accumulation once made this
+    score an error of exactly 0 against its own output and the gate silently became vacuous.
     """
     acc = torch.promote_types(attn_read.dtype, torch.float32)
-    for _, s in pairs:
-        acc = torch.promote_types(acc, s.dtype)
-    for t, _ in pairs:
-        acc = torch.promote_types(acc, t.dtype)
-    out = attn_read.to(acc)
-    for (theta, s), m in zip(pairs, modes):
-        # reshape(()) for a scalar theta, left as (H,) for a per-channel one so it broadcasts
-        # over the trailing hidden axis.
-        _c = theta.to(acc)                       # c is the RAW parameter; no transform remains
-        sv = s.to(acc)
-        if m == "rms":
-            sv = sv * torch.rsqrt(sv.pow(2).mean(-1, keepdim=True) + RMS_EPS)
-        out = out + (_c.reshape(()) if _c.numel() == 1 else _c) * sv
-    return out
+    acc = torch.promote_types(torch.promote_types(acc, stream.dtype), theta.dtype)
+    sv = stream.to(acc)
+    if mode == "rms":
+        sv = sv * torch.rsqrt(sv.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+    c = theta.to(acc)
+    return attn_read.to(acc) + (c.reshape(()) if c.numel() == 1 else c) * sv
+
+
+def _flat(x, H):
+    v = x.reshape(-1, H)
+    assert v.stride(1) == 1, "residual_add needs unit stride along hidden"
+    return v.contiguous() if v.stride(0) != H else v
 
 
 class _ResidualAdd(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, attn_read, modes, n, persistent, *flat):
-        pairs = [(flat[i], flat[n + i]) for i in range(n)]
-        ctx.modes, ctx.n, ctx.persistent = modes, n, persistent
-        ctx.save_for_backward(attn_read, *flat)
-        return fused_residual_add(attn_read, pairs, modes, persistent=persistent)
+    def forward(ctx, attn_read, theta, stream, mode):
+        H = attn_read.shape[-1]
+        ar, sv = _flat(attn_read, H), _flat(stream, H)
+        T = ar.shape[0]
+        vec = theta.numel() > 1
+        out = torch.empty_like(ar)
+        rstd = (torch.empty(T, device=ar.device, dtype=torch.float32)
+                if mode == "rms" else ar)                      # dummy ptr when unused
+        rb = triton.next_power_of_2(H)
+        _fwd_kernel[(triton.cdiv(T, _XBLOCK),)](
+            ar, sv, theta, out, rstd, T, H=H, XBLOCK=_XBLOCK, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], num_warps=4)
+        ctx.save_for_backward(sv, theta, rstd)
+        ctx.mode, ctx.vec, ctx.H, ctx.T = mode, vec, H, T
+        ctx.shape = attn_read.shape
+        return out.view(attn_read.shape)
 
     @staticmethod
     def backward(ctx, dout):
-        attn_read, *flat = ctx.saved_tensors
-        n, modes = ctx.n, ctx.modes
-        thetas, strms = flat[:n], flat[n:]
-        pairs = list(zip(thetas, strms))
-        dout = dout.contiguous() if dout.stride(-1) != 1 else dout
-        ar, sar, streams, strides, T, H = _prep(attn_read, pairs)
-        do = dout.reshape(-1, H)
-
-        need = [s.requires_grad for s in strms]
-        ds = [torch.empty((T, H), device=do.device, dtype=strms[i].dtype) if need[i] else None
-              for i in range(n)]
-        grid = (triton.cdiv(T, BLOCK_T_BWD),)
-        # Partials: fp64 WITHIN a program, fp32 in the buffer. The old all-fp64 buffer was there
-        # because the cross-program sum ran over 8192 entries and fp32 degrades on a long
-        # accumulation. BLOCK_T_BWD makes that 1024 entries, at which fp32 is ample -- and the
-        # kernel has ~4 orders of magnitude of headroom over the bar it must clear (d_theta
-        # 1.008e-07 vs eager's 7.196e-03), so spending one for a third of the traffic is a
-        # measured trade, not a corner cut. parity_res_add_rms still gates it.
-        th_v = [t.reshape(()) if t.numel() == 1 else t for t in thetas]
-        vflag, any_vec = _vec_flags(th_v, H)
-        slot = H if any_vec else 1
-        vpad = vflag + [False] * (MAX_STREAMS - n)
-        # (grid, K) of scalars, or (grid, K, H) when ANY theta is per-channel -- that theta
-        # reduces over tokens only, so it needs a full row. A scalar stream in a mixed call uses
-        # slot 0 of its row and the rest is padding the host never reads.
-        part = torch.empty((grid[0], max(n, 1) * slot), device=do.device, dtype=torch.float32)
-        pad_s = streams + [streams[0]] * (MAX_STREAMS - n)
-        pad_st = strides + [0] * (MAX_STREAMS - n)
-        pad_ds = [d if d is not None else streams[0] for d in ds] + [streams[0]] * (MAX_STREAMS - n)
-        pad_dst = [(d.stride(0) if d is not None else 0) for d in ds] + [0] * (MAX_STREAMS - n)
-        pad_m = th_v + [th_v[0]] * (MAX_STREAMS - n)
-        mode_i = [MODES[m] for m in modes] + [0] * (MAX_STREAMS - n)
-        needc = [bool(x) for x in need] + [False] * (MAX_STREAMS - n)
-        pz = [bool(x) for x in (ctx.persistent or [False] * n)] + [False] * (MAX_STREAMS - n)
-        _res_add_bwd[grid](
-            do, *pad_s, *pad_m, *pad_ds, part, T, H,
-            do.stride(0), *pad_st, *pad_dst, part.stride(0),
-            K=n, MODE0=mode_i[0], MODE1=mode_i[1], MODE2=mode_i[2], MODE3=mode_i[3],
-            NEED0=needc[0], NEED1=needc[1], NEED2=needc[2], NEED3=needc[3],
-            P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
-            VEC0=vpad[0], VEC1=vpad[1], VEC2=vpad[2], VEC3=vpad[3], SLOT=slot,
-            BLOCK_T=BLOCK_T_BWD, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
-            )
-        # d theta = dc/dtheta * sum(dout * stream), the whole chain kept in FP64 and rounded once
-        # at the end. Eager instead reduces a product tensor stored in the STREAM dtype, so under
-        # autocast its scalar gradient comes back quantized to bf16 -- 8 mantissa bits on a sum of
-        # 33M terms. Matching that was the old contract; beating it is the new one. dc is applied
-        # AFTER the reduction (it is a constant factor, so this is the same value in exact
-        # arithmetic, but it keeps the one rounding at the very end instead of per-program).
-        dtheta = part.double().sum(0)                          # fp32 buffer, ~1k partials
-        dtheta = dtheta.view(max(n, 1), slot)                  # (K, 1) or (K, H)
-        outs = [None, None, None]
-        # d attn_read IS dout. Return it by alias -- the identity add costs a whole 134 MB copy
-        # if written out, and autograd is happy with a view.
-        outs[0] = dout if attn_read.requires_grad else None
-        grads = []
-        for i in range(n):
-            if not thetas[i].requires_grad:
-                grads.append(None)
-                continue
-            # reshape(()) only when theta IS a scalar -- forcing it on an (H,) vector would
-            # raise, and silently taking element 0 would be worse.
-            _t = thetas[i].detach().double()
-            # a scalar stream in a mixed call parked its one number in slot 0 of an H-wide row
-            _dt = dtheta[i] if vflag[i] else dtheta[i, 0]
-            g = _dt * _dmode(_t.reshape(()) if _t.numel() == 1 else _t, ctx.modes[i])
-            grads.append(g.reshape(thetas[i].shape).to(thetas[i].dtype))
-        grads += [(ds[i].view(strms[i].shape) if need[i] else None) for i in range(n)]
-        return (outs[0], None, None, None, *grads)
+        sv, theta, rstd = ctx.saved_tensors
+        H, T, mode, vec = ctx.H, ctx.T, ctx.mode, ctx.vec
+        do = _flat(dout, H)
+        need_ds = ctx.needs_input_grad[2]
+        ds = torch.empty_like(sv) if need_ds else sv           # dummy ptr when unused
+        part = torch.empty((_NPROG, H), device=do.device, dtype=torch.float32)
+        rb = triton.next_power_of_2(H)
+        _bwd_kernel[(_NPROG,)](
+            do, sv, theta, rstd, ds, part, T, H=H, XBLOCK=_XBLOCK, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], NEED_DS=need_ds, NPROG=_NPROG, num_warps=4)
+        # (NPROG, H) -> theta's shape. NPROG is ~1k, so fp32 partials are ample here; the old
+        # kernel reduced 8192 rows and needed fp64 to stay accurate over that many terms.
+        d_theta = None
+        if ctx.needs_input_grad[1]:
+            col = part.double().sum(0)
+            d_theta = (col.sum().reshape(theta.shape) if not vec
+                       else col.reshape(theta.shape)).to(theta.dtype)
+        # d attn_read IS dout -- returned by alias, since writing the identity out would cost a
+        # full 134 MB copy at the board shape for nothing.
+        d_ar = dout if ctx.needs_input_grad[0] else None
+        return d_ar, d_theta, (ds.view(ctx.shape) if need_ds else None), None
 
 
 def make_mlp_input(attn_read, *pairs, modes=None, persistent=None):
-    """h = attn_read + sum_k f_k(theta_k) * stream_k, fused, with autograd.
+    """h = attn_read + c * f(stream), fused, with autograd.
 
-    Call as make_mlp_input(attn_read, theta_0, stream_0, theta_1, stream_1, ...) -- the first
-    (multiplier, stream) pair is required, up to MAX_STREAMS are allowed, so a new stream can be
-    added later without touching the kernel.
-
-    theta is the RAW parameter; `modes` names the transform applied to it inside the kernel, one
-    entry per pair, from MODES ("none", "rms"). Default "none".
+    Call as make_mlp_input(attn_read, theta, stream, modes=("rms",)). The *pairs spelling is kept
+    so existing call sites do not have to change shape, but ONE pair is the contract now -- the
+    embedding stream is retired, and silently accepting a second one would compute a different
+    model than the caller wrote.
     """
-    assert len(pairs) % 2 == 0 and pairs, "pairs must be (multiplier, stream), at least one"
-    n = len(pairs) // 2
-    thetas = [pairs[2 * i] for i in range(n)]
-    strms = [pairs[2 * i + 1] for i in range(n)]
-    modes = tuple(modes) if modes is not None else ("none",) * n
-    assert len(modes) == n, f"got {n} streams but {len(modes)} modes"
-    for m in modes:
-        assert m in MODES, f"unknown mode {m!r}; valid: {sorted(MODES)}"
+    assert len(pairs) == 2, (f"single stream only: expected (theta, stream), got {len(pairs)} "
+                             f"positional args. The multi-stream/embedding path was removed.")
+    theta, stream = pairs
+    mode = (modes[0] if modes else "none")
+    assert mode in MODES, f"unknown mode {mode!r}; valid: {sorted(MODES)}"
     if not attn_read.is_cuda:
-        return residual_add_reference(attn_read, list(zip(thetas, strms)), modes).to(attn_read.dtype)
-    return _ResidualAdd.apply(attn_read, modes, n, tuple(persistent) if persistent else None,
-                              *thetas, *strms)
-
-
-
+        return residual_add_reference(attn_read, theta, stream, mode).to(attn_read.dtype)
+    return _ResidualAdd.apply(attn_read, theta, stream, mode)
