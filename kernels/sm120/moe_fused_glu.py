@@ -257,7 +257,7 @@ def grouped_gemm_scatter(a, b_enk, tok, tile_map, n_rows_out):
 #   phase 1  per n-tile: gate GEMM -> store to GU, accumulate sum(g^2)      (r needs all of I)
 #   phase 2  per n-tile: up GEMM, reload gate from GU (L2-hot), apply, store
 # Same GEMM FLOPs as before; the 1.8 GB DRAM round trip becomes an L2 re-read of the gate.
-_RBM, _RBN, _RBK, _RWARPS, _RSTAGES = 32, 256, 64, 8, 3
+_RBM, _RBN, _RBK, _RWARPS, _RSTAGES = 16, 1024, 64, 8, 2
 
 
 @triton.jit
@@ -265,54 +265,50 @@ def _gate_up_radial_kernel(X, W, GU, IT, TE, TS, TM, ALPHA,
                            H: tl.constexpr, I: tl.constexpr, EPS: tl.constexpr,
                            WRITE_GU: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                            BK: tl.constexpr):
+    """One program owns a row block at FULL gate width, so r is available without any reload.
+
+    The first version of this kernel tiled N and looped twice (gate pass, then up pass reloading
+    the gate from GU). That was measured SLOWER than not fusing at all -- it traded a 1.8 GB DRAM
+    round trip for a 0.6 GB reload plus a second pass of X loads plus a 3x smaller grid. Keeping
+    the gate resident is the only arrangement that removes traffic instead of moving it.
+
+    BN spans all of I (padded to a power of two and masked), so BM must stay small: the two fp32
+    accumulators are 2 * BM * BN * 4 bytes of registers.
+    """
     t = tl.program_id(0)
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
     mm = tl.load(TM + t)
     rm = r0 + tl.arange(0, BM)
+    rn = tl.arange(0, BN)
     mask_m = tl.arange(0, BM) < mm
+    mask_n = rn < I
+    mask = mask_m[:, None] & mask_n[None, :]
     Wb = W + e.to(tl.int64) * (2 * I * H)
 
-    # ---- phase 1: gate GEMM over every N tile, keeping only the running sum of squares.
-    ss = tl.zeros((BM,), tl.float32)
-    for n0 in range(0, I, BN):
-        rn = n0 + tl.arange(0, BN)
-        ag = tl.zeros((BM, BN), tl.float32)
-        for k0 in range(0, H, BK):
-            rk = k0 + tl.arange(0, BK)
-            x = tl.load(X + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
-            wg = tl.load(Wb + rn[:, None] * H + rk[None, :])
-            ag = tl.dot(x, tl.trans(wg), ag)
-        ss += tl.sum(ag * ag, axis=1)
-        # the gate half of GU is written here regardless: the backward needs it, and phase 2
-        # reads it back from L2 instead of recomputing the GEMM
-        tl.store(GU + rm[:, None] * (2 * I) + rn[None, :], ag.to(GU.dtype.element_ty),
-                 mask=mask_m[:, None])
+    ag = tl.zeros((BM, BN), tl.float32)
+    au = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, H, BK):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
+        wg = tl.load(Wb + rn[:, None] * H + rk[None, :], mask=mask_n[:, None], other=0.0)
+        wu = tl.load(Wb + (I + rn[:, None]) * H + rk[None, :], mask=mask_n[:, None], other=0.0)
+        ag = tl.dot(x, tl.trans(wg), ag)
+        au = tl.dot(x, tl.trans(wu), au)
 
-    r = tl.sqrt(ss / I + EPS)                       # RMS over the FULL gate row
+    # r over the FULL gate row -- masked lanes contributed 0 and must not count toward the mean
+    ss = tl.sum(tl.where(mask, ag * ag, 0.0), axis=1)
+    r = tl.sqrt(ss / I + EPS)
     aa = tl.load(ALPHA + rm, mask=mask_m, other=0.0).to(tl.float32)
     p = 1.0 / (1.0 + tl.exp(-aa))                   # code 8: p = sigmoid(theta)
-    rp = tl.exp(p * tl.log(r))                      # gain r^p, bounded by [1, r]
-
-    # ---- phase 2: up GEMM, then apply r^p * SiLU(g/r) * up
-    for n0 in range(0, I, BN):
-        rn = n0 + tl.arange(0, BN)
-        au = tl.zeros((BM, BN), tl.float32)
-        for k0 in range(0, H, BK):
-            rk = k0 + tl.arange(0, BK)
-            x = tl.load(X + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
-            wu = tl.load(Wb + (I + rn[:, None]) * H + rk[None, :])
-            au = tl.dot(x, tl.trans(wu), au)
-        ag = tl.load(GU + rm[:, None] * (2 * I) + rn[None, :], mask=mask_m[:, None],
-                     other=0.0).to(tl.float32)
-        gn = ag / r[:, None]
-        f = gn * tl.sigmoid(gn)
-        act = rp[:, None] * f
-        tl.store(IT + rm[:, None] * I + rn[None, :], (act * au).to(IT.dtype.element_ty),
-                 mask=mask_m[:, None])
-        if WRITE_GU:
-            tl.store(GU + rm[:, None] * (2 * I) + (I + rn[None, :]), au.to(GU.dtype.element_ty),
-                     mask=mask_m[:, None])
+    rp = tl.exp(p * tl.log(r))
+    gn = ag / r[:, None]
+    act = rp[:, None] * (gn * tl.sigmoid(gn))
+    tl.store(IT + rm[:, None] * I + rn[None, :], (act * au).to(IT.dtype.element_ty), mask=mask)
+    if WRITE_GU:
+        tl.store(GU + rm[:, None] * (2 * I) + rn[None, :], ag.to(GU.dtype.element_ty), mask=mask)
+        tl.store(GU + rm[:, None] * (2 * I) + (I + rn[None, :]), au.to(GU.dtype.element_ty),
+                 mask=mask)
 
 
 def radial_supported(hidden, gate_up_proj, codes):
@@ -321,7 +317,7 @@ def radial_supported(hidden, gate_up_proj, codes):
     I = gate_up_proj.shape[1] // 2
     return (tiles_supported(hidden) and hidden.dtype is torch.bfloat16
             and gate_up_proj.is_contiguous()
-            and I % _RBN == 0 and gate_up_proj.shape[2] % _RBK == 0
+            and I <= _RBN and gate_up_proj.shape[2] % _RBK == 0
             and len(set(codes)) == 1 and codes[0] == 8)
 
 
