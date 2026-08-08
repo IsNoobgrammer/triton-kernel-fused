@@ -27,11 +27,15 @@ RMS_EPS = 1e-6
 
 
 def eager(attn_read, theta, stream, mode, dt):
+    """The eager spelling. At bf16 the result is STORED in bf16, exactly as the model would --
+    comparing an fp32 eager output against a bf16 kernel output charges the kernel for a rounding
+    step eager also takes, and makes every `out` row read WORSE THAN EAGER for free."""
     ar, th, sv = attn_read.to(dt), theta.to(dt), stream.to(dt)
     if mode == "rms":
         sv = sv * torch.rsqrt(sv.pow(2).mean(-1, keepdim=True) + RMS_EPS)
     c = th.reshape(()) if th.numel() == 1 else th
-    return ar + c * sv
+    out = ar + c * sv
+    return out if dt == torch.float64 else out.to(torch.bfloat16)
 
 
 def _run(fn, dt, per_dim, seed=0):

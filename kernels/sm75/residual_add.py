@@ -111,7 +111,10 @@ def _rms_scale(s, H, MODE: tl.constexpr):
     if MODE == 1:
         ms = tl.sum(s * s, axis=1) / H
         return (1.0 / tl.sqrt(ms + RMS_EPS))[:, None]
-    return tl.zeros([1, 1], tl.float32) + 1.0
+    # DERIVED FROM s, not a literal: both branches must return the same SHAPE, and a bare
+    # tl.zeros([1,1]) fails to unify against the (BLOCK_T,1) above with no inner diagnostic.
+    # `sum(s*0)` carries the row count without needing BLOCK_T passed in.
+    return (tl.sum(s * 0.0, axis=1) + 1.0)[:, None]
 
 
 @triton.jit
