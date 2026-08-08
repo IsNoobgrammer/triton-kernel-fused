@@ -56,8 +56,10 @@ def _run(force_loop):
         d = dn.detach().requires_grad_(True)
         t = theta.detach().requires_grad_(True)
         out = moe_per_expert(h, idx, wt, g, d, codes, act_params=t)
-        import kernels.sm75.moe as _m
-        path = _m._LAST_PATH
+        # kernels.sm75's __init__ re-exports the `moe` FUNCTION under that name, so
+        # `import kernels.sm75.moe as _m` binds the function, not the module. Go via sys.modules.
+        import sys
+        path = sys.modules["kernels.sm75.moe"]._LAST_PATH
         torch.manual_seed(1234)                       # same upstream grad for both paths
         out.backward(torch.randn_like(out) * 0.01)
         return (out.detach(), h.grad.detach(), g.grad.detach(), d.grad.detach(),
