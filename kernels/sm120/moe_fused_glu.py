@@ -320,8 +320,22 @@ def _gate_up_radial_kernel(X, W, GU, IT, TE, TS, TM, ALPHA,
 
 
 def radial_supported(hidden, gate_up_proj, codes):
-    """Radial (code 8) with the fused epilogue. Same shape constraints as gemm_supported, plus a
-    tile map built at _RBM -- the caller must pass the matching map."""
+    """Radial (code 8) with the fused epilogue. OFF unless BIBO_RADIAL_FUSED=1.
+
+    MEASURED LOSS at BiBo's shapes (H=512, I=768), all three designs, against 195.4k tok/s for
+    the unfused path:
+        v1  tile N, reload gate from GU        192.5k   traded a DRAM round trip for a reload
+        v2  full width, one k-loop             would not launch: 264 KB smem vs a 101 KB limit
+        v3  full width, two k-loops            177.0k
+
+    The blocker is that I=768 is NOT a power of two, so tl.arange forces BN=1024 and 25% of every
+    tensor-core lane is masked -- roughly 33% extra GEMM work, against the ~0.8 ms of activation
+    traffic the fusion removes. Fusing radial only pays when I is a power of two (512 or 1024);
+    at 768 it cannot. Kept behind a flag so the finding stays reproducible.
+    """
+    import os
+    if os.environ.get("BIBO_RADIAL_FUSED") != "1":
+        return False
     I = gate_up_proj.shape[1] // 2
     return (tiles_supported(hidden) and hidden.dtype is torch.bfloat16
             and gate_up_proj.is_contiguous()
