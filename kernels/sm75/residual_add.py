@@ -342,13 +342,13 @@ def _prep(attn_read, pairs):
 
 
 BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K stream tiles
-# The BACKWARD gets a wider tile, because its cost is not the accumulator -- it is PART, the
-# per-program d_theta partial of shape (grid, K*slot). At BLOCK_T=8 and T=65536 that is 8192 rows
-# x 512 fp64 = 33.5 MB written and read back, against ~200 MB of genuine traffic (dout + stream +
-# d_stream). Measured: the fused backward ran 1.8x SLOWER than torch.compile, which fuses its
-# reduction instead of materialising one. BLOCK_T_BWD=64 cuts grid 8x, and fp32 partials halve
-# what is left: 33.5 MB -> 2 MB.
-BLOCK_T_BWD = 64
+# The backward uses the SAME tile. Widening it to shrink PART (the per-program d_theta partial,
+# 8192 x 512 at T=65536) looked obviously right and was measured wrong -- the accumulator is
+# BLOCK_T x 512 fp32, so a wider tile spills before the saved traffic pays:
+#     BLOCK_T_BWD   4      8      16     32     64
+#     fwd+bwd ms    0.597  0.532  0.554  0.604  2.294
+# 8 is the optimum, which is what the accumulator note above already implied.
+BLOCK_T_BWD = 8
 
 # CONTRACT: this kernel is graded against FP64 TRUTH, and it must be at least as close to that
 # truth as eager is, in EVERY dtype layout. It is deliberately NOT bit-identical to eager.
