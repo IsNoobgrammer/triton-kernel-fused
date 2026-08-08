@@ -27,10 +27,31 @@ def _code_max(act_codes):
 
 
 _CAST_CACHE = {}
-try:
-    from kernels.sm120 import moe_fused_glu as _FUSED_GLU
-except Exception:
-    _FUSED_GLU = None
+_FUSED_GLU = None
+_FUSED_GLU_TRIED = False
+
+
+def _fused_glu():
+    """The fused GEMM+GLU module, resolved LAZILY on first use.
+
+    This used to be a module-level `from kernels.sm120 import moe_fused_glu` inside a bare
+    try/except, and it ALWAYS failed: kernels.sm120.__init__ imports .moe, which imports back from
+    kernels.sm75.moe -- still half-initialised at that point, because this very line is what
+    triggered it. The except swallowed the ImportError and left _FUSED_GLU = None, so the fused
+    GEMM+GLU epilogue was silently off for EVERY activation, on every run, since it was written.
+
+    Importing the submodule by name still goes through the parent package, so the fix is timing,
+    not spelling: resolve on first call, once both modules are fully initialised.
+    """
+    global _FUSED_GLU, _FUSED_GLU_TRIED
+    if not _FUSED_GLU_TRIED:
+        _FUSED_GLU_TRIED = True
+        try:
+            import importlib
+            _FUSED_GLU = importlib.import_module("kernels.sm120.moe_fused_glu")
+        except Exception:
+            _FUSED_GLU = None
+    return _FUSED_GLU
 
 
 def _cached_cast(t, dt):
@@ -760,29 +781,30 @@ class _PerExpertMoE(torch.autograd.Function):
         tile_map = None; tile_map_gg = None; tile_map_bw = None
         if use_gmm:
             hint = codes[0] if len(set(codes)) == 1 else None
-            if _FUSED_GLU is not None and _FUSED_GLU.tiles_supported(x_s):
-                tile_map_gg = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
-                                                        bm=_FUSED_GLU._GG[0])
+            _FG = _fused_glu()
+            if _FG is not None and _FG.tiles_supported(x_s):
+                tile_map_gg = _FG.build_tile_map(counts, counts_t, dev,
+                                                        bm=_FG._GG[0])
             gu_all = it_all = None
-            if tile_map_gg is not None and _FUSED_GLU.gemm_supported(x_s, gate_up_proj, codes):
-                tm = _FUSED_GLU.build_tile_map(counts, counts_t, dev)
+            if tile_map_gg is not None and _FG.gemm_supported(x_s, gate_up_proj, codes):
+                tm = _FG.build_tile_map(counts, counts_t, dev)
                 # the GEMM+GLU fusion has no theta argument, so it must not apply the activation
                 # when one exists -- the GEMM half is still used, only the act is deferred to
                 # _glu_fwd, which does take row_alpha
-                act = _FUSED_GLU.fused_supported(x_s, gate_up_proj, codes) and ap32 is None
-                gu_all, it_all = _FUSED_GLU.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
+                act = _FG.fused_supported(x_s, gate_up_proj, codes) and ap32 is None
+                gu_all, it_all = _FG.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
                                                               want_gu=True, act=act)
                 if act:
                     tile_map = tm
-                    tile_map_bw = _FUSED_GLU.build_tile_map(counts, counts_t, dev,
-                                                            bm=_FUSED_GLU._BBM)
+                    tile_map_bw = _FG.build_tile_map(counts, counts_t, dev,
+                                                            bm=_FG._BBM)
             if gu_all is None:
                 gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
             if it_all is None:
                 it_all = _glu_fwd(gu_all, row_act, code_hint=hint, row_alpha=row_alpha)
             eo_all = None
             if tile_map_gg is not None:
-                eo_all = _FUSED_GLU.grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
+                eo_all = _fused_glu().grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
                                                  if not down_proj.transpose(1, 2).is_contiguous()
                                                  else down_proj.transpose(1, 2), tile_map_gg)
             if eo_all is None:
@@ -847,10 +869,10 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_down_proj = torch._grouped_mm(ge_all.t(), it_all, offs=offs)
             hint = codes[0] if len(set(codes)) == 1 else None
             if ctx.tile_map is not None:
-                grad_gate_up = _FUSED_GLU.fused_dinter_glu_bwd(
+                grad_gate_up = _fused_glu().fused_dinter_glu_bwd(
                     ge_all, down_proj, gu_all, ctx.tile_map_bw, codes[0])
             else:
-                grad_inter = (_FUSED_GLU.grouped_gemm(ge_all, down_proj, ctx.tile_map_gg)
+                grad_inter = (_fused_glu().grouped_gemm(ge_all, down_proj, ctx.tile_map_gg)
                               if ctx.tile_map_gg is not None else None)
                 if grad_inter is None:
                     grad_inter = torch._grouped_mm(ge_all, down_proj, offs=offs)
@@ -868,7 +890,7 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
             grad_hidden = None
             if ctx.tile_map_gg is not None:
-                gh32 = _FUSED_GLU.grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
+                gh32 = _fused_glu().grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
                                                        ctx.tile_map_gg, N)
                 if gh32 is not None:
                     grad_hidden = gh32.to(grad_out.dtype)
