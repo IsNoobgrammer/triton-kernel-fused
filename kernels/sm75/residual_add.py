@@ -83,7 +83,12 @@ __all__ = ["make_mlp_input", "fused_residual_add", "residual_add_reference", "MO
 # the accuracy problem the bounded modes carried, where a per-channel 2sigmoid graded 1.10x worse
 # than eager on d_stream and needed an fp64 sigmoid to claw back.
 MODES = {"none": 0, "rms": 1}
-RMS_EPS = 1e-6
+RMS_EPS = 1e-6                       # host side: residual_add_reference and the parity harness
+# Kernel side. A plain Python global is NOT readable from a @triton.jit function -- it raises
+# "Cannot access global variable ... instantiated as constexpr", and the message surfaces under
+# the CALL SITE's line number, so it reads as a shape problem in _rms_scale rather than a name
+# problem. Same value, declared the way the JIT requires.
+_RMS_EPS = tl.constexpr(1e-6)
 MAX_STREAMS = 4
 
 
@@ -110,7 +115,7 @@ def _rms_scale(s, H, MODE: tl.constexpr):
     """
     if MODE == 1:
         ms = tl.sum(s * s, axis=1) / H
-        return (1.0 / tl.sqrt(ms + RMS_EPS))[:, None]
+        return (1.0 / tl.sqrt(ms + _RMS_EPS))[:, None]
     # DERIVED FROM s, not a literal: both branches must return the same SHAPE, and a bare
     # tl.zeros([1,1]) fails to unify against the (BLOCK_T,1) above with no inner diagnostic.
     # `sum(s*0)` carries the row count without needing BLOCK_T passed in.
