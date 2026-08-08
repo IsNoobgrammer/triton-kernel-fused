@@ -223,9 +223,11 @@ def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
     # mixed call therefore writes one number into slot 0 of its H-wide row and leaves the rest
     # untouched -- the host reads element 0 back and never looks at the padding.
     if VEC:
-        tl.store(PART + pid * spart + k * SLOT + offs_h, tl.sum(prod, axis=0), mask=offs_h < H)
+        tl.store(PART + pid * spart + k * SLOT + offs_h,
+                 tl.sum(prod, axis=0).to(tl.float32), mask=offs_h < H)
     else:
-        tl.store(PART + pid * spart + k * SLOT, tl.sum(tl.sum(prod, axis=1), axis=0))
+        tl.store(PART + pid * spart + k * SLOT,
+                 tl.sum(tl.sum(prod, axis=1), axis=0).to(tl.float32))
     if NEED:
         g = (c[None, :] * go) if VEC else (c * go)
         if MODE == 1:
@@ -340,6 +342,13 @@ def _prep(attn_read, pairs):
 
 
 BLOCK_T = 8            # 8 x 512 fp32 = 16 KB of accumulator; leaves room for K stream tiles
+# The BACKWARD gets a wider tile, because its cost is not the accumulator -- it is PART, the
+# per-program d_theta partial of shape (grid, K*slot). At BLOCK_T=8 and T=65536 that is 8192 rows
+# x 512 fp64 = 33.5 MB written and read back, against ~200 MB of genuine traffic (dout + stream +
+# d_stream). Measured: the fused backward ran 1.8x SLOWER than torch.compile, which fuses its
+# reduction instead of materialising one. BLOCK_T_BWD=64 cuts grid 8x, and fp32 partials halve
+# what is left: 33.5 MB -> 2 MB.
+BLOCK_T_BWD = 64
 
 # CONTRACT: this kernel is graded against FP64 TRUTH, and it must be at least as close to that
 # truth as eager is, in EVERY dtype layout. It is deliberately NOT bit-identical to eager.
@@ -478,11 +487,13 @@ class _ResidualAdd(torch.autograd.Function):
         need = [s.requires_grad for s in strms]
         ds = [torch.empty((T, H), device=do.device, dtype=strms[i].dtype) if need[i] else None
               for i in range(n)]
-        grid = (triton.cdiv(T, BLOCK_T),)
-        # FP64 partials. Each program tree-reduces its own tile in fp32 (tl.sum is a tree, so the
-        # within-tile error is O(log 4096) ULP, not O(4096)); the cross-program sum then runs over
-        # ~T/BLOCK_T entries -- 8192 at the board shape -- and doing THAT in fp32 is where a long
-        # accumulation actually degrades. fp64 here costs one tiny buffer and removes it.
+        grid = (triton.cdiv(T, BLOCK_T_BWD),)
+        # Partials: fp64 WITHIN a program, fp32 in the buffer. The old all-fp64 buffer was there
+        # because the cross-program sum ran over 8192 entries and fp32 degrades on a long
+        # accumulation. BLOCK_T_BWD makes that 1024 entries, at which fp32 is ample -- and the
+        # kernel has ~4 orders of magnitude of headroom over the bar it must clear (d_theta
+        # 1.008e-07 vs eager's 7.196e-03), so spending one for a third of the traffic is a
+        # measured trade, not a corner cut. parity_res_add_rms still gates it.
         th_v = [t.reshape(()) if t.numel() == 1 else t for t in thetas]
         vflag, any_vec = _vec_flags(th_v, H)
         slot = H if any_vec else 1
@@ -490,7 +501,7 @@ class _ResidualAdd(torch.autograd.Function):
         # (grid, K) of scalars, or (grid, K, H) when ANY theta is per-channel -- that theta
         # reduces over tokens only, so it needs a full row. A scalar stream in a mixed call uses
         # slot 0 of its row and the rest is padding the host never reads.
-        part = torch.empty((grid[0], max(n, 1) * slot), device=do.device, dtype=torch.float64)
+        part = torch.empty((grid[0], max(n, 1) * slot), device=do.device, dtype=torch.float32)
         pad_s = streams + [streams[0]] * (MAX_STREAMS - n)
         pad_st = strides + [0] * (MAX_STREAMS - n)
         pad_ds = [d if d is not None else streams[0] for d in ds] + [streams[0]] * (MAX_STREAMS - n)
@@ -506,7 +517,7 @@ class _ResidualAdd(torch.autograd.Function):
             NEED0=needc[0], NEED1=needc[1], NEED2=needc[2], NEED3=needc[3],
             P0=pz[0], P1=pz[1], P2=pz[2], P3=pz[3],
             VEC0=vpad[0], VEC1=vpad[1], VEC2=vpad[2], VEC3=vpad[3], SLOT=slot,
-            BLOCK_T=BLOCK_T, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
+            BLOCK_T=BLOCK_T_BWD, BLOCK_H=triton.next_power_of_2(H), num_warps=4,
             )
         # d theta = dc/dtheta * sum(dout * stream), the whole chain kept in FP64 and rounded once
         # at the end. Eager instead reduces a product tensor stored in the STREAM dtype, so under
@@ -514,7 +525,7 @@ class _ResidualAdd(torch.autograd.Function):
         # 33M terms. Matching that was the old contract; beating it is the new one. dc is applied
         # AFTER the reduction (it is a constant factor, so this is the same value in exact
         # arithmetic, but it keeps the one rounding at the very end instead of per-program).
-        dtheta = part.sum(0)                                   # fp64, ~8k partials
+        dtheta = part.double().sum(0)                          # fp32 buffer, ~1k partials
         dtheta = dtheta.view(max(n, 1), slot)                  # (K, 1) or (K, H)
         outs = [None, None, None]
         # d attn_read IS dout. Return it by alias -- the identity add costs a whole 134 MB copy
