@@ -8,6 +8,7 @@ import triton.language as tl
 __all__ = ["moe", "moe_per_expert", "moe_grouped", "moe_grouped_cublas", "moe_eager",
            "BatchedGLU", "GROUPED_MIN_TOKENS"]
 
+_DBG = []
 _LAST_PATH = None          # "gmm" | "uniform" | "loop" -- set by _PerExpertMoE.forward, read by tests
 GROUPED_MIN_TOKENS = 4096
 SCHED_BLOCK_M = 64
@@ -782,6 +783,15 @@ class _PerExpertMoE(torch.autograd.Function):
         if use_gmm:
             hint = codes[0] if len(set(codes)) == 1 else None
             _FG = _fused_glu()
+            if os.environ.get("BIBO_MOE_DEBUG") == "1" and not _DBG:
+                _DBG.append(1)
+                print(f"[moe dbg] fused_glu={_FG is not None} "
+                      f"tiles={_FG.tiles_supported(x_s) if _FG else None} "
+                      f"gemm={_FG.gemm_supported(x_s, gate_up_proj, codes) if _FG else None} "
+                      f"fused={_FG.fused_supported(x_s, gate_up_proj, codes) if _FG else None} "
+                      f"ap={ap32 is not None} dtype={x_s.dtype} "
+                      f"gu_contig={gate_up_proj.is_contiguous()} I={gate_up_proj.shape[1]//2} "
+                      f"H={gate_up_proj.shape[2]}", flush=True)
             if _FG is not None and _FG.tiles_supported(x_s):
                 tile_map_gg = _FG.build_tile_map(counts, counts_t, dev,
                                                         bm=_FG._GG[0])
