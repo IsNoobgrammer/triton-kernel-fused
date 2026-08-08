@@ -802,8 +802,16 @@ class _PerExpertMoE(torch.autograd.Function):
                 # when one exists -- the GEMM half is still used, only the act is deferred to
                 # _glu_fwd, which does take row_alpha
                 act = _FG.fused_supported(x_s, gate_up_proj, codes) and ap32 is None
-                gu_all, it_all = _FG.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
-                                                              want_gu=True, act=act)
+                # radial gets its OWN fused epilogue: r is an RMS over all I gate columns, which
+                # no single N-tile of the generic kernel can see, so radial otherwise pays a
+                # separate _glu_fwd pass (1.222 ms/call at N=65536 -- a pure DRAM round trip).
+                if (ap32 is not None and hasattr(_FG, "radial_supported")
+                        and _FG.radial_supported(x_s, gate_up_proj, codes)):
+                    rtm = _FG.build_tile_map(counts, counts_t, dev, bm=_FG._RBM)
+                    gu_all, it_all = _FG.fused_gate_up_radial(x_s, gate_up_proj, rtm, row_alpha)
+                else:
+                    gu_all, it_all = _FG.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
+                                                           want_gu=True, act=act)
                 if act:
                     tile_map = tm
                     tile_map_bw = _FG.build_tile_map(counts, counts_t, dev,
