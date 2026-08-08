@@ -73,7 +73,17 @@ __all__ = ["make_mlp_input", "fused_residual_add", "residual_add_reference", "MO
 
 # transform codes. Kept as ints because they are tl.constexpr compile keys; a string would
 # recompile on identity anyway but reads worse in the launcher.
-MODES = {"none": 0, "sigmoid": 1, "tanh": 2, "2sigmoid": 3, "2tanh": 4}
+# "none" -> h += c * stream          c is the RAW parameter, no transform
+# "rms"  -> h += c * stream/rms(stream)
+#
+# The bounded transforms (sigmoid/tanh/2sigmoid/2tanh) are GONE. They existed to stop an
+# unbounded c running away -- the first carry attempt reached 7936 by step 400. "rms" removes the
+# reason for a cage instead of building a better one: once the stream it multiplies has unit RMS,
+# c is a coefficient on a normalised quantity and has nothing to run away from. It also deletes
+# the accuracy problem the bounded modes carried, where a per-channel 2sigmoid graded 1.10x worse
+# than eager on d_stream and needed an fp64 sigmoid to claw back.
+MODES = {"none": 0, "rms": 1}
+RMS_EPS = 1e-6
 MAX_STREAMS = 4
 
 
@@ -90,68 +100,18 @@ def _ld(P, off, mask, PERSIST: tl.constexpr):
 
 
 @triton.jit
-def _sigmoid(x):
-    """sigmoid via libdevice.exp, NOT tl.sigmoid.
+def _rms_scale(s, H, MODE: tl.constexpr):
+    """1/rms(s) per row, or 1.0 when MODE is "none".
 
-    tl.sigmoid is exactly 1/(1+tl.exp(-x)) -- measured byte-identical -- and tl.exp is the fast
-    intrinsic. Against fp64 on linspace(-6, 6):
-
-        tl.sigmoid          max 3.393e-07   mean 5.393e-08
-        1/(1+libdevice.exp) max 1.626e-07   mean 3.618e-08
-        torch.sigmoid fp32  max 1.430e-07   mean 3.451e-08
-
-    so tl.sigmoid is 1.56x less accurate than the torch it is graded against, and libdevice
-    closes that to 1.05x. This surfaced as `bounded 2sigmoid PER-DIM` grading 1.10x worse than
-    eager on d_stream: with a SCALAR theta the single value happened to round well and the case
-    passed, and only 512 independent channels made the average visible. The bounded modes were
-    always slightly behind eager; the scalar grade could not see it.
-
-    NOT the tanh identity. 2*sigmoid(x) == 1 + tanh(x/2) is exact algebra and libdevice.tanh is
-    the accurate one this file already switched to elsewhere, so it looked like the obvious fix --
-    measured 5.611e-06 max / 2.630e-07 mean, i.e. 5x WORSE on the mean than what it replaced.
-
-    FP64, then round once. libdevice alone still left the kernel 1.08x behind eager, because
-    torch's fp32 sigmoid is simply better than anything cheap here. Evaluating in fp64 stops the
-    contest instead of trying to win it narrowly: the contract is "at least as close as eager",
-    and this is unconditionally closer. It is free -- theta is ONE scalar or ONE (H,) vector per
-    program against a (BLOCK_T, H) tile of streamed data, and this kernel is memory-bound.
+    Returned as a (BLOCK_T, 1) column so both branches have the SAME shape -- Triton unifies a
+    function's return signature across branches even though MODE is constexpr, and returning a
+    bare scalar from one branch and a tensor from the other fails to compile with no inner
+    diagnostic. That exact trap already cost this file once, on _apply_mode's per-channel theta.
     """
-    xd = x.to(tl.float64)
-    return (1.0 / (1.0 + libdevice.exp(-xd))).to(tl.float32)
-
-
-@triton.jit
-def _apply_mode(theta, MODE: tl.constexpr):
-    """f(theta) and f'(theta), together, because backward always needs both.
-
-    Every branch must return the SAME TYPES: Triton unifies a function's return signature across
-    all its return statements, even though MODE is constexpr and only one branch is ever taken.
-    With a scalar theta a bare `1.0` matched the other branches' scalars, but once theta became a
-    PER-CHANNEL (H,) vector it did not -- branch 0 returned (tensor, float) while branch 1
-    returned (tensor, tensor), and the call site failed to compile with no inner diagnostic.
-    `theta * 0.0 + 1.0` carries theta's shape either way; it is dead code in this file (every
-    caller does `c, _ = ...`, and the chain rule for d theta is applied host-side after the
-    reduction) so it costs nothing after DCE.
-    """
-    if MODE == 0:
-        return theta, theta * 0.0 + 1.0
     if MODE == 1:
-        s = _sigmoid(theta)
-        return s, s * (1.0 - s)
-    if MODE == 2:
-        # libdevice.tanh, NOT 2*sigmoid(2x)-1. The identity is exact in real arithmetic and
-        # catastrophic in fp32: at small theta it evaluates 2*0.5 - 1, cancelling away the
-        # mantissa. Measured against fp64 on linspace(-3, 3): 2*sigmoid(2x)-1 gives 8.139e-05
-        # max relative error, libdevice.tanh gives 1.511e-07 -- identical to torch.tanh. The
-        # exhaustive dtype grade caught this as d_stream (= c*dout) coming out 1.29x WORSE than
-        # eager on every tanh case; nothing else in the kernel was at fault.
-        t = libdevice.tanh(theta)
-        return t, 1.0 - t * t
-    if MODE == 3:
-        s = _sigmoid(theta)
-        return 2.0 * s, 2.0 * s * (1.0 - s)
-    t = libdevice.tanh(theta)
-    return 2.0 * t, 2.0 * (1.0 - t * t)
+        ms = tl.sum(s * s, axis=1) / H
+        return (1.0 / tl.sqrt(ms + RMS_EPS))[:, None]
+    return tl.zeros([1, 1], tl.float32) + 1.0
 
 
 @triton.jit
@@ -182,32 +142,36 @@ def _res_add_fwd(
             m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M0).to(tl.float32)
-        c, _ = _apply_mode(m, MODE0)
+        c = m
         sv = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
+        sv = sv * _rms_scale(sv, H, MODE0)
         acc += (c[None, :] * sv) if VEC0 else (c * sv)
     if K > 1:
         if VEC1:
             m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M1).to(tl.float32)
-        c, _ = _apply_mode(m, MODE1)
+        c = m
         sv = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
+        sv = sv * _rms_scale(sv, H, MODE1)
         acc += (c[None, :] * sv) if VEC1 else (c * sv)
     if K > 2:
         if VEC2:
             m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M2).to(tl.float32)
-        c, _ = _apply_mode(m, MODE2)
+        c = m
         sv = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
+        sv = sv * _rms_scale(sv, H, MODE2)
         acc += (c[None, :] * sv) if VEC2 else (c * sv)
     if K > 3:
         if VEC3:
             m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M3).to(tl.float32)
-        c, _ = _apply_mode(m, MODE3)
+        c = m
         sv = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
+        sv = sv * _rms_scale(sv, H, MODE3)
         acc += (c[None, :] * sv) if VEC3 else (c * sv)
 
     tl.store(OUT + offs_t[:, None] * so_t + offs_h[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
@@ -215,7 +179,7 @@ def _res_add_fwd(
 
 @triton.jit
 def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
-             NEED: tl.constexpr, VEC: tl.constexpr, SLOT: tl.constexpr):
+             NEED: tl.constexpr, VEC: tl.constexpr, SLOT: tl.constexpr, MODE: tl.constexpr):
     """One stream's backward: its d theta partial, and d stream where required.
 
     Takes c and s ALREADY LOADED. _ld and _apply_mode are multi-return helpers and Triton only
@@ -235,7 +199,12 @@ def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
     VEC: theta is per-channel, so d theta is (H,) and the reduction runs over TOKENS ONLY. The
     scalar case additionally reduces over H. Same arithmetic, one fewer axis collapsed.
     """
-    prod = go.to(tl.float64) * s.to(tl.float64)
+    # d theta is taken against the value theta actually multiplies, so under "rms" that is the
+    # NORMALISED stream, not the raw one. Using the raw stream here would give a gradient for a
+    # different function and would still look plausible.
+    inv = _rms_scale(s, H, MODE)
+    sn = s * inv
+    prod = go.to(tl.float64) * sn.to(tl.float64)
     # SLOT is H when ANY stream in this call is per-channel, else 1. A scalar stream in a
     # mixed call therefore writes one number into slot 0 of its H-wide row and leaves the rest
     # untouched -- the host reads element 0 back and never looks at the padding.
@@ -244,8 +213,15 @@ def _bwd_one(c, s, DS, PART, pid, spart, k, offs_t, offs_h, d_t, mask, go, H,
     else:
         tl.store(PART + pid * spart + k * SLOT, tl.sum(tl.sum(prod, axis=1), axis=0))
     if NEED:
+        g = (c[None, :] * go) if VEC else (c * go)
+        if MODE == 1:
+            # y = s/r with r = sqrt(mean(s^2)+eps): dL/ds = (g - sn*mean(g*sn)) / r.
+            # The second term is what makes this a projection rather than a plain rescale --
+            # dropping it is the classic RMSNorm-backward bug and shows up only as a slow
+            # quality drift, never as an error.
+            g = (g - sn * (tl.sum(g * sn, axis=1) / H)[:, None]) * inv
         tl.store(DS + offs_t[:, None] * d_t + offs_h[None, :],
-                 ((c[None, :] * go) if VEC else (c * go)).to(DS.dtype.element_ty), mask=mask)
+                 g.to(DS.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -281,54 +257,50 @@ def _res_add_bwd(
             m = tl.load(M0 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M0).to(tl.float32)
-        c, _ = _apply_mode(m, MODE0)
+        c = m
         s = _ld(S0, offs_t[:, None] * s0_t + offs_h[None, :], mask, P0).to(tl.float32)
         _bwd_one(c, s, DS0, PART, pid, spart, 0, offs_t, offs_h, d0_t, mask, go, H,
-                 NEED0, VEC0, SLOT)
+                 NEED0, VEC0, SLOT, MODE0)
     if K > 1:
         if VEC1:
             m = tl.load(M1 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M1).to(tl.float32)
-        c, _ = _apply_mode(m, MODE1)
+        c = m
         s = _ld(S1, offs_t[:, None] * s1_t + offs_h[None, :], mask, P1).to(tl.float32)
         _bwd_one(c, s, DS1, PART, pid, spart, 1, offs_t, offs_h, d1_t, mask, go, H,
-                 NEED1, VEC1, SLOT)
+                 NEED1, VEC1, SLOT, MODE1)
     if K > 2:
         if VEC2:
             m = tl.load(M2 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M2).to(tl.float32)
-        c, _ = _apply_mode(m, MODE2)
+        c = m
         s = _ld(S2, offs_t[:, None] * s2_t + offs_h[None, :], mask, P2).to(tl.float32)
         _bwd_one(c, s, DS2, PART, pid, spart, 2, offs_t, offs_h, d2_t, mask, go, H,
-                 NEED2, VEC2, SLOT)
+                 NEED2, VEC2, SLOT, MODE2)
     if K > 3:
         if VEC3:
             m = tl.load(M3 + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
         else:
             m = tl.load(M3).to(tl.float32)
-        c, _ = _apply_mode(m, MODE3)
+        c = m
         s = _ld(S3, offs_t[:, None] * s3_t + offs_h[None, :], mask, P3).to(tl.float32)
         _bwd_one(c, s, DS3, PART, pid, spart, 3, offs_t, offs_h, d3_t, mask, go, H,
-                 NEED3, VEC3, SLOT)
+                 NEED3, VEC3, SLOT, MODE3)
 
 
 def _dmode(t, mode):
-    """dc/dtheta in torch, matching what autograd produces for the eager spelling of each mode.
+    """dc/dtheta. Both surviving modes use c = theta RAW, so this is identically 1.
 
-    Lives on the torch side, not in the kernel, because it must be applied AFTER the reduction
-    has been rounded to the stream dtype -- see the note in _ResidualAdd.backward.
+    Kept as a function rather than inlined: it is the hook a future transform would need, and the
+    call site documents WHERE the chain rule belongs -- after the reduction has been rounded to
+    the stream dtype, see the note in _ResidualAdd.backward. "rms" transforms the STREAM, not
+    theta, so it does not appear here.
     """
-    if mode == "none":
+    if mode in MODES:
         return torch.ones_like(t)
-    if mode in ("sigmoid", "2sigmoid"):
-        s = torch.sigmoid(t)
-        return (2.0 if mode == "2sigmoid" else 1.0) * s * (1.0 - s)
-    if mode in ("tanh", "2tanh"):
-        h = torch.tanh(t)
-        return (2.0 if mode == "2tanh" else 1.0) * (1.0 - h * h)
-    raise ValueError(f"unknown mode {mode!r}")
+    raise ValueError(f"unknown mode {mode!r}; valid: {sorted(MODES)}")
 
 
 def _prep(attn_read, pairs):
@@ -454,8 +426,6 @@ def residual_add_reference(attn_read, pairs, modes):
     inputs silently returned an fp32 answer, so fp32 eager scored an error of exactly 0 against its
     own output and the `kernel <= eager` gate quietly became vacuous at that dtype.
     """
-    f = {"none": lambda x: x, "sigmoid": torch.sigmoid, "tanh": torch.tanh,
-         "2sigmoid": lambda x: 2.0 * torch.sigmoid(x), "2tanh": lambda x: 2.0 * torch.tanh(x)}
     acc = torch.promote_types(attn_read.dtype, torch.float32)
     for _, s in pairs:
         acc = torch.promote_types(acc, s.dtype)
@@ -465,8 +435,11 @@ def residual_add_reference(attn_read, pairs, modes):
     for (theta, s), m in zip(pairs, modes):
         # reshape(()) for a scalar theta, left as (H,) for a per-channel one so it broadcasts
         # over the trailing hidden axis.
-        _c = f[m](theta.to(acc))
-        out = out + (_c.reshape(()) if _c.numel() == 1 else _c) * s.to(acc)
+        _c = theta.to(acc)                       # c is the RAW parameter; no transform remains
+        sv = s.to(acc)
+        if m == "rms":
+            sv = sv * torch.rsqrt(sv.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+        out = out + (_c.reshape(()) if _c.numel() == 1 else _c) * sv
     return out
 
 
@@ -557,7 +530,7 @@ def make_mlp_input(attn_read, *pairs, modes=None, persistent=None):
     added later without touching the kernel.
 
     theta is the RAW parameter; `modes` names the transform applied to it inside the kernel, one
-    entry per pair, from MODES ("none", "sigmoid", "tanh", "2sigmoid", "2tanh"). Default "none".
+    entry per pair, from MODES ("none", "rms"). Default "none".
     """
     assert len(pairs) % 2 == 0 and pairs, "pairs must be (multiplier, stream), at least one"
     n = len(pairs) // 2
