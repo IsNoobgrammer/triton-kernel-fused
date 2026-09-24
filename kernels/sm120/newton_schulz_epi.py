@@ -83,6 +83,40 @@ def bgemm_epi(A, B, C=None, alpha=1.0, beta=0.0, out=None):
     return D
 
 
+_NT_CONFIGS = [triton.Config({"BI": bi, "BJ": bj}, num_warps=w)
+               for bi, bj, w in [(64, 64, 4), (128, 64, 4), (64, 128, 4), (128, 128, 8), (32, 128, 4), (128, 32, 4)]]
+
+
+@triton.autotune(configs=_NT_CONFIGS, key=["R", "C"])
+@triton.jit
+def _norm_t_kernel(U, NRM, OUT, R, C, sub, sui, suj, BI: tl.constexpr, BJ: tl.constexpr):
+    """OUT[b, j, i] = bf16(f32(U[b, i, j]) / f32(NRM[b])), OUT contiguous (n, C, R).
+
+    Replaces `(U.transpose(1, 2) / nrm).contiguous()` -- a strided divide plus a strided copy,
+    10.5 ms on the BiBo board -- with one tiled pass: coalesced load along j, tl.trans through
+    shared memory, coalesced store along i. div_rn = the IEEE-rounded division torch uses for its
+    fp32 opmath (plain `/` in Triton is the approximate div.full.f32), so the result is bit-identical.
+    """
+    pi, pj = tl.program_id(0), tl.program_id(1)
+    b = tl.program_id(2).to(tl.int64)
+    ri = pi * BI + tl.arange(0, BI)
+    rj = pj * BJ + tl.arange(0, BJ)
+    m = (ri[:, None] < R) & (rj[None, :] < C)
+    x = tl.load(U + b * sub + ri[:, None] * sui + rj[None, :] * suj, mask=m, other=0.0).to(tl.float32)
+    s = tl.load(NRM + b).to(tl.float32)
+    y = tl.math.div_rn(x, s).to(OUT.dtype.element_ty)
+    tl.store(OUT + b * C * R + rj[:, None] * R + ri[None, :], tl.trans(y), mask=tl.trans(m))
+
+
+def normalize_transpose(U, nrm):
+    """(n, R, C) -> (n, C, R) contiguous, each matrix divided by its norm. nrm: (n,) in U's dtype."""
+    n, R, C = U.shape
+    out = torch.empty((n, C, R), device=U.device, dtype=U.dtype)
+    grid = lambda meta: (triton.cdiv(R, meta["BI"]), triton.cdiv(C, meta["BJ"]), n)
+    _norm_t_kernel[grid](U, nrm.reshape(n).contiguous(), out, R, C, *U.stride())
+    return out
+
+
 def newton_schulz_epi(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7):
     """Drop-in for kernels.sm75.muon.newton_schulz (same normalize / orientation / dtype rules)."""
     orig_dtype = G.dtype
@@ -90,14 +124,16 @@ def newton_schulz_epi(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7)
     X = G.unsqueeze(0) if squeeze else G
     nrm = torch.linalg.vector_norm(X.flatten(1), dim=1, dtype=torch.float32).clamp_min(eps).view(-1, 1, 1)
     transposed = X.size(1) > X.size(2)
-    if transposed:
-        X = X.transpose(1, 2)
-    X = X.to(ns_dtype) / nrm.to(ns_dtype)
-    n, m, _ = X.shape
+    n, m = X.shape[0], min(X.shape[1], X.shape[2])
     if m % EPI_BK or X.numel() < EPI_MIN_ELEMS:      # the small side is the K of both epi GEMMs
         from kernels.sm75.muon import newton_schulz
         return newton_schulz(G, coeffs, ns_dtype, eps)
-    X = X.contiguous()
+    if transposed and X.dtype == ns_dtype:
+        X = normalize_transpose(X, nrm.to(ns_dtype))
+    else:
+        if transposed:
+            X = X.transpose(1, 2)
+        X = (X.to(ns_dtype) / nrm.to(ns_dtype)).contiguous()
     A = torch.empty((n, m, m), device=X.device, dtype=ns_dtype)
     Bm = torch.empty_like(A)
     Xb = torch.empty_like(X)
