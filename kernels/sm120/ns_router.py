@@ -130,7 +130,10 @@ class NSRouter:
     def _decide(self, key):
         rows = {n: {"ms": min(s["ms"]), "rel": sum(s["rel"]) / len(s["rel"]), "bit": s["bit"]}
                 for n, s in self._stats.pop(key).items() if n != "_seen"}
-        base = rows["cublas"]["rel"]
+        # tol is relative to the BEST of the exact-arithmetic backends, not to cuBLAS alone: on a single
+        # (1, 2048, 6144) matrix cuBLAS's own error was 1.25e-2 against epi's 5.49e-3, which loosened the
+        # bar enough to admit a 1.35e-2 gram. gram is the only candidate that changes the algorithm.
+        base = min(r["rel"] for n, r in rows.items() if not n.startswith("gram"))
         ok = [n for n in self.order if n in rows and rows[n]["rel"] <= self.tol * base]
         fastest = min(rows[n]["ms"] for n in ok)
         pick = next(n for n in ok if rows[n]["ms"] <= fastest * (1 + self.margin))
