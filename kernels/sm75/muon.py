@@ -41,6 +41,7 @@ class FusedMuon(optim.Optimizer):
     """
 
     DEFAULT_NS_DTYPE = _NS_DTYPE
+    _fused_tail = False      # sm120 sets this: one Triton pass each for the pre-NS and post-NS elementwise work
 
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0,
                  variant=_scaling.DEFAULT_VARIANT, scale="adam", ns_coeffs="dsv4", ns_dtype=None,
@@ -287,7 +288,8 @@ class FusedMuon(optim.Optimizer):
             if var.owns_step and (spectral or cautious or do_xorth):
                 raise NotImplementedError(f"variant {var.name!r} does not compose with spectral_wd / "
                                           "cautious_decay / xorth")
-            if wd != 0 and not spectral and not cautious and not var.owns_step:
+            fuse = self._fused_tail and not spectral and not cautious and not var.owns_step
+            if wd != 0 and not spectral and not cautious and not var.owns_step and not fuse:
                 torch._foreach_mul_(params, 1.0 - lr * wd)
             for g in plan:
                 r, c = g["r"], g["c"]
@@ -301,10 +303,13 @@ class FusedMuon(optim.Optimizer):
                         self._muown_chunk(g, members, start, crows, mom_c, lr, momentum, nesterov, wd)
                         continue
                     gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
-                    torch._foreach_copy_([gbuf[o:o + n] for _, o, n in members],
-                                         [p.grad.reshape(n, r, c) for p, o, n in members])
-                    mom_c.mul_(momentum).add_(gbuf)
-                    u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
+                    if fuse:
+                        u = self._tail_pre([p.grad for p, _, _ in members], gbuf, mom_c, momentum, nesterov)
+                    else:
+                        torch._foreach_copy_([gbuf[o:o + n] for _, o, n in members],
+                                             [p.grad.reshape(n, r, c) for p, o, n in members])
+                        mom_c.mul_(momentum).add_(gbuf)
+                        u = gbuf.add_(mom_c, alpha=momentum) if nesterov else mom_c
                     if do_xorth and self.xorth_where == "pre":
                         if not nesterov:
                             u = u.clone()
@@ -321,6 +326,11 @@ class FusedMuon(optim.Optimizer):
                                         self.scale, r, c)
                     if do_xorth and self.xorth_where == "post":
                         self._whiten_chunk(out, members, r, c, xp)
+                    if fuse:
+                        dec = (1.0 - lr * wd) if wd != 0 else None
+                        for p, o, n in members:
+                            self._tail_post(p.view(n, r, c), out[o:o + n], alpha, dec)
+                        continue
                     _pl = [p for p, _, _ in members]
                     _ul = [out[o:o + n].reshape(p.shape) for p, o, n in members]
                     if cautious:

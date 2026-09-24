@@ -4,6 +4,7 @@ from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.ns_router import NSRouter, FAMILIES as NS_BACKENDS
 from kernels.sm120.newton_schulz_gram import GRAM_RESTART_AT
+from kernels.sm120.muon_tail import tail_pre, tail_post
 
 NS_BATCH_ELEMS = 8 * 1024 * 1024
 
@@ -26,9 +27,10 @@ class FusedMuon(_FusedMuon75):
     DEFAULT_NS_DTYPE = torch.bfloat16
 
     def __init__(self, *args, ns_backend="auto", gram_restarts=None, ns_tol=1.05, ns_pinned=None,
-                 ns_probe_steps=10, **kwargs):
+                 ns_probe_steps=10, fused_tail=False, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
+        self._fused_tail = bool(fused_tail)     # see muon_tail.py; gated off until its parity passes
         if ns_backend != "auto" and ns_backend not in NS_BACKENDS:
             raise ValueError(f"ns_backend must be 'auto' or one of {NS_BACKENDS}, got {ns_backend!r}")
         self.ns_backend = ns_backend
@@ -38,6 +40,14 @@ class FusedMuon(_FusedMuon75):
         self.ns_router = NSRouter(self.coeffs, self.ns_dtype, candidates=cands, tol=ns_tol,
                                   gram_restarts=gram_restarts, pinned=ns_pinned, probe_steps=ns_probe_steps)
         self._ns_fixed = None if ns_backend == "auto" else self.ns_router.fixed(ns_backend)
+
+    @staticmethod
+    def _tail_pre(grads, gbuf, mom, momentum, nesterov):
+        return tail_pre(grads, gbuf, mom, momentum, nesterov)
+
+    @staticmethod
+    def _tail_post(p3, o3, alpha, decay):
+        tail_post(p3, o3, alpha, decay)
 
     def _polar(self, u):
         if self._ns_fixed is not None:
