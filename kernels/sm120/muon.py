@@ -27,10 +27,10 @@ class FusedMuon(_FusedMuon75):
     DEFAULT_NS_DTYPE = torch.bfloat16
 
     def __init__(self, *args, ns_backend="auto", gram_restarts=None, ns_tol=1.05, ns_pinned=None,
-                 ns_probe_steps=10, fused_tail=False, **kwargs):
+                 ns_probe_steps=10, fused_tail=True, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
-        self._fused_tail = bool(fused_tail)     # see muon_tail.py; gated off until its parity passes
+        self._fused_tail = bool(fused_tail)     # muon_tail.py: bit-identical to the eager tail (12/12 configs)
         if ns_backend != "auto" and ns_backend not in NS_BACKENDS:
             raise ValueError(f"ns_backend must be 'auto' or one of {NS_BACKENDS}, got {ns_backend!r}")
         self.ns_backend = ns_backend

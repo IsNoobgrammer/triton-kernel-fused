@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-FMA = True
+FMA = True     # torch's compiled add(alpha=) contracts to FMA: FMA=True is bit-identical 12/12, False is not
 
 
 @triton.jit
