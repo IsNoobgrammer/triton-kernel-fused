@@ -1,20 +1,20 @@
-"""Per-shape Newton-Schulz backend routing, decided once on real momentum.
+"""Per-shape Newton-Schulz backend routing, decided over the first few steps on real momentum.
 
 No backend wins every shape (measured on an RTX PRO 6000, ns8 bf16):
   small side 512, ratio <= 1.5     epi       (cuBLAS X X^T + fused-epilogue Triton GEMMs)
   small side >= 1024, square       symmul    (symmetric X X^T, half the FLOPs)
   small side >= 2048, ratio >= 1.5 gram      (Gram-space NS: ~4 large GEMMs instead of 16)
-and gram's ERROR also depends on the shape (2x cuBLAS's at 512, equal at 4096). So FusedMuon routes
-per shape bucket: the first time a (shape, dtype) reaches `NSRouter.__call__`, every candidate runs
-on that actual momentum chunk, is timed, and is scored against an fp32 NS of the same input. The
-fastest one whose error is within `tol` x cuBLAS's wins, and the choice is cached for the rest of the
-run. A training run therefore mixes backends: epi on the MoE stacks, gram on a big tall matrix,
-cuBLAS on tiny ones.
+and gram's ERROR depends on the shape and on WHERE its restarts sit. So FusedMuon routes per shape
+bucket. For the first `probe_steps` times a (shape, dtype) reaches the router, the cuBLAS result is
+what the optimizer applies (so probing never changes training), and every candidate -- including
+every gram restart placement in GRAM_PLACEMENTS -- is timed and scored against an fp32 NS of that
+step's actual momentum. After the window, the fastest candidate whose mean error is within `tol` x
+cuBLAS's is locked in for the rest of the run. A run therefore mixes backends per shape.
 
-Numerics are only a function of the choice, so the decision rule is made hard to flip:
-  - candidates within `margin` of the fastest tie, and a tie goes to the EARLIEST in `order` --
-    cublas, epi, symmul are listed before gram, and cublas/epi are bit-identical;
-  - `pinned` forces a backend for a shape (e.g. to reproduce a previous run exactly);
+Decisions are made hard to flip, because numerics depend on them:
+  - candidates within `margin` of the fastest tie, and a tie goes to the EARLIEST in ORDER
+    (cublas / epi / symepi / symmul are bit-identical to cuBLAS where they are supported; gram is not);
+  - `pinned` forces a backend for a shape (e.g. to reproduce a logged run exactly);
   - `table` holds every decision with its timings and errors for logging.
 """
 import torch
@@ -24,24 +24,36 @@ from kernels.sm120.newton_schulz_epi import newton_schulz_epi
 from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul, SYMMUL_MIN_DIM
 from kernels.sm120.newton_schulz_gram import newton_schulz_gram
 
-ORDER = ("cublas", "epi", "symmul", "gram")
+FAMILIES = ("cublas", "epi", "symepi", "symmul", "gram")
+# gram restart placements tried by "gram" (1-based iteration after which to re-orthogonalize; () = none)
+GRAM_PLACEMENTS = ((), (2,), (3,), (4,), (5,), (6,), (2, 4), (3, 5), (4, 6), (2, 5), (3, 6), (4, 5), (2, 4, 6))
+
+
+def _name(family, restarts=None):
+    return family if family != "gram" else "gram@" + ",".join(map(str, restarts))
 
 
 def _supported(name, shape):
-    # symmul is WRONG below its 2048 gate (rel err 9 to 3e3, and NaN, on 512-wide stacks; found by this
-    # router's accuracy check Sep 24 2026 -- the gate had always hidden it). Never time it there.
+    # symmul's own small-shape fallback used to drop out= (garbage below 2048, fixed Sep 24 2026);
+    # its Triton kernels are correct at 512 now, but it only ever competes where it was validated.
     return not (name == "symmul" and min(shape[-2], shape[-1]) < SYMMUL_MIN_DIM)
 
 
-def _backends(coeffs, ns_dtype, gram_restarts):
-    rs = {} if gram_restarts is None else {"restart_at": gram_restarts}
-    return {
-        "cublas": lambda u: _cublas(u, coeffs, ns_dtype),
-        "epi": lambda u: newton_schulz_epi(u, coeffs, ns_dtype),
-        "symmul": lambda u: newton_schulz_symmul(u, coeffs, ns_dtype, force_eager=True, min_dim=0),
-        "gram": lambda u: newton_schulz_gram(u, coeffs, ns_dtype, force_eager=True, min_dim=0,
-                                             min_ratio=0.0, **rs),
-    }
+def _backends(coeffs, ns_dtype, families, placements):
+    fns = {}
+    if "cublas" in families:
+        fns["cublas"] = lambda u: _cublas(u, coeffs, ns_dtype)
+    if "epi" in families:
+        fns["epi"] = lambda u: newton_schulz_epi(u, coeffs, ns_dtype)
+    if "symepi" in families:
+        fns["symepi"] = lambda u: newton_schulz_epi(u, coeffs, ns_dtype, sym=True)
+    if "symmul" in families:
+        fns["symmul"] = lambda u: newton_schulz_symmul(u, coeffs, ns_dtype, force_eager=True, min_dim=0)
+    if "gram" in families:
+        for rs in placements:
+            fns[_name("gram", rs)] = (lambda r: lambda u: newton_schulz_gram(
+                u, coeffs, ns_dtype, force_eager=True, min_dim=0, min_ratio=0.0, restart_at=r))(rs)
+    return fns
 
 
 def _time(fn, u, reps=5, warm=2):
@@ -58,51 +70,81 @@ def _time(fn, u, reps=5, warm=2):
 
 
 class NSRouter:
-    def __init__(self, coeffs, ns_dtype, candidates=ORDER, tol=1.05, margin=0.03, gram_restarts=None,
-                 pinned=None, verbose=True):
-        bad = set(candidates) - set(ORDER)
+    def __init__(self, coeffs, ns_dtype, candidates=FAMILIES, tol=1.05, margin=0.03, gram_restarts=None,
+                 pinned=None, probe_steps=3, verbose=True):
+        bad = set(candidates) - set(FAMILIES)
         if bad:
-            raise ValueError(f"unknown NS backend(s) {sorted(bad)}; choose from {ORDER}")
-        self.fns = _backends(coeffs, ns_dtype, gram_restarts)
-        self.coeffs, self.candidates = coeffs, [c for c in ORDER if c in candidates]
-        self.tol, self.margin, self.verbose = float(tol), float(margin), verbose
+            raise ValueError(f"unknown NS backend(s) {sorted(bad)}; choose from {FAMILIES}")
+        placements = GRAM_PLACEMENTS if gram_restarts is None else (tuple(gram_restarts),)
+        self.fns = _backends(coeffs, ns_dtype, set(candidates) | {"cublas"}, placements)
+        self.order = [n for n in self.fns if n.split("@")[0] in candidates]
+        self.coeffs, self.tol, self.margin = coeffs, float(tol), float(margin)
+        self.probe_steps, self.verbose = max(1, int(probe_steps)), verbose
         self.pinned = dict(pinned or {})
-        self.choice, self.table = {}, {}
+        self.choice, self.table, self._stats = {}, {}, {}
+        self.step = 0          # set by the optimizer each step: probing counts STEPS, not calls (many
+                               # layers share a shape, so one step makes many calls per key)
+
+    def fixed(self, family):
+        """The single function a forced ns_backend uses (gram: its one configured placement)."""
+        return next(self.fns[n] for n in self.fns if n.split("@")[0] == family)
 
     def __call__(self, u):
         key = (tuple(u.shape), u.dtype)
         c = self.choice.get(key)
-        if c is None:
-            c = self.choice[key] = self._decide(u, key)
-        return self.fns[c](u)
+        if c is not None:
+            return self.fns[c](u)
+        if key[0] in self.pinned:
+            self.choice[key] = self.pinned[key[0]]
+            self.table[key] = {"choice": self.pinned[key[0]], "pinned": True}
+            return self.fns[self.choice[key]](u)
+        seen = self._stats.setdefault(key, {}).setdefault("_seen", set())
+        if self.step in seen:                        # this shape was already probed this step
+            return self.fns["cublas"](u)
+        seen.add(self.step)
+        out = self._probe(u, key)                   # cuBLAS result during the probe window
+        if len(seen) >= self.probe_steps:
+            self.choice[key] = self._decide(key)
+        return out
 
     @torch.no_grad()
-    def _decide(self, u, key):
-        shape = key[0]
-        if shape in self.pinned:
-            self.table[key] = {"choice": self.pinned[shape], "pinned": True}
-            return self.pinned[shape]
+    def _probe(self, u, key):
+        st = self._stats.setdefault(key, {})
         o32 = _cublas(u.float(), self.coeffs, torch.float32)
         n32 = o32.norm()
         ref = self.fns["cublas"](u)
-        rows = {}
-        for name in self.candidates:
-            if not _supported(name, shape):
+        for name in self.order:
+            if name not in self.fns or not _supported(name, key[0]):
                 continue
+            s = st.setdefault(name, {"ms": [], "rel": [], "bit": True})
             try:
-                o = self.fns[name](u)
-                rows[name] = {"ms": _time(self.fns[name], u),
-                              "rel": ((o.float() - o32).norm() / n32).item(),
-                              "bit": bool(torch.equal(o, ref))}
+                o = ref if name == "cublas" else self.fns[name](u)
+                s["rel"].append(((o.float() - o32).norm() / n32).item())
+                s["bit"] &= bool(torch.equal(o, ref))
+                s["ms"].append(_time(self.fns[name], u))
             except Exception as ex:                    # a candidate that cannot run here just loses
-                rows[name] = {"ms": float("inf"), "rel": float("inf"), "bit": False, "err": repr(ex)[:80]}
-        base = rows["cublas"]["rel"] if "cublas" in rows else min(r["rel"] for r in rows.values())
-        ok = [n for n in self.candidates if rows[n]["rel"] <= self.tol * base]
+                s["rel"].append(float("inf")); s["ms"].append(float("inf")); s["bit"] = False
+                s["err"] = repr(ex)[:80]
+        return ref
+
+    def _decide(self, key):
+        rows = {n: {"ms": min(s["ms"]), "rel": sum(s["rel"]) / len(s["rel"]), "bit": s["bit"]}
+                for n, s in self._stats.pop(key).items() if n != "_seen"}
+        base = rows["cublas"]["rel"]
+        ok = [n for n in self.order if n in rows and rows[n]["rel"] <= self.tol * base]
         fastest = min(rows[n]["ms"] for n in ok)
         pick = next(n for n in ok if rows[n]["ms"] <= fastest * (1 + self.margin))
-        self.table[key] = {"choice": pick, **{n: rows[n] for n in rows}}
+        self.table[key] = {"choice": pick, **rows}
         if self.verbose:
-            cells = "  ".join(f"{n} {r['ms']:.2f}ms rel {r['rel']:.2e}{' =cuBLAS' if r['bit'] else ''}"
-                              f"{'' if n in ok else ' REJECTED'}" for n, r in rows.items())
-            print(f"[ns-router] {shape} -> {pick}   | {cells}", flush=True)
+            gram = {n: r for n, r in rows.items() if n.startswith("gram")}
+            bestg = min(gram, key=lambda n: rows[n]["ms"] if n in ok else float("inf")) if gram else None
+            show = [n for n in rows if not n.startswith("gram")] + ([bestg] if bestg else [])
+            if gram and bestg not in ok:
+                bestg = min(gram, key=lambda n: rows[n]["rel"])
+                show[-1] = bestg
+            cells = "  ".join(f"{n} {rows[n]['ms']:.2f}ms rel {rows[n]['rel']:.2e}{' =cuBLAS' if rows[n]['bit'] else ''}"
+                              f"{'' if n in ok else ' REJ'}" for n in show)
+            gok = sum(1 for n in gram if n in ok)
+            print(f"[ns-router] {key[0]} -> {pick}   | {cells}   (gram placements within tol: {gok}/{len(gram)})",
+                  flush=True)
         return pick

@@ -2,7 +2,8 @@ import torch
 
 from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
-from kernels.sm120.ns_router import NSRouter, ORDER as NS_BACKENDS
+from kernels.sm120.ns_router import NSRouter, FAMILIES as NS_BACKENDS
+from kernels.sm120.newton_schulz_gram import GRAM_RESTART_AT
 
 NS_BATCH_ELEMS = 8 * 1024 * 1024
 
@@ -12,8 +13,10 @@ class FusedMuon(_FusedMuon75):
     loop, every variant and every decay mode are the shared sm75 code.
 
     ns_backend  "auto" (default): per shape bucket, the fastest backend whose error vs an fp32 NS is
-                within ns_tol x cuBLAS's, decided once on the first step (see ns_router.py).
-                Or force one everywhere: "cublas" (no Triton) | "epi" | "symmul" | "gram".
+                within ns_tol x cuBLAS's, probed over the first ns_probe_steps steps (cuBLAS is applied
+                meanwhile) including every gram restart placement; see ns_router.py.
+                Or force one everywhere: "cublas" (no Triton) | "epi" | "symepi" | "symmul" | "gram".
+    gram_restarts  auto: None = search all placements, or pin one; forced gram: None = (4, 6).
     ns_tol      auto only: allowed error ratio vs cuBLAS. 1.05 keeps cuBLAS-level accuracy (gram is
                 rejected at small shapes); raise it to let gram in where it is faster.
     ns_pinned   auto only: {shape: backend} overrides, e.g. to reproduce a logged run exactly.
@@ -21,19 +24,25 @@ class FusedMuon(_FusedMuon75):
 
     DEFAULT_NS_DTYPE = torch.bfloat16
 
-    def __init__(self, *args, ns_backend="auto", gram_restarts=None, ns_tol=1.05, ns_pinned=None, **kwargs):
+    def __init__(self, *args, ns_backend="auto", gram_restarts=None, ns_tol=1.05, ns_pinned=None,
+                 ns_probe_steps=3, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
         if ns_backend != "auto" and ns_backend not in NS_BACKENDS:
             raise ValueError(f"ns_backend must be 'auto' or one of {NS_BACKENDS}, got {ns_backend!r}")
         self.ns_backend = ns_backend
         cands = NS_BACKENDS if ns_backend == "auto" else (ns_backend,)
+        if ns_backend == "gram" and gram_restarts is None:
+            gram_restarts = GRAM_RESTART_AT
         self.ns_router = NSRouter(self.coeffs, self.ns_dtype, candidates=cands, tol=ns_tol,
-                                  gram_restarts=gram_restarts, pinned=ns_pinned)
-        self._ns_fixed = None if ns_backend == "auto" else self.ns_router.fns[ns_backend]
+                                  gram_restarts=gram_restarts, pinned=ns_pinned, probe_steps=ns_probe_steps)
+        self._ns_fixed = None if ns_backend == "auto" else self.ns_router.fixed(ns_backend)
 
     def _polar(self, u):
-        return self._ns_fixed(u) if self._ns_fixed is not None else self.ns_router(u)
+        if self._ns_fixed is not None:
+            return self._ns_fixed(u)
+        self.ns_router.step = self._step_count
+        return self.ns_router(u)
 
     def _compute(self, work, decay):
         for params, f in decay:

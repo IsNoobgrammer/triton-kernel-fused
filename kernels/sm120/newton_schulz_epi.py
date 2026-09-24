@@ -16,6 +16,7 @@ import triton
 import triton.language as tl
 
 from kernels.sm75.muon import _DSV4_COEFFS
+from kernels.sm120.newton_schulz_symmul import symmul, symmul_axpy
 
 _CONFIGS = [
     triton.Config({"BM": bm, "BN": bn, "BK": bk, "GROUP_M": 8}, num_stages=s, num_warps=w)
@@ -117,8 +118,13 @@ def normalize_transpose(U, nrm):
     return out
 
 
-def newton_schulz_epi(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7):
-    """Drop-in for kernels.sm75.muon.newton_schulz (same normalize / orientation / dtype rules)."""
+def newton_schulz_epi(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7, sym=False):
+    """Drop-in for kernels.sm75.muon.newton_schulz (same normalize / orientation / dtype rules).
+
+    sym=True ("symepi"): X X^T and c A A + b A run on symmul's symmetric Triton kernels (upper
+    triangle only, mirrored: half the FLOPs), B X + a X stays on the fused epilogue. The two
+    symmetric products are exactly where symmul saves work; B X is not symmetric and is exactly
+    where symmul used to fall back to baddbmm's copy."""
     orig_dtype = G.dtype
     squeeze = G.ndim == 2
     X = G.unsqueeze(0) if squeeze else G
@@ -138,8 +144,12 @@ def newton_schulz_epi(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7)
     Bm = torch.empty_like(A)
     Xb = torch.empty_like(X)
     for a, b, c in coeffs:
-        torch.bmm(X, X.transpose(1, 2), out=A)
-        bgemm_epi(A, A, A, alpha=c, beta=b, out=Bm)
+        if sym:
+            symmul(X, out=A, min_dim=0)
+            symmul_axpy(A, b, c, out=Bm, min_dim=0)
+        else:
+            torch.bmm(X, X.transpose(1, 2), out=A)
+            bgemm_epi(A, A, A, alpha=c, beta=b, out=Bm)
         bgemm_epi(Bm, X, X, alpha=1.0, beta=a, out=Xb)
         X, Xb = Xb, X
     if transposed:

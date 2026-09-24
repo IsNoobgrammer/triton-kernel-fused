@@ -71,12 +71,12 @@ def _bmmt_kernel(
         tl.store(ct_ptrs, tl.permute(c, (1, 0)), mask=ct_mask)
 
 
-def symmul(X, out=None):
+def symmul(X, out=None, min_dim=None):
     squeeze = X.ndim == 2
     if squeeze:
         X = X.unsqueeze(0)
     B, M, K = X.shape
-    if M < SYMMUL_MIN_DIM:
+    if M < (SYMMUL_MIN_DIM if min_dim is None else min_dim):
         Y = torch.bmm(X, X.transpose(1, 2)) if out is None else torch.bmm(X, X.transpose(1, 2), out=out)
         return Y.squeeze(0) if squeeze else Y
     X = X.contiguous()
@@ -144,13 +144,15 @@ def _bmmt_axpy_kernel(
         tl.store(ct_ptrs, tl.permute(c, (1, 0)), mask=ct_mask)
 
 
-def symmul_axpy(A, sa, saa, out=None):
+def symmul_axpy(A, sa, saa, out=None, min_dim=None):
     squeeze = A.ndim == 2
     if squeeze:
         A = A.unsqueeze(0)
     B, M, K = A.shape
-    if M < SYMMUL_MIN_DIM:
-        AA = torch.baddbmm(A, A, A, beta=sa, alpha=saa)
+    if M < (SYMMUL_MIN_DIM if min_dim is None else min_dim):
+        # out= MUST be honored: _amalg_eager ignores the return value and reads `out`. This used to
+        # drop it, leaving `out` as uninitialized torch.empty memory (garbage / NaN NS below 2048).
+        AA = torch.baddbmm(A, A, A, beta=sa, alpha=saa, out=out)
         return AA.squeeze(0) if squeeze else AA
     A = A.contiguous()
     Y = torch.empty((B, M, M), device=A.device, dtype=A.dtype) if out is None else out
@@ -197,14 +199,14 @@ except Exception:
     _amalg_compiled = None
 
 
-def _amalg_eager(X, coeffs):
+def _amalg_eager(X, coeffs, min_dim=None):
     Bsz, M, _ = X.shape
     A = torch.empty((Bsz, M, M), device=X.device, dtype=X.dtype)
     B = torch.empty_like(A)
     Xb = torch.empty_like(X)
     for a, b, c in coeffs:
-        symmul(X, out=A)
-        symmul_axpy(A, b, c, out=B)
+        symmul(X, out=A, min_dim=min_dim)
+        symmul_axpy(A, b, c, out=B, min_dim=min_dim)
         torch.baddbmm(X, B, X, beta=a, alpha=1.0, out=Xb)
         X, Xb = Xb, X
     return X
@@ -228,13 +230,13 @@ def newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e
     if transposed:
         X = X.transpose(1, 2)
     X = (X.to(ns_dtype) / nrm.to(ns_dtype)).contiguous()
-    if AMALG_COMPILE and not force_eager:
+    if AMALG_COMPILE and not force_eager and min_dim is None:
         try:
             X = _amalg_compiled(X, coeffs)
         except Exception:
             X = _amalg_eager(X, coeffs)
     else:
-        X = _amalg_eager(X, coeffs)
+        X = _amalg_eager(X, coeffs, min_dim)       # min_dim reaches the inner kernels' gates too
     if transposed:
         X = X.transpose(1, 2)
     if squeeze:
