@@ -82,3 +82,8 @@ def tail_post(p3, o3, alpha, decay):
     grid = (triton.cdiv(R, BR), triton.cdiv(C, BC), n)
     _post_kernel[grid](p3, o3, R, C, *p3.stride(), *o3.stride(), float(alpha), float(decay or 1.0),
                        HAS_DECAY=decay is not None, O_T=o_t, USE_FMA=FMA, BR=BR, BC=BC, num_warps=4)
+    # A Triton store is invisible to autograd's version counter, and kernels/sm75/moe.py:_cached_cast
+    # keys its bf16 weight-cast cache on (storage, _version): without this bump the MoE kept reading
+    # the STALE bf16 expert weights forever (params bit-identical to eager, forward not -- 50-step
+    # board runs 0.16 worse at step 45). Views share the counter, so bumping p3 bumps the parameter.
+    torch.autograd.graph.increment_version(p3)
