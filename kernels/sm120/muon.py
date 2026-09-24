@@ -2,54 +2,47 @@ import torch
 
 from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
-from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
-from kernels.sm120.newton_schulz_gram import newton_schulz_gram
-from kernels.sm120.newton_schulz_epi import newton_schulz_epi
+from kernels.sm120.ns_router import NSRouter, ORDER as NS_BACKENDS
 
 NS_BATCH_ELEMS = 8 * 1024 * 1024
 
 
 class FusedMuon(_FusedMuon75):
     """sm75 FusedMuon with the Blackwell Newton-Schulz backends. Only `_polar` changes: the step
-    loop, every variant and every decay mode are the shared sm75 code."""
+    loop, every variant and every decay mode are the shared sm75 code.
+
+    ns_backend  "auto" (default): per shape bucket, the fastest backend whose error vs an fp32 NS is
+                within ns_tol x cuBLAS's, decided once on the first step (see ns_router.py).
+                Or force one everywhere: "cublas" (no Triton) | "epi" | "symmul" | "gram".
+    ns_tol      auto only: allowed error ratio vs cuBLAS. 1.05 keeps cuBLAS-level accuracy (gram is
+                rejected at small shapes); raise it to let gram in where it is faster.
+    ns_pinned   auto only: {shape: backend} overrides, e.g. to reproduce a logged run exactly.
+    """
 
     DEFAULT_NS_DTYPE = torch.bfloat16
 
-    def __init__(self, *args, use_symmul=True, use_gram=True, gram_restarts=None, use_epi=False, **kwargs):
+    def __init__(self, *args, ns_backend="auto", gram_restarts=None, ns_tol=1.05, ns_pinned=None, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
-        if use_epi and use_gram:
-            raise ValueError("use_epi replaces the NS iteration; pass use_gram=False with it")
-        self.use_epi = use_epi
-        self.use_symmul = use_symmul
-        self.use_gram = use_gram
-        self.gram_restarts = gram_restarts
-
-    def _ns(self, u, force_eager=False):
-        if self.use_gram:
-            kw = {} if self.gram_restarts is None else {"restart_at": self.gram_restarts}
-            return newton_schulz_gram(u, self.coeffs, self.ns_dtype, force_eager=force_eager, **kw)
-        return newton_schulz_symmul(u, self.coeffs, self.ns_dtype, force_eager=force_eager)
+        if ns_backend != "auto" and ns_backend not in NS_BACKENDS:
+            raise ValueError(f"ns_backend must be 'auto' or one of {NS_BACKENDS}, got {ns_backend!r}")
+        self.ns_backend = ns_backend
+        cands = NS_BACKENDS if ns_backend == "auto" else (ns_backend,)
+        self.ns_router = NSRouter(self.coeffs, self.ns_dtype, candidates=cands, tol=ns_tol,
+                                  gram_restarts=gram_restarts, pinned=ns_pinned)
+        self._ns_fixed = None if ns_backend == "auto" else self.ns_router.fns[ns_backend]
 
     def _polar(self, u):
-        # use_symmul=False is the documented "no Triton at all" switch, so it must reach every
-        # variant (it used to leave aurora on the gram kernel).
-        if not self.use_symmul:
-            return newton_schulz(u, self.coeffs, self.ns_dtype)
-        if self.use_epi:      # cuBLAS X X^T + fused-epilogue Triton GEMMs, see newton_schulz_epi.py
-            return newton_schulz_epi(u, self.coeffs, self.ns_dtype)
-        return self._ns(u)
+        return self._ns_fixed(u) if self._ns_fixed is not None else self.ns_router(u)
 
     def _compute(self, work, decay):
-        if not self.use_symmul:
-            return super()._compute(work, decay)
         for params, f in decay:
             torch._foreach_mul_(params, f)
         for w in work:
             mom_c, gbuf = w["mom_c"], w["gbuf"]
             mom_c.mul_(w["momentum"]).add_(gbuf)
             u = gbuf.add_(mom_c, alpha=w["momentum"]) if w["nesterov"] else mom_c
-            out = self._ns(u, force_eager=True)
+            out = self._polar(u)
             torch._foreach_add_(w["out_params"],
                                 [out[o:o + n].reshape(p.shape) for p, o, n in w["members"]], alpha=w["alpha"])
 

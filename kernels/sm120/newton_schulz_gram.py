@@ -86,11 +86,15 @@ def symmul2(S1, S2, out=None):
 
 
 def newton_schulz_gram(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7,
-                       gram_dtype=None, restart_at=GRAM_RESTART_AT, force_eager=False):
+                       gram_dtype=None, restart_at=GRAM_RESTART_AT, force_eager=False,
+                       min_dim=None, min_ratio=None):
+    """min_dim / min_ratio: below these, fall back to symmul (None = SYMMUL_MIN_DIM / GRAM_MIN_RATIO;
+    the NS router passes 0 so the candidate it times is really gram)."""
     n, m = G.shape[-2], G.shape[-1]
     r = max(n, m) / min(n, m)
-    if min(n, m) < SYMMUL_MIN_DIM or r < GRAM_MIN_RATIO:
-        return newton_schulz_symmul(G, coeffs, ns_dtype, eps, force_eager=force_eager)
+    md = SYMMUL_MIN_DIM if min_dim is None else min_dim
+    if min(n, m) < md or r < (GRAM_MIN_RATIO if min_ratio is None else min_ratio):
+        return newton_schulz_symmul(G, coeffs, ns_dtype, eps, force_eager=force_eager, min_dim=md)
 
     orig_dtype = G.dtype
     squeeze = G.ndim == 2

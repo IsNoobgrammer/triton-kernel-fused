@@ -213,9 +213,11 @@ def _amalg_eager(X, coeffs):
 AMALG_COMPILE = _amalg_compiled is not None
 
 
-def newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7, force_eager=False):
+def newton_schulz_symmul(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7, force_eager=False,
+                         min_dim=None):
+    """min_dim: below this small side, fall back to cuBLAS (None = SYMMUL_MIN_DIM; the NS router passes 0)."""
     gram = min(G.shape[-2], G.shape[-1])
-    if gram < SYMMUL_MIN_DIM:
+    if gram < (SYMMUL_MIN_DIM if min_dim is None else min_dim):
         return _newton_schulz_cublas(G, coeffs, ns_dtype, eps)
 
     orig_dtype = G.dtype
