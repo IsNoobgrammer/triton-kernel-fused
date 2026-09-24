@@ -26,6 +26,10 @@ _CONFIGS = [
     ]
 ]
 EPI_BK = 64          # every config's BK divides this, so K % EPI_BK == 0 is the only shape rule
+# Below this many elements per NS call the epi path loses to cuBLAS: its 16 Triton launches per call
+# cost a ~0.64 ms floor (measured: router 9x64x512 0.33 -> 0.64 ms). The two paths are bit-identical,
+# so routing small calls to cuBLAS is free.
+EPI_MIN_ELEMS = 4 * 1024 * 1024
 
 
 # ponytail: key is (M, N, K, HAS_C) only, never the batch -- a grid-size key re-autotunes per batch
@@ -90,7 +94,7 @@ def newton_schulz_epi(G, coeffs=_DSV4_COEFFS, ns_dtype=torch.bfloat16, eps=1e-7)
         X = X.transpose(1, 2)
     X = X.to(ns_dtype) / nrm.to(ns_dtype)
     n, m, _ = X.shape
-    if m % EPI_BK:                                   # the small side is the K of both epi GEMMs
+    if m % EPI_BK or X.numel() < EPI_MIN_ELEMS:      # the small side is the K of both epi GEMMs
         from kernels.sm75.muon import newton_schulz
         return newton_schulz(G, coeffs, ns_dtype, eps)
     X = X.contiguous()
