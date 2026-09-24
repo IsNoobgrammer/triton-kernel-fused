@@ -14,14 +14,13 @@ NS8_COEFFS = (_KJ,) * 6 + (_PIN,) * 2
 
 class ManasOptimizer(FusedMuon):
     def __init__(self, params, lr=3e-4, probe_gamma=0.08, probe_rho=0.98,
-                 probe_rank=8, probe_refresh=None, comp=None, coeffs=NS8_COEFFS,
-                 scale_mode="aurora", aurora_k=1, probe_warmup_steps=0,
+                 probe_rank=8, probe_refresh=None, comp=None, ns_coeffs="ns8",
+                 variant="aurora", probe_warmup_steps=0,
                  rgd_tau=None, probe_norm="global", cos_beta=0.0,
                  micro_vote=False, nexus_gamma=0.0, probe_rho_step=None,
                  probe_gamma_intra=None, probe_sketch_rho=0.96, probe_sketch_votes=None,
                  probe_sketch_min_votes=None, probe_min_votes=2, **kw):
-        super().__init__(params, lr=lr, coeffs=coeffs, scale_mode=scale_mode,
-                         aurora_k=aurora_k, **kw)
+        super().__init__(params, lr=lr, ns_coeffs=ns_coeffs, variant=variant, **kw)
         self.probe_rho_step = None if probe_rho_step is None else float(probe_rho_step)
         if self.probe_rho_step is not None:
             if not micro_vote:

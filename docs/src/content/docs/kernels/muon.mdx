@@ -62,13 +62,14 @@ from kernels.sm120 import FusedMuon
 
 FusedMuon(
     params,
-    lr=3e-4,                           # AdamW-band: every scale_mode targets update RMS 0.2
+    lr=3e-4,                           # AdamW band: scale="adam" gives every variant update RMS 0.2
     momentum=0.95,
     nesterov=True,
     weight_decay=0.0,
     ns_dtype=torch.float16,            # fp16 (tensor cores); fp32 = safe fallback, bf16 = Ampere/Hopper
-    scale_mode="aurora",               # update row shape: "polar" | "normuon" | "aurora" (all AdamW LR band)
-    aurora_k=None,                     # aurora polar-solve count; None = default (1)
+    variant="aurora",                  # "polar" | "aurora" | "normuon" | "muown", or Aurora(k=2) / Muown(betas=...)
+    scale="adam",                      # "adam" = update RMS 0.2 (AdamW lr/wd carry over) | "none" = raw orthogonal update
+    ns_coeffs="dsv4",                  # NS schedule: "ns8" | "dsv4" | "quintic5" | "pe8", or a tuple of (a, b, c)
     ns_batch_elems=8 * 1024 * 1024,    # batched Newton-Schulz size cap (the memory gate); sm120 knee = 8M
     use_symmul=True,                   # MASTER Triton switch. False = pure-cuBLAS champion (no Triton)
     use_gram=True,                     # when Triton is on: Gram-space NS (default) vs symmul NS
@@ -98,8 +99,9 @@ AdamW for everything else.
 | `nesterov` | `True` | Use Nesterov momentum. |
 | `weight_decay` | `0.0` | Decoupled (AdamW-style) weight decay. |
 | `ns_dtype` | `torch.float16` | Newton-Schulz compute dtype. **fp16** for T4 tensor cores; **fp32** for a numerically-safe fallback; **bf16** only on Ampere/Hopper. Normalization is always fp32 regardless. |
-| `scale_mode` | `"aurora"` | Row shape of the update — see [Update scaling](#update-scaling-scale_mode). All modes target update RMS `0.2`, so **your AdamW LR and weight decay carry over** regardless of mode. Default `"aurora"` additionally fixes the tall-matrix "neuron death" issue. |
-| `aurora_k` | `None` | Number of prescale→orthogonalize passes for `scale_mode="aurora"` (`None` = 1). `1` matches the paper's `2` for our matrices at half the cost; `2` = full paper Aurora. Ignored for non-aurora modes. |
+| `variant` | `"aurora"` | Which Muon — see [Variants](#variants-variant). A name, or an instance carrying its own knobs: `Aurora(k=2)` (prescale→orthogonalize passes; `1` matches the paper's `2` for our matrices at half the cost), `NorMuon(beta2=0.95)`, `Muown(betas=(0.9, 0.95))`. |
+| `scale` | `"adam"` | `"adam"`: every variant's update has RMS `0.2`, so **your AdamW LR and weight decay carry over**. `"none"`: the raw orthogonalized update (unit singular values); retune the LR. |
+| `ns_coeffs` | `"dsv4"` | Newton-Schulz schedule. Presets in `muon_scaling.NS_PRESETS`: `"ns8"` (6 quintic + 2 finishing, the BiBo board), `"dsv4"` (8 + 2), `"quintic5"` (Keller Jordan / Muown reference), `"pe8"` (Polar Express). Or an explicit tuple of `(a, b, c)`, one per iteration. |
 | `ns_batch_elems` | `8M` (sm120) | Caps `rows × r × c` per batched Newton-Schulz call — the **memory gate**. `sm120` default is 8M (the Blackwell knee); `sm75` is 4M. |
 | `use_symmul` | `True` (sm120) | **Master Triton switch.** `True` runs a Triton Newton-Schulz backend (gram or symmul, per `use_gram`); `False` runs the pure-cuBLAS champion with **no Triton launched at all** (a Triton-free environment or an exact-reference run). When `False`, `use_gram` and `gram_restarts` are ignored. See [Three Newton-Schulz backends](#three-newton-schulz-backends). |
 | `use_gram` | `True` (sm120) | When Triton is on (`use_symmul=True`), selects the **Gram-space** NS (default, fastest) over the symmetric-matmul NS. Both self-gate by shape and fall back to cuBLAS for small matrices, so parity is preserved either way. See the [gram sub-page](/kernels/muon/gram/). |
@@ -198,22 +200,22 @@ Newton-Schulz dtype stays **fp16** on every arch: bf16's 7 mantissa bits orthogo
 fp16's 10, and Blackwell runs fp16 on full-rate tensor cores, so fp16 is both tighter and fast.
 </Aside>
 
-## Update scaling (`scale_mode`)
+## Variants (`variant`)
 
 Newton-Schulz returns an (approximately) orthogonal factor whose singular values are all ~1. Before it is
 applied as `p += -lr · update`, that factor is scaled. **Every mode targets update RMS `0.2`** — the
 Moonlight / DeepSeek-V4 convention — so **your AdamW learning rate and weight decay carry over unchanged,
 whatever mode you pick.** One less hyperparameter to tune. The NS iteration and its coefficients are
-untouched by `scale_mode`.
+untouched by `variant`.
 
 What the modes actually differ in is the **row shape** of the update (all in
 `kernels/muon/muon_scaling.py`, shared by `sm75` and `sm120`):
 
-| `scale_mode` | What it does | Rows | Orthogonal? |
+| `variant` | What it does | Rows | Orthogonal? |
 |---|---|---|---|
 | `"polar"` | Plain orthogonalized update `× 0.2·sqrt(max(rows, cols))`. | leverage-skewed on tall matrices | yes |
 | `"normuon"` | Per-row EMA second-moment normalize **after** the polar. | uniform | slightly broken by the post-hoc rescale |
-| `"aurora"` **(default)** | Divide rows by their norm **before** the polar and re-orthogonalize (`aurora_k` passes). | uniform | yes |
+| `"aurora"` **(default)** | Divide rows by their norm **before** the polar and re-orthogonalize (`Aurora(k)` passes). | uniform | yes |
 | `"muown"` | Not a row shape: reparameterizes the **weight** per row as `W = g · v/‖v‖` ([Muown, arXiv 2605.10797](https://arxiv.org/abs/2605.10797)). The direction `v` gets `polar` Muon on the radial-free gradient; the gain `g` gets Adam at the same LR. Row norms of `W` equal `g` exactly. Meant to run with `weight_decay=0`. `FusedMuon` only (not `DistributedMuon`); no `cautious_decay` / `xorth`. Parity vs the reference: `parity_check/parity_muown.py`. | set by `g` | direction step yes |
 
 **Why the default is `aurora` (the "neuron death" issue).** On a *tall* weight (rows ≫ cols) the plain
@@ -221,7 +223,7 @@ orthogonalized update has row norms that follow the matrix's leverage scores —
 update, others near zero, and the small ones can stall (the Tilde/Aurora finding). Square matrices are fine
 (uniform rows), so all three modes coincide there and `polar` is the cheapest. On rectangular weights,
 `normuon` fixes the row imbalance cheaply but post-hoc; `aurora` fixes it while keeping the update
-orthogonal, at the cost of `aurora_k` polar solves.
+orthogonal, at the cost of `k` polar solves.
 
 Earlier releases shipped extra modes (`moonlight`, `polarexpress`/`jordan`, `unormuon`,
 `unormuon_spectral`) that were these same three row shapes under different scalar conventions
@@ -231,11 +233,12 @@ variants collapse into `normuon`. They now raise a `ValueError` naming the repla
 
 ```python
 # default: leverage-aware, orthogonal, AdamW-band — reuse your AdamW LR:
-muon = FusedMuon(matrix_params, lr=3e-4)                             # scale_mode="aurora", aurora_k=1
+muon = FusedMuon(matrix_params, lr=3e-4)                             # variant="aurora" (k=1), scale="adam"
 
 # same LR band, other row shapes:
-muon = FusedMuon(matrix_params, lr=3e-4, scale_mode="polar")         # classic Muon direction
-muon = FusedMuon(matrix_params, lr=3e-4, scale_mode="normuon")       # cheap per-row fix
+muon = FusedMuon(matrix_params, lr=3e-4, variant="polar")            # classic Muon direction
+muon = FusedMuon(matrix_params, lr=3e-4, variant="normuon")          # cheap per-row fix
+muon = FusedMuon(matrix_params, lr=3e-4, variant="muown", weight_decay=0.0)  # Muon on direction, Adam on row gain
 ```
 
 ## Scaling the Newton-Schulz iteration count
@@ -279,7 +282,7 @@ so more iterations stay within the same memory gate.
 This is a runtime-scaling study: step time is set by the iteration **count** (three matmuls
 each), and the per-iteration coefficient values only affect orthogonalization quality. The 5
 Polar-Express tuples are tuned per iteration; for counts above 5 the settled (last) tuple is
-repeated to reach `N`. Pass your own `coeffs` tuple of length `N` to `FusedMuon` /
+repeated to reach `N`. Pass your own `ns_coeffs` tuple of length `N` to `FusedMuon` /
 `newton_schulz` to run `N` iterations.
 </Aside>
 
@@ -386,7 +389,7 @@ my_coeffs = (
     (3.4445, -4.7750, 2.0315),   # step 3
 )
 O = newton_schulz_symmul(G, coeffs=my_coeffs)          # runs 3 iterations
-opt = FusedMuon(matrix_params, coeffs=my_coeffs)       # same recipe inside the optimizer
+opt = FusedMuon(matrix_params, ns_coeffs=my_coeffs)    # same recipe inside the optimizer
 ```
 
 The default `_DSV4_COEFFS` is DeepSeek-V4's hybrid schedule (arXiv 2606.19348): 8 steps of the
@@ -410,7 +413,7 @@ def scaled_coeffs(n_iters: int):
         return _DSV4_COEFFS[:n_iters]
     return _DSV4_COEFFS + (_DSV4_COEFFS[-1],) * (n_iters - len(_DSV4_COEFFS))
 
-opt = FusedMuon(matrix_params, coeffs=scaled_coeffs(12))   # 12-step Newton-Schulz
+opt = FusedMuon(matrix_params, ns_coeffs=scaled_coeffs(12))   # 12-step Newton-Schulz
 ```
 
 More steps give tighter orthogonalization (SV closer to 1) at a linear cost in matmuls. On Blackwell the

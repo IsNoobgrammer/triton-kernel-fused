@@ -17,8 +17,8 @@ from kernels.sm120.muon import FusedMuon
 from kernels.sm120.manas import ManasOptimizer, NS8_COEFFS
 
 STEPS, ACCUM, SEED = 6, 4, 0
-MUON_KW = dict(lr=3e-3, momentum=0.95, weight_decay=0.1, coeffs=NS8_COEFFS,
-               ns_dtype=torch.float32, aurora_k=1, scale_mode="aurora",
+MUON_KW = dict(lr=3e-3, momentum=0.95, weight_decay=0.1, ns_coeffs=NS8_COEFFS,
+               ns_dtype=torch.float32, variant="aurora",
                cautious_decay=False, use_gram=False, use_symmul=False)
 
 

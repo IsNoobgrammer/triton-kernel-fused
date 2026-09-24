@@ -1,11 +1,9 @@
 from .muon_scaling import (
-    ALL_MODES, SCALAR_MODES, PERROW_MODES, AURORA_MODES, DEFAULT_MODE, RMS_TARGET, AURORA_K,
-    is_perrow, is_aurora, validate, scalar_scale, perrow_state, apply_perrow, aurora_update,
+    RMS_TARGET, SCALES, NS_PRESETS, VARIANTS, DEFAULT_VARIANT,
+    Variant, Polar, Aurora, NorMuon, Muown, make_variant, ns_coeffs, gain,
 )
 
 __all__ = [
-    "ALL_MODES", "SCALAR_MODES", "PERROW_MODES", "AURORA_MODES", "DEFAULT_MODE",
-    "RMS_TARGET", "AURORA_K",
-    "is_perrow", "is_aurora", "validate", "scalar_scale", "perrow_state",
-    "apply_perrow", "aurora_update",
+    "RMS_TARGET", "SCALES", "NS_PRESETS", "VARIANTS", "DEFAULT_VARIANT",
+    "Variant", "Polar", "Aurora", "NorMuon", "Muown", "make_variant", "ns_coeffs", "gain",
 ]

@@ -28,7 +28,7 @@ import manas_mnist1d as M
 from scale_mode_mnist1d import make_source, NS8
 from kernels.sm75.muon import FusedMuon
 
-MODES = ("polar", "aurora", "normuon", "aurora_ema", "aurora_ema_v2")
+MODES = ("polar", "aurora", "normuon", "muown")   # aurora_ema* deleted Sep 24 2026 (closed twice)
 # An ARM is "mode" or "mode@wd" (Muon-group weight decay; default 0.01). The Muown round runs
 # --arms aurora@0.01,aurora@0,muown@0,muown@0.01 -- aurora@0 is the control that says whether wd
 # matters at all here; without it, "muown is wd-insensitive" is unfalsifiable on this net.
@@ -82,7 +82,7 @@ def run(arm, seed, lr, S, steps, h, i, e, blocks):
     rest = [q for n, q in model.named_parameters() if q.ndim not in (2, 3) or "stem" in n]
     assert sum(1 for q in mp if q.ndim == 3) == 2 * blocks
     opt = FusedMuon([{"params": mp}], lr=lr, momentum=0.95, weight_decay=wd,
-                    coeffs=NS8, ns_dtype=torch.bfloat16, scale_mode=mode)
+                    ns_coeffs=NS8, ns_dtype=torch.bfloat16, variant=mode)
     aux = torch.optim.AdamW(rest, lr=lr, weight_decay=0.01)
 
     tr = {s: S[(s, seed)][0] for s in ("s0", "s1", "s2")}

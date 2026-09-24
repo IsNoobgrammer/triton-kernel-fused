@@ -1,4 +1,4 @@
-"""Parity: FusedMuon(scale_mode="muown") vs the reference Muown (github.com/kcc-lion/muown @3bd0c05).
+"""Parity: FusedMuon(variant="muown") vs the reference Muown (github.com/kcc-lion/muown @3bd0c05).
 
     python parity_check/parity_muown.py [--ref C:/Users/shaur/src/muown]
 
@@ -33,7 +33,7 @@ def run(ref_cls, wd, steps, dev):
     for w in init:
         ref += [torch.nn.Parameter(x.clone()) for x in (w.unbind(0) if w.ndim == 3 else [w])]
 
-    opt = FusedMuon(ours, lr=2e-2, weight_decay=wd, scale_mode="muown", ns_dtype=torch.float32)
+    opt = FusedMuon(ours, lr=2e-2, weight_decay=wd, variant="muown", ns_dtype=torch.float32)
     ropt = ref_cls(ref, lr=2e-2, weight_decay=wd, betas=S.MUOWN_BETAS, ns_steps=len(_DSV4_COEFFS))
     ropt._zeropower_fn = lambda G, steps: newton_schulz(G, _DSV4_COEFFS, torch.float32)
 
@@ -57,7 +57,7 @@ def run(ref_cls, wd, steps, dev):
         worst = max(worst, max((a - b.detach()).abs().max().item() for a, b in zip(flat, ref)))
 
         for p in ours:
-            st = opt.state[p].get("muown")
+            st = opt.state[p].get("variant")
             if st is None:
                 continue
             rn = torch.linalg.vector_norm(p.detach().reshape(-1, p.shape[-1]), dim=-1)

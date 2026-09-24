@@ -1,68 +1,177 @@
+"""Muon variants: WHAT the orthogonalized step does to a matrix, one class per optimizer.
+
+    FusedMuon(params, variant="aurora", scale="adam", ns_coeffs="ns8")
+
+variant   polar | aurora | normuon | muown        (or an instance, e.g. Aurora(k=2), Muown(betas=...))
+scale     "adam" -> every variant's update has RMS 0.2 (Moonlight / DeepSeek-V4 convention), so the
+                    AdamW lr and wd carry over unchanged. This is 0.2*sqrt(max(rows, cols)) on an
+                    orthogonal update; normuon renormalizes to exactly that RMS.
+          "none" -> the raw orthogonalized update (unit singular values). The lr must be retuned.
+ns_coeffs a preset name from NS_PRESETS or an explicit tuple of (a, b, c) per iteration.
+
+Every variant runs the same momentum, the same Newton-Schulz and the same decoupled wd; the only
+thing that differs is the row handling below, so an A/B between two variants changes one thing.
+"""
 import torch
 
-SCALAR_MODES = ("polar",)
-PERROW_MODES = ("normuon",)
-AURORA_MODES = ("aurora",)
-AURORA_EMA_MODES = ("aurora_ema", "aurora_ema_v2")
-MUOWN_MODES = ("muown",)
-ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES + AURORA_EMA_MODES + MUOWN_MODES
-DEFAULT_MODE = "aurora"
-
 RMS_TARGET = 0.2
+SCALES = ("adam", "none")
+
+_KJ = (3.4445, -4.7750, 2.0315)      # Keller Jordan quintic: fast growth of small singular values
+_PIN = (2.0, -1.5, 0.5)              # finishing step: pulls the singular values onto 1
+NS_PRESETS = {
+    "ns8": (_KJ,) * 6 + (_PIN,) * 2,                 # BiBo board default
+    "dsv4": (_KJ,) * 8 + (_PIN,) * 2,                # DeepSeek-V4 10-step schedule
+    "quintic5": (_KJ,) * 5,                          # Keller Jordan / Muown reference
+    "pe8": (
+        (8.28721201814563, -23.595886519098837, 17.300387312530933),
+        (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+        (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+        (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+        (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+        (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+        (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+        (1.875, -1.25, 0.375),
+    ),                                               # Polar Express 8-step
+}
 
 PERROW_BETA2 = 0.95
 PERROW_EPS = 1e-8
-AURORA_K = 1
-AURORA_BETA = 0.0
 
+# Removed names -> what to use. aurora_ema / aurora_ema_v2 were closed twice (137M four-way tie,
+# MNIST-1D five-way tie incl. polar): deleted Sep 24 2026, recoverable from git before that date.
 _REMOVED = {"moonlight": "polar", "polarexpress": "polar", "jordan": "polar",
-            "unormuon": "normuon", "unormuon_spectral": "normuon"}
+            "unormuon": "normuon", "unormuon_spectral": "normuon",
+            "aurora_ema": "aurora", "aurora_ema_v2": "aurora"}
 
 
-def is_perrow(mode):
-    return mode in PERROW_MODES
+def ns_coeffs(spec):
+    if isinstance(spec, str):
+        if spec not in NS_PRESETS:
+            raise ValueError(f"unknown ns_coeffs preset {spec!r}; choose from {tuple(NS_PRESETS)}")
+        return NS_PRESETS[spec]
+    return tuple(tuple(c) for c in spec)
 
 
-def is_aurora(mode):
-    return mode in AURORA_MODES
+def validate_scale(scale):
+    if scale not in SCALES:
+        raise ValueError(f"unknown scale {scale!r}; choose from {SCALES}")
+    return scale
 
 
-def is_aurora_ema(mode):
-    return mode in AURORA_EMA_MODES
+def gain(scale, rows, cols):
+    """Multiplier that takes an orthogonal (rows, cols) update to the scale's RMS."""
+    return RMS_TARGET * (max(rows, cols) ** 0.5) if scale == "adam" else 1.0
 
 
-def is_muown(mode):
-    return mode in MUOWN_MODES
+class Variant:
+    """Base = polar. Subclasses override `direction`, or own the whole chunk step (Muown).
+
+    folds_gain: False -> the optimizer applies `gain` through the lr (alpha = -lr * gain), which
+                keeps polar bit-identical to the pre-refactor path; True -> direction() returns
+                an already-scaled update and alpha = -lr.
+    graphable:  the CUDA-graph fast path replays a fixed kernel sequence with no per-row state.
+    owns_step:  the variant replaces momentum + write-back for its chunk (Muown).
+    needs_weights: init_state reads the weight values (Muown); otherwise only the shape is used,
+                so the optimizer never materializes a copy of the weights for it.
+    """
+    name = "polar"
+    folds_gain = False
+    graphable = True
+    owns_step = False
+    needs_weights = False
+
+    def init_state(self, shape, device, W=None):
+        """shape (M, r, c) of a bucket; W its weights iff needs_weights -> state dict, or None."""
+        return None
+
+    def direction(self, u, polar, state, scale, rows, cols):
+        return polar(u)
+
+    def __repr__(self):
+        return f"{type(self).__name__}()"
 
 
-def needs_perrow_state(mode):
-    return mode in PERROW_MODES or mode in AURORA_EMA_MODES
+class Polar(Variant):
+    pass
 
 
-def folds_scale(mode):
-    return mode in AURORA_MODES or mode in PERROW_MODES or mode in AURORA_EMA_MODES
+class Aurora(Variant):
+    """Divide each momentum row by its norm, THEN orthogonalize (k passes). Uniform rows, orthogonal."""
+    name = "aurora"
+    folds_gain = True
+    graphable = False
+
+    def __init__(self, k=1):
+        self.k = int(k)
+
+    def direction(self, u, polar, state, scale, rows, cols):
+        return aurora_update(u, polar, gain=gain(scale, rows, cols), K=self.k)
+
+    def __repr__(self):
+        return f"Aurora(k={self.k})"
 
 
-def validate(mode):
-    if mode in _REMOVED:
-        raise ValueError(f"scale_mode {mode!r} was removed; use {_REMOVED[mode]!r} "
-                         f"(all modes now share the AdamW LR band, update RMS {RMS_TARGET})")
-    if mode not in ALL_MODES:
-        raise ValueError(f"unknown scale_mode {mode!r}; choose from {ALL_MODES}")
-    return mode
+class NorMuon(Variant):
+    """Orthogonalize, then divide rows by an EMA of their mean square; renormalize the whole update."""
+    name = "normuon"
+    folds_gain = True
+    graphable = False
+
+    def __init__(self, beta2=PERROW_BETA2, eps=PERROW_EPS):
+        self.beta2, self.eps = float(beta2), float(eps)
+
+    def init_state(self, shape, device, W=None):
+        return {"v": torch.zeros(shape[:-1], device=device, dtype=torch.float32)}
+
+    def direction(self, u, polar, state, scale, rows, cols):
+        fro = RMS_TARGET * (rows * cols) ** 0.5 if scale == "adam" else min(rows, cols) ** 0.5
+        return apply_perrow(polar(u), state["v"], fro, self.beta2, self.eps)
+
+    def __repr__(self):
+        return f"NorMuon(beta2={self.beta2:g})"
 
 
-def scalar_scale(mode, rows, cols):
-    if mode == "polar":
-        return RMS_TARGET * (max(rows, cols) ** 0.5)
-    raise ValueError(f"{mode!r} is not a scalar scale_mode")
+class Muown(Variant):
+    """W_i = g_i * v_i/||v_i||: Muon on the direction v, Adam on the per-row gain g, same lr.
+    arXiv 2605.10797; reference github.com/kcc-lion/muown optim/muown.py @3bd0c05."""
+    name = "muown"
+    folds_gain = True
+    graphable = False
+    owns_step = True
+    needs_weights = True
+
+    def __init__(self, betas=None, eps=None):
+        self.betas = tuple(betas) if betas is not None else MUOWN_BETAS
+        self.eps = float(eps) if eps is not None else MUOWN_EPS
+
+    def init_state(self, shape, device, W=None):
+        return muown_state(W)
+
+    def __repr__(self):
+        return f"Muown(betas={self.betas})"
 
 
-def perrow_state(M, rows, device):
-    return torch.zeros((M, rows), device=device, dtype=torch.float32)
+VARIANTS = {"polar": Polar, "aurora": Aurora, "normuon": NorMuon, "muown": Muown}
+DEFAULT_VARIANT = "aurora"
 
 
-def aurora_update(M, polar_fn, gain=None, K=AURORA_K, beta=AURORA_BETA, eps=PERROW_EPS):
+def make_variant(spec):
+    if isinstance(spec, Variant):
+        return spec
+    if spec in _REMOVED:
+        raise ValueError(f"variant {spec!r} was removed; use {_REMOVED[spec]!r}")
+    if spec not in VARIANTS:
+        raise ValueError(f"unknown variant {spec!r}; choose from {tuple(VARIANTS)}")
+    return VARIANTS[spec]()
+
+
+def slice_state(state, start, n):
+    """Per-row state tensors are stacked over a bucket's matrices; take one chunk's rows."""
+    return None if state is None else {k: v[start:start + n] for k, v in state.items()}
+
+
+def aurora_update(M, polar_fn, gain=None, K=1, beta=0.0, eps=PERROW_EPS):
     rows, cols = M.shape[-2], M.shape[-1]
     if gain is None:
         gain = RMS_TARGET * (max(rows, cols) ** 0.5)
@@ -83,44 +192,14 @@ def aurora_update(M, polar_fn, gain=None, K=AURORA_K, beta=AURORA_BETA, eps=PERR
     return (gain * X).to(dt)
 
 
-def aurora_ema_update(M, polar_fn, v_ema, gain=None, beta2=PERROW_BETA2, eps=PERROW_EPS):
-    rows, cols = M.shape[-2], M.shape[-1]
-    if gain is None:
-        gain = RMS_TARGET * (max(rows, cols) ** 0.5)
-    tgt = (min(rows, cols) / rows) ** 0.5
-    dt = M.dtype
-    rn = torch.linalg.vector_norm(M, dim=-1, dtype=torch.float32)
-    fro = torch.linalg.vector_norm(rn, dim=-1).clamp_min(eps)
-    row_ms = (rn / fro.unsqueeze(-1)).square() / cols
-    v_ema.mul_(beta2).add_(row_ms, alpha=1.0 - beta2)
-    D = v_ema.sqrt().clamp_min(eps)
-    X = polar_fn((M * (tgt / (fro.unsqueeze(-1) * D)).unsqueeze(-1)).to(dt))
-    return (X * gain).to(dt)
-
-
-def aurora_ema_v2_update(M, polar_fn, v_ema, gain=None, K=AURORA_K, beta2=PERROW_BETA2, eps=PERROW_EPS):
-    rows, cols = M.shape[-2], M.shape[-1]
-    if gain is None:
-        gain = RMS_TARGET * (max(rows, cols) ** 0.5)
-    O = aurora_update(M, polar_fn, gain=gain, K=K).float()
-    row_sq = O.mul(O).mean(dim=-1)
-    v_ema.mul_(beta2).add_(row_sq, alpha=1.0 - beta2)
-    Ohat = O / v_ema.sqrt().add(eps).unsqueeze(-1)
-    fro = Ohat.flatten(-2).norm(dim=-1).clamp_min(1e-12)
-    C = RMS_TARGET * (rows * cols) ** 0.5
-    return (Ohat * (C / fro).view(*fro.shape, 1, 1)).to(M.dtype)
-
-
-def apply_perrow(mode, O, v, beta2=PERROW_BETA2, eps=PERROW_EPS):
-    if mode not in PERROW_MODES:
-        raise ValueError(f"{mode!r} is not a per-row scale_mode")
+def apply_perrow(O, v, fro, beta2=PERROW_BETA2, eps=PERROW_EPS):
+    """NorMuon row normalize: rows / sqrt(EMA of row mean-square), then Frobenius -> `fro`."""
     rows, cols = O.shape[-2], O.shape[-1]
     rn = torch.linalg.vector_norm(O, dim=-1, dtype=torch.float32)
     v.mul_(beta2).add_(rn.square() / cols, alpha=1.0 - beta2)
     inv = 1.0 / (v.sqrt() + eps)
-    fro = torch.linalg.vector_norm(rn * inv, dim=-1).clamp_min(1e-12)
-    C = RMS_TARGET * (rows * cols) ** 0.5
-    mult = inv * (C / fro).unsqueeze(-1)
+    nrm = torch.linalg.vector_norm(rn * inv, dim=-1).clamp_min(1e-12)
+    mult = inv * (fro / nrm).unsqueeze(-1)
     return (O * mult.unsqueeze(-1)).to(O.dtype)
 
 
@@ -236,8 +315,8 @@ def _selfcheck():
     for (m, n) in [(2048, 2048), (8192, 2048), (2048, 8192)]:
         O = torch.randn(2, m, n, device=dev)
         O = O / O.flatten(1).norm(dim=1).view(-1, 1, 1) * (min(m, n) ** 0.5)
-        v = perrow_state(2, m, dev)
-        T = apply_perrow("normuon", O, v)
+        nm = NorMuon()
+        T = nm.direction(O, lambda x: x, nm.init_state(O.shape, O.device), "adam", m, n)
         rn = T[0].norm(dim=-1)
         cv = (rn.std() / rn.mean()).item()
         dead = (rn < 0.1 * rn.mean()).float().mean().item()
@@ -246,13 +325,13 @@ def _selfcheck():
         assert abs(rms_pr - RMS_TARGET) / RMS_TARGET < 0.05, f"normuon {m}x{n}: RMS {rms_pr:.4f}"
         Q = torch.linalg.qr(torch.randn(1, max(m, n), min(m, n), device=dev))[0]
         Q = Q if m >= n else Q.transpose(-2, -1)
-        rms_sc = (scalar_scale("polar", m, n) * Q).pow(2).mean().sqrt().item()
-        rms_au = aurora_update(Q, lambda x: x, K=1).pow(2).mean().sqrt().item()
+        rms_sc = (gain("adam", m, n) * Q).pow(2).mean().sqrt().item()
+        rms_au = Aurora().direction(Q, lambda x: x, None, "adam", m, n).pow(2).mean().sqrt().item()
         for name, rms in [("polar", rms_sc), ("aurora", rms_au)]:
             assert abs(rms - RMS_TARGET) / RMS_TARGET < 0.05, f"{name} {m}x{n}: RMS {rms:.4f}"
         print(f"{m:>5}x{n:<5}  RMS  polar {rms_sc:.4f}  normuon {rms_pr:.4f}  aurora {rms_au:.4f}"
               f"  | normuon row-CV {cv:.4f} dead {dead:.0%}")
-    print(f"muon_scaling self-check PASS (all modes AdamW band, RMS {RMS_TARGET})")
+    print(f"muon_scaling self-check PASS (scale='adam' -> RMS {RMS_TARGET} for every variant)")
 
 
 if __name__ == "__main__":
