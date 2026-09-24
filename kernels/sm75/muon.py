@@ -50,11 +50,12 @@ class FusedMuon(optim.Optimizer):
                  ns_batch_elems=4 * 1024 * 1024, use_graph=False, graph_warmup=3, aurora_k=None,
                  spectral_wd=0.0, swd_beta=0.99, xorth_post=0.0, xorth_backend="ns",
                  xorth_ns_iters=18, xorth_ema=0.95, xorth_gate_ref=0.3,
-                 xorth_warmup_steps=0, xorth_where="post", cautious_decay=False):
+                 xorth_warmup_steps=0, xorth_where="post", cautious_decay=False, muown_betas=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay,
                         xorth_post=float(xorth_post))
         super().__init__(params, defaults)
         self.cautious_decay = bool(cautious_decay)
+        self.muown_betas = tuple(muown_betas) if muown_betas is not None else _scaling.MUOWN_BETAS
         self.coeffs = coeffs
         self.ns_dtype = ns_dtype if ns_dtype is not None else self.DEFAULT_NS_DTYPE
         self.scale_mode = _scaling.validate(scale_mode)
@@ -130,6 +131,9 @@ class FusedMuon(optim.Optimizer):
                 members.append((p, off, n)); off += n
             M = off
             anchor = ps[0]
+            if _scaling.is_muown(self.scale_mode) and "muown" not in self.state[anchor]:
+                self.state[anchor]["muown"] = _scaling.muown_state(
+                    torch.cat([p.detach().reshape(n, r, c) for p, _o, n in members]))
             if "muon_mom" not in self.state[anchor]:
                 self.state[anchor]["muon_mom"] = torch.zeros((M, r, c), device=anchor.device, dtype=self.ns_dtype)
             if _scaling.needs_perrow_state(self.scale_mode) and "scale_v" not in self.state[anchor]:
@@ -149,6 +153,32 @@ class FusedMuon(optim.Optimizer):
             plan.append({"r": r, "c": c, "M": M, "chunks": chunks, "anchor": anchor, "scale": scale})
         cache[key] = plan
         return plan
+
+    def _muown_chunk(self, g, members, start, crows, mom_c, lr, momentum, nesterov, wd):
+        # Muown step for one chunk. Momentum sees the DIRECTION gradient, not dL/dW; the weight is
+        # written back by recomposition, so decoupled wd is applied after (reference order) and g
+        # resynced. self._xorth_step is the global step count (bumped once per step()) -> Adam t.
+        # ponytail: the reference splits qkv (rows == 3*cols) into 3 NS calls; skipped because no
+        # other scale_mode here does, so the aurora-vs-muown A/B stays apples-to-apples.
+        r, c = g["r"], g["c"]
+        st = self.state[g["anchor"]]["muown"]
+        sl = slice(start, start + crows)
+        gg, vn, m, s = st["g"][sl], st["vn"][sl], st["m"][sl], st["s"][sl]
+        W = torch.cat([p.reshape(n, r, c).float() for p, _o, n in members])
+        G = torch.cat([p.grad.reshape(n, r, c).float() for p, _o, n in members])
+        v, grad_g, grad_v = _scaling.muown_split(W, G, gg, vn)
+        gv = grad_v.to(mom_c.dtype)
+        mom_c.mul_(momentum).add_(gv)
+        u = gv.add_(mom_c, alpha=momentum) if nesterov else mom_c
+        v.add_(self._polar(u).float(), alpha=-lr * _scaling.RMS_TARGET * max(r, c) ** 0.5)
+        _scaling.muown_adam_g(gg, m, s, grad_g, lr, self._xorth_step, self.muown_betas)
+        W_new, vn_new = _scaling.muown_compose(v, gg)
+        vn.copy_(vn_new)
+        if wd != 0:
+            W_new.add_(W, alpha=-lr * wd)
+            gg.copy_(torch.linalg.vector_norm(W_new, dim=-1))
+        for p, o, n in members:
+            p.copy_(W_new[o:o + n].reshape(p.shape))
 
     def _build_graph_work(self):
         if self._gwork is not None:
@@ -238,7 +268,7 @@ class FusedMuon(optim.Optimizer):
         if (self.use_graph and self.spectral_wd == 0
                 and not any(g.get("xorth_post", 0) > 0 for g in self.param_groups)
                 and not (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)
-                         or _scaling.is_aurora_ema(self.scale_mode))):
+                         or _scaling.is_aurora_ema(self.scale_mode) or _scaling.is_muown(self.scale_mode))):
             self._graph_step()
             return loss
 
@@ -254,7 +284,11 @@ class FusedMuon(optim.Optimizer):
             plan = self._plan(group, params)
             spectral = self.spectral_wd > 0 and wd != 0
             cautious = self.cautious_decay and wd != 0 and not spectral
-            if wd != 0 and not spectral and not cautious:
+            muown = _scaling.is_muown(self.scale_mode)
+            if muown and (spectral or cautious or do_xorth):
+                raise NotImplementedError("scale_mode 'muown' does not compose with spectral_wd / "
+                                          "cautious_decay / xorth")
+            if wd != 0 and not spectral and not cautious and not muown:
                 torch._foreach_mul_(params, 1.0 - lr * wd)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
@@ -268,6 +302,9 @@ class FusedMuon(optim.Optimizer):
                 sc_alpha = -lr if _scaling.folds_scale(self.scale_mode) else alpha
                 for members, start, crows in g["chunks"]:
                     mom_c = mom[start:start + crows]
+                    if muown:
+                        self._muown_chunk(g, members, start, crows, mom_c, lr, momentum, nesterov, wd)
+                        continue
                     gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
                     torch._foreach_copy_([gbuf[o:o + n] for _, o, n in members],
                                          [p.grad.reshape(n, r, c) for p, o, n in members])
@@ -312,6 +349,8 @@ class DistributedMuon(FusedMuon):
 
     def __init__(self, params, *, process_group=None, **kwargs):
         super().__init__(params, **kwargs)
+        if _scaling.is_muown(self.scale_mode):
+            raise NotImplementedError("scale_mode 'muown' is only supported by FusedMuon, not DistributedMuon")
         if _scaling.is_aurora_ema(self.scale_mode):
             raise NotImplementedError("scale_mode 'aurora_ema' is only supported by FusedMuon, not DistributedMuon")
         self.pg = process_group

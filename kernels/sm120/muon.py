@@ -32,7 +32,7 @@ class FusedMuon(_FusedMuon75):
     @torch.no_grad()
     def step(self, closure=None):
         _eager_mode = (_scaling.is_perrow(self.scale_mode) or _scaling.is_aurora(self.scale_mode)
-                       or _scaling.is_aurora_ema(self.scale_mode))
+                       or _scaling.is_aurora_ema(self.scale_mode) or _scaling.is_muown(self.scale_mode))
         _sm75_only = self.spectral_wd > 0
         if not self.use_symmul or _sm75_only or (self.use_graph and not _eager_mode):
             return super().step(closure)
@@ -49,13 +49,16 @@ class FusedMuon(_FusedMuon75):
                                           group["weight_decay"], group["nesterov"])
             plan = self._plan(group, params)
             cautious = self.cautious_decay and wd != 0
-            if wd != 0 and not cautious:
+            muown = _scaling.is_muown(self.scale_mode)
+            if wd != 0 and not cautious and not muown:
                 torch._foreach_mul_(params, 1.0 - lr * wd)
             perrow = _scaling.is_perrow(self.scale_mode)
             aurora = _scaling.is_aurora(self.scale_mode)
             aurora_ema = _scaling.is_aurora_ema(self.scale_mode)
             xp = group["xorth_post"]
             do_xorth = xp > 0 and self._xorth_step > self.xorth_warmup_steps
+            if muown and (cautious or do_xorth):
+                raise NotImplementedError("scale_mode 'muown' does not compose with cautious_decay / xorth")
             for g in plan:
                 r, c = g["r"], g["c"]
                 mom = self.state[g["anchor"]]["muon_mom"]
@@ -63,6 +66,9 @@ class FusedMuon(_FusedMuon75):
                 alpha = -lr * g["scale"]
                 for members, start, crows in g["chunks"]:
                     mom_c = mom[start:start + crows]
+                    if muown:
+                        self._muown_chunk(g, members, start, crows, mom_c, lr, momentum, nesterov, wd)
+                        continue
                     gbuf = torch.empty((crows, r, c), device=mom.device, dtype=self.ns_dtype)
                     torch._foreach_copy_([gbuf[o:o + n] for _, o, n in members],
                                          [p.grad.reshape(n, r, c) for p, o, n in members])

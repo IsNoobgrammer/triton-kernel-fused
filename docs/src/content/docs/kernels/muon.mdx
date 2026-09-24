@@ -214,6 +214,7 @@ What the modes actually differ in is the **row shape** of the update (all in
 | `"polar"` | Plain orthogonalized update `× 0.2·sqrt(max(rows, cols))`. | leverage-skewed on tall matrices | yes |
 | `"normuon"` | Per-row EMA second-moment normalize **after** the polar. | uniform | slightly broken by the post-hoc rescale |
 | `"aurora"` **(default)** | Divide rows by their norm **before** the polar and re-orthogonalize (`aurora_k` passes). | uniform | yes |
+| `"muown"` | Not a row shape: reparameterizes the **weight** per row as `W = g · v/‖v‖` ([Muown, arXiv 2605.10797](https://arxiv.org/abs/2605.10797)). The direction `v` gets `polar` Muon on the radial-free gradient; the gain `g` gets Adam at the same LR. Row norms of `W` equal `g` exactly. Meant to run with `weight_decay=0`. `FusedMuon` only (not `DistributedMuon`); no `cautious_decay` / `xorth`. Parity vs the reference: `parity_check/parity_muown.py`. | set by `g` | direction step yes |
 
 **Why the default is `aurora` (the "neuron death" issue).** On a *tall* weight (rows ≫ cols) the plain
 orthogonalized update has row norms that follow the matrix's leverage scores — some neurons get a large

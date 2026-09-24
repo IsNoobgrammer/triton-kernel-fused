@@ -4,7 +4,8 @@ SCALAR_MODES = ("polar",)
 PERROW_MODES = ("normuon",)
 AURORA_MODES = ("aurora",)
 AURORA_EMA_MODES = ("aurora_ema", "aurora_ema_v2")
-ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES + AURORA_EMA_MODES
+MUOWN_MODES = ("muown",)
+ALL_MODES = SCALAR_MODES + PERROW_MODES + AURORA_MODES + AURORA_EMA_MODES + MUOWN_MODES
 DEFAULT_MODE = "aurora"
 
 RMS_TARGET = 0.2
@@ -28,6 +29,10 @@ def is_aurora(mode):
 
 def is_aurora_ema(mode):
     return mode in AURORA_EMA_MODES
+
+
+def is_muown(mode):
+    return mode in MUOWN_MODES
 
 
 def needs_perrow_state(mode):
@@ -188,6 +193,41 @@ def spectral_wd_mult(u, e_ema, gamma, beta=0.99, eps=1e-12):
     s = (e_ema / mean).clamp_min(eps).pow(-gamma)
     s = s / s.mean(dim=-1, keepdim=True).clamp_min(eps)
     return s.clamp(0.25, 4.0), cov
+
+
+# Muown (arXiv 2605.10797, reference github.com/kcc-lion/muown optim/muown.py @3bd0c05).
+# Every 2D row is W_i = g_i * v_i / ||v_i||. Muon moves the direction v, Adam moves the gain g,
+# at the SAME lr (Muon's step carries the 0.2*sqrt(max) AdamW-RMS match). All math is fp32 on
+# (n, r, c) stacks; g / vn / m / s are (n, r). Reference names: v_norm -> vn, m_g -> m, v_g -> s.
+MUOWN_BETAS = (0.9, 0.95)
+MUOWN_EPS = 1e-8
+
+
+def muown_state(W):
+    rn = torch.linalg.vector_norm(W.float(), dim=-1)
+    z = torch.zeros_like(rn)
+    return {"g": rn.clone(), "vn": rn.clone(), "m": z, "s": z.clone()}
+
+
+def muown_split(W, G, g, vn):
+    """(W, dL/dW) -> (v, dL/dg, dL/dv). Reference `_wn_pre_ns`, same op order."""
+    u = W / g.unsqueeze(-1)
+    grad_g = (G * u).sum(dim=-1)
+    grad_v = (g / vn).unsqueeze(-1) * (G - u * grad_g.unsqueeze(-1))
+    return u * vn.unsqueeze(-1), grad_g, grad_v
+
+
+def muown_adam_g(g, m, s, grad_g, lr, t, betas=MUOWN_BETAS, eps=MUOWN_EPS):
+    b1, b2 = betas
+    m.mul_(b1).add_(grad_g, alpha=1 - b1)
+    s.mul_(b2).addcmul_(grad_g, grad_g, value=1 - b2)
+    g.addcdiv_(m / (1 - b1 ** t), (s / (1 - b2 ** t)).sqrt().add_(eps), value=-lr)
+
+
+def muown_compose(v_new, g):
+    """W = g * v_new / ||v_new||; returns (W, new vn). Reference `_wn_recompose`."""
+    vn = torch.linalg.vector_norm(v_new, dim=-1)
+    return g.unsqueeze(-1) * (v_new / vn.unsqueeze(-1)), vn
 
 
 def _selfcheck():
