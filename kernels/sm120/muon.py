@@ -4,7 +4,8 @@ from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.ns_router import NSRouter, FAMILIES as NS_BACKENDS
 from kernels.sm120.newton_schulz_gram import GRAM_RESTART_AT
-from kernels.sm120.muon_tail import tail_pre, tail_post
+from kernels.sm120.muon_tail import tail_pre, tail_post, muown_pre, muown_post
+from kernels.muon import muon_scaling as _scaling
 
 NS_BATCH_ELEMS = 8 * 1024 * 1024
 
@@ -48,6 +49,24 @@ class FusedMuon(_FusedMuon75):
     @staticmethod
     def _tail_post(p3, o3, alpha, decay):
         tail_post(p3, o3, alpha, decay)
+
+    def _muown_chunk(self, g, members, start, crows, mom_c, lr, momentum, nesterov, wd):
+        # Same math as the sm75 eager chunk in two Triton passes around NS (muon_tail.py).
+        if not self._fused_tail:
+            return super()._muown_chunk(g, members, start, crows, mom_c, lr, momentum, nesterov, wd)
+        r, c = g["r"], g["c"]
+        var = self.variant
+        st = _scaling.slice_state(self.state[g["anchor"]]["variant"], start, crows)
+        dg = torch.empty((crows, r), device=mom_c.device, dtype=torch.float32)
+        gbuf = torch.empty((crows, r, c), device=mom_c.device, dtype=self.ns_dtype)
+        for p, o, n in members:
+            muown_pre(p.view(n, r, c), p.grad.reshape(n, r, c), _scaling.slice_state(st, o, n), dg[o:o + n],
+                      mom_c[o:o + n], gbuf[o:o + n], momentum, nesterov)
+        out = self._polar(gbuf if nesterov else mom_c)
+        step_a = -lr * _scaling.RMS_TARGET * max(r, c) ** 0.5 if self.scale == "adam" else -lr
+        for p, o, n in members:
+            muown_post(p.view(n, r, c), out[o:o + n], _scaling.slice_state(st, o, n), dg[o:o + n], step_a, lr,
+                       var.betas, var.eps, self._step_count, lr * wd)
 
     def _polar(self, u):
         if self._ns_fixed is not None:
