@@ -71,7 +71,7 @@ def _time(fn, u, reps=5, warm=2):
 
 class NSRouter:
     def __init__(self, coeffs, ns_dtype, candidates=FAMILIES, tol=1.05, margin=0.03, gram_restarts=None,
-                 pinned=None, probe_steps=3, verbose=True):
+                 pinned=None, probe_steps=10, verbose=True):
         bad = set(candidates) - set(FAMILIES)
         if bad:
             raise ValueError(f"unknown NS backend(s) {sorted(bad)}; choose from {FAMILIES}")
@@ -89,6 +89,7 @@ class NSRouter:
         """The single function a forced ns_backend uses (gram: its one configured placement)."""
         return next(self.fns[n] for n in self.fns if n.split("@")[0] == family)
 
+    @torch.compiler.disable      # host syncs, CUDA-event timing, .item(), dict state: never trace this
     def __call__(self, u):
         key = (tuple(u.shape), u.dtype)
         c = self.choice.get(key)
@@ -121,14 +122,16 @@ class NSRouter:
                 o = ref if name == "cublas" else self.fns[name](u)
                 s["rel"].append(((o.float() - o32).norm() / n32).item())
                 s["bit"] &= bool(torch.equal(o, ref))
-                s["ms"].append(_time(self.fns[name], u))
+                if not s["ms"]:                        # timing depends on the shape, not the data:
+                    s["ms"].append(_time(self.fns[name], u))   # time once, score accuracy every probe step
             except Exception as ex:                    # a candidate that cannot run here just loses
                 s["rel"].append(float("inf")); s["ms"].append(float("inf")); s["bit"] = False
                 s["err"] = repr(ex)[:80]
         return ref
 
     def _decide(self, key):
-        rows = {n: {"ms": min(s["ms"]), "rel": sum(s["rel"]) / len(s["rel"]), "bit": s["bit"]}
+        rows = {n: {"ms": min(s["ms"]), "rel": sum(s["rel"]) / len(s["rel"]), "bit": s["bit"],
+                    "rel_max": max(s["rel"]), "probes": len(s["rel"])}
                 for n, s in self._stats.pop(key).items() if n != "_seen"}
         # tol is relative to the BEST of the exact-arithmetic backends, not to cuBLAS alone: on a single
         # (1, 2048, 6144) matrix cuBLAS's own error was 1.25e-2 against epi's 5.49e-3, which loosened the

@@ -13,8 +13,9 @@ class FusedMuon(_FusedMuon75):
     loop, every variant and every decay mode are the shared sm75 code.
 
     ns_backend  "auto" (default): per shape bucket, the fastest backend whose error vs an fp32 NS is
-                within ns_tol x cuBLAS's, probed over the first ns_probe_steps steps (cuBLAS is applied
-                meanwhile) including every gram restart placement; see ns_router.py.
+                within ns_tol x the best exact backend's, probed over the first ns_probe_steps (10)
+                optimizer steps -- training applies the cuBLAS result meanwhile, i.e. exactly the
+                pre-router numerics -- including every gram restart placement; see ns_router.py.
                 Or force one everywhere: "cublas" (no Triton) | "epi" | "symepi" | "symmul" | "gram".
     gram_restarts  auto: None = search all placements, or pin one; forced gram: None = (4, 6).
     ns_tol      auto only: allowed error ratio vs cuBLAS. 1.05 keeps cuBLAS-level accuracy (gram is
@@ -25,7 +26,7 @@ class FusedMuon(_FusedMuon75):
     DEFAULT_NS_DTYPE = torch.bfloat16
 
     def __init__(self, *args, ns_backend="auto", gram_restarts=None, ns_tol=1.05, ns_pinned=None,
-                 ns_probe_steps=3, **kwargs):
+                 ns_probe_steps=10, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
         if ns_backend != "auto" and ns_backend not in NS_BACKENDS:

@@ -255,6 +255,10 @@ class FusedMuon(optim.Optimizer):
         return (self.use_graph and self.variant.graphable and self.spectral_wd == 0
                 and not any(g.get("xorth_post", 0) > 0 for g in self.param_groups))
 
+    # Kept out of any torch.compile graph: a compiled train step that calls opt.step() gets a graph
+    # break here instead of Dynamo tracing Python-side plan caches, per-row state dicts and (sm120)
+    # the NS router's host-synchronizing timing probes.
+    @torch.compiler.disable
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
