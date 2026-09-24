@@ -21,10 +21,16 @@ import torch
 
 from kernels.sm75.muon import newton_schulz as _cublas
 from kernels.sm120.newton_schulz_epi import newton_schulz_epi
-from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
+from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul, SYMMUL_MIN_DIM
 from kernels.sm120.newton_schulz_gram import newton_schulz_gram
 
 ORDER = ("cublas", "epi", "symmul", "gram")
+
+
+def _supported(name, shape):
+    # symmul is WRONG below its 2048 gate (rel err 9 to 3e3, and NaN, on 512-wide stacks; found by this
+    # router's accuracy check Sep 24 2026 -- the gate had always hidden it). Never time it there.
+    return not (name == "symmul" and min(shape[-2], shape[-1]) < SYMMUL_MIN_DIM)
 
 
 def _backends(coeffs, ns_dtype, gram_restarts):
@@ -81,6 +87,8 @@ class NSRouter:
         ref = self.fns["cublas"](u)
         rows = {}
         for name in self.candidates:
+            if not _supported(name, shape):
+                continue
             try:
                 o = self.fns[name](u)
                 rows[name] = {"ms": _time(self.fns[name], u),
