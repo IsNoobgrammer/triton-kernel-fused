@@ -4,6 +4,7 @@ from kernels.sm75.muon import newton_schulz, _PE_COEFFS, _DSV4_COEFFS
 from kernels.sm75.muon import FusedMuon as _FusedMuon75, DistributedMuon as _DistributedMuon75
 from kernels.sm120.newton_schulz_symmul import newton_schulz_symmul
 from kernels.sm120.newton_schulz_gram import newton_schulz_gram
+from kernels.sm120.newton_schulz_epi import newton_schulz_epi
 
 NS_BATCH_ELEMS = 8 * 1024 * 1024
 
@@ -14,9 +15,12 @@ class FusedMuon(_FusedMuon75):
 
     DEFAULT_NS_DTYPE = torch.bfloat16
 
-    def __init__(self, *args, use_symmul=True, use_gram=True, gram_restarts=None, **kwargs):
+    def __init__(self, *args, use_symmul=True, use_gram=True, gram_restarts=None, use_epi=False, **kwargs):
         kwargs.setdefault("ns_batch_elems", NS_BATCH_ELEMS)
         super().__init__(*args, **kwargs)
+        if use_epi and use_gram:
+            raise ValueError("use_epi replaces the NS iteration; pass use_gram=False with it")
+        self.use_epi = use_epi
         self.use_symmul = use_symmul
         self.use_gram = use_gram
         self.gram_restarts = gram_restarts
@@ -32,6 +36,8 @@ class FusedMuon(_FusedMuon75):
         # variant (it used to leave aurora on the gram kernel).
         if not self.use_symmul:
             return newton_schulz(u, self.coeffs, self.ns_dtype)
+        if self.use_epi:      # cuBLAS X X^T + fused-epilogue Triton GEMMs, see newton_schulz_epi.py
+            return newton_schulz_epi(u, self.coeffs, self.ns_dtype)
         return self._ns(u)
 
     def _compute(self, work, decay):
