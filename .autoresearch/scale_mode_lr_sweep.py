@@ -28,7 +28,7 @@ import manas_mnist1d as M
 from scale_mode_mnist1d import make_source, NS8
 from kernels.sm75.muon import FusedMuon
 
-MODES = ("polar", "aurora", "normuon", "muown")   # aurora_ema* deleted Sep 24 2026 (closed twice)
+MODES = ("base", "aurora", "normuon", "muown")   # aurora_ema* deleted Sep 24 2026 (closed twice)
 # An ARM is "mode" or "mode@wd" (Muon-group weight decay; default 0.01). The Muown round runs
 # --arms aurora@0.01,aurora@0,muown@0,muown@0.01 -- aurora@0 is the control that says whether wd
 # matters at all here; without it, "muown is wd-insensitive" is unfalsifiable on this net.

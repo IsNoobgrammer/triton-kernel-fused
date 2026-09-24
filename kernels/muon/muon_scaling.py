@@ -2,7 +2,7 @@
 
     FusedMuon(params, variant="aurora", scale="adam", ns_coeffs="ns8")
 
-variant   polar | aurora | normuon | muown        (or an instance, e.g. Aurora(k=2), Muown(betas=...))
+variant   base | aurora | normuon | muown        (or an instance, e.g. Aurora(k=2), Muown(betas=...))
 scale     "adam" -> every variant's update has RMS 0.2 (Moonlight / DeepSeek-V4 convention), so the
                     AdamW lr and wd carry over unchanged. This is 0.2*sqrt(max(rows, cols)) on an
                     orthogonal update; normuon renormalizes to exactly that RMS.
@@ -40,7 +40,7 @@ PERROW_EPS = 1e-8
 
 # Removed names -> what to use. aurora_ema / aurora_ema_v2 were closed twice (137M four-way tie,
 # MNIST-1D five-way tie incl. polar): deleted Sep 24 2026, recoverable from git before that date.
-_REMOVED = {"moonlight": "polar", "polarexpress": "polar", "jordan": "polar",
+_REMOVED = {"polar": "base", "moonlight": "base", "polarexpress": "base", "jordan": "base",
             "unormuon": "normuon", "unormuon_spectral": "normuon",
             "aurora_ema": "aurora", "aurora_ema_v2": "aurora"}
 
@@ -65,17 +65,17 @@ def gain(scale, rows, cols):
 
 
 class Variant:
-    """Base = polar. Subclasses override `direction`, or own the whole chunk step (Muown).
+    """Plain Muon (the update is the polar factor of the momentum). Subclasses override `direction`, or own the whole chunk step (Muown).
 
     folds_gain: False -> the optimizer applies `gain` through the lr (alpha = -lr * gain), which
-                keeps polar bit-identical to the pre-refactor path; True -> direction() returns
+                keeps base bit-identical to the pre-refactor path; True -> direction() returns
                 an already-scaled update and alpha = -lr.
     graphable:  the CUDA-graph fast path replays a fixed kernel sequence with no per-row state.
     owns_step:  the variant replaces momentum + write-back for its chunk (Muown).
     needs_weights: init_state reads the weight values (Muown); otherwise only the shape is used,
                 so the optimizer never materializes a copy of the weights for it.
     """
-    name = "polar"
+    name = "base"
     folds_gain = False
     graphable = True
     owns_step = False
@@ -92,8 +92,8 @@ class Variant:
         return f"{type(self).__name__}()"
 
 
-class Polar(Variant):
-    pass
+class Base(Variant):
+    """Plain Muon: no row handling. (Not Polar Express -- that is the "pe8" ns_coeffs preset.)"""
 
 
 class Aurora(Variant):
@@ -152,7 +152,7 @@ class Muown(Variant):
         return f"Muown(betas={self.betas})"
 
 
-VARIANTS = {"polar": Polar, "aurora": Aurora, "normuon": NorMuon, "muown": Muown}
+VARIANTS = {"base": Base, "aurora": Aurora, "normuon": NorMuon, "muown": Muown}
 DEFAULT_VARIANT = "aurora"
 
 
@@ -327,9 +327,9 @@ def _selfcheck():
         Q = Q if m >= n else Q.transpose(-2, -1)
         rms_sc = (gain("adam", m, n) * Q).pow(2).mean().sqrt().item()
         rms_au = Aurora().direction(Q, lambda x: x, None, "adam", m, n).pow(2).mean().sqrt().item()
-        for name, rms in [("polar", rms_sc), ("aurora", rms_au)]:
+        for name, rms in [("base", rms_sc), ("aurora", rms_au)]:
             assert abs(rms - RMS_TARGET) / RMS_TARGET < 0.05, f"{name} {m}x{n}: RMS {rms:.4f}"
-        print(f"{m:>5}x{n:<5}  RMS  polar {rms_sc:.4f}  normuon {rms_pr:.4f}  aurora {rms_au:.4f}"
+        print(f"{m:>5}x{n:<5}  RMS  base {rms_sc:.4f}  normuon {rms_pr:.4f}  aurora {rms_au:.4f}"
               f"  | normuon row-CV {cv:.4f} dead {dead:.0%}")
     print(f"muon_scaling self-check PASS (scale='adam' -> RMS {RMS_TARGET} for every variant)")
 

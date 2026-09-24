@@ -35,7 +35,7 @@ def newton_schulz(G, coeffs=_DSV4_COEFFS, ns_dtype=_NS_DTYPE, eps=1e-7):
 class FusedMuon(optim.Optimizer):
     """Muon for 2D/3D matrices (3D = batched per leading index, e.g. MoE expert stacks).
 
-    variant   "polar" | "aurora" | "normuon" | "muown", or a muon_scaling.Variant instance
+    variant   "base" | "aurora" | "normuon" | "muown", or a muon_scaling.Variant instance
     scale     "adam" (update RMS 0.2 -> AdamW lr/wd carry over) | "none" (raw orthogonal update)
     ns_coeffs Newton-Schulz schedule: a muon_scaling.NS_PRESETS name or explicit (a, b, c) tuples
     """
@@ -331,7 +331,7 @@ class DistributedMuon(FusedMuon):
 
     def __init__(self, params, *, process_group=None, **kwargs):
         super().__init__(params, **kwargs)
-        if not isinstance(self.variant, (_scaling.Polar, _scaling.Aurora, _scaling.NorMuon)):
+        if not isinstance(self.variant, (_scaling.Base, _scaling.Aurora, _scaling.NorMuon)):
             raise NotImplementedError(f"variant {self.variant.name!r} is only supported by FusedMuon, "
                                       "not DistributedMuon")
         self.pg = process_group
