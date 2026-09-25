@@ -29,7 +29,10 @@ import triton.language as tl
 
 __all__ = ["attn_xsa", "AttnXSA", "attn_xsa_reference"]
 
-BM, BN = 64, 64
+# Per-kernel tiles. dkdv/dq at 2 stages with 64x64 tiles need 115-124 KB of shared memory (> 101 KB
+# on sm120), so their tiles are set independently. Swept by parity_check/parity_attn_xsa.py --sweep.
+CFG = {"fwd": dict(BM=64, BN=64, warps=8, stages=2), "pre": dict(BM=64, warps=4),
+       "dkdv": dict(BM=64, BN=64, warps=8, stages=1), "dq": dict(BM=64, BN=64, warps=8, stages=1)}
 
 
 @triton.jit
@@ -280,11 +283,12 @@ class AttnXSA(torch.autograd.Function):
         Z = torch.empty_like(q) if xsa else O
         LSE = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         W = int(window) if window is not None else 0
-        _fwd[(triton.cdiv(S, BM), B * HKV)](
+        c = CFG["fwd"]
+        _fwd[(triton.cdiv(S, c["BM"]), B * HKV)](
             q, k, v, O, Z, LSE, A if A is not None else q, wq, wk, S, H, HKV, float(scale),
             float(q_scale), float(k_scale), float(eps), W,
-            GROUP=G, D=D, BM=BM, BN=BN, WINDOW=window is not None, XSA=bool(xsa),
-            HAS_A=A is not None, QK_NORM=qk_norm, num_warps=8, num_stages=2)
+            GROUP=G, D=D, BM=c["BM"], BN=c["BN"], WINDOW=window is not None, XSA=bool(xsa),
+            HAS_A=A is not None, QK_NORM=qk_norm, num_warps=c["warps"], num_stages=c["stages"])
         ctx.save_for_backward(q, k, v, O, LSE, A if A is not None else q.new_zeros(0),
                               q_norm_w if qk_norm else q.new_zeros(0),
                               k_norm_w if qk_norm else q.new_zeros(0))
@@ -305,25 +309,28 @@ class AttnXSA(torch.autograd.Function):
         DELTA = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         GA = torch.empty(B, H, S, device=q.device, dtype=torch.float32) if (xsa and has_a) else DELTA
         GVS = torch.empty(B, HKV, S, D, device=q.device, dtype=torch.float32) if xsa else DELTA
-        _bwd_pre[(triton.cdiv(S, BM), B * HKV)](
+        c = CFG["pre"]
+        _bwd_pre[(triton.cdiv(S, c["BM"]), B * HKV)](
             O, dZ, v, A if has_a else q, DO, DELTA, GA, GVS, S, H, HKV,
-            GROUP=G, D=D, BM=BM, XSA=xsa, HAS_A=has_a, num_warps=4)
+            GROUP=G, D=D, BM=c["BM"], XSA=xsa, HAS_A=has_a, num_warps=c["warps"])
         wq_ = wq if qk_norm else q
         wk_ = wk if qk_norm else q
         DK, DV = torch.empty_like(k), torch.empty_like(v)
-        nkb = triton.cdiv(S, BN)
+        c = CFG["dkdv"]
+        nkb = triton.cdiv(S, c["BN"])
         PWK = torch.empty(B * HKV * nkb, D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         _bwd_dkdv[(nkb, B * HKV)](
             q, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wq_, wk_, S, H, HKV, float(scale),
-            q_scale, k_scale, eps, W, GROUP=G, D=D, BM=BM, BN=BN, WINDOW=window is not None,
-            XSA=xsa, QK_NORM=qk_norm, num_warps=8, num_stages=1)   # 2 stages: 124 KB smem > 101 KB
+            q_scale, k_scale, eps, W, GROUP=G, D=D, BM=c["BM"], BN=c["BN"], WINDOW=window is not None,
+            XSA=xsa, QK_NORM=qk_norm, num_warps=c["warps"], num_stages=c["stages"])
         DQ = torch.empty_like(q)
-        nqb = triton.cdiv(S, BM)
+        c = CFG["dq"]
+        nqb = triton.cdiv(S, c["BM"])
         PWQ = torch.empty(B * HKV * nqb, D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         _bwd_dq[(nqb, B * HKV)](
             q, k, DO, LSE, DELTA, v, DQ, PWQ, wq_, wk_, S, H, HKV, float(scale), q_scale, k_scale,
-            eps, W, GROUP=G, D=D, BM=BM, BN=BN, WINDOW=window is not None, QK_NORM=qk_norm,
-            num_warps=8, num_stages=1)   # 2 stages: 115 KB smem > 101 KB
+            eps, W, GROUP=G, D=D, BM=c["BM"], BN=c["BN"], WINDOW=window is not None, QK_NORM=qk_norm,
+            num_warps=c["warps"], num_stages=c["stages"])
         d_alpha = None
         if xsa and has_a:
             d_alpha = (GA.sum(dim=(0, 2)) * (1.0 - A * A)).to(a_dtype)

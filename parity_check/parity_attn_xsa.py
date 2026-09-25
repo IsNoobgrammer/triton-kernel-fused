@@ -147,7 +147,64 @@ def bench():
                 print(f"     {name:42s} FAILED {type(ex).__name__}: {str(ex).splitlines()[0][:100]}", flush=True)
 
 
+def sweep():
+    """Greedy per-kernel tile sweep at the board shape; prints the winners and leaves them in CFG."""
+    import kernels.sm120.attn_xsa as AX
+    torch.manual_seed(0)
+    B, S = 64, 1024
+    q = torch.randn(B, H, S, D, device=dev).to(bf)
+    k = torch.randn(B, HKV, S, D, device=dev).to(bf)
+    v = torch.randn(B, HKV, S, D, device=dev).to(bf)
+    alpha = torch.randn(H, device=dev) * 0.5
+    wq, wk = torch.ones(D, device=dev), torch.ones(D, device=dev)
+    go = torch.randn(B, H, S, D, device=dev).to(bf)
+
+    def run(window, bwd, n=8):
+        ins = [x.detach().clone().requires_grad_() for x in (q, k, v, alpha, wq, wk)]
+        f = lambda: attn_xsa(*ins[:3], scale=SC, window=window, alpha=ins[3], q_norm_w=ins[4], k_norm_w=ins[5])
+        for _ in range(2):
+            o = f(); o.backward(go) if bwd else None
+        e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+        torch.cuda.synchronize(); e0.record()
+        for _ in range(n):
+            o = f()
+            if bwd:
+                o.backward(go)
+        e1.record(); torch.cuda.synchronize()
+        return e0.elapsed_time(e1) / n
+
+    space = {
+        "fwd": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
+                ((64, 64, 8, 2), (64, 64, 4, 2), (64, 64, 8, 3), (32, 64, 4, 2), (32, 64, 4, 3), (64, 32, 4, 3), (64, 128, 8, 2))],
+        "dkdv": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
+                 ((64, 64, 8, 1), (32, 64, 4, 2), (32, 64, 8, 2), (32, 64, 4, 3), (64, 32, 4, 2), (32, 32, 4, 2),
+                  (32, 32, 4, 3), (16, 64, 4, 3), (32, 128, 8, 2))],
+        "dq": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
+               ((64, 64, 8, 1), (32, 64, 4, 2), (32, 64, 8, 2), (64, 32, 8, 2), (64, 32, 4, 2), (32, 32, 4, 2),
+                (32, 32, 4, 3), (16, 64, 4, 2), (32, 64, 4, 3))],
+    }
+    for window in (None, 128):
+        print(f"== sweep, {'global causal' if window is None else f'window {window}'}")
+        for part in ("fwd", "dkdv", "dq"):
+            best = None
+            for cfg in space[part]:
+                AX.CFG[part] = cfg
+                try:
+                    t = run(window, bwd=(part != "fwd"))
+                except Exception as ex:
+                    print(f"   {part:5s} {cfg} FAILED {type(ex).__name__}", flush=True)
+                    continue
+                print(f"   {part:5s} {cfg}  {t:7.3f} ms", flush=True)
+                if best is None or t < best[0]:
+                    best = (t, cfg)
+            AX.CFG[part] = best[1]
+            print(f"   -> {part} best {best[1]} {best[0]:.3f} ms", flush=True)
+        print(f"   FINAL {window}: {AX.CFG}  fwd {run(window, False):.3f}  fwd+bwd {run(window, True):.3f}", flush=True)
+
+
 if __name__ == "__main__":
+    if "--sweep" in sys.argv:
+        sweep()
     good = main()
     if "--bench" in sys.argv:
         bench()
