@@ -202,6 +202,10 @@ def _fwd(Q, K, V, O, Z, LSE, A,
     ooff = b.to(tl.int64) * osb + h.to(tl.int64) * osh + s.to(tl.int64) * oss
     tl.store(O + ooff[:, None] + d[None, :], o.to(O.dtype.element_ty), mask=rmask[:, None])
     if XSA:
+        # XSA on the bf16-ROUNDED o, i.e. exactly the O the backward reads back: the alpha / v
+        # gradients are then taken at the same point the forward used (fp32 o here made d_alpha
+        # 1.67x noisier than production at S=4096)
+        o = o.to(O.dtype.element_ty).to(tl.float32)
         vs = tl.load(V + vb0 + s.to(tl.int64)[:, None] * vss + d[None, :], mask=rmask[:, None],
                      other=0.0).to(tl.float32)
         n2 = tl.sum(vs * vs, axis=1)
