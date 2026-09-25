@@ -149,7 +149,12 @@ class _CEFusedFwdBwd(torch.autograd.Function):
         lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
         tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
         gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype) if need_gh else None
-        gw = torch.zeros_like(weight) if need_gw else None
+        # FP32 OUTPUTS for both backward GEMMs (then one rounding). With a bf16 C, cuBLAS split-K
+        # on these small-M / K=V shapes rounded its partials, and dW was additionally re-rounded
+        # into a bf16 accumulator once per chunk: d_hidden 5.0e-3 and d_weight 4.4e-3 vs fp32,
+        # where plain PyTorch bf16 gets 3.7e-3 / 3.1e-3 (diag_ce_grad.py). fp32 C costs 0.13 ms
+        # per chunk. dW is returned in fp32 -- the lm_head master weight is fp32.
+        gw = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32) if need_gw else None
         for i in range(0, N, C):
             cl = min(C, N - i)
             hc = hidden[i:i + C]
@@ -166,9 +171,9 @@ class _CEFusedFwdBwd(torch.autograd.Function):
             if need_grad:
                 _grad_logits_inplace(logits, lse[i:i + C], labels[i:i + C], nv, ignore_index)
                 if need_gh:
-                    torch.mm(logits, weight, out=gh[i:i + C])
+                    gh[i:i + C] = torch.mm(logits, weight, out_dtype=torch.float32)
                 if need_gw:
-                    gw.addmm_(logits.t(), hc)
+                    torch.addmm(gw, logits.t(), hc, out_dtype=torch.float32, out=gw)
         loss = ((lse - tgt) * valid).sum() / n_valid
         ctx.save_for_backward(gh, gw)
         return loss
