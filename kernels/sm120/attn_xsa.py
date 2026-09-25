@@ -9,25 +9,26 @@ q (B, H, S, D), k / v (B, Hkv, S, D): bf16, ANY strides with a unit last dim -- 
 projection views transposed to (B, H, S, D) are read in place, and z / dq / dk / dv come back in
 the SAME layout as their input, so no .contiguous() copy happens on either side of attention.
   qk norm   q_norm_w / k_norm_w (D,) -> q' = q_scale * RMSNorm(q) * w_q (same for k). None = no
-            norm (q_scale / k_scale still multiply). The scalars are fixed hyperparameters.
+            norm. q_scale / k_scale are fixed hyperparameters, folded into the softmax scale.
   rope      cos / sin (S, D) or (B, S, D), HF rotate_half convention (tables are cat(f, f), so only
             the first half is read), applied AFTER the norm.
   window    None = causal over the whole sequence; W = key j visible to query i iff i-W < j <= i.
   xsa       z = o - a * (o.v_i / |v_i|^2) v_i with v_i the query position's own value row and
             a = tanh(alpha[h]) (alpha None -> a = 1). xsa=False returns o.
 
-Q and K tiles are held as two (rows, D/2) HALVES everywhere, so rotate_half is [-x2, x1] in
-registers and QK^T is two K=D/2 dots; V / O stay full width.
-
-Forward: one program per (query block, batch, kv head); BOTH query heads of the GQA group are
-stacked into one tile, so each K/V tile is loaded once per group. Online softmax; XSA in the
-epilogue (v_i is the V row at the query's own position).
-Backward, three passes, each output written by exactly one program (bitwise repeatable):
-  pre    XSA backward (dZ -> dO, self-value grad, per-row alpha-grad terms) + delta = dO . O
-  dkdv   one program per key block, loops over every query block that sees it (both heads)
-  dq     one program per query block, loops over its key blocks
-norm and RoPE are recomputed on every load and differentiated through at the store; norm-weight
-grads are per-program partial rows summed on the host in a fixed order.
+Layout of the work:
+  prep   (only with norm and/or RoPE) one pass per Q / K row -> rope(norm(x) * w) in bf16, so every
+         attention inner loop is plain bf16 loads + MMA; recomputed in the backward, never saved.
+  fwd    one program per (query block, batch, kv head); BOTH query heads of the GQA group stacked
+         into one tile, so each K/V tile is loaded once per group. Base-2 online softmax, masks
+         only on diagonal / window-edge / tail blocks, XSA in the epilogue (v_i is the V row at the
+         query's own position). Without XSA the output buffer doubles as O.
+  bwd    pre (XSA backward + delta = dO . O; without XSA dO is dZ itself), dkdv (one program per
+         key block), dq (one program per query block): every output written by exactly one
+         program, so the backward is bitwise repeatable. Norm / RoPE are differentiated at the
+         final store of dq / dk; norm-weight grads are per-program partials summed in fixed order.
+Q and K are held as two (rows, D/2) halves, so RoPE's rotate_half is [-x2, x1] in registers and
+QK^T is two chained K=D/2 MMAs into one accumulator.
 """
 import torch
 import triton
@@ -37,31 +38,31 @@ __all__ = ["attn_xsa", "AttnXSA", "attn_xsa_reference", "CFG"]
 
 LOG2E = 1.4426950408889634
 
-# Per-kernel tiles (swept at the board shape with parity_check/parity_attn_xsa.py --sweep).
-# Keyed by mode: "causal" (global layers) and "window" (SWA layers, usually with RoPE).
+# Per-kernel tiles, keyed by mode (swept with parity_check/parity_attn_xsa.py --sweep/--sweep_long).
 CFG = {
-    "causal": {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
-               "dkdv": dict(BM=64, BN=32, warps=8, stages=1), "dq": dict(BM=64, BN=32, warps=8, stages=2)},
-    "window": {"fwd": dict(BM=64, BN=32, warps=8, stages=2), "pre": dict(BM=64, warps=4),
-               "dkdv": dict(BM=32, BN=32, warps=4, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=2)},
+    "causal": {"fwd": dict(BM=64, BN=64, warps=8, stages=2), "pre": dict(BM=64, warps=4),
+               "dkdv": dict(BM=32, BN=32, warps=4, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=3)},
+    "window": {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
+               "dkdv": dict(BM=32, BN=32, warps=8, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=2)},
 }
+PREP_ROWS = 64
 
 
 @triton.jit
-def _qk_in(P, off, msk, pos, WN, COS, SIN, csb, css, cbase, scale, eps,
+def _qk_in(P, off, msk, pos, WN, COS, SIN, cbase, css, eps,
            D: tl.constexpr, HD: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
-    """Load rows at element offsets `off` -> transformed halves (fp32) + rstd + raw halves."""
+    """Raw rows at element offsets `off` -> rope(norm(x) * w) halves (fp32), rstd, raw halves."""
     dh = tl.arange(0, HD)
     x1 = tl.load(P + off[:, None] + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
     x2 = tl.load(P + off[:, None] + HD + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
     r = tl.sum(x1 * 0.0, axis=1) + 1.0
     if QK_NORM:
         r = 1.0 / tl.sqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / D + eps)
-        y1 = x1 * r[:, None] * tl.load(WN + dh).to(tl.float32)[None, :] * scale
-        y2 = x2 * r[:, None] * tl.load(WN + HD + dh).to(tl.float32)[None, :] * scale
+        y1 = x1 * r[:, None] * tl.load(WN + dh).to(tl.float32)[None, :]
+        y2 = x2 * r[:, None] * tl.load(WN + HD + dh).to(tl.float32)[None, :]
     else:
-        y1 = x1 * scale
-        y2 = x2 * scale
+        y1 = x1
+        y2 = x2
     if ROPE:                   # half tables: HF cos/sin are cat(f, f), both halves identical
         co = cbase + pos.to(tl.int64) * css
         c = tl.load(COS + co[:, None] + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
@@ -75,11 +76,11 @@ def _qk_in(P, off, msk, pos, WN, COS, SIN, csb, css, cbase, scale, eps,
 
 
 @triton.jit
-def _qk_back(g1, g2, x1, x2, r, pos, msk, WN, COS, SIN, cbase, css, scale,
+def _qk_back(g1, g2, x1, x2, r, pos, msk, WN, COS, SIN, cbase, css,
              D: tl.constexpr, HD: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
-    """Grad w.r.t. the transformed halves -> grad w.r.t. the raw halves + norm-weight grad terms."""
+    """Grad w.r.t. rope(norm(x) * w) -> grad w.r.t. raw x, plus the per-column norm-weight terms."""
     dh = tl.arange(0, HD)
-    if ROPE:                   # z1 = y1 c - y2 s, z2 = y2 c + y1 s  (transpose of the rotation)
+    if ROPE:                   # transpose of the rotation
         co = cbase + pos.to(tl.int64) * css
         c = tl.load(COS + co[:, None] + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
         sn = tl.load(SIN + co[:, None] + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
@@ -93,28 +94,48 @@ def _qk_back(g1, g2, x1, x2, r, pos, msk, WN, COS, SIN, cbase, css, scale,
         w2 = tl.load(WN + HD + dh).to(tl.float32)
         xh1 = x1 * r[:, None]
         xh2 = x2 * r[:, None]
-        gh1 = d1 * w1[None, :] * scale
-        gh2 = d2 * w2[None, :] * scale
+        gh1 = d1 * w1[None, :]
+        gh2 = d2 * w2[None, :]
         mu = (tl.sum(gh1 * xh1, axis=1) + tl.sum(gh2 * xh2, axis=1)) / D
         dx1 = r[:, None] * (gh1 - xh1 * mu[:, None])
         dx2 = r[:, None] * (gh2 - xh2 * mu[:, None])
-        dw1 = tl.sum(d1 * xh1 * scale, axis=0)
-        dw2 = tl.sum(d2 * xh2 * scale, axis=0)
+        dw1 = tl.sum(d1 * xh1, axis=0)
+        dw2 = tl.sum(d2 * xh2, axis=0)
     else:
-        dx1 = d1 * scale
-        dx2 = d2 * scale
+        dx1 = d1
+        dx2 = d2
         dw1 = tl.sum(d1 * 0.0, axis=0)
         dw2 = dw1
     return dx1, dx2, dw1, dw2
 
 
 @triton.jit
-def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, COS, SIN,
-         qsb, qsh, qss, ksb, ksh, kss, vsb, vsh, vss, osb, osh, oss, csb, css,
-         S, H, HKV, sm_scale, q_scale, k_scale, eps, W,
+def _prep(X, OUT, WN, COS, SIN, xsb, xsh, xss, csb, css, NR, S, NH, eps,
+          D: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr, BR: tl.constexpr):
+    """rope(norm(x) * w) for every (b, h, s) row of a (B, NH, S, D) tensor, into a contiguous bf16
+    copy. Row-local, so the attention loops never redo it per tile."""
+    HD: tl.constexpr = D // 2
+    r_ = tl.program_id(0) * BR + tl.arange(0, BR)
+    msk = r_ < NR
+    s = r_ % S
+    bh = r_ // S
+    b = bh // NH
+    h = bh % NH
+    off = b.to(tl.int64) * xsb + h.to(tl.int64) * xsh + s.to(tl.int64) * xss
+    z1, z2, _r, _a, _b = _qk_in(X, off, msk, s, WN, COS, SIN, b.to(tl.int64) * csb, css, eps,
+                                D, HD, QK_NORM, ROPE)
+    dh = tl.arange(0, HD)
+    o = r_.to(tl.int64)[:, None] * D + dh[None, :]
+    tl.store(OUT + o, z1.to(OUT.dtype.element_ty), mask=msk[:, None])
+    tl.store(OUT + o + HD, z2.to(OUT.dtype.element_ty), mask=msk[:, None])
+
+
+@triton.jit
+def _fwd(Q, K, V, O, Z, LSE, A,
+         qsb, qsh, qss, ksb, ksh, kss, vsb, vsh, vss, osb, osh, oss, zsb, zsh, zss,
+         S, H, HKV, sm_scale, W,
          GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-         WINDOW: tl.constexpr, XSA: tl.constexpr, HAS_A: tl.constexpr, QK_NORM: tl.constexpr,
-         ROPE: tl.constexpr):
+         WINDOW: tl.constexpr, XSA: tl.constexpr, HAS_A: tl.constexpr):
     HD: tl.constexpr = D // 2
     pid_m = tl.program_id(0)
     pid = tl.program_id(1)
@@ -126,12 +147,10 @@ def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, COS, SIN,
     h = kvh * GROUP + r_ // BM
     rmask = s < S
     d = tl.arange(0, D)
-    cbase = b.to(tl.int64) * csb
+    dh = tl.arange(0, HD)
     qoff = b.to(tl.int64) * qsb + h.to(tl.int64) * qsh + s.to(tl.int64) * qss
-    q1, q2, _qr, _qa, _qb = _qk_in(Q, qoff, rmask, s, WQ, COS, SIN, csb, css, cbase, q_scale, eps,
-                                   D, HD, QK_NORM, ROPE)
-    q1 = q1.to(tl.bfloat16)
-    q2 = q2.to(tl.bfloat16)
+    q1 = tl.load(Q + qoff[:, None] + dh[None, :], mask=rmask[:, None], other=0.0)
+    q2 = tl.load(Q + qoff[:, None] + HD + dh[None, :], mask=rmask[:, None], other=0.0)
     kb0 = b.to(tl.int64) * ksb + kvh.to(tl.int64) * ksh
     vb0 = b.to(tl.int64) * vsb + kvh.to(tl.int64) * vsh
     m_i = tl.full((GROUP * BM,), float("-inf"), tl.float32)
@@ -144,15 +163,14 @@ def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, COS, SIN,
     for n0 in range(lo, hi, BN):
         n = n0 + tl.arange(0, BN)
         nmask = n < S
-        k1, k2, _kr, _ka, _kb = _qk_in(K, kb0 + n.to(tl.int64) * kss, nmask, n, WK, COS, SIN, csb, css,
-                                       cbase, k_scale, eps, D, HD, QK_NORM, ROPE)
+        koff = kb0 + n.to(tl.int64) * kss
+        k1 = tl.load(K + koff[:, None] + dh[None, :], mask=nmask[:, None], other=0.0)
+        k2 = tl.load(K + koff[:, None] + HD + dh[None, :], mask=nmask[:, None], other=0.0)
         v = tl.load(V + vb0 + n.to(tl.int64)[:, None] * vss + d[None, :], mask=nmask[:, None], other=0.0)
-        # base-2 softmax: log2(e) is folded into sm_scale by the host
-        qk = (tl.dot(q1, tl.trans(k1.to(tl.bfloat16))) + tl.dot(q2, tl.trans(k2.to(tl.bfloat16)))) * sm_scale
-        # only blocks touching the diagonal, the window's lower edge or the sequence tail need a mask
-        edge = (n0 + BN > m0) | (n0 + BN > S)
+        qk = tl.dot(q2, tl.trans(k2), tl.dot(q1, tl.trans(k1))) * sm_scale   # base 2: log2e in sm_scale
+        edge = (n0 + BN > m0) | (n0 + BN > S)            # diagonal / tail blocks need a mask
         if WINDOW:
-            edge = edge | (n0 < m0 + BM - W)
+            edge = edge | (n0 < m0 + BM - W)              # ... and the window's lower edge
         if edge:
             valid = (n[None, :] <= s[:, None]) & nmask[None, :]
             if WINDOW:
@@ -163,7 +181,7 @@ def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, COS, SIN,
         corr = tl.exp2(m_i - m_safe)
         p = tl.exp2(qk - m_safe[:, None])
         l_i = l_i * corr + tl.sum(p, axis=1)
-        acc = acc * corr[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        acc = tl.dot(p.to(tl.bfloat16), v, acc * corr[:, None])
         m_i = m_new
     l_safe = tl.where(l_i > 0.0, l_i, 1.0)
     o = acc / l_safe[:, None]
@@ -179,7 +197,8 @@ def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, COS, SIN,
         if HAS_A:
             c = c * tl.load(A + h).to(tl.float32)
         o = o - c[:, None] * vs
-        tl.store(Z + qoff[:, None] + d[None, :], o.to(Z.dtype.element_ty), mask=rmask[:, None])
+        zoff = b.to(tl.int64) * zsb + h.to(tl.int64) * zsh + s.to(tl.int64) * zss
+        tl.store(Z + zoff[:, None] + d[None, :], o.to(Z.dtype.element_ty), mask=rmask[:, None])
 
 
 @triton.jit
@@ -226,9 +245,9 @@ def _bwd_pre(O, DZ, V, A, DO, DELTA, GA, GVS, zsb, zsh, zss, vsb, vsh, vss, osb,
 
 
 @triton.jit
-def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WQ, WK, COS, SIN,
-              qsb, qsh, qss, ksb, ksh, kss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
-              S, H, HKV, sm_scale, nat_scale, q_scale, k_scale, eps, W,
+def _bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN,
+              qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
+              S, H, HKV, sm_scale, nat_scale, eps, W,
               GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
               WINDOW: tl.constexpr, XSA: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
     HD: tl.constexpr = D // 2
@@ -241,13 +260,10 @@ def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WQ, WK, COS, SIN,
     nmask = n < S
     d = tl.arange(0, D)
     dh = tl.arange(0, HD)
-    cbase = b.to(tl.int64) * csb
     koff = b.to(tl.int64) * ksb + kvh.to(tl.int64) * ksh + n.to(tl.int64) * kss
     voff = b.to(tl.int64) * vsb + kvh.to(tl.int64) * vsh + n.to(tl.int64) * vss
-    k1, k2, rk, kx1, kx2 = _qk_in(K, koff, nmask, n, WK, COS, SIN, csb, css, cbase, k_scale, eps,
-                                  D, HD, QK_NORM, ROPE)
-    k1b = k1.to(tl.bfloat16)
-    k2b = k2.to(tl.bfloat16)
+    k1 = tl.load(KN + koff[:, None] + dh[None, :], mask=nmask[:, None], other=0.0)
+    k2 = tl.load(KN + koff[:, None] + HD + dh[None, :], mask=nmask[:, None], other=0.0)
     v = tl.load(V + voff[:, None] + d[None, :], mask=nmask[:, None], other=0.0)
     dk1 = tl.zeros((BN, HD), tl.float32)
     dk2 = tl.zeros((BN, HD), tl.float32)
@@ -262,48 +278,54 @@ def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WQ, WK, COS, SIN,
         edge = (m0 < n0 + BN) | (m0 + BM > S) | (n0 + BN > S)
         if WINDOW:
             edge = edge | (m0 + BM - 1 - n0 >= W)
-        valid = (n[:, None] <= s[None, :]) & smask[None, :] & nmask[:, None]
-        if WINDOW:
-            valid = valid & ((s[None, :] - n[:, None]) < W)
         for jj in tl.static_range(GROUP):
             h = kvh * GROUP + jj
             qoff = b.to(tl.int64) * qsb + h.to(tl.int64) * qsh + s.to(tl.int64) * qss
-            q1, q2, _qr, _qa, _qb = _qk_in(Q, qoff, smask, s, WQ, COS, SIN, csb, css, cbase, q_scale, eps,
-                                           D, HD, QK_NORM, ROPE)
-            q1b = q1.to(tl.bfloat16)
-            q2b = q2.to(tl.bfloat16)
+            q1 = tl.load(QN + qoff[:, None] + dh[None, :], mask=smask[:, None], other=0.0)
+            q2 = tl.load(QN + qoff[:, None] + HD + dh[None, :], mask=smask[:, None], other=0.0)
             irow = (b * H + h).to(tl.int64) * S + s
             dooff = b.to(tl.int64) * dsb + h.to(tl.int64) * dsh + s.to(tl.int64) * dss
             do = tl.load(DO + dooff[:, None] + d[None, :], mask=smask[:, None], other=0.0)
             lse = tl.load(LSE + irow, mask=smask, other=0.0)
             dl = tl.load(DELTA + irow, mask=smask, other=0.0)
-            st = (tl.dot(k1b, tl.trans(q1b)) + tl.dot(k2b, tl.trans(q2b))) * sm_scale   # (BN, BM) = S^T, base 2
+            st = tl.dot(k2, tl.trans(q2), tl.dot(k1, tl.trans(q1))) * sm_scale   # (BN, BM) = S^T
             p = tl.exp2(st - lse[None, :])
             if edge:
+                valid = (n[:, None] <= s[None, :]) & smask[None, :] & nmask[:, None]
+                if WINDOW:
+                    valid = valid & ((s[None, :] - n[:, None]) < W)
                 p = tl.where(valid, p, 0.0)
-            dv += tl.dot(p.to(tl.bfloat16), do)
+            dv = tl.dot(p.to(tl.bfloat16), do, dv)
             dp = tl.dot(v, tl.trans(do))
             ds = (p * (dp - dl[None, :])).to(tl.bfloat16)
-            dk1 += tl.dot(ds, q1b)
-            dk2 += tl.dot(ds, q2b)
-    dx1, dx2, dw1, dw2 = _qk_back(dk1 * nat_scale, dk2 * nat_scale, kx1, kx2, rk, n, nmask, WK, COS, SIN,
-                                  cbase, css, k_scale, D, HD, QK_NORM, ROPE)
-    if QK_NORM:
-        pw = (pid.to(tl.int64) * tl.num_programs(0) + pid_n) * D
-        tl.store(PWK + pw + dh, dw1)
-        tl.store(PWK + pw + HD + dh, dw2)
+            dk1 = tl.dot(ds, q1, dk1)
+            dk2 = tl.dot(ds, q2, dk2)
+    dk1 = dk1 * nat_scale
+    dk2 = dk2 * nat_scale
+    if QK_NORM or ROPE:
+        roff = b.to(tl.int64) * rsb + kvh.to(tl.int64) * rsh + n.to(tl.int64) * rss
+        cbase = b.to(tl.int64) * csb
+        _z1, _z2, rk, kx1, kx2 = _qk_in(KR, roff, nmask, n, WK, COS, SIN, cbase, css, eps, D, HD, QK_NORM, ROPE)
+        dk1, dk2, dw1, dw2 = _qk_back(dk1, dk2, kx1, kx2, rk, n, nmask, WK, COS, SIN, cbase, css,
+                                      D, HD, QK_NORM, ROPE)
+        if QK_NORM:
+            pw = (pid.to(tl.int64) * tl.num_programs(0) + pid_n) * D
+            tl.store(PWK + pw + dh, dw1)
+            tl.store(PWK + pw + HD + dh, dw2)
+    else:
+        roff = b.to(tl.int64) * rsb + kvh.to(tl.int64) * rsh + n.to(tl.int64) * rss
     if XSA:
         dv += tl.load(GVS + ((b * HKV + kvh).to(tl.int64) * S + n)[:, None] * D + d[None, :],
                       mask=nmask[:, None], other=0.0)
-    tl.store(DK + koff[:, None] + dh[None, :], dx1.to(DK.dtype.element_ty), mask=nmask[:, None])
-    tl.store(DK + koff[:, None] + HD + dh[None, :], dx2.to(DK.dtype.element_ty), mask=nmask[:, None])
+    tl.store(DK + roff[:, None] + dh[None, :], dk1.to(DK.dtype.element_ty), mask=nmask[:, None])
+    tl.store(DK + roff[:, None] + HD + dh[None, :], dk2.to(DK.dtype.element_ty), mask=nmask[:, None])
     tl.store(DV + voff[:, None] + d[None, :], dv.to(DV.dtype.element_ty), mask=nmask[:, None])
 
 
 @triton.jit
-def _bwd_dq(Q, K, V, DO, LSE, DELTA, DQ, PWQ, WQ, WK, COS, SIN,
-            qsb, qsh, qss, ksb, ksh, kss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
-            S, H, HKV, sm_scale, nat_scale, q_scale, k_scale, eps, W,
+def _bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
+            qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
+            S, H, HKV, sm_scale, nat_scale, eps, W,
             GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
             WINDOW: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
     HD: tl.constexpr = D // 2
@@ -318,12 +340,9 @@ def _bwd_dq(Q, K, V, DO, LSE, DELTA, DQ, PWQ, WQ, WK, COS, SIN,
     rmask = s < S
     d = tl.arange(0, D)
     dh = tl.arange(0, HD)
-    cbase = b.to(tl.int64) * csb
     qoff = b.to(tl.int64) * qsb + h.to(tl.int64) * qsh + s.to(tl.int64) * qss
-    q1, q2, rq, qx1, qx2 = _qk_in(Q, qoff, rmask, s, WQ, COS, SIN, csb, css, cbase, q_scale, eps,
-                                  D, HD, QK_NORM, ROPE)
-    q1b = q1.to(tl.bfloat16)
-    q2b = q2.to(tl.bfloat16)
+    q1 = tl.load(QN + qoff[:, None] + dh[None, :], mask=rmask[:, None], other=0.0)
+    q2 = tl.load(QN + qoff[:, None] + HD + dh[None, :], mask=rmask[:, None], other=0.0)
     irow = (b * H + h).to(tl.int64) * S + s
     dooff = b.to(tl.int64) * dsb + h.to(tl.int64) * dsh + s.to(tl.int64) * dss
     do = tl.load(DO + dooff[:, None] + d[None, :], mask=rmask[:, None], other=0.0)
@@ -340,12 +359,11 @@ def _bwd_dq(Q, K, V, DO, LSE, DELTA, DQ, PWQ, WQ, WK, COS, SIN,
     for n0 in range(lo, hi, BN):
         n = n0 + tl.arange(0, BN)
         nmask = n < S
-        k1, k2, _kr, _ka, _kb = _qk_in(K, kb0 + n.to(tl.int64) * kss, nmask, n, WK, COS, SIN, csb, css,
-                                       cbase, k_scale, eps, D, HD, QK_NORM, ROPE)
-        k1b = k1.to(tl.bfloat16)
-        k2b = k2.to(tl.bfloat16)
+        koff = kb0 + n.to(tl.int64) * kss
+        k1 = tl.load(KN + koff[:, None] + dh[None, :], mask=nmask[:, None], other=0.0)
+        k2 = tl.load(KN + koff[:, None] + HD + dh[None, :], mask=nmask[:, None], other=0.0)
         v = tl.load(V + vb0 + n.to(tl.int64)[:, None] * vss + d[None, :], mask=nmask[:, None], other=0.0)
-        qk = (tl.dot(q1b, tl.trans(k1b)) + tl.dot(q2b, tl.trans(k2b))) * sm_scale
+        qk = tl.dot(q2, tl.trans(k2), tl.dot(q1, tl.trans(k1))) * sm_scale
         p = tl.exp2(qk - lse[:, None])
         edge = (n0 + BN > m0) | (n0 + BN > S)
         if WINDOW:
@@ -357,16 +375,22 @@ def _bwd_dq(Q, K, V, DO, LSE, DELTA, DQ, PWQ, WQ, WK, COS, SIN,
             p = tl.where(valid, p, 0.0)
         dp = tl.dot(do, tl.trans(v))
         ds = (p * (dp - dl[:, None])).to(tl.bfloat16)
-        dq1 += tl.dot(ds, k1b)
-        dq2 += tl.dot(ds, k2b)
-    dx1, dx2, dw1, dw2 = _qk_back(dq1 * nat_scale, dq2 * nat_scale, qx1, qx2, rq, s, rmask, WQ, COS, SIN,
-                                  cbase, css, q_scale, D, HD, QK_NORM, ROPE)
-    if QK_NORM:
-        pw = (pid.to(tl.int64) * tl.num_programs(0) + pid_m) * D
-        tl.store(PWQ + pw + dh, dw1)
-        tl.store(PWQ + pw + HD + dh, dw2)
-    tl.store(DQ + qoff[:, None] + dh[None, :], dx1.to(DQ.dtype.element_ty), mask=rmask[:, None])
-    tl.store(DQ + qoff[:, None] + HD + dh[None, :], dx2.to(DQ.dtype.element_ty), mask=rmask[:, None])
+        dq1 = tl.dot(ds, k1, dq1)
+        dq2 = tl.dot(ds, k2, dq2)
+    dq1 = dq1 * nat_scale
+    dq2 = dq2 * nat_scale
+    roff = b.to(tl.int64) * rsb + h.to(tl.int64) * rsh + s.to(tl.int64) * rss
+    if QK_NORM or ROPE:
+        cbase = b.to(tl.int64) * csb
+        _z1, _z2, rq, qx1, qx2 = _qk_in(QR, roff, rmask, s, WQ, COS, SIN, cbase, css, eps, D, HD, QK_NORM, ROPE)
+        dq1, dq2, dw1, dw2 = _qk_back(dq1, dq2, qx1, qx2, rq, s, rmask, WQ, COS, SIN, cbase, css,
+                                      D, HD, QK_NORM, ROPE)
+        if QK_NORM:
+            pw = (pid.to(tl.int64) * tl.num_programs(0) + pid_m) * D
+            tl.store(PWQ + pw + dh, dw1)
+            tl.store(PWQ + pw + HD + dh, dw2)
+    tl.store(DQ + roff[:, None] + dh[None, :], dq1.to(DQ.dtype.element_ty), mask=rmask[:, None])
+    tl.store(DQ + roff[:, None] + HD + dh[None, :], dq2.to(DQ.dtype.element_ty), mask=rmask[:, None])
 
 
 _FIT = {}
@@ -402,6 +426,18 @@ def _like(t):
     return torch.empty_strided(t.shape, t.stride(), device=t.device, dtype=t.dtype)
 
 
+def _prepped(x, w, cos, sin, csb, css, eps, qk_norm, rope):
+    """rope(norm(x) * w) as a contiguous bf16 (B, NH, S, D) tensor, or x itself when neither applies."""
+    if not (qk_norm or rope):
+        return x
+    B, NH, S, D = x.shape
+    out = torch.empty(B, NH, S, D, device=x.device, dtype=x.dtype)
+    NR = B * NH * S
+    _prep[(triton.cdiv(NR, PREP_ROWS),)](x, out, w if qk_norm else x, cos, sin, *_st(x), csb, css, NR, S, NH,
+                                         float(eps), D=D, QK_NORM=qk_norm, ROPE=rope, BR=PREP_ROWS, num_warps=4)
+    return out
+
+
 class AttnXSA(torch.autograd.Function):
 
     @staticmethod
@@ -415,79 +451,83 @@ class AttnXSA(torch.autograd.Function):
         qk_norm = q_norm_w is not None
         rope = cos is not None
         A = torch.tanh(alpha.float()).contiguous() if alpha is not None else None
-        wq = q_norm_w.contiguous() if qk_norm else q
-        wk = k_norm_w.contiguous() if qk_norm else q
+        wq = q_norm_w.contiguous() if qk_norm else None
+        wk = k_norm_w.contiguous() if qk_norm else None
         if rope:
-            # HF tables are cat(freqs, freqs): the kernel reads ONE half (S, D/2) and uses it for both
+            # HF tables are cat(freqs, freqs): the kernels read ONE half (S, D/2) for both halves
             cos = cos[..., : D // 2].to(q.dtype).contiguous()
             sin = sin[..., : D // 2].to(q.dtype).contiguous()
             csb, css = (cos.stride(0), cos.stride(1)) if cos.dim() == 3 else (0, cos.stride(0))
         else:
             cos = sin = q
             csb = css = 0
+        qn = _prepped(q, wq, cos, sin, csb, css, eps, qk_norm, rope)
+        kn = _prepped(k, wk, cos, sin, csb, css, eps, qk_norm, rope)
         Z = _like(q)
-        # without XSA the attention output IS z: no separate O buffer
-        O = torch.empty(B, H, S, D, device=q.device, dtype=q.dtype) if xsa else Z
+        O = torch.empty(B, H, S, D, device=q.device, dtype=q.dtype) if xsa else Z   # no XSA: z IS o
         LSE = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         W = int(window) if window is not None else 0
         mode = "window" if window is not None else "causal"
-        flags = dict(WINDOW=window is not None, XSA=bool(xsa), HAS_A=A is not None, QK_NORM=qk_norm, ROPE=rope)
-        key = (mode, D, G, q.dtype, tuple(flags.values()))
-        _launch(_fwd, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), CFG[mode]["fwd"], ("fwd",) + key,
-                q, k, v, O, Z, LSE, A if A is not None else q, wq, wk, cos, sin,
-                *_st(q), *_st(k), *_st(v), *_st(O), csb, css, S, H, HKV, float(scale) * LOG2E,
-                float(q_scale), float(k_scale), float(eps), W, GROUP=G, D=D, **flags)
+        sm = float(scale) * float(q_scale) * float(k_scale)          # the scalars fold into the logits
+        flags = dict(WINDOW=window is not None, XSA=bool(xsa), HAS_A=A is not None)
+        _launch(_fwd, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), CFG[mode]["fwd"],
+                ("fwd", mode, D, G, q.dtype, tuple(flags.values())),
+                qn, kn, v, O, Z, LSE, A if A is not None else q,
+                *_st(qn), *_st(kn), *_st(v), *_st(O), *_st(Z), S, H, HKV, sm * LOG2E, W, GROUP=G, D=D, **flags)
         ctx.save_for_backward(q, k, v, O, LSE, A if A is not None else q.new_zeros(0),
-                              q_norm_w if qk_norm else q.new_zeros(0),
-                              k_norm_w if qk_norm else q.new_zeros(0), cos, sin)
-        ctx.cfg = (scale, window, bool(xsa), float(q_scale), float(k_scale), float(eps),
-                   A is not None, qk_norm, rope, csb, css, alpha.dtype if alpha is not None else None)
+                              wq if qk_norm else q.new_zeros(0), wk if qk_norm else q.new_zeros(0), cos, sin)
+        ctx.cfg = (sm, window, bool(xsa), float(eps), A is not None, qk_norm, rope, csb, css,
+                   alpha.dtype if alpha is not None else None,
+                   q_norm_w.dtype if qk_norm else None, k_norm_w.dtype if qk_norm else None)
         return Z
 
     @staticmethod
     def backward(ctx, dZ):
         q, k, v, O, LSE, A, wq, wk, cos, sin = ctx.saved_tensors
-        scale, window, xsa, q_scale, k_scale, eps, has_a, qk_norm, rope, csb, css, a_dtype = ctx.cfg
+        sm, window, xsa, eps, has_a, qk_norm, rope, csb, css, a_dtype, wq_dtype, wk_dtype = ctx.cfg
         B, H, S, D = q.shape
         HKV = k.shape[1]
         G = H // HKV
         if dZ.stride(-1) != 1:
             dZ = dZ.contiguous()
         W = int(window) if window is not None else 0
+        mode = "window" if window is not None else "causal"
+        cf = CFG[mode]
+        key = (mode, D, G, q.dtype, window is not None, xsa, has_a, qk_norm, rope)
         DO = torch.empty(B, H, S, D, device=q.device, dtype=q.dtype) if xsa else dZ   # no XSA: dO = dZ
         DELTA = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         GA = torch.empty(B, H, S, device=q.device, dtype=torch.float32) if (xsa and has_a) else DELTA
         GVS = torch.empty(B, HKV, S, D, device=q.device, dtype=torch.float32) if xsa else DELTA
-        mode = "window" if window is not None else "causal"
-        cf = CFG[mode]
-        key = (mode, D, G, q.dtype, window is not None, xsa, has_a, qk_norm, rope)
         c = cf["pre"]
         _bwd_pre[(triton.cdiv(S, c["BM"]), B * HKV)](
             O, dZ, v, A if has_a else q, DO, DELTA, GA, GVS, *_st(dZ), *_st(v), *_st(O), S, H, HKV,
             GROUP=G, D=D, BM=c["BM"], XSA=xsa, HAS_A=has_a, num_warps=c["warps"])
-        wq_ = wq if qk_norm else q
-        wk_ = wk if qk_norm else q
-        common = (*_st(q), *_st(k), *_st(v), *_st(DO), csb, css, S, H, HKV, float(scale) * LOG2E, float(scale),
-                  q_scale, k_scale, eps, W)
+        wq_ = wq if qk_norm else None
+        wk_ = wk if qk_norm else None
+        qn = _prepped(q, wq_, cos, sin, csb, css, eps, qk_norm, rope)     # recomputed, never saved
+        kn = _prepped(k, wk_, cos, sin, csb, css, eps, qk_norm, rope)
         DK, DV = _like(k), _like(v)
-        # the norm-weight partial buffers are sized by the tile count, so a fallback that changes BN
-        # (dkdv) or BM (dq) needs them re-allocated: size for the smallest tile the fallback can reach
+        # norm-weight partials are sized by the tile count, so allocate for the smallest tile the
+        # OutOfResources fallback can reach and slice to the real count afterwards
         PWK = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
+        common = (csb, css, S, H, HKV, sm * LOG2E, sm, float(eps), W)
         c = _launch(_bwd_dkdv, lambda c: (triton.cdiv(S, c["BN"]), B * HKV), cf["dkdv"], ("dkdv",) + key,
-                    q, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wq_, wk_, cos, sin, *common,
+                    qn, kn, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wk_ if qk_norm else q, cos, sin,
+                    *_st(qn), *_st(kn), *_st(k), *_st(v), *_st(DO), *common,
                     GROUP=G, D=D, WINDOW=window is not None, XSA=xsa, QK_NORM=qk_norm, ROPE=rope)
         nkb = triton.cdiv(S, c["BN"])
         DQ = _like(q)
         PWQ = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         c = _launch(_bwd_dq, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cf["dq"], ("dq",) + key,
-                    q, k, v, DO, LSE, DELTA, DQ, PWQ, wq_, wk_, cos, sin, *common,
+                    qn, kn, q, v, DO, LSE, DELTA, DQ, PWQ, wq_ if qk_norm else q, cos, sin,
+                    *_st(qn), *_st(kn), *_st(q), *_st(v), *_st(DO), *common,
                     GROUP=G, D=D, WINDOW=window is not None, QK_NORM=qk_norm, ROPE=rope)
         nqb = triton.cdiv(S, c["BM"])
         d_alpha = None
         if xsa and has_a:
             d_alpha = (GA.sum(dim=(0, 2)) * (1.0 - A * A)).to(a_dtype)
-        dwq = PWQ[: B * HKV * nqb].sum(0).to(wq.dtype) if qk_norm else None
-        dwk = PWK[: B * HKV * nkb].sum(0).to(wk.dtype) if qk_norm else None
+        dwq = PWQ[: B * HKV * nqb].sum(0).to(wq_dtype) if qk_norm else None
+        dwk = PWK[: B * HKV * nkb].sum(0).to(wk_dtype) if qk_norm else None
         return DQ, DK, DV, d_alpha, dwq, dwk, None, None, None, None, None, None, None, None
 
 
