@@ -56,6 +56,23 @@ def _backends(coeffs, ns_dtype, families, placements):
     return fns
 
 
+# CROSS-RUN DETERMINISM. Timing differs per process, so no timing comparison may change the BITS:
+#   - exact backends (cublas/epi/symepi/symmul) compete on time only if they were bitwise equal to
+#     cuBLAS on this shape in THIS process -- any pick among them then yields the same bits, whichever
+#     wins (an epi whose autotune landed on a different BK fails `bit` and simply drops out);
+#   - gram changes the algorithm, so it is eligible only by a SHAPE rule (the regime it wins in:
+#     small side >= GRAM_MIN_SIDE and aspect >= GRAM_MIN_RATIO) AND only when >= GRAM_WIN faster; its
+#     restart placement is chosen by error (identical data -> identical errors), never by time.
+# Measured Sep 26 2026: two same-seed board runs locked gram@2,4 vs epi on (9, 64, 512) -- 0.41 vs
+# 0.43 ms, pure noise -- and trained different models (6.9517 vs 6.9511 final loss).
+GRAM_MIN_SIDE, GRAM_MIN_RATIO, GRAM_WIN = 2048, 1.5, 0.15
+
+
+def _gram_shape(shape):
+    a, b = shape[-2], shape[-1]
+    return min(a, b) >= GRAM_MIN_SIDE and max(a, b) / min(a, b) >= GRAM_MIN_RATIO
+
+
 def _time(fn, u, reps=5, warm=2):
     for _ in range(warm):
         fn(u)
@@ -138,8 +155,17 @@ class NSRouter:
         # bar enough to admit a 1.35e-2 gram. gram is the only candidate that changes the algorithm.
         base = min(r["rel"] for n, r in rows.items() if not n.startswith("gram"))
         ok = [n for n in self.order if n in rows and rows[n]["rel"] <= self.tol * base]
-        fastest = min(rows[n]["ms"] for n in ok)
-        pick = next(n for n in ok if rows[n]["ms"] <= fastest * (1 + self.margin))
+        # bitwise equal to cuBLAS == cuBLAS's error, so no tol filter (it could reject all of them
+        # when a non-bitwise exact backend is more accurate); non-bitwise exact backends are dropped
+        exact = [n for n in self.order if n in rows and not n.startswith("gram")
+                 and (n == "cublas" or rows[n]["bit"])]
+        fastest = min(rows[n]["ms"] for n in exact)
+        pick = next(n for n in exact if rows[n]["ms"] <= fastest * (1 + self.margin))
+        gram_ok = [n for n in ok if n.startswith("gram")] if _gram_shape(key[0]) else []
+        if gram_ok:
+            g = min(gram_ok, key=lambda n: (rows[n]["rel"], n))      # by error: deterministic
+            if rows[g]["ms"] <= rows[pick]["ms"] * (1 - GRAM_WIN):
+                pick = g
         self.table[key] = {"choice": pick, **rows}
         if self.verbose:
             gram = {n: r for n, r in rows.items() if n.startswith("gram")}
