@@ -142,6 +142,9 @@ def main():
     for S in (256, 4096):                              # other lengths, BiBo global + SWA configs
         ok &= run_case(CASES[0][0], CASES[0][1], 1, S)
         ok &= run_case(CASES[4][0], CASES[4][1], 1, S)
+    for seed in (1, 2, 3):                             # the S=4096 global case over more seeds
+        torch.manual_seed(seed)
+        ok &= run_case(CASES[0][0] + f" seed {seed}", CASES[0][1], 1, 4096)
     print("PARITY", "PASS" if ok else "FAIL")
     return ok
 
