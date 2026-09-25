@@ -776,6 +776,74 @@ def _ap_grad_from_rows(da, row_expert, E, ap_shape, device):
     return g[:, :ap_shape[1]]
 
 
+# ALL-ACTIVE layers (top_k == num_experts, e.g. the L0 ensemble 0:8:8:576) skip the sparse
+# machinery: no sort, no 8x token gather, no grouped GEMMs, no combine. With every expert active,
+# out = sum_e w_e * (act(x @ Wgu_e^T) @ Wd_e^T) is two DENSE GEMMs over the concatenated experts,
+# the router weight folded into the intermediate. The sparse path also sent 576-wide experts to
+# torch._grouped_mm (the fused GEMM needs I % 256 == 0), a host loop + sync per call on sm120.
+# TKF_MOE_DENSE=0 forces the sparse path.
+DENSE_ALL_ACTIVE = os.environ.get("TKF_MOE_DENSE", "1") != "0"
+
+
+def _dense_ok(hidden, idx, codes, E):
+    return (DENSE_ALL_ACTIVE and idx.shape[1] == E and hidden.is_cuda
+            and hidden.dtype in (torch.bfloat16, torch.float16)
+            and len(set(codes)) == 1 and codes[0] not in (3, 4)
+            and os.environ.get("BIBO_MOE_FORCE_LOOP") != "1")
+
+
+def _dense_fwd(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes, ap32, ap_shape, codes):
+    N, H = hidden.shape
+    E, twoI, _ = gate_up_proj.shape
+    I = twoI // 2
+    w = torch.zeros(N, E, device=hidden.device, dtype=torch.float32).scatter_(1, idx, wt.float())
+    row_act = act_codes.to(torch.int32).repeat(N)                 # row n*E+e -> expert e
+    row_alpha = ap32[:, 0].contiguous().repeat(N) if ap32 is not None else None
+    wgu = gate_up_proj.reshape(E * twoI, H)
+    wd = down_proj.transpose(1, 2).reshape(E * I, H)              # rows e*I+i = down_proj[e, :, i]
+    gu = torch.mm(hidden, wgu.t()).view(N * E, twoI)
+    it = _glu_fwd(gu, row_act, code_hint=codes[0], row_alpha=row_alpha)
+    its = (it.float() * w.view(-1, 1)).to(it.dtype)
+    out = torch.mm(its.view(N, E * I), wd)
+    ctx.save_for_backward(hidden, idx, w, gate_up_proj, down_proj, gu, it, row_act,
+                          row_alpha if row_alpha is not None else torch.empty(0))
+    ctx.dense = True
+    ctx.shapes = (N, H, E, I)
+    ctx.codes = codes; ctx.has_ap = ap32 is not None; ctx.ap_shape = ap_shape
+    return out
+
+
+def _dense_bwd(ctx, grad_out):
+    hidden, idx, w, gate_up_proj, down_proj, gu, it, row_act, row_alpha = ctx.saved_tensors
+    N, H, E, I = ctx.shapes
+    row_alpha = row_alpha if ctx.has_ap else None
+    go = grad_out.to(hidden.dtype).contiguous()
+    wd = down_proj.transpose(1, 2).reshape(E * I, H)
+    its = (it.float() * w.view(-1, 1)).to(it.dtype)               # recomputed, bitwise the forward's
+    d_its = torch.mm(go, wd.t()).view(N * E, I)
+    grad_down = torch.mm(its.view(N, E * I).t(), go).view(E, I, H).transpose(1, 2).contiguous()
+    d_w = (d_its.float() * it.float()).sum(-1).view(N, E)
+    d_it = (d_its.float() * w.view(-1, 1)).to(it.dtype)
+    grad_ap = None
+    if ctx.has_ap and ctx.needs_input_grad[6]:
+        dgu, da = _glu_bwd(d_it, gu, row_act, code_hint=ctx.codes[0], row_alpha=row_alpha,
+                           want_act_grads=True)
+        per_e = da.reshape(N, E).double().sum(0).float()          # fixed-order, deterministic
+        if len(ctx.ap_shape) == 1:
+            grad_ap = per_e
+        else:
+            grad_ap = torch.zeros(E, 2, device=go.device, dtype=torch.float32)
+            grad_ap[:, 0] = per_e
+            grad_ap = grad_ap[:, :ctx.ap_shape[1]]
+    else:
+        dgu = _glu_bwd(d_it, gu, row_act, code_hint=ctx.codes[0], row_alpha=row_alpha)
+    dgu2 = dgu.view(N, E * 2 * I)
+    grad_gu = torch.mm(dgu2.t(), hidden).view(E, 2 * I, H)
+    grad_hidden = torch.mm(dgu2, gate_up_proj.reshape(E * 2 * I, H))
+    grad_wt = d_w.gather(1, idx).to(grad_out.dtype)
+    return grad_hidden, None, grad_wt, grad_gu, grad_down, None, grad_ap
+
+
 class _PerExpertMoE(torch.autograd.Function):
 
     @staticmethod
@@ -785,6 +853,16 @@ class _PerExpertMoE(torch.autograd.Function):
         E = act_codes.shape[0]
         codes = _codes_list(act_codes)
         top_k = idx.shape[1]; dev = hidden.device
+        ctx.dense = False
+        if _dense_ok(hidden, idx, codes, E):
+            ap32 = act_params.float().contiguous() if act_params is not None else None
+            ap_shape = ap32.shape if ap32 is not None else None
+            if ap32 is not None and ap32.ndim == 1:
+                ap32 = ap32[:, None].contiguous()
+            global _LAST_PATH
+            _LAST_PATH = "dense"
+            return _dense_fwd(ctx, hidden.contiguous(), idx, wt, gate_up_proj.contiguous(),
+                              down_proj, act_codes, ap32, ap_shape, codes)
         # The batched (gmm) path never needs the counts on the host: tile maps are built on the
         # device (build_tile_map(None, ...)) and torch._grouped_mm takes device offsets. Reading
         # them back was one GPU drain per MoE layer per micro-batch; only the per-expert loop
@@ -839,7 +917,6 @@ class _PerExpertMoE(torch.autograd.Function):
         # which branch ran, for tests. A parity check that cannot prove the candidate took the NEW
         # path passes trivially when both arms fall down the same one -- that exact failure has
         # already shipped here once (kernel parity green while the feature was inert).
-        global _LAST_PATH
         _LAST_PATH = "gmm" if use_gmm else ("uniform" if uniform else "loop")
         offs = counts_t.cumsum(0).to(torch.int32) if use_gmm else None
         tile_map = None; tile_map_gg = None; tile_map_bw = None
@@ -943,6 +1020,8 @@ class _PerExpertMoE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        if ctx.dense:
+            return _dense_bwd(ctx, grad_out)
         (x_s, st, sw, order, row_act, gate_up_proj, down_proj, ap32) = ctx.saved_tensors
         gate_up_l, inter_l, eo_all = ctx.lists
         sw_eff = ctx.sw_eff
