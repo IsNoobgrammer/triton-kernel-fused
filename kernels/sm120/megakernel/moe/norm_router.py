@@ -245,16 +245,19 @@ def _rmsnorm_bwd(X, DHN, NW, RSTD, DX, DNW, T,
         nw = tl.load(NW + hc, mask=m_h, other=0.0).to(tl.float32)
         dx = rstd[:, None] * dh * nw[None, :] - c[:, None] * x
         tl.store(DX + rows[:, None] * H + hc[None, :], dx.to(DX.dtype.element_ty), mask=m)
-        # d_nw accumulates over ALL tokens, so it must be atomic; reduce within the block first
-        tl.atomic_add(DNW + hc, tl.sum(tl.where(m, dh * x * rstd[:, None], 0.0), axis=0), mask=m_h)
+        # d_nw sums over ALL tokens: each block writes its partial to its OWN row, and the host
+        # side sums the rows in a fixed order (an atomic_add here made d_nw run-to-run different)
+        tl.store(DNW + tl.program_id(0) * H + hc, tl.sum(tl.where(m, dh * x * rstd[:, None], 0.0), axis=0),
+                 mask=m_h)
 
 
 def rmsnorm_backward(x, d_hn, nw, rstd, block_t=32, block_h=128):
     """-> (d_x [T,H] same dtype as x, d_nw [H] fp32)."""
     T, H = x.shape
     dx = torch.empty_like(x)
-    # zeroed: atomic_add accumulates and a reused buffer would keep summing
-    dnw = torch.zeros(H, device=x.device, dtype=torch.float32)
-    _rmsnorm_bwd[(triton.cdiv(T, block_t),)](x, d_hn, nw, rstd, dx, dnw, T,
-                                             H=H, BLOCK_T=block_t, BLOCK_H=block_h)
+    nblk = triton.cdiv(T, block_t)
+    part = torch.empty(nblk, H, device=x.device, dtype=torch.float32)   # one d_nw partial per block
+    _rmsnorm_bwd[(nblk,)](x, d_hn, nw, rstd, dx, part, T,
+                          H=H, BLOCK_T=block_t, BLOCK_H=block_h)
+    dnw = part.sum(0)
     return dx, dnw

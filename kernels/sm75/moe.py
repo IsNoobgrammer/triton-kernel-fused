@@ -9,6 +9,10 @@ __all__ = ["moe", "moe_per_expert", "moe_grouped", "moe_grouped_cublas", "moe_ea
            "BatchedGLU", "GROUPED_MIN_TOKENS"]
 
 _DBG = []
+# Bitwise run-to-run reproducible MoE (default): every float reduction whose order depended on
+# atomic scheduling -- the combine scatter, the dX scatter, the per-expert theta grad, the norm
+# weight grad -- sums in a fixed order instead. TKF_MOE_DETERMINISTIC=0 restores the atomic paths.
+DETERMINISTIC = os.environ.get("TKF_MOE_DETERMINISTIC", "1") != "0"
 _LAST_PATH = None          # "gmm" | "uniform" | "loop" -- set by _PerExpertMoE.forward, read by tests
 GROUPED_MIN_TOKENS = 4096
 SCHED_BLOCK_M = 64
@@ -726,8 +730,16 @@ def _ap_grad_from_rows(da, row_expert, E, ap_shape, device):
     caller's shape matters: autograd rejects a gradient whose shape differs from its input, and a
     1-D (E,) act_params is documented as legal.
     """
-    per_e = torch.zeros(E, device=device, dtype=torch.float32).index_add_(
-        0, row_expert, da.reshape(-1).float())
+    if DETERMINISTIC:
+        # rows are expert-SORTED, so each expert's rows are one contiguous run: a fixed-order
+        # prefix sum (fp64) differenced at the run ends, instead of an atomic index_add_
+        cnt = expert_counts(row_expert, E)
+        end = torch.cumsum(cnt, 0)
+        cs = torch.cat([da.new_zeros(1, dtype=torch.float64), da.reshape(-1).double().cumsum(0)])
+        per_e = (cs[end] - cs[end - cnt]).float()
+    else:
+        per_e = torch.zeros(E, device=device, dtype=torch.float32).index_add_(
+            0, row_expert, da.reshape(-1).float())
     if len(ap_shape) == 1:
         return per_e
     g = torch.zeros(E, 2, device=device, dtype=torch.float32)
@@ -882,8 +894,15 @@ class _PerExpertMoE(torch.autograd.Function):
                               )
                 torch.mm(it, down_proj[e].t(), out=eo_all[s:en])
                 gate_up_l[e] = gu; inter_l[e] = it
-        out = torch.zeros(N, H, device=dev, dtype=torch.float32)
-        _combine_scatter(eo_all, sw_eff, st, out)
+        _FGc = _fused_glu()
+        inv = None
+        if DETERMINISTIC and _FGc is not None:
+            inv = _FGc.inverse_order(order)
+            out = _FGc.combine_gather(eo_all, inv, N, top_k, w=sw_eff)
+        else:
+            out = torch.zeros(N, H, device=dev, dtype=torch.float32)
+            _combine_scatter(eo_all, sw_eff, st, out)
+        ctx.inv = inv
         ctx.sw_eff = sw_eff
         ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
                               ap32 if ap32 is not None else torch.empty(0))
@@ -930,14 +949,22 @@ class _PerExpertMoE(torch.autograd.Function):
             grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
             grad_hidden = None
             if ctx.tile_map_gg is not None:
-                gh32 = _fused_glu().grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
-                                                       ctx.tile_map_gg, N)
+                if ctx.inv is not None:
+                    gh32 = _fused_glu().grouped_gemm_gather(grad_gate_up, gate_up_proj, ctx.inv,
+                                                            ctx.tile_map_gg, N, top_k)
+                else:
+                    gh32 = _fused_glu().grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
+                                                           ctx.tile_map_gg, N)
                 if gh32 is not None:
                     grad_hidden = gh32.to(grad_out.dtype)
             if grad_hidden is None:
                 grad_x = torch._grouped_mm(grad_gate_up, gate_up_proj, offs=offs)
-                grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
-                grad_hidden.index_add_(0, st, grad_x)
+                if ctx.inv is not None:
+                    grad_hidden = _fused_glu().combine_gather(grad_x, ctx.inv, N, top_k,
+                                                              out_dtype=grad_out.dtype)
+                else:
+                    grad_hidden = torch.zeros(N, H, device=grad_out.device, dtype=grad_out.dtype)
+                    grad_hidden.index_add_(0, st, grad_x)
             grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
             grad_wt[order] = gw_all.to(grad_out.dtype)
             return (grad_hidden, None, grad_wt.view(N, top_k), grad_gate_up_proj, grad_down_proj,

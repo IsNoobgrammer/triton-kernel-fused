@@ -177,7 +177,7 @@ def _grouped_gemm_kernel(A, B, C, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
         a = tl.load(A + rm[:, None] * K + rk[None, :], mask=mask_m[:, None], other=0.0)
         b = tl.load(Bb + rk[:, None] * N + rn[None, :])
         acc = tl.dot(a, b, acc)
-    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=mask_m[:, None])
+    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(C.dtype.element_ty), mask=mask_m[:, None])
 
 
 _GG = (128, 256, 64, 8, 3)
@@ -375,3 +375,53 @@ def fused_gate_up_radial(x_s, gate_up_proj, tile_map, row_alpha, eps=1e-6, want_
         x_s, gate_up_proj, gu, it, TE, TS, TM, row_alpha.contiguous(), H, I, eps, want_gu,
         _RBM, _RBN, _RBK, num_warps=_RWARPS, num_stages=_RSTAGES)
     return gu, it
+
+
+# ───────────────────── deterministic combine: gather instead of atomic scatter ─────────────────────
+# Every token owns exactly K expert-sorted rows. Scattering them with atomic_add sums the K
+# contributions in whatever order the SMs finish -- run-to-run different fp32 rounding. Here each
+# token GATHERS its K rows by the inverse sort permutation and sums them in slot order j = 0..K-1,
+# so the result is bitwise reproducible. Same bytes read, and plain stores instead of atomics.
+
+@triton.jit
+def _combine_gather_kernel(ROWS, W, INV, OUT, NT, H, s_r, s_o, K: tl.constexpr, HAS_W: tl.constexpr,
+                           BT: tl.constexpr, BH: tl.constexpr):
+    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    h = tl.program_id(1) * BH + tl.arange(0, BH)
+    mt = t < NT
+    m = mt[:, None] & (h < H)[None, :]
+    acc = tl.zeros((BT, BH), tl.float32)
+    for j in tl.static_range(K):
+        r = tl.load(INV + t.to(tl.int64) * K + j, mask=mt, other=0)
+        x = tl.load(ROWS + r[:, None] * s_r + h[None, :], mask=m, other=0.0).to(tl.float32)
+        if HAS_W:
+            x = x * tl.load(W + r, mask=mt, other=0.0).to(tl.float32)[:, None]
+        acc += x
+    tl.store(OUT + t.to(tl.int64)[:, None] * s_o + h[None, :], acc.to(OUT.dtype.element_ty), mask=m)
+
+
+def inverse_order(order):
+    """order[r] = flat slot (token*K + j) of expert-sorted row r  ->  inv[slot] = r."""
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(order.numel(), device=order.device, dtype=order.dtype)
+    return inv
+
+
+def combine_gather(rows, inv, n_tok, k, w=None, out=None, out_dtype=torch.float32):
+    """out[t] = sum_j rows[inv[t*k + j]] * (w[inv[t*k + j]] if w is not None else 1), j in order."""
+    H = rows.shape[1]
+    out = torch.empty(n_tok, H, device=rows.device, dtype=out_dtype) if out is None else out
+    BT, BH = 32, 128
+    _combine_gather_kernel[(triton.cdiv(n_tok, BT), triton.cdiv(H, BH))](
+        rows, rows if w is None else w, inv, out, n_tok, H, rows.stride(0), out.stride(0),
+        K=k, HAS_W=w is not None, BT=BT, BH=BH, num_warps=4)
+    return out
+
+
+def grouped_gemm_gather(a, b_enk, inv, tile_map, n_tok, k):
+    """Deterministic grouped_gemm_scatter: the per-row GEMM result goes to an fp32 row buffer, then
+    combine_gather sums each token's k rows in slot order. Costs one extra fp32 (M, N) write+read."""
+    rows = torch.empty(a.shape[0], b_enk.shape[2], device=a.device, dtype=torch.float32)
+    if grouped_gemm(a, b_enk, tile_map, out=rows) is None:
+        return None
+    return combine_gather(rows, inv, n_tok, k)
