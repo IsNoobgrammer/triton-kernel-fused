@@ -185,7 +185,12 @@ def main():
     assert torch.cuda.is_available(), "needs a GPU"
     # single-stream only: make_mlp_input dropped the multi-stream (embedding-term) API, so the
     # K>=2 configs grade a call nothing can make any more
-    cases = [c for c in list(_all_cases()) + list(_bounded_spot_check()) if len(c[2]) == 1]
+    from kernels.sm75.residual_add import MODES as _KMODES
+    # single-stream, kernel-supported modes only: make_mlp_input dropped the multi-stream API and
+    # the bounded transforms (c = f(theta) now lives in torch), so those configs grade calls
+    # nothing can make any more
+    cases = [c for c in list(_all_cases()) + list(_bounded_spot_check())
+             if len(c[2]) == 1 and all(m in _KMODES for m in c[3])]
     print(f"grading {len(cases)} configurations x 4 quantities "
           f"= {len(cases) * 4} measurements against fp64 "
           f"({len(list(_all_cases()))} dtype configs at mode=none, 4 bounded spot checks)\n")
