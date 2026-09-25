@@ -199,8 +199,10 @@ def scale():
     """Global causal attention vs sequence length at a FIXED 64k tokens per batch."""
     torch.manual_seed(0)
     print("== seq-len scaling, global causal, 65536 tokens/batch (ms: fwd | fwd+bwd | peak MiB)")
+    torch._dynamo.config.recompile_limit = 64
     for S in (512, 1024, 2048, 4096, 8192, 16384):
         B = max(1, 65536 // S)
+        torch._dynamo.reset()          # flex compiles per shape; never let it fall back to eager
         ins, go = _inputs(B, S, norm=True)
         rows = [
             ("ours: attention only", lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, xsa=False), False),
