@@ -9,10 +9,11 @@ _BM, _BN, _BK, _WARPS, _STAGES = 64, 256, 32, 8, 3
 
 
 @triton.jit
-def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM,
+def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM, XROWS,
                         H: tl.constexpr, I: tl.constexpr, CODE: tl.constexpr,
                         WRITE_GU: tl.constexpr, ACT: tl.constexpr,
-                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                        GATHER: tl.constexpr = False):
     t = tl.program_id(0)
     pid_n = tl.program_id(1)
     e = tl.load(TE + t)
@@ -22,11 +23,17 @@ def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM,
     rn = pid_n * BN + tl.arange(0, BN)
     mask_m = tl.arange(0, BM) < mm
     Wb = W + e.to(tl.int64) * (2 * I * H)
+    # GATHER: X is the UNSORTED hidden and XROWS the sort index, so the (M, H) expert-sorted copy
+    # (x_s, ~400 MB per layer at the board shape) is never written, read back, or kept for backward
+    if GATHER:
+        xr = tl.load(XROWS + rm, mask=mask_m, other=0).to(tl.int64)
+    else:
+        xr = rm.to(tl.int64)
     ag = tl.zeros((BM, BN), tl.float32)
     au = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, H, BK):
         rk = k0 + tl.arange(0, BK)
-        x = tl.load(X + rm[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
+        x = tl.load(X + xr[:, None] * H + rk[None, :], mask=mask_m[:, None], other=0.0)
         wg = tl.load(Wb + rn[:, None] * H + rk[None, :])
         wu = tl.load(Wb + (I + rn[:, None]) * H + rk[None, :])
         ag = tl.dot(x, tl.trans(wg), ag)
@@ -97,15 +104,18 @@ def build_tile_map(counts, counts_t, device, bm=None, m_rows=None):
     return te, ts, tm
 
 
-def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True, act=True):
+def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True, act=True, rows=None):
+    """rows: x_s is then the UNSORTED (N, H) hidden and row r of the product reads x_s[rows[r]]."""
     TE, TS, TM = tile_map
     M, H = x_s.shape
+    if rows is not None:
+        M = rows.numel()
     I = gate_up_proj.shape[1] // 2
     it = torch.empty(M, I, device=x_s.device, dtype=x_s.dtype) if act else None
     gu = torch.empty(M, 2 * I, device=x_s.device, dtype=x_s.dtype) if want_gu else it
     _gate_up_glu_kernel[(TE.numel(), I // _BN)](
-        x_s, gate_up_proj, gu, it, TE, TS, TM, H, I, code, want_gu, act,
-        _BM, _BN, _BK, num_warps=_WARPS, num_stages=_STAGES)
+        x_s, gate_up_proj, gu, it, TE, TS, TM, rows if rows is not None else TE, H, I, code,
+        want_gu, act, _BM, _BN, _BK, num_warps=_WARPS, num_stages=_STAGES, GATHER=rows is not None)
     return gu, it
 
 
@@ -211,9 +221,10 @@ _WG = dict(CH=16384, BM=128, BN=128, BK=32, num_warps=4, num_stages=4)
 
 
 @triton.jit
-def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, N1, N2, sa, sb,
+def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, BROWS, N1, N2, sa, sb,
                NT2: tl.constexpr, NTILE: tl.constexpr,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr):
+               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr,
+               GATHER_B: tl.constexpr):
     pid = tl.program_id(0)
     item = tl.load(ORDER + pid // NTILE)
     e = tl.load(IT_E + item)
@@ -230,7 +241,11 @@ def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, N1, N2, sa, sb,
         mk = (k0 + rk) < n
         rows = s0 + k0 + rk
         a = tl.load(A + rows[:, None] * sa + r1[None, :], mask=mk[:, None], other=0.0)
-        b = tl.load(B + rows[:, None] * sb + r2[None, :], mask=mk[:, None], other=0.0)
+        if GATHER_B:
+            brow = tl.load(BROWS + rows, mask=mk, other=0).to(tl.int64)
+        else:
+            brow = rows
+        b = tl.load(B + brow[:, None] * sb + r2[None, :], mask=mk[:, None], other=0.0)
         acc = tl.dot(tl.trans(a), b, acc)
     slot = tl.load(IT_SLOT + item)
     off = r1[:, None] * N2 + r2[None, :]
@@ -260,12 +275,13 @@ def _wg_reduce(P, C, FIRST, NCH, NN, BLOCK: tl.constexpr, ACC: tl.constexpr):
     tl.store(C + e.to(tl.int64) * NN + o, acc.to(C.dtype.element_ty), mask=m)
 
 
-def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False):
+def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False, b_rows=None):
     """out (E, N1, N2) = per expert a[s:t]^T @ b[s:t], with offs the int32 END row offsets exactly as
     torch._grouped_mm(a.t(), b, offs=offs) takes them. a (M, N1), b (M, N2), same dtype. Returns
     None when the shape is not tileable (caller falls back).
     out: a contiguous (E, N1, N2) buffer to write (any float dtype, e.g. a param's fp32 .grad);
-    accumulate=True adds into it instead (fp32 accumulate, fixed order, deterministic)."""
+    accumulate=True adds into it instead (fp32 accumulate, fixed order, deterministic).
+    b_rows: row r of b is b[b_rows[r]] (b is then the unsorted tensor, any row count)."""
     c = dict(_WG, **(cfg or {}))
     M, N1 = a.shape
     N2 = b.shape[1]
@@ -299,8 +315,11 @@ def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False):
     nt2 = N2 // BN
     ntile = (N1 // BM) * nt2
     _wg_kernel[(NI * ntile,)](a, b, out, part, it_e.to(torch.int32), it_s, it_n.to(torch.int32),
-                              it_slot.to(torch.int32), order, N1, N2, a.stride(0), b.stride(0),
+                              it_slot.to(torch.int32), order,
+                              b_rows if b_rows is not None else order, N1, N2,
+                              a.stride(0), b.stride(0),
                               NT2=nt2, NTILE=ntile, BM=BM, BN=BN, BK=BK, ACC=bool(accumulate),
+                              GATHER_B=b_rows is not None,
                               num_warps=c["num_warps"], num_stages=c["num_stages"])
     RB = 1024
     _wg_reduce[(E, triton.cdiv(N1 * N2, RB))](part, out, (cend - nch), nch, N1 * N2, BLOCK=RB,

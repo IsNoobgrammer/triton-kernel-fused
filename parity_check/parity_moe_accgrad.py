@@ -61,4 +61,13 @@ for case in ((64, 6, 768), (8, 8, 576)):
         ok &= good
         print(f"   {k:12s} rel err vs fp32: autograd {eo:.3e}  acc-into-.grad {en:.3e}  "
               f"repeat {'bitwise' if rep else 'DIFFERS'}  {'OK' if good else 'WORSE'}")
+# token gather folded into the GEMM loads (TKF_MOE_GATHER) must be BITWISE the materialized x_s
+case = (64, 6, 768)
+M.GATHER_X = False
+nog, _ = run(case, "acc")
+M.GATHER_X = True
+gat, _ = run(case, "acc")
+same = all(torch.equal(nog[k], gat[k]) for k in nog)
+ok &= same
+print(f"== gather-on-load vs materialized x_s (E=64): {'bitwise identical' if same else 'DIFFERS'}")
 print("ACCGRAD PASS" if ok else "ACCGRAD FAIL")

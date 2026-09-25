@@ -46,6 +46,7 @@ WGRAD = os.environ.get("TKF_MOE_WGRAD", "triton")
 # (a full copy) and AccumulateGrad added (another read-read-write). TKF_MOE_ACC_GRAD=0 restores the
 # autograd return. Only for leaf fp32 contiguous Parameters with no grad hooks.
 ACC_GRAD = os.environ.get("TKF_MOE_ACC_GRAD", "1") != "0"
+GATHER_X = os.environ.get("TKF_MOE_GATHER", "1") != "0"
 
 
 def _acc_target(p):
@@ -55,7 +56,7 @@ def _acc_target(p):
             else None)
 
 
-def _wgrad(a, b, offs, acc=None, shape=None):
+def _wgrad(a, b, offs, acc=None, shape=None, b_rows=None):
     """Per-expert a[rows_e]^T @ b[rows_e] (== torch._grouped_mm(a.t(), b, offs=offs)).
     acc = a Parameter: accumulate into acc.grad and return None (autograd gets no grad for it)."""
     g = _fused_glu() if WGRAD == "triton" else None
@@ -63,11 +64,14 @@ def _wgrad(a, b, offs, acc=None, shape=None):
         fresh = acc.grad is None
         buf = torch.empty_like(acc) if fresh else acc.grad
         view = buf.view(shape) if shape is not None else buf       # dense path: (1, E*2I, H)
-        if g.grouped_wgrad(a, b, offs, out=view, accumulate=not fresh) is not None:
+        if g.grouped_wgrad(a, b, offs, out=view, accumulate=not fresh, b_rows=b_rows) is not None:
             if fresh:
                 acc.grad = buf
             return None
-    out = g.grouped_wgrad(a, b, offs) if g is not None and hasattr(g, "grouped_wgrad") else None
+    out = (g.grouped_wgrad(a, b, offs, b_rows=b_rows)
+           if g is not None and hasattr(g, "grouped_wgrad") else None)
+    if out is None and b_rows is not None:
+        b = b.index_select(0, b_rows)
     return out if out is not None else torch._grouped_mm(a.t(), b, offs=offs)
 
 
@@ -917,7 +921,13 @@ class _PerExpertMoE(torch.autograd.Function):
         _gmm_ok = (hasattr(torch, "_grouped_mm") and hidden.dtype in (torch.bfloat16, torch.float16)
                    and all(c <= 2 or c >= 6 for c in codes) and os.environ.get("BIBO_MOE_FORCE_LOOP") != "1")
         st, sw, order, counts, bounds, counts_t = _sort_by_expert(idx, wt, E, host=not _gmm_ok)
-        x_s = hidden.index_select(0, st)
+        # GATHER_X: the gate/up GEMM and the dW GEMM read token rows through `st` instead of an
+        # expert-sorted copy. Decided per call once the kernels are known (see _need_xs below);
+        # every other consumer materializes x_s exactly as before. TKF_MOE_GATHER=0 turns it off.
+        hidden = hidden.contiguous()
+        _gather = _gmm_ok and WGRAD == "triton" and GATHER_X
+        x_s = None if _gather else hidden.index_select(0, st)
+        x_src = hidden if _gather else x_s                 # dtype/device/contiguity checks only
         M_rows = idx.numel()
         row_act = torch.repeat_interleave(act_codes, counts_t, output_size=M_rows).to(torch.int32)
         ap32 = act_params.float().contiguous() if act_params is not None else None
@@ -973,37 +983,42 @@ class _PerExpertMoE(torch.autograd.Function):
             if os.environ.get("BIBO_MOE_DEBUG") == "1" and not _DBG:
                 _DBG.append(1)
                 print(f"[moe dbg] fused_glu={_FG is not None} "
-                      f"tiles={_FG.tiles_supported(x_s) if _FG else None} "
-                      f"gemm={_FG.gemm_supported(x_s, gate_up_proj, codes) if _FG else None} "
-                      f"fused={_FG.fused_supported(x_s, gate_up_proj, codes) if _FG else None} "
-                      f"ap={ap32 is not None} dtype={x_s.dtype} "
+                      f"tiles={_FG.tiles_supported(x_src) if _FG else None} "
+                      f"gemm={_FG.gemm_supported(x_src, gate_up_proj, codes) if _FG else None} "
+                      f"fused={_FG.fused_supported(x_src, gate_up_proj, codes) if _FG else None} "
+                      f"ap={ap32 is not None} dtype={x_src.dtype} gather={_gather} "
                       f"gu_contig={gate_up_proj.is_contiguous()} I={gate_up_proj.shape[1]//2} "
                       f"H={gate_up_proj.shape[2]}", flush=True)
-            if _FG is not None and _FG.tiles_supported(x_s):
+            if _FG is not None and _FG.tiles_supported(x_src):
                 tile_map_gg = _FG.build_tile_map(counts, counts_t, dev,
                                                         bm=_FG._GG[0], m_rows=M_rows)
             gu_all = it_all = None
-            if tile_map_gg is not None and _FG.gemm_supported(x_s, gate_up_proj, codes):
+            if tile_map_gg is not None and _FG.gemm_supported(x_src, gate_up_proj, codes):
                 tm = _FG.build_tile_map(counts, counts_t, dev, m_rows=M_rows)
                 # the GEMM+GLU fusion has no theta argument, so it must not apply the activation
                 # when one exists -- the GEMM half is still used, only the act is deferred to
                 # _glu_fwd, which does take row_alpha
-                act = _FG.fused_supported(x_s, gate_up_proj, codes) and ap32 is None
+                act = _FG.fused_supported(x_src, gate_up_proj, codes) and ap32 is None
                 # radial gets its OWN fused epilogue: r is an RMS over all I gate columns, which
                 # no single N-tile of the generic kernel can see, so radial otherwise pays a
                 # separate _glu_fwd pass (1.222 ms/call at N=65536 -- a pure DRAM round trip).
                 if (ap32 is not None and hasattr(_FG, "radial_supported")
-                        and _FG.radial_supported(x_s, gate_up_proj, codes)):
+                        and _FG.radial_supported(x_src, gate_up_proj, codes)):
+                    if x_s is None:
+                        x_s = hidden.index_select(0, st)
                     rtm = _FG.build_tile_map(counts, counts_t, dev, bm=_FG._RBM, m_rows=M_rows)
                     gu_all, it_all = _FG.fused_gate_up_radial(x_s, gate_up_proj, rtm, row_alpha)
                 else:
-                    gu_all, it_all = _FG.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
-                                                           want_gu=True, act=act)
+                    gu_all, it_all = _FG.fused_gate_up_glu(
+                        x_s if x_s is not None else hidden, gate_up_proj, tm, codes[0],
+                        want_gu=True, act=act, rows=None if x_s is not None else st)
                 if act:
                     tile_map = tm
                     tile_map_bw = _FG.build_tile_map(counts, counts_t, dev,
                                                             bm=_FG._BBM, m_rows=M_rows)
             if gu_all is None:
+                if x_s is None:
+                    x_s = hidden.index_select(0, st)
                 gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
             if it_all is None:
                 it_all = _glu_fwd(gu_all, row_act, code_hint=hint, row_alpha=row_alpha)
@@ -1057,8 +1072,9 @@ class _PerExpertMoE(torch.autograd.Function):
             _combine_scatter(eo_all, sw_eff, st, out)
         ctx.inv = inv
         ctx.sw_eff = sw_eff
-        ctx.save_for_backward(x_s, st, sw, order, row_act, gate_up_proj, down_proj,
-                              ap32 if ap32 is not None else torch.empty(0))
+        ctx.gather = x_s is None                            # saved "x_s" is then the unsorted hidden
+        ctx.save_for_backward(hidden if x_s is None else x_s, st, sw, order, row_act, gate_up_proj,
+                              down_proj, ap32 if ap32 is not None else torch.empty(0))
         ctx.lists = (gate_up_l, inter_l, eo_all); ctx.bounds = bounds; ctx.uniform = uniform
         ctx.offs = offs; ctx.shapes = (N, H, top_k, E); ctx.tile_map = tile_map; ctx.tile_map_gg = tile_map_gg; ctx.tile_map_bw = tile_map_bw
         ctx.codes = codes; ctx.has_ap = ap32 is not None; ctx.ap_shape = ap_shape
@@ -1101,7 +1117,8 @@ class _PerExpertMoE(torch.autograd.Function):
                 else:
                     grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
                                             row_alpha=ctx.row_alpha)
-            grad_gate_up_proj = _wgrad(grad_gate_up, x_s, offs, acc=ctx.acc[0])
+            grad_gate_up_proj = _wgrad(grad_gate_up, x_s, offs, acc=ctx.acc[0],
+                                       b_rows=st if ctx.gather else None)
             grad_hidden = None
             if ctx.tile_map_gg is not None:
                 if ctx.inv is not None:
