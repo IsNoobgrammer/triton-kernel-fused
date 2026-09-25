@@ -67,7 +67,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fused_attn_res", "attn_res", "FusedAttnRes", "attn_res_reference"]
+__all__ = ["fused_attn_res", "attn_res", "FusedAttnRes", "attn_res_reference", "BlockStore"]
 
 # Tokens per backward program. >1 shrinks the dw partial from (T,H) to (T/TILE,H) AND amortizes
 # the (H,) score-weight load, but the loop is UNROLLED, so a large value blows up registers and
@@ -142,17 +142,30 @@ def _topk_sel(score, is_last, mask_n, TOPK: tl.constexpr):
 
 
 @triton.jit
+def _block_offsets(offs_n, O1, O2, O3, O4, O5, O6, O7):
+    """Per-row element offset of block n from block 0 (LIST mode). Scalars, not a device table:
+    building a table would be a host->device copy per call."""
+    z = offs_n.to(tl.int64) * 0
+    return (tl.where(offs_n == 1, z + O1, z) + tl.where(offs_n == 2, z + O2, z)
+            + tl.where(offs_n == 3, z + O3, z) + tl.where(offs_n == 4, z + O4, z)
+            + tl.where(offs_n == 5, z + O5, z) + tl.where(offs_n == 6, z + O6, z)
+            + tl.where(offs_n == 7, z + O7, z))
+
+
+@triton.jit
 def _attn_res_fwd(
     BR, PS, W, OUT, BSQ,
     T, N, H, eps,
     sbr_t, sbr_n, sbr_h,
     sps_t, sps_h,
     sout_t, sout_h,
+    O1, O2, O3, O4, O5, O6, O7,
     HAS_BSQ: tl.constexpr,
     SCORE_MODE: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    LIST: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     if t >= T:
@@ -166,8 +179,14 @@ def _attn_res_fwd(
 
     # ---- load V once. Rows [0, N-1) come from block_residual, row N-1 from prefix_sum. The
     # `cat` in the reference exists only to put them in one tensor; here a select does it.
-    br = tl.load(BR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
-                 mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
+    if LIST:
+        # blocks are separate (T, H) tensors: row n lives at BR + O_n (element offset from block 0)
+        boff = _block_offsets(offs_n, O1, O2, O3, O4, O5, O6, O7)
+        br = tl.load(BR + boff[:, None] + t.to(tl.int64) * sbr_t + offs_h[None, :] * sbr_h,
+                     mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
+    else:
+        br = tl.load(BR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
+                     mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
     ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h,
                  mask=mask_h[None, :], other=0.0)
     # FP64 for the whole mix. The reference is fp32 (`vf = v.float()`), so this is strictly
@@ -257,6 +276,7 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
         block_residual.stride(0), block_residual.stride(1), block_residual.stride(2),
         prefix_sum.stride(0), prefix_sum.stride(1),
         out.stride(0), out.stride(1),
+        0, 0, 0, 0, 0, 0, 0,
         HAS_BSQ=block_sq_sum is not None, SCORE_MODE=score_mode,
         TOPK=_eff_topk(topk, N), BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
         **_launch_kw(_FWD_WARPS, _FWD_STAGES),
@@ -271,11 +291,14 @@ def _attn_res_bwd(
     sbr_t, sbr_n, sbr_h,
     sps_t, sps_h,
     sdo_t, sdo_h,
+    O1, O2, O3, O4, O5, O6, O7,
+    A1, A2, A3, A4, A5, A6, A7, FRESH,
     SCORE_MODE: tl.constexpr,
     TOPK: tl.constexpr,
     TILE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    LIST: tl.constexpr = False,
 ):
     """Recompute the forward from the SAVED INPUTS, then backprop -- one read of V, no fp32
     (T,N,H) tensor stored between forward and backward.
@@ -296,12 +319,22 @@ def _attn_res_bwd(
     # whole TILE of tokens, so it is the one most exposed to fp32 accumulation drift.
     w = tl.load(W + offs_h, mask=mask_h, other=0.0).to(tl.float32)   # once per TILE, not per token
     acc_dw = tl.zeros([BLOCK_H], dtype=tl.float32)
+    if LIST:
+        boff = _block_offsets(offs_n, O1, O2, O3, O4, O5, O6, O7)
+        aoff = _block_offsets(offs_n, A1, A2, A3, A4, A5, A6, A7)
+        # bit n of FRESH: block n's accumulator has no gradient yet -> write, else read-add-write
+        fresh = ((FRESH >> offs_n) & 1) == 1
 
     for k in tl.static_range(TILE):
         t = pid * TILE + k
         if t < T:
-            br = tl.load(BR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
-                         mask=(mask_n & (~is_last))[:, None] & mask_h[None, :], other=0.0)
+            bmask = (mask_n & (~is_last))[:, None] & mask_h[None, :]
+            if LIST:
+                br = tl.load(BR + boff[:, None] + t.to(tl.int64) * sbr_t + offs_h[None, :] * sbr_h,
+                             mask=bmask, other=0.0)
+            else:
+                br = tl.load(BR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
+                             mask=bmask, other=0.0)
             ps = tl.load(PS + t * sps_t + offs_h[None, :] * sps_h,
                          mask=mask_h[None, :], other=0.0)
             v = tl.where(is_last[:, None], ps.to(tl.float32), br.to(tl.float32))
@@ -341,9 +374,13 @@ def _attn_res_bwd(
 
             dv = p[:, None] * dout[None, :] + d_dot[:, None] * w[None, :] + 2.0 * v * dsq[:, None]
 
-            tl.store(DBR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
-                     dv.to(DBR.dtype.element_ty),
-                     mask=(mask_n & (~is_last))[:, None] & mask_h[None, :])
+            if LIST:
+                ap = DBR + aoff[:, None] + t.to(tl.int64) * sbr_t + offs_h[None, :] * sbr_h
+                old = tl.load(ap, mask=bmask & (~fresh)[:, None], other=0.0)
+                tl.store(ap, old + dv, mask=bmask)
+            else:
+                tl.store(DBR + t * sbr_t + offs_n[:, None] * sbr_n + offs_h[None, :] * sbr_h,
+                         dv.to(DBR.dtype.element_ty), mask=bmask)
             tl.store(DPS + t * sps_t + offs_h * sps_h,
                      tl.sum(tl.where(is_last[:, None], dv, 0.0), axis=0).to(DPS.dtype.element_ty),
                      mask=mask_h)
@@ -384,6 +421,7 @@ class FusedAttnRes(torch.autograd.Function):
             br.stride(0), br.stride(1), br.stride(2),
             ps.stride(0), ps.stride(1),
             dout.stride(0), dout.stride(1),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             SCORE_MODE=ctx.score_mode, TOPK=_eff_topk(ctx.topk, N),
             TILE=TILE, BLOCK_N=triton.next_power_of_2(N),
             BLOCK_H=triton.next_power_of_2(H), **_launch_kw(_BWD_WARPS, _BWD_STAGES),
@@ -432,3 +470,114 @@ def attn_res_reference(block_residual, prefix_sum, score_weight, eps=1e-6, score
         sp = torch.sigmoid(scores)
         probs = sp / sp.sum(-1, keepdim=True).clamp_min(1e-30)
     return torch.matmul(probs.unsqueeze(1), vf).squeeze(1).to(v.dtype)
+
+
+# ───────────────────── LIST mode: blocks as separate tensors, grads accumulated in-kernel ─────────────
+# The model used to torch.cat each new block onto a (T, n, H) block_residual (a full copy at every
+# boundary) and let autograd (a) slice the cat's gradient back apart and (b) SUM each block's
+# gradient over every site that read it -- 18 full (T, H) adds per micro-batch at b3 x 10 layers.
+# ~30 ms/board step, measured. Here a block is archived once, the mix kernel reads it in place by
+# pointer offset, and each site's backward ADDS its block gradients into one fp32 accumulator per
+# block (fixed order: the graph's backward order, so deterministic). A tiny autograd node per block
+# hands the accumulator back once every site that read it has run -- autograd orders that for free,
+# because the sites consume the node's output even though they return no gradient for it.
+
+_MAXB = 8                                     # blocks per store (O1..O7 kernel scalars)
+
+
+class _Archive(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, store, k):
+        ctx.set_materialize_grads(False)
+        ctx.store, ctx.k = store, k
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        acc = ctx.store.acc[ctx.k]
+        ctx.store.acc[ctx.k] = None
+        if acc is None:
+            return g, None, None
+        acc = acc.to(ctx.store.blocks[ctx.k].dtype)
+        return (acc if g is None else g + acc), None, None
+
+
+class _ListMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, ps, w, eps, score_mode, topk, store, n, *blocks):
+        T, H = ps.shape
+        N = n + 1
+        b0 = blocks[0]
+        es = b0.element_size()
+        offs = [(b.data_ptr() - b0.data_ptr()) // es for b in blocks[1:]]
+        offs += [0] * (_MAXB - 1 - len(offs))
+        out_dtype = torch.promote_types(b0.dtype, ps.dtype)
+        out = torch.empty(ps.shape, device=ps.device, dtype=out_dtype)
+        _attn_res_fwd[(T,)](
+            b0, ps, w.contiguous().float(), out, b0, T, N, H, eps,
+            b0.stride(0), 0, b0.stride(1), ps.stride(0), ps.stride(1), out.stride(0), out.stride(1),
+            *offs, HAS_BSQ=False, SCORE_MODE=score_mode, TOPK=_eff_topk(topk, N),
+            BLOCK_N=triton.next_power_of_2(N), BLOCK_H=triton.next_power_of_2(H), LIST=True,
+            **_launch_kw(_FWD_WARPS, _FWD_STAGES))
+        ctx.save_for_backward(ps, w, *blocks)
+        ctx.eps, ctx.score_mode, ctx.topk, ctx.store, ctx.n = eps, score_mode, topk, store, n
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        ps, w, *blocks = ctx.saved_tensors
+        store, n = ctx.store, ctx.n
+        T, H = ps.shape
+        N = n + 1
+        dout = dout.contiguous()
+        fresh = 0
+        for k in range(n):
+            if store.acc[k] is None:
+                store.acc[k] = torch.empty(T, H, device=ps.device, dtype=torch.float32)
+                fresh |= 1 << k
+        a0 = store.acc[0]
+        b0 = blocks[0]
+        es, ea = b0.element_size(), a0.element_size()
+        offs = [(b.data_ptr() - b0.data_ptr()) // es for b in blocks[1:]]
+        offs += [0] * (_MAXB - 1 - len(offs))
+        aoffs = [(store.acc[k].data_ptr() - a0.data_ptr()) // ea for k in range(1, n)]
+        aoffs += [0] * (_MAXB - 1 - len(aoffs))
+        dps = torch.empty_like(ps)
+        TILE = _bwd_tile(N)
+        n_prog = triton.cdiv(T, TILE)
+        dwp = torch.empty(n_prog, H, device=ps.device, dtype=torch.float32)
+        _attn_res_bwd[(n_prog,)](
+            b0, ps, w.contiguous().float(), dout, a0, dps, dwp, T, N, H, ctx.eps,
+            b0.stride(0), 0, b0.stride(1), ps.stride(0), ps.stride(1), dout.stride(0), dout.stride(1),
+            *offs, *aoffs, fresh,
+            SCORE_MODE=ctx.score_mode, TOPK=_eff_topk(ctx.topk, N), TILE=TILE,
+            BLOCK_N=triton.next_power_of_2(N), BLOCK_H=triton.next_power_of_2(H), LIST=True,
+            **_launch_kw(_BWD_WARPS, _BWD_STAGES))
+        return (dps, dwp.sum(0).to(w.dtype), None, None, None, None, None) + (None,) * n
+
+
+class BlockStore:
+    """The committed AttnRes blocks of ONE forward pass. archive() a (T, H) block (it is not copied);
+    mix() the depth read over every block archived so far plus the live prefix sum."""
+
+    def __init__(self):
+        self.blocks, self.refs, self.acc = [], [], []
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def archive(self, x):
+        assert x.ndim == 2 and x.stride(1) == 1 and x.stride(0) == x.shape[1], "need a contiguous (T, H) block"
+        assert len(self.blocks) < _MAXB, f"at most {_MAXB} blocks"
+        if self.blocks:
+            assert x.dtype == self.blocks[0].dtype and x.shape == self.blocks[0].shape
+        k = len(self.blocks)
+        self.blocks.append(x)
+        self.acc.append(None)
+        self.refs.append(_Archive.apply(x, self, k))
+        return self
+
+    def mix(self, prefix_sum, score_weight, eps=1e-6, score_mode=0, topk=0):
+        n = len(self.blocks)
+        assert n > 0
+        return _ListMix.apply(prefix_sum, score_weight, eps, score_mode, topk, self, n, *self.refs[:n])
