@@ -258,7 +258,7 @@ def sweep_long(S=4096):
     for part in ("fwd", "dkdv", "dq"):
         best = None
         for cfg in space[part]:
-            AX.CFG["causal"][part] = cfg
+            _cfg("causal", S)[part] = cfg
             AX._FIT.clear()
             try:
                 tf, tfb = _time(fn, ins, go, n=5)
@@ -269,13 +269,17 @@ def sweep_long(S=4096):
             print(f"   {part:5s} {cfg}  {t:7.3f} ms", flush=True)
             if best is None or t < best[0]:
                 best = (t, cfg)
-        AX.CFG["causal"][part] = best[1]
+        _cfg("causal", S)[part] = best[1]
         AX._FIT.clear()
         print(f"   -> {part} best {best[1]} {best[0]:.3f} ms", flush=True)
-    print(f"   FINAL causal: {AX.CFG['causal']}", flush=True)
+    print(f"   FINAL causal S={S}: {_cfg('causal', S)}", flush=True)
 
 
-_BASE_CFG = {m: {k: dict(v) for k, v in c.items()} for m, c in AX.CFG.items()}
+def _cfg(mode, S):
+    return AX.cfg_for(mode, S)
+
+
+_BASE_CFG = {m: {k: dict(v) for k, v in AX.cfg_for(m, 1024).items()} for m in AX.CFG}
 
 
 def sweep():
@@ -301,7 +305,7 @@ def sweep():
         for part in ("fwd", "dkdv", "dq"):
             best = None
             for cfg in space[part]:
-                AX.CFG[mode][part] = cfg
+                _cfg(mode, S)[part] = cfg
                 AX._FIT.clear()
                 try:
                     tf, tfb = _time(fn, ins, go, n=5)
@@ -314,11 +318,11 @@ def sweep():
                     best = (t, cfg)
             if best is None:
                 print(f"   -> {part}: every config failed, keeping {base[part]}", flush=True)
-                AX.CFG[mode][part] = base[part]
+                _cfg(mode, S)[part] = base[part]
                 continue
-            AX.CFG[mode][part] = best[1]
+            _cfg(mode, S)[part] = best[1]
             print(f"   -> {part} best {best[1]} {best[0]:.3f} ms", flush=True)
-        print(f"   FINAL {mode}: {AX.CFG[mode]}", flush=True)
+        print(f"   FINAL {mode}: {_cfg(mode, S)}", flush=True)
 
 
 if __name__ == "__main__":

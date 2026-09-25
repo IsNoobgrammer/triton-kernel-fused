@@ -38,13 +38,25 @@ __all__ = ["attn_xsa", "AttnXSA", "attn_xsa_reference", "CFG"]
 
 LOG2E = 1.4426950408889634
 
-# Per-kernel tiles, keyed by mode (swept with parity_check/parity_attn_xsa.py --sweep/--sweep_long).
+# Per-kernel tiles by mode and sequence length: [(max_S, cfg), ...], first entry with S <= max_S
+# wins. Chosen by SHAPE only (never by timing), so a run's numerics never depend on a benchmark.
+# Swept with parity_check/parity_attn_xsa.py --sweep (S=1024) / --sweep_long (S=4096).
 CFG = {
-    "causal": {"fwd": dict(BM=64, BN=64, warps=8, stages=2), "pre": dict(BM=64, warps=4),
-               "dkdv": dict(BM=32, BN=32, warps=4, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=3)},
-    "window": {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
-               "dkdv": dict(BM=32, BN=32, warps=8, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=2)},
+    "causal": [
+        (1024, {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
+                "dkdv": dict(BM=32, BN=32, warps=4, stages=3), "dq": dict(BM=32, BN=32, warps=4, stages=2)}),
+        (1 << 30, {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
+                   "dkdv": dict(BM=64, BN=32, warps=8, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=3)}),
+    ],
+    "window": [
+        (1 << 30, {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
+                   "dkdv": dict(BM=32, BN=32, warps=4, stages=3), "dq": dict(BM=32, BN=32, warps=4, stages=3)}),
+    ],
 }
+
+
+def cfg_for(mode, S):
+    return next(c for max_s, c in CFG[mode] if S <= max_s)
 PREP_ROWS = 64
 
 
@@ -137,7 +149,7 @@ def _fwd(Q, K, V, O, Z, LSE, A,
          GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
          WINDOW: tl.constexpr, XSA: tl.constexpr, HAS_A: tl.constexpr):
     HD: tl.constexpr = D // 2
-    pid_m = tl.program_id(0)
+    pid_m = tl.num_programs(0) - 1 - tl.program_id(0)      # longest-first: last query blocks do the most work
     pid = tl.program_id(1)
     b = pid // HKV
     kvh = pid % HKV
@@ -329,7 +341,7 @@ def _bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
             GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
             WINDOW: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
     HD: tl.constexpr = D // 2
-    pid_m = tl.program_id(0)
+    pid_m = tl.num_programs(0) - 1 - tl.program_id(0)      # longest-first (see _fwd)
     pid = tl.program_id(1)
     b = pid // HKV
     kvh = pid % HKV
@@ -470,8 +482,8 @@ class AttnXSA(torch.autograd.Function):
         mode = "window" if window is not None else "causal"
         sm = float(scale) * float(q_scale) * float(k_scale)          # the scalars fold into the logits
         flags = dict(WINDOW=window is not None, XSA=bool(xsa), HAS_A=A is not None)
-        _launch(_fwd, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), CFG[mode]["fwd"],
-                ("fwd", mode, D, G, q.dtype, tuple(flags.values())),
+        _launch(_fwd, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cfg_for(mode, S)["fwd"],
+                ("fwd", mode, S, D, G, q.dtype, tuple(flags.values())),
                 qn, kn, v, O, Z, LSE, A if A is not None else q,
                 *_st(qn), *_st(kn), *_st(v), *_st(O), *_st(Z), S, H, HKV, sm * LOG2E, W, GROUP=G, D=D, **flags)
         ctx.save_for_backward(q, k, v, O, LSE, A if A is not None else q.new_zeros(0),
@@ -492,8 +504,8 @@ class AttnXSA(torch.autograd.Function):
             dZ = dZ.contiguous()
         W = int(window) if window is not None else 0
         mode = "window" if window is not None else "causal"
-        cf = CFG[mode]
-        key = (mode, D, G, q.dtype, window is not None, xsa, has_a, qk_norm, rope)
+        cf = cfg_for(mode, S)
+        key = (mode, S if mode == "causal" else 0, D, G, q.dtype, window is not None, xsa, has_a, qk_norm, rope)
         DO = torch.empty(B, H, S, D, device=q.device, dtype=q.dtype) if xsa else dZ   # no XSA: dO = dZ
         DELTA = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         GA = torch.empty(B, H, S, device=q.device, dtype=torch.float32) if (xsa and has_a) else DELTA
