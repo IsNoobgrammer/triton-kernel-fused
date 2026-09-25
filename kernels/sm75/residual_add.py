@@ -45,21 +45,20 @@ _RMS_EPS = tl.constexpr(1e-6)          # a plain global is unreadable from @trit
 
 _NPROG = 1024                          # backward grid: ~SM count x a few, so PART stays ~2 MB
 
-# Autotuned, not hardcoded. The first rewrite copied XBLOCK=8/num_warps=4 from the old tiled
-# kernel and ran 38% behind Inductor on the forward for that reason alone -- Inductor's
-# persistent_reduction heuristic picks both per shape.
-#
-# key=("H",) ONLY. H is a true shape constant; T is the GRID dimension, and keying an autotuner
-# on a grid dim has already cost this repo a 4.1x eval stall when a stale cache entry was reused
-# across sequence lengths.
+# PINNED, not autotuned. The backward's d_theta partials are summed in an order set by XBLOCK and
+# num_warps: over the 30 configs once autotuned here, the same inputs gave 10 distinct d_theta bit
+# patterns, so two processes that timed their way to different configs trained different models
+# (BiBo board, Sep 25 2026: 6.94457 vs 6.94319 final loss, same code path). Swept at T=65536
+# H=512 on the RTX PRO 6000, every config is within 2% (fwd 239-248 us, bwd 202-210 us, 83-86% of
+# bandwidth), so the fixed one costs nothing. carry_sweep.py in the tkf session scratchpad.
 _MAX_XBLOCK = 16
-_CFGS = [triton.Config({"XBLOCK": b}, num_warps=w, num_stages=st)
-         for b in (1, 2, 4, 8, _MAX_XBLOCK) for w in (2, 4, 8) for st in (1, 2)]
+_FWD_CFG = dict(XBLOCK=8, num_warps=2, num_stages=2)
+_BWD_CFG = dict(XBLOCK=8, num_warps=2, num_stages=2)
 
 
 def _even(T, H, rb):
-    """Can EVERY autotune config run unmasked? XBLOCK is chosen by the autotuner, so this must
-    hold for the largest of them, not just the one that happens to win."""
+    """Can the kernels run unmasked? Checked against _MAX_XBLOCK, not the pinned XBLOCK, so a
+    re-pin up to 16 needs no change here."""
     return H == rb and T % _MAX_XBLOCK == 0
 
 
@@ -72,7 +71,6 @@ def _coef(c, CSIG: tl.constexpr):
     return c
 
 
-@triton.autotune(configs=_CFGS, key=("H",))
 @triton.jit
 def _fwd_kernel(AR, S, M, OUT, RSTD, PS, PSO, T, H: tl.constexpr, RBLOCK: tl.constexpr,
                 VEC: tl.constexpr, MODE: tl.constexpr, EVEN: tl.constexpr,
@@ -116,7 +114,6 @@ def _fwd_kernel(AR, S, M, OUT, RSTD, PS, PSO, T, H: tl.constexpr, RBLOCK: tl.con
     tl.store(OUT + xs * H + r, (ar + c * s).to(OUT.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=_CFGS, key=("H",))
 @triton.jit
 def _bwd_kernel(DO, S, M, RSTD, DS, PART, DPS, T, H: tl.constexpr,
                 RBLOCK: tl.constexpr, VEC: tl.constexpr, MODE: tl.constexpr,
@@ -219,9 +216,9 @@ class _ResidualAdd(torch.autograd.Function):
         rstd = (torch.empty(T, device=ar.device, dtype=torch.float32)
                 if mode == "rms" else ar)                      # dummy ptr when unused
         rb = triton.next_power_of_2(H)
-        _fwd_kernel[lambda meta: (triton.cdiv(T, meta["XBLOCK"]),)](
+        _fwd_kernel[(triton.cdiv(T, _FWD_CFG["XBLOCK"]),)](
             ar, sv, theta, out, rstd, ar, ar, T, H=H, RBLOCK=rb,
-            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb), HAS_PS=False, CSIG=False)
+            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb), HAS_PS=False, CSIG=False, **_FWD_CFG)
         ctx.save_for_backward(sv, theta, rstd)
         ctx.mode, ctx.vec, ctx.H, ctx.T = mode, vec, H, T
         ctx.shape = attn_read.shape
@@ -239,7 +236,7 @@ class _ResidualAdd(torch.autograd.Function):
         _bwd_kernel[(_NPROG,)](
             do, sv, theta, rstd, ds, part, do, T, H=H, RBLOCK=rb,
             VEC=vec, MODE=MODES[mode], NEED_DS=need_ds, NPROG=_NPROG,
-            EVEN=_even(T, H, rb), HAS_DPS=False, CSIG=False)
+            EVEN=_even(T, H, rb), HAS_DPS=False, CSIG=False, **_BWD_CFG)
         # (NPROG, H) -> theta's shape. NPROG is ~1k, so fp32 partials are ample here; the old
         # kernel reduced 8192 rows and needed fp64 to stay accurate over that many terms.
         d_theta = None
@@ -293,9 +290,9 @@ class _CarryUpdate(torch.autograd.Function):
         pso = torch.empty_like(pv) if has_ps else ar
         rstd = torch.empty(T, device=ar.device, dtype=torch.float32) if mode == "rms" else ar
         rb = triton.next_power_of_2(H)
-        _fwd_kernel[lambda meta: (triton.cdiv(T, meta["XBLOCK"]),)](
+        _fwd_kernel[(triton.cdiv(T, _FWD_CFG["XBLOCK"]),)](
             ar, sv, theta, out, rstd, pv, pso, T, H=H, RBLOCK=rb,
-            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb), HAS_PS=has_ps, CSIG=csig)
+            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb), HAS_PS=has_ps, CSIG=csig, **_FWD_CFG)
         ctx.save_for_backward(sv, theta, rstd)
         ctx.mode, ctx.vec, ctx.H, ctx.T, ctx.csig, ctx.has_ps = mode, vec, H, T, csig, has_ps
         ctx.shape = attn_read.shape
@@ -316,7 +313,7 @@ class _CarryUpdate(torch.autograd.Function):
         _bwd_kernel[(_NPROG,)](
             do, sv, theta, rstd, ds, part, dpv if dpv is not None else do, T, H=H, RBLOCK=rb,
             VEC=vec, MODE=MODES[mode], NEED_DS=True, NPROG=_NPROG,
-            EVEN=_even(T, H, rb), HAS_DPS=dpv is not None, CSIG=csig)
+            EVEN=_even(T, H, rb), HAS_DPS=dpv is not None, CSIG=csig, **_BWD_CFG)
         d_theta = None
         if ctx.needs_input_grad[1]:
             col = part.double().sum(0)
