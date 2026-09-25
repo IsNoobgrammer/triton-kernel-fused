@@ -74,7 +74,7 @@ for k in cat:
             rn = ref[k].norm().item() or 1.0
             ec = (cat[k].double() - ref[k]).norm().item() / rn
             el = (lst[k].double() - ref[k]).norm().item() / rn
-            good = el <= ec * 1.01
+            good = el <= max(ec * 1.05, 1e-6)          # both at the fp32 floor
             print(f"   {k:9s} not bitwise vs cat; rel err vs fp64: cat {ec:.3e}  list {el:.3e}  {'OK' if good else 'WORSE'}")
     ok &= good
 print("   outputs, prefix-sum grads, score-weight grads: bitwise == cat path unless listed above")

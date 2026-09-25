@@ -152,7 +152,9 @@ def _block_offsets(offs_n, O1, O2, O3, O4, O5, O6, O7):
             + tl.where(offs_n == 7, z + O7, z))
 
 
-@triton.jit
+# The block offsets are allocation-address differences: letting Triton specialize them (on
+# divisibility by 16 / == 1) recompiled the kernel on almost every call -- 380 ms per board step.
+@triton.jit(do_not_specialize=["O1", "O2", "O3", "O4", "O5", "O6", "O7"])
 def _attn_res_fwd(
     BR, PS, W, OUT, BSQ,
     T, N, H, eps,
@@ -284,7 +286,8 @@ def fused_attn_res(block_residual, prefix_sum, score_weight, eps=1e-6, block_sq_
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["O1", "O2", "O3", "O4", "O5", "O6", "O7",
+                               "A1", "A2", "A3", "A4", "A5", "A6", "A7", "FRESH"])
 def _attn_res_bwd(
     BR, PS, W, DOUT, DBR, DPS, DWP,
     T, N, H, eps,
