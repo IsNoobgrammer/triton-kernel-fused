@@ -93,6 +93,10 @@ def grade(T=8192, H=512, E=64, K=6, seed=0, eps=1e-6):
     s = mapK.sum(1)
     assert torch.allclose(s, torch.ones_like(s), atol=1e-3), \
         f"kernel weights do not sum to 1: min {s.min():.6f} max {s.max():.6f}"
+    # the block no longer returns counts; the MoE builds them from the indices with expert_counts,
+    # so that is what is checked against bincount
+    from kernels.sm75.moe import expert_counts
+    cntK = expert_counts(idxK.reshape(-1).long(), E).to(torch.int32)
     ref_cnt = torch.bincount(idxK.reshape(-1).long(), minlength=E).to(torch.int32)
     assert torch.equal(cntK, ref_cnt), "counts != bincount(indices)"
     assert cntK.sum().item() == T * K, f"counts sum {cntK.sum().item()} != T*K {T*K}"

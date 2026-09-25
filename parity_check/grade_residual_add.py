@@ -183,7 +183,9 @@ def _bounded_spot_check():
 
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
-    cases = list(_all_cases()) + list(_bounded_spot_check())
+    # single-stream only: make_mlp_input dropped the multi-stream (embedding-term) API, so the
+    # K>=2 configs grade a call nothing can make any more
+    cases = [c for c in list(_all_cases()) + list(_bounded_spot_check()) if len(c[2]) == 1]
     print(f"grading {len(cases)} configurations x 4 quantities "
           f"= {len(cases) * 4} measurements against fp64 "
           f"({len(list(_all_cases()))} dtype configs at mode=none, 4 bounded spot checks)\n")
