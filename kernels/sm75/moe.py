@@ -36,6 +36,18 @@ _FUSED_GLU = None
 _FUSED_GLU_TRIED = False
 
 
+# MoE dW GEMMs: "triton" = moe_fused_glu.grouped_wgrad (one launch, no host sync, deterministic);
+# "torch" = torch._grouped_mm, which on sm120 is a host loop of per-expert cuBLAS GEMMs + a sync.
+WGRAD = os.environ.get("TKF_MOE_WGRAD", "triton")
+
+
+def _wgrad(a, b, offs):
+    """Per-expert a[rows_e]^T @ b[rows_e] (== torch._grouped_mm(a.t(), b, offs=offs))."""
+    g = _fused_glu() if WGRAD == "triton" else None
+    out = g.grouped_wgrad(a, b, offs) if g is not None and hasattr(g, "grouped_wgrad") else None
+    return out if out is not None else torch._grouped_mm(a.t(), b, offs=offs)
+
+
 def _fused_glu():
     """The fused GEMM+GLU module, resolved LAZILY on first use.
 
@@ -925,7 +937,7 @@ class _PerExpertMoE(torch.autograd.Function):
             want_ap = ctx.has_ap and ctx.needs_input_grad[6]
             grad_ap = None
             ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)
-            grad_down_proj = torch._grouped_mm(ge_all.t(), it_all, offs=offs)
+            grad_down_proj = _wgrad(ge_all, it_all, offs)
             hint = codes[0] if len(set(codes)) == 1 else None
             if ctx.tile_map is not None:
                 grad_gate_up = _fused_glu().fused_dinter_glu_bwd(
@@ -946,7 +958,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 else:
                     grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
                                             row_alpha=ctx.row_alpha)
-            grad_gate_up_proj = torch._grouped_mm(grad_gate_up.t(), x_s, offs=offs)
+            grad_gate_up_proj = _wgrad(grad_gate_up, x_s, offs)
             grad_hidden = None
             if ctx.tile_map_gg is not None:
                 if ctx.inv is not None:

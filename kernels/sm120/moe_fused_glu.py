@@ -205,7 +205,9 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
 # first. An expert with more than CH rows is SPLIT: each chunk writes an fp32 partial and
 # _wg_reduce sums them in chunk order, so the result is deterministic (no atomics). Experts with
 # no rows get one empty chunk, which stores zeros -- the same as torch._grouped_mm.
-_WG = dict(CH=8192, BM=128, BN=128, BK=32, num_warps=8, num_stages=3)
+# swept on the RTX PRO 6000 at the board shapes (bench_grouped_wgrad.py --sweep): grad_down 1.16 ms vs
+# torch 1.89 (1.63x), grad_gate_up 2.17 vs 2.95 (1.36x), L0 gate_up 2.30 vs 2.37. Fixed, not autotuned.
+_WG = dict(CH=16384, BM=128, BN=128, BK=32, num_warps=4, num_stages=4)
 
 
 @triton.jit
