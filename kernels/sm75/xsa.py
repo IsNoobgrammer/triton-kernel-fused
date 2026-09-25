@@ -41,12 +41,10 @@ def _xsa_fwd_kernel(Y, V, Z, A, n_rows, S, D, H, Hkv, GROUP: tl.constexpr,
         tl.store(Z + y_row[:, None] * D + offs_d[None, :], z.to(Z.dtype.element_ty), mask=full)
 
 
-# reset_to_zero=["GA"] is REQUIRED, not tidiness: the autotuner runs this kernel once per config
-# (and per warmup/rep iteration) to time it, and GA is accumulated with atomic_add. Without the
-# reset, the FIRST backward for each new shape returns the alpha gradient summed over every
-# autotune trial -- measured ~17000x too large -- and every later call is correct because the
-# config is then cached. That is the worst shape of bug: one enormous wrong optimizer step on
-# alpha, once, invisible afterwards. GY/GV are plain stores, so they are unaffected.
+# GA is now a per-row buffer written with plain stores (no atomics), so autotune trials cannot
+# accumulate into it. History: while GA was atomic_add'ed, reset_to_zero=["GA"] was REQUIRED --
+# without it the FIRST backward per shape returned the alpha grad summed over every autotune
+# trial (~17000x too large). Kept: it is free and guards any future return to accumulation.
 # key EXCLUDES S. S only sets the grid size (n_rows = B*Hkv*S); it does not change the work per
 # program at all -- XBLOCK is rows-per-program and BLOCK_D covers D. Keying on it re-tunes 27
 # configs for every distinct sequence length: measured 5.37 s per new S, which turned the
@@ -79,9 +77,10 @@ def _xsa_bwd_kernel(GZ, Y, V, GY, GV, A, GA, n_rows, S, D, H, Hkv, GROUP: tl.con
         a = tl.full((XBLOCK,), 1.0, dtype=tl.float32)
         if HAS_A:
             a = tl.load(A + (kv * GROUP + j), mask=rmask, other=0.0).to(tl.float32)
-            # dL/da = -coeff * (gz.v), reduced over every row this head sees. atomic because a block
-            # is not guaranteed to hold one head's rows exclusively.
-            tl.atomic_add(GA + (kv * GROUP + j), -coeff * gzv, mask=rmask)
+            # dL/da = -coeff * (gz.v) per ROW, stored to that row's own slot; backward() sums each
+            # head's rows in a fixed order. (An atomic_add per row into GA[h] made the alpha grad
+            # differ run to run -- the last nondeterministic gradient of the board step.)
+            tl.store(GA + row, -coeff * gzv, mask=rmask)
         gy = gz - (a * gzv * inv)[:, None] * v
         tl.store(GY + bp, gy.to(GY.dtype.element_ty), mask=full)
         gv += a[:, None] * ((-(gzv * inv))[:, None] * y
@@ -117,13 +116,14 @@ class FusedXSA(torch.autograd.Function):
         gZ = gZ.contiguous()
         GY = torch.empty_like(Y)
         GV = torch.empty_like(V)
-        GA = torch.zeros(H, device=Y.device, dtype=torch.float32) if ctx.has_a else None
+        GA = torch.empty(B * H * S, device=Y.device, dtype=torch.float32) if ctx.has_a else None
         n_rows = B * Hkv * S
         grid = lambda meta: (triton.cdiv(n_rows, meta["XBLOCK"]),)
         _xsa_bwd_kernel[grid](gZ, Y, V, GY, GV, A if ctx.has_a else Y, GA if ctx.has_a else Y,
                               n_rows, S, D, H, Hkv, GROUP=group, HAS_A=ctx.has_a, BLOCK_D=BLOCK_D)
         if not ctx.has_a:
             return GY, GV, None
+        GA = GA.view(B, H, S).sum(dim=(0, 2))        # per-row terms -> per head, fixed order
         # chain through the tanh: alpha_used = tanh(theta), so dL/dtheta = dL/dalpha * (1 - a^2)
         return GY, GV, (GA * (1.0 - A * A)).to(alpha.dtype)
 
