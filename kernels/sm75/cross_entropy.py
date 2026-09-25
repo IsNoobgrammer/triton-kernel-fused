@@ -30,10 +30,12 @@ def _grad_logits_kernel(L_ptr, Lse_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
 
 def _grad_logits_inplace(logits, lse, labels, nv, ignore_index):
     M, Vv = logits.shape
-    BLOCK_M, BLOCK_V = 8, 1024
+    # swept on the RTX PRO 6000 at a 6553 x 81920 chunk (bench_ce_combine.py): 1.571 ms vs 1.624 for
+    # the old 8/1024/4w. Elementwise, so the config never changes a bit.
+    BLOCK_M, BLOCK_V = 1, 512
     _grad_logits_kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(Vv, BLOCK_V))](
         logits, lse, labels, nv, M, Vv, ignore_index,
-        logits.stride(0), logits.stride(1), BLOCK_M=BLOCK_M, BLOCK_V=BLOCK_V, num_warps=4)
+        logits.stride(0), logits.stride(1), BLOCK_M=BLOCK_M, BLOCK_V=BLOCK_V, num_warps=8)
     return logits
 
 
@@ -83,7 +85,7 @@ class _CEFusedFwdBwd(torch.autograd.Function):
             logits = torch.mm(hc, weight.t())
             _fwd_reduce_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
                                       cl, V, logits.stride(0), logits.stride(1), ignore_index,
-                                      BLOCK_V=1024)
+                                      BLOCK_V=2048, num_warps=16)   # swept: 0.832 vs 0.901 ms/chunk
             if need_grad:
                 _grad_logits_inplace(logits, lse[i:i + C], labels[i:i + C], nv, ignore_index)
                 if need_gh:
