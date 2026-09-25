@@ -323,7 +323,7 @@ class AttnXSA(torch.autograd.Function):
         _bwd_dq[(nqb, B * HKV)](
             q, k, DO, LSE, DELTA, v, DQ, PWQ, wq_, wk_, S, H, HKV, float(scale), q_scale, k_scale,
             eps, W, GROUP=G, D=D, BM=BM, BN=BN, WINDOW=window is not None, QK_NORM=qk_norm,
-            num_warps=8, num_stages=2)
+            num_warps=8, num_stages=1)   # 2 stages: 115 KB smem > 101 KB
         d_alpha = None
         if xsa and has_a:
             d_alpha = (GA.sum(dim=(0, 2)) * (1.0 - A * A)).to(a_dtype)
