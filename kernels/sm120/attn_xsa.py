@@ -257,11 +257,12 @@ def _bwd_pre(O, DZ, V, A, DO, DELTA, GA, GVS, zsb, zsh, zss, vsb, vsh, vss, osb,
 
 
 @triton.jit
-def _bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN,
+def _bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN, DQACC,
               qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
               S, H, HKV, sm_scale, nat_scale, eps, W,
               GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-              WINDOW: tl.constexpr, XSA: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
+              WINDOW: tl.constexpr, XSA: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr,
+              ATOMIC_DQ: tl.constexpr):
     HD: tl.constexpr = D // 2
     pid_n = tl.program_id(0)
     pid = tl.program_id(1)
@@ -312,6 +313,11 @@ def _bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN,
             ds = (p * (dp - dl[None, :])).to(tl.bfloat16)
             dk1 = tl.dot(ds, q1, dk1)
             dk2 = tl.dot(ds, q2, dk2)
+            if ATOMIC_DQ:          # deterministic=False: dQ here, FA2-style, 5 matmuls instead of 7
+                dqp1 = tl.dot(tl.trans(ds), k1)
+                dqp2 = tl.dot(tl.trans(ds), k2)
+                tl.atomic_add(DQACC + irow[:, None] * D + dh[None, :], dqp1, mask=smask[:, None])
+                tl.atomic_add(DQACC + irow[:, None] * D + HD + dh[None, :], dqp2, mask=smask[:, None])
     dk1 = dk1 * nat_scale
     dk2 = dk2 * nat_scale
     if QK_NORM or ROPE:
@@ -405,6 +411,32 @@ def _bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
     tl.store(DQ + roff[:, None] + HD + dh[None, :], dq2.to(DQ.dtype.element_ty), mask=rmask[:, None])
 
 
+@triton.jit
+def _dq_epi(DQACC, QR, DQ, PWQ, WQ, COS, SIN, rsb, rsh, rss, csb, css, NR, S, H, nat_scale, eps,
+            D: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr, BR: tl.constexpr):
+    """deterministic=False only: the atomically accumulated dQ (w.r.t. rope(norm(q) * w)) -> raw dq."""
+    HD: tl.constexpr = D // 2
+    r_ = tl.program_id(0) * BR + tl.arange(0, BR)
+    msk = r_ < NR
+    s = r_ % S
+    bh = r_ // S
+    b = bh // H
+    h = bh % H
+    dh = tl.arange(0, HD)
+    g1 = tl.load(DQACC + r_.to(tl.int64)[:, None] * D + dh[None, :], mask=msk[:, None], other=0.0) * nat_scale
+    g2 = tl.load(DQACC + r_.to(tl.int64)[:, None] * D + HD + dh[None, :], mask=msk[:, None], other=0.0) * nat_scale
+    roff = b.to(tl.int64) * rsb + h.to(tl.int64) * rsh + s.to(tl.int64) * rss
+    if QK_NORM or ROPE:
+        cbase = b.to(tl.int64) * csb
+        _z1, _z2, rq, qx1, qx2 = _qk_in(QR, roff, msk, s, WQ, COS, SIN, cbase, css, eps, D, HD, QK_NORM, ROPE)
+        g1, g2, dw1, dw2 = _qk_back(g1, g2, qx1, qx2, rq, s, msk, WQ, COS, SIN, cbase, css, D, HD, QK_NORM, ROPE)
+        if QK_NORM:
+            tl.store(PWQ + tl.program_id(0).to(tl.int64) * D + dh, dw1)
+            tl.store(PWQ + tl.program_id(0).to(tl.int64) * D + HD + dh, dw2)
+    tl.store(DQ + roff[:, None] + dh[None, :], g1.to(DQ.dtype.element_ty), mask=msk[:, None])
+    tl.store(DQ + roff[:, None] + HD + dh[None, :], g2.to(DQ.dtype.element_ty), mask=msk[:, None])
+
+
 _FIT = {}
 
 
@@ -453,7 +485,8 @@ def _prepped(x, w, cos, sin, csb, css, eps, qk_norm, rope):
 class AttnXSA(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, alpha, q_norm_w, k_norm_w, cos, sin, scale, window, xsa, q_scale, k_scale, eps):
+    def forward(ctx, q, k, v, alpha, q_norm_w, k_norm_w, cos, sin, scale, window, xsa, q_scale, k_scale, eps,
+                deterministic=True):
         B, H, S, D = q.shape
         HKV = k.shape[1]
         G = H // HKV
@@ -488,6 +521,7 @@ class AttnXSA(torch.autograd.Function):
                 *_st(qn), *_st(kn), *_st(v), *_st(O), *_st(Z), S, H, HKV, sm * LOG2E, W, GROUP=G, D=D, **flags)
         ctx.save_for_backward(q, k, v, O, LSE, A if A is not None else q.new_zeros(0),
                               wq if qk_norm else q.new_zeros(0), wk if qk_norm else q.new_zeros(0), cos, sin)
+        ctx.det = bool(deterministic)
         ctx.cfg = (sm, window, bool(xsa), float(eps), A is not None, qk_norm, rope, csb, css,
                    alpha.dtype if alpha is not None else None,
                    q_norm_w.dtype if qk_norm else None, k_norm_w.dtype if qk_norm else None)
@@ -523,30 +557,42 @@ class AttnXSA(torch.autograd.Function):
         # OutOfResources fallback can reach and slice to the real count afterwards
         PWK = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         common = (csb, css, S, H, HKV, sm * LOG2E, sm, float(eps), W)
-        c = _launch(_bwd_dkdv, lambda c: (triton.cdiv(S, c["BN"]), B * HKV), cf["dkdv"], ("dkdv",) + key,
-                    qn, kn, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wk_ if qk_norm else q, cos, sin,
+        det = ctx.det
+        DQACC = DELTA if det else torch.zeros(B, H, S, D, device=q.device, dtype=torch.float32)
+        c = _launch(_bwd_dkdv, lambda c: (triton.cdiv(S, c["BN"]), B * HKV), cf["dkdv"], ("dkdv", det) + key,
+                    qn, kn, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wk_ if qk_norm else q, cos, sin, DQACC,
                     *_st(qn), *_st(kn), *_st(k), *_st(v), *_st(DO), *common,
-                    GROUP=G, D=D, WINDOW=window is not None, XSA=xsa, QK_NORM=qk_norm, ROPE=rope)
+                    GROUP=G, D=D, WINDOW=window is not None, XSA=xsa, QK_NORM=qk_norm, ROPE=rope,
+                    ATOMIC_DQ=not det)
         nkb = triton.cdiv(S, c["BN"])
         DQ = _like(q)
         PWQ = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
-        c = _launch(_bwd_dq, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cf["dq"], ("dq",) + key,
-                    qn, kn, q, v, DO, LSE, DELTA, DQ, PWQ, wq_ if qk_norm else q, cos, sin,
-                    *_st(qn), *_st(kn), *_st(q), *_st(v), *_st(DO), *common,
-                    GROUP=G, D=D, WINDOW=window is not None, QK_NORM=qk_norm, ROPE=rope)
-        nqb = triton.cdiv(S, c["BM"])
+        if det:
+            c = _launch(_bwd_dq, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cf["dq"], ("dq",) + key,
+                        qn, kn, q, v, DO, LSE, DELTA, DQ, PWQ, wq_ if qk_norm else q, cos, sin,
+                        *_st(qn), *_st(kn), *_st(q), *_st(v), *_st(DO), *common,
+                        GROUP=G, D=D, WINDOW=window is not None, QK_NORM=qk_norm, ROPE=rope)
+            nqb = B * HKV * triton.cdiv(S, c["BM"])
+        else:
+            NR = B * H * S
+            nqb = triton.cdiv(NR, PREP_ROWS)
+            PWQ = torch.empty(nqb, D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
+            _dq_epi[(nqb,)](DQACC, q, DQ, PWQ, wq_ if qk_norm else q, cos, sin, *_st(q), csb, css, NR, S, H,
+                            sm, float(eps), D=D, QK_NORM=qk_norm, ROPE=rope, BR=PREP_ROWS, num_warps=4)
         d_alpha = None
         if xsa and has_a:
             d_alpha = (GA.sum(dim=(0, 2)) * (1.0 - A * A)).to(a_dtype)
-        dwq = PWQ[: B * HKV * nqb].sum(0).to(wq_dtype) if qk_norm else None
+        dwq = PWQ[:nqb].sum(0).to(wq_dtype) if qk_norm else None
         dwk = PWK[: B * HKV * nkb].sum(0).to(wk_dtype) if qk_norm else None
-        return DQ, DK, DV, d_alpha, dwq, dwk, None, None, None, None, None, None, None, None
+        return DQ, DK, DV, d_alpha, dwq, dwk, None, None, None, None, None, None, None, None, None
 
 
 def attn_xsa(q, k, v, *, scale, window=None, xsa=True, alpha=None, q_norm_w=None, k_norm_w=None,
-             q_scale=1.0, k_scale=1.0, eps=1e-6, cos=None, sin=None):
+             q_scale=1.0, k_scale=1.0, eps=1e-6, cos=None, sin=None, deterministic=True):
+    """deterministic=False accumulates dQ with fp32 atomics inside the dK/dV pass (FA2-style):
+    5 backward matmuls instead of 7, faster at long sequences, but not bitwise repeatable."""
     return AttnXSA.apply(q, k, v, alpha, q_norm_w, k_norm_w, cos, sin, scale, window, xsa,
-                         q_scale, k_scale, eps)
+                         q_scale, k_scale, eps, deterministic)
 
 
 def _rotate_half(x):
