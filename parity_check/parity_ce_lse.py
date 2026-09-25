@@ -28,6 +28,9 @@ def run(mode):
     w = w0.clone().requires_grad_()
     if mode == "ref":
         loss = F.cross_entropy(x @ w.t(), lab, ignore_index=-100)
+    elif mode == "eager_bf16":            # plain PyTorch under bf16 autocast: the bf16 floor
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = F.cross_entropy(x @ w.t(), lab, ignore_index=-100)
     else:
         CE.LSE_GEMM = mode == "fused"
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -38,6 +41,7 @@ def run(mode):
 
 
 ref, old, new, new2 = run("ref"), run("old"), run("fused"), run("fused")
+eag = run("eager_bf16")
 ok = True
 for k in ref:
     rn = ref[k].norm().item()
@@ -46,5 +50,7 @@ for k in ref:
     rep = torch.equal(new[k], new2[k])
     good = rep and en <= max(eo * 1.02, 1e-6)
     ok &= good
-    print(f"   {k:9s} rel err vs fp32: cuBLAS+reduce {eo:.3e}  lse-GEMM {en:.3e}  repeat {'bitwise' if rep else 'DIFFERS'}  {'OK' if good else 'WORSE'}")
+    ee = (eag[k] - ref[k]).norm().item() / rn
+    print(f"   {k:9s} rel err vs fp32: torch bf16 eager {ee:.3e}  cuBLAS+reduce {eo:.3e}  lse-GEMM {en:.3e}"
+          f"  repeat {'bitwise' if rep else 'DIFFERS'}  {'OK' if good else 'WORSE'}")
 print("CE LSE PASS" if ok else "CE LSE FAIL")
