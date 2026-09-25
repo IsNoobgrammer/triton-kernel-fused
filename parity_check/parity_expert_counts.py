@@ -19,7 +19,7 @@ for E in (8, 64, 65):
             ok &= torch.equal(expert_counts(e, E), torch.bincount(e, minlength=E))
 e = torch.randint(0, 64, (393216,), device="cuda")
 n = [0]
-warnings.showwarning = lambda *a, **k: n.__setitem__(0, n[0] + 1)
+warnings.showwarning = lambda msg, *a, **k: n.__setitem__(0, n[0] + ("synchroniz" in str(msg)))  # sync warnings only
 warnings.simplefilter("always")
 torch.cuda.synchronize(); torch.cuda.set_sync_debug_mode("warn")
 expert_counts(e, 64)
