@@ -15,6 +15,8 @@ M = importlib.import_module("kernels.sm75.moe")   # the package re-exports a `mo
 
 dev = "cuda"
 N, H, E, I = 65536, 512, 8, 576
+codes = torch.full((E,), 8, device=dev, dtype=torch.int64)   # one buffer, as in the model: its host
+                                                             # copy is cached per tensor
 
 
 def inputs(seed=0):
@@ -32,7 +34,6 @@ def inputs(seed=0):
 def run(mode, seed=0):
     hidden, idx, wt, gu, dn, ap, go = inputs(seed)
     leaves = [t.requires_grad_() for t in (hidden, wt, gu, dn, ap)]
-    codes = torch.full((E,), 8, device=dev, dtype=torch.int64)
     M.DENSE_ALL_ACTIVE = mode == "dense"
     os.environ["BIBO_MOE_FORCE_LOOP"] = "1" if mode == "ref" else "0"
     if mode == "ref":
