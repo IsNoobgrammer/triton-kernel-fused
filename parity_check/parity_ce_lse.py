@@ -48,9 +48,10 @@ for k in ref:
     eo = (old[k] - ref[k]).norm().item() / rn
     en = (new[k] - ref[k]).norm().item() / rn
     rep = torch.equal(new[k], new2[k])
-    good = rep and en <= max(eo * 1.02, 1e-6)
-    ok &= good
     ee = (eag[k] - ref[k]).norm().item() / rn
+    # at least as close as the old path AND as plain PyTorch bf16
+    good = rep and en <= max(eo * 1.02, 1e-6) and en <= max(ee * 1.05, 1e-6)
+    ok &= good
     print(f"   {k:9s} rel err vs fp32: torch bf16 eager {ee:.3e}  cuBLAS+reduce {eo:.3e}  lse-GEMM {en:.3e}"
           f"  repeat {'bitwise' if rep else 'DIFFERS'}  {'OK' if good else 'WORSE'}")
 print("CE LSE PASS" if ok else "CE LSE FAIL")
