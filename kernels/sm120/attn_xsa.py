@@ -122,7 +122,7 @@ def _qk_back(g1, g2, x1, x2, r, pos, msk, WN, COS, SIN, cbase, css,
 
 
 @triton.jit
-def _prep(X, OUT, WN, COS, SIN, xsb, xsh, xss, csb, css, NR, S, NH, eps,
+def _attn_prep(X, OUT, WN, COS, SIN, xsb, xsh, xss, csb, css, NR, S, NH, eps,
           D: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr, BR: tl.constexpr):
     """rope(norm(x) * w) for every (b, h, s) row of a (B, NH, S, D) tensor, into a contiguous bf16
     copy. Row-local, so the attention loops never redo it per tile."""
@@ -143,7 +143,7 @@ def _prep(X, OUT, WN, COS, SIN, xsb, xsh, xss, csb, css, NR, S, NH, eps,
 
 
 @triton.jit
-def _fwd(Q, K, V, O, Z, LSE, A,
+def _attn_fwd(Q, K, V, O, Z, LSE, A,
          qsb, qsh, qss, ksb, ksh, kss, vsb, vsh, vss, osb, osh, oss, zsb, zsh, zss,
          S, H, HKV, sm_scale, W,
          GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
@@ -218,7 +218,7 @@ def _fwd(Q, K, V, O, Z, LSE, A,
 
 
 @triton.jit
-def _bwd_pre(O, DZ, V, A, DO, DELTA, GA, GVS, zsb, zsh, zss, vsb, vsh, vss, osb, osh, oss, S, H, HKV,
+def _attn_bwd_pre(O, DZ, V, A, DO, DELTA, GA, GVS, zsb, zsh, zss, vsb, vsh, vss, osb, osh, oss, S, H, HKV,
              GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr,
              XSA: tl.constexpr, HAS_A: tl.constexpr):
     pid_m = tl.program_id(0)
@@ -261,7 +261,7 @@ def _bwd_pre(O, DZ, V, A, DO, DELTA, GA, GVS, zsb, zsh, zss, vsb, vsh, vss, osb,
 
 
 @triton.jit
-def _bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN,
+def _attn_bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN,
               qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
               S, H, HKV, sm_scale, nat_scale, eps, W,
               GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
@@ -339,7 +339,7 @@ def _bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN,
 
 
 @triton.jit
-def _bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
+def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
             qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
             S, H, HKV, sm_scale, nat_scale, eps, W,
             GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
@@ -449,7 +449,7 @@ def _prepped(x, w, cos, sin, csb, css, eps, qk_norm, rope):
     B, NH, S, D = x.shape
     out = torch.empty(B, NH, S, D, device=x.device, dtype=x.dtype)
     NR = B * NH * S
-    _prep[(triton.cdiv(NR, PREP_ROWS),)](x, out, w if qk_norm else x, cos, sin, *_st(x), csb, css, NR, S, NH,
+    _attn_prep[(triton.cdiv(NR, PREP_ROWS),)](x, out, w if qk_norm else x, cos, sin, *_st(x), csb, css, NR, S, NH,
                                          float(eps), D=D, QK_NORM=qk_norm, ROPE=rope, BR=PREP_ROWS, num_warps=4)
     return out
 
@@ -491,7 +491,7 @@ class AttnXSA(torch.autograd.Function):
         mode = "window" if window is not None else "causal"
         sm = float(scale) * float(q_scale) * float(k_scale)          # the scalars fold into the logits
         flags = dict(WINDOW=window is not None, XSA=bool(xsa), HAS_A=A is not None)
-        _launch(_fwd, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cfg_for(mode, S)["fwd"],
+        _launch(_attn_fwd, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cfg_for(mode, S)["fwd"],
                 ("fwd", mode, S, D, G, q.dtype, tuple(flags.values())),
                 qn, kn, v, O, Z, LSE, A if A is not None else q,
                 *_st(qn), *_st(kn), *_st(v), *_st(O), *_st(Z), S, H, HKV, sm * LOG2E, W, GROUP=G, D=D, **flags)
@@ -520,7 +520,7 @@ class AttnXSA(torch.autograd.Function):
         GA = torch.empty(B, H, S, device=q.device, dtype=torch.float32) if (xsa and has_a) else DELTA
         GVS = torch.empty(B, HKV, S, D, device=q.device, dtype=torch.float32) if xsa else DELTA
         c = cf["pre"]
-        _bwd_pre[(triton.cdiv(S, c["BM"]), B * HKV)](
+        _attn_bwd_pre[(triton.cdiv(S, c["BM"]), B * HKV)](
             O, dZ, v, A if has_a else q, DO, DELTA, GA, GVS, *_st(dZ), *_st(v), *_st(O), S, H, HKV,
             GROUP=G, D=D, BM=c["BM"], XSA=xsa, HAS_A=has_a, num_warps=c["warps"])
         wq_ = wq if qk_norm else None
@@ -532,14 +532,14 @@ class AttnXSA(torch.autograd.Function):
         # OutOfResources fallback can reach and slice to the real count afterwards
         PWK = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         common = (csb, css, S, H, HKV, sm * LOG2E, sm, float(eps), W)
-        c = _launch(_bwd_dkdv, lambda c: (triton.cdiv(S, c["BN"]), B * HKV), cf["dkdv"], ("dkdv",) + key,
+        c = _launch(_attn_bwd_dkdv, lambda c: (triton.cdiv(S, c["BN"]), B * HKV), cf["dkdv"], ("dkdv",) + key,
                     qn, kn, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wk_ if qk_norm else q, cos, sin,
                     *_st(qn), *_st(kn), *_st(k), *_st(v), *_st(DO), *common,
                     GROUP=G, D=D, WINDOW=window is not None, XSA=xsa, QK_NORM=qk_norm, ROPE=rope)
         nkb = triton.cdiv(S, c["BN"])
         DQ = _like(q)
         PWQ = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
-        c = _launch(_bwd_dq, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cf["dq"], ("dq",) + key,
+        c = _launch(_attn_bwd_dq, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cf["dq"], ("dq",) + key,
                     qn, kn, q, v, DO, LSE, DELTA, DQ, PWQ, wq_ if qk_norm else q, cos, sin,
                     *_st(qn), *_st(kn), *_st(q), *_st(v), *_st(DO), *common,
                     GROUP=G, D=D, WINDOW=window is not None, QK_NORM=qk_norm, ROPE=rope)
