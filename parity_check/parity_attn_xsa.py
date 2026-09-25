@@ -93,6 +93,7 @@ CASES = [
     ("global, qk-norm, q_scale 1.3 k_scale 0.8", dict(window=None, xsa=True, alpha=True, norm=True, qs=1.3, ks=0.8, rope=False)),
     ("global, xsa off, qk-norm", dict(window=None, xsa=False, alpha=False, norm=True, qs=1.0, ks=1.0, rope=False)),
     ("window 128, rope, qk-norm, xsa+alpha (BiBo SWA)", dict(window=128, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=True)),
+    ("window 128, rope as (1, S, D), qk-norm, xsa (model layout of the tables)", dict(window=128, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=True, rope_b1=True)),
     ("window 128, rope, no qk-norm, xsa off", dict(window=128, xsa=False, alpha=False, norm=False, qs=1.0, ks=1.0, rope=True)),
     ("global, rope, qk-norm, xsa+alpha", dict(window=None, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=True)),
     ("FAST (deterministic=False): global, qk-norm, xsa+alpha", dict(window=None, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=False, det=False)),
@@ -107,6 +108,8 @@ def run_case(title, c, B, S, verbose=True):
     wq = (1 + 0.1 * torch.randn(D, device=dev)) if c["norm"] else None
     wk = (1 + 0.1 * torch.randn(D, device=dev)) if c["norm"] else None
     cos, sin = rope_tables(S) if c["rope"] else (None, None)
+    if c.get("rope_b1"):                   # the model passes ONE (1, S, D) table for the whole batch
+        cos, sin = cos[None], sin[None]
     go = torch.randn(B, H, S, D, device=dev).to(bf)
     ins = [q, k, v, alpha, wq, wk]
     kw = dict(scale=SC, window=c["window"], xsa=c["xsa"], q_scale=c["qs"], k_scale=c["ks"], cos=cos, sin=sin)
