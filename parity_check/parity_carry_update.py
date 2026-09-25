@@ -20,7 +20,14 @@ def unfused(read, theta, ao, ps, mode, csig):
     return h, (ao if ps is None else ps + ao)
 
 
-def run(fn, T, H, vec, boundary, mode, csig, seed=0):
+def ref64(read, theta, ao, ps, mode, csig):
+    """The formula in fp64 -- ground truth for outputs AND grads (autograd in fp64)."""
+    c = 2.0 * torch.sigmoid(theta) if csig else theta
+    s_ = ao * torch.rsqrt(ao.pow(2).mean(-1, keepdim=True) + 1e-6) if mode == "rms" else ao
+    return read + c * s_, (ao if ps is None else ps + ao)
+
+
+def run(fn, T, H, vec, boundary, mode, csig, seed=0, dtype=None):
     g = torch.Generator(device=dev).manual_seed(seed)
     read = (torch.randn(T, H, device=dev, generator=g) * 4).to(bf).requires_grad_()
     ao = torch.randn(T, H, device=dev, generator=g).to(bf).requires_grad_()
@@ -28,6 +35,12 @@ def run(fn, T, H, vec, boundary, mode, csig, seed=0):
     theta = (torch.randn(H if vec else 1, device=dev, generator=g) * 0.7).requires_grad_()
     gh = torch.randn(T, H, device=dev, generator=g).to(bf)
     gp = torch.randn(T, H, device=dev, generator=g).to(bf)
+    if dtype is not None:                   # fp64 reference: same (bf16-valued) inputs, upcast
+        read, ao, gh, gp = (t.detach().to(dtype) for t in (read, ao, gh, gp))
+        ps = None if ps is None else ps.detach().to(dtype)
+        theta = theta.detach().to(dtype)
+        for t in (read, ao, theta) + (() if ps is None else (ps,)):
+            t.requires_grad_()
     h, pn = fn(read, theta, ao, ps, mode, csig)
     torch.autograd.backward([h, pn], [gh, gp])
     outs = {"h": h, "ps_new": pn, "d_read": read.grad, "d_ao": ao.grad, "d_theta": theta.grad}
@@ -48,8 +61,15 @@ def main():
                         bad = {k: (a[k].double() - b[k].double()).abs().max().item() for k in a
                                if not torch.equal(a[k], b[k])}
                         ok &= not bad
+                        # and against fp64 truth, every output and every grad
+                        r = run(ref64, T, 512, vec, boundary, mode, csig, dtype=torch.float64)
+                        errs = {k: (b[k].double() - r[k]).norm().item() / (r[k].norm().item() or 1.0)
+                                for k in r}
+                        worst = max(errs.values())
                         print(f"T={T:5d} vec={vec:d} boundary={boundary:d} mode={mode:4s} csig={csig:d}: "
-                              + ("bitwise OK" if not bad else f"DIFF {bad}"))
+                              + ("bitwise OK" if not bad else f"DIFF {bad}")
+                              + "  | vs fp64: " + " ".join(f"{k} {v:.1e}" for k, v in errs.items()))
+                        ok &= worst < 1e-2              # bf16 outputs/grads: ~4e-3 is the floor
     print("CARRY PARITY PASS" if ok else "CARRY PARITY FAIL")
 
     T, H = 65536, 512
