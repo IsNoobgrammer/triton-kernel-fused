@@ -260,9 +260,12 @@ def grouped_wgrad(a, b, offs, cfg=None):
     torch._grouped_mm(a.t(), b, offs=offs) takes them. a (M, N1), b (M, N2), same dtype. Returns
     None when the shape is not tileable (caller falls back)."""
     c = dict(_WG, **(cfg or {}))
-    CH, BM, BN, BK = c["CH"], c["BM"], c["BN"], c["BK"]
     M, N1 = a.shape
     N2 = b.shape[1]
+    if cfg is None:                      # narrow tiles for widths that are not a 128 multiple (576)
+        c["BM"] = c["BM"] if N1 % c["BM"] == 0 else 64
+        c["BN"] = c["BN"] if N2 % c["BN"] == 0 else 64
+    CH, BM, BN, BK = c["CH"], c["BM"], c["BN"], c["BK"]
     E = offs.numel()
     if N1 % BM or N2 % BN or a.stride(1) != 1 or b.stride(1) != 1:
         return None
