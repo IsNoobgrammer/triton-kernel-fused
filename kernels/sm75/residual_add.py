@@ -31,7 +31,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["make_mlp_input", "residual_add_reference", "MODES", "RMS_EPS"]
+__all__ = ["make_mlp_input", "carry_update", "residual_add_reference", "MODES", "RMS_EPS"]
 
 # "none" -> c * stream           c is the RAW parameter; no transform
 # "rms"  -> c * stream/rms(stream)
@@ -63,11 +63,20 @@ def _even(T, H, rb):
     return H == rb and T % _MAX_XBLOCK == 0
 
 
+@triton.jit
+def _coef(c, CSIG: tl.constexpr):
+    """c = 2*sigmoid(theta) when CSIG, computed the way torch does (expf + IEEE divide), so the
+    fused coefficient is bitwise the one `2.0 * torch.sigmoid(theta)` produced on the host."""
+    if CSIG:
+        c = 2.0 * libdevice.div_rn(1.0, 1.0 + libdevice.exp(-c))
+    return c
+
+
 @triton.autotune(configs=_CFGS, key=("H",))
 @triton.jit
-def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, RBLOCK: tl.constexpr,
+def _fwd_kernel(AR, S, M, OUT, RSTD, PS, PSO, T, H: tl.constexpr, RBLOCK: tl.constexpr,
                 VEC: tl.constexpr, MODE: tl.constexpr, EVEN: tl.constexpr,
-                XBLOCK: tl.constexpr):
+                HAS_PS: tl.constexpr, CSIG: tl.constexpr, XBLOCK: tl.constexpr):
     xs = (tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK))[:, None]
     r = tl.arange(0, RBLOCK)[None, :]
     # EVEN: H == RBLOCK and T divides XBLOCK, so nothing can fall off either edge and every
@@ -90,6 +99,14 @@ def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, RBLOCK: tl.constexpr,
                         eviction_policy="evict_last").to(tl.float32)
     else:
         c = tl.load(M).to(tl.float32)
+    c = _coef(c, CSIG)
+    if HAS_PS:
+        # the prefix-sum update ps + attn_out, from the attn_out registers already loaded
+        if EVEN:
+            p = tl.load(PS + xs * H + r).to(tl.float32)
+        else:
+            p = tl.load(PS + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+        tl.store(PSO + xs * H + r, (p + s).to(PSO.dtype.element_ty), mask=mask)
     if MODE == 1:
         ms = tl.sum(s * s, axis=1)[:, None] / H
         rstd = libdevice.rsqrt(ms + _RMS_EPS)
@@ -101,10 +118,10 @@ def _fwd_kernel(AR, S, M, OUT, RSTD, T, H: tl.constexpr, RBLOCK: tl.constexpr,
 
 @triton.autotune(configs=_CFGS, key=("H",))
 @triton.jit
-def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr,
+def _bwd_kernel(DO, S, M, RSTD, DS, PART, DPS, T, H: tl.constexpr,
                 RBLOCK: tl.constexpr, VEC: tl.constexpr, MODE: tl.constexpr,
                 NEED_DS: tl.constexpr, NPROG: tl.constexpr, EVEN: tl.constexpr,
-                XBLOCK: tl.constexpr):
+                HAS_DPS: tl.constexpr, CSIG: tl.constexpr, XBLOCK: tl.constexpr):
     """Grid-stride over rows; d_theta lives in registers for the whole walk.
 
     d_theta is accumulated PER CHANNEL even when theta is a scalar -- the scalar is then one more
@@ -122,6 +139,7 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr,
                         eviction_policy="evict_last").to(tl.float32)
     else:
         c = tl.load(M).to(tl.float32)
+    c = _coef(c, CSIG)
     acc = tl.zeros([RBLOCK], tl.float32)[None, :]
 
     for x0 in tl.range(pid * XBLOCK, T, NPROG * XBLOCK):
@@ -154,6 +172,15 @@ def _bwd_kernel(DO, S, M, RSTD, DS, PART, T, H: tl.constexpr,
                 # dropping it gives a gradient that is close, never NaN, and surfaces only as a
                 # slow quality drift nothing attributes back to this kernel.
                 g = (g - sn * (tl.sum(g * sn, axis=1)[:, None] / H)) * rstd
+            if HAS_DPS:
+                # d attn_out also gets the prefix-sum path's gradient. Rounded to the stream dtype
+                # FIRST, then added: that is the two-step rounding autograd did when it summed the
+                # two bf16 grads, so the fused path stays bitwise the unfused one.
+                if EVEN:
+                    dp = tl.load(DPS + xs * H + r).to(tl.float32)
+                else:
+                    dp = tl.load(DPS + xs * H + r, mask=mask, other=0.0).to(tl.float32)
+                g = g.to(DS.dtype.element_ty).to(tl.float32) + dp
             tl.store(DS + xs * H + r, g.to(DS.dtype.element_ty), mask=mask)
 
     tl.store(PART + pid * H + r, acc, mask=rm)   # rm is None when EVEN
@@ -193,8 +220,8 @@ class _ResidualAdd(torch.autograd.Function):
                 if mode == "rms" else ar)                      # dummy ptr when unused
         rb = triton.next_power_of_2(H)
         _fwd_kernel[lambda meta: (triton.cdiv(T, meta["XBLOCK"]),)](
-            ar, sv, theta, out, rstd, T, H=H, RBLOCK=rb,
-            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb))
+            ar, sv, theta, out, rstd, ar, ar, T, H=H, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb), HAS_PS=False, CSIG=False)
         ctx.save_for_backward(sv, theta, rstd)
         ctx.mode, ctx.vec, ctx.H, ctx.T = mode, vec, H, T
         ctx.shape = attn_read.shape
@@ -210,9 +237,9 @@ class _ResidualAdd(torch.autograd.Function):
         part = torch.empty((_NPROG, H), device=do.device, dtype=torch.float32)
         rb = triton.next_power_of_2(H)
         _bwd_kernel[(_NPROG,)](
-            do, sv, theta, rstd, ds, part, T, H=H, RBLOCK=rb,
+            do, sv, theta, rstd, ds, part, do, T, H=H, RBLOCK=rb,
             VEC=vec, MODE=MODES[mode], NEED_DS=need_ds, NPROG=_NPROG,
-            EVEN=_even(T, H, rb))
+            EVEN=_even(T, H, rb), HAS_DPS=False, CSIG=False)
         # (NPROG, H) -> theta's shape. NPROG is ~1k, so fp32 partials are ample here; the old
         # kernel reduced 8192 rows and needed fp64 to stay accurate over that many terms.
         d_theta = None
@@ -242,3 +269,72 @@ def make_mlp_input(attn_read, *pairs, modes=None, persistent=None):
     if not attn_read.is_cuda:
         return residual_add_reference(attn_read, theta, stream, mode).to(attn_read.dtype)
     return _ResidualAdd.apply(attn_read, theta, stream, mode)
+
+
+class _CarryUpdate(torch.autograd.Function):
+    """Both residual updates of the carry site in one pass over attn_out:
+
+        h      = attn_read + c * f(attn_out)      c = theta, or 2*sigmoid(theta) when csig
+        ps_new = ps + attn_out                    (ps None: block boundary, ps_new IS attn_out)
+
+    Backward: d_read = dh and d_ps = d_ps_new (aliases); d_attn_out = c*dh (+ the rms term) +
+    d_ps_new in one kernel; d_theta from the same partials. Bitwise the unfused path (separate
+    add, host-side 2*sigmoid, autograd summing the two attn_out grads)."""
+
+    @staticmethod
+    def forward(ctx, attn_read, theta, stream, ps, mode, csig):
+        H = attn_read.shape[-1]
+        ar, sv = _flat(attn_read, H), _flat(stream, H)
+        T = ar.shape[0]
+        vec = theta.numel() > 1
+        out = torch.empty_like(ar)
+        has_ps = ps is not None
+        pv = _flat(ps, H) if has_ps else ar
+        pso = torch.empty_like(pv) if has_ps else ar
+        rstd = torch.empty(T, device=ar.device, dtype=torch.float32) if mode == "rms" else ar
+        rb = triton.next_power_of_2(H)
+        _fwd_kernel[lambda meta: (triton.cdiv(T, meta["XBLOCK"]),)](
+            ar, sv, theta, out, rstd, pv, pso, T, H=H, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], EVEN=_even(T, H, rb), HAS_PS=has_ps, CSIG=csig)
+        ctx.save_for_backward(sv, theta, rstd)
+        ctx.mode, ctx.vec, ctx.H, ctx.T, ctx.csig, ctx.has_ps = mode, vec, H, T, csig, has_ps
+        ctx.shape = attn_read.shape
+        # boundary: the new prefix sum is attn_out itself; a view keeps it on this node so its
+        # gradient arrives here and is folded into d_attn_out instead of a separate autograd add
+        ps_new = pso.view(stream.shape) if has_ps else stream.view_as(stream)
+        return out.view(attn_read.shape), ps_new
+
+    @staticmethod
+    def backward(ctx, dout, dps):
+        sv, theta, rstd = ctx.saved_tensors
+        H, T, mode, vec, csig = ctx.H, ctx.T, ctx.mode, ctx.vec, ctx.csig
+        do = _flat(dout, H)
+        dpv = _flat(dps, H) if dps is not None else None
+        ds = torch.empty_like(sv)
+        part = torch.empty((_NPROG, H), device=do.device, dtype=torch.float32)
+        rb = triton.next_power_of_2(H)
+        _bwd_kernel[(_NPROG,)](
+            do, sv, theta, rstd, ds, part, dpv if dpv is not None else do, T, H=H, RBLOCK=rb,
+            VEC=vec, MODE=MODES[mode], NEED_DS=True, NPROG=_NPROG,
+            EVEN=_even(T, H, rb), HAS_DPS=dpv is not None, CSIG=csig)
+        d_theta = None
+        if ctx.needs_input_grad[1]:
+            col = part.double().sum(0)
+            d_c = (col.sum().reshape(theta.shape) if not vec
+                   else col.reshape(theta.shape)).to(theta.dtype)
+            # the chain autograd ran through `2.0 * torch.sigmoid(theta)`, op for op
+            d_theta = (torch.ops.aten.sigmoid_backward(d_c * 2.0, torch.sigmoid(theta))
+                       if csig else d_c)
+        d_ps = dps if ctx.has_ps else None
+        return dout, d_theta, ds.view(ctx.shape), d_ps, None, None
+
+
+def carry_update(attn_read, theta, attn_out, ps=None, mode="none", csig=False):
+    """(h, ps_new) = (attn_read + c*f(attn_out), ps + attn_out), fused. See _CarryUpdate.
+    csig: c = 2*sigmoid(theta) computed in-kernel; else c = theta."""
+    assert mode in MODES, f"unknown mode {mode!r}; valid: {sorted(MODES)}"
+    if not attn_read.is_cuda:
+        c = 2.0 * torch.sigmoid(theta) if csig else theta
+        h = residual_add_reference(attn_read, c, attn_out, mode).to(attn_read.dtype)
+        return h, (attn_out if ps is None else ps + attn_out)
+    return _CarryUpdate.apply(attn_read, theta, attn_out, ps, mode, bool(csig))
