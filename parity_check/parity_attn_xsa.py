@@ -96,8 +96,6 @@ CASES = [
     ("window 128, rope as (1, S, D), qk-norm, xsa (model layout of the tables)", dict(window=128, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=True, rope_b1=True)),
     ("window 128, rope, no qk-norm, xsa off", dict(window=128, xsa=False, alpha=False, norm=False, qs=1.0, ks=1.0, rope=True)),
     ("global, rope, qk-norm, xsa+alpha", dict(window=None, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=True)),
-    ("FAST (deterministic=False): global, qk-norm, xsa+alpha", dict(window=None, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=False, det=False)),
-    ("FAST (deterministic=False): window 128, rope, qk-norm, xsa", dict(window=128, xsa=True, alpha=True, norm=True, qs=1.0, ks=1.0, rope=True, det=False)),
 ]
 NAMES = ["out", "dq", "dk", "dv", "dalpha", "dwq", "dwk"]
 
@@ -113,8 +111,7 @@ def run_case(title, c, B, S, verbose=True):
     go = torch.randn(B, H, S, D, device=dev).to(bf)
     ins = [q, k, v, alpha, wq, wk]
     kw = dict(scale=SC, window=c["window"], xsa=c["xsa"], q_scale=c["qs"], k_scale=c["ks"], cos=cos, sin=sin)
-    det = c.get("det", True)
-    f_new = lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, alpha=a, q_norm_w=wq, k_norm_w=wk, deterministic=det, **kw)
+    f_new = lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, alpha=a, q_norm_w=wq, k_norm_w=wk, **kw)
     f_ref = lambda q, k, v, a, wq, wk: attn_xsa_reference(q, k, v, alpha=a, q_norm_w=wq, k_norm_w=wk,
                                                          dtype=torch.float64, **kw)
     f_prod = lambda q, k, v, a, wq, wk: production(q, k, v, a, wq, wk, c["window"], c["xsa"], c["qs"],
@@ -122,8 +119,6 @@ def run_case(title, c, B, S, verbose=True):
     ref, new, prod = grads(f_ref, ins, go), grads(f_new, ins, go), grads(f_prod, ins, go)
     reps = [grads(f_new, ins, go) for _ in range(2)]
     repeat = all(torch.equal(a, b) for r in reps for a, b in zip(new, r) if a is not None)
-    if not det:
-        repeat = True          # deterministic=False: atomic dQ, repeatability is not promised
     layout = new[1].stride() == ins[0].stride() if new[1] is not None else True
     ok = repeat and layout
     if verbose:
@@ -214,8 +209,6 @@ def scale():
         ins, go = _inputs(B, S, norm=True)
         rows = [
             ("ours: attention only", lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, xsa=False), False),
-            ("ours: attn only, FAST (atomic)", lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, xsa=False,
-                                                                                deterministic=False), False),
             ("flash (enable_gqa)", lambda q, k, v, a, wq, wk: F.scaled_dot_product_attention(
                 q, k, v, is_causal=True, scale=SC, enable_gqa=True), False),
             ("flash, deterministic mode", lambda q, k, v, a, wq, wk: F.scaled_dot_product_attention(
