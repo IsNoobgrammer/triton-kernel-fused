@@ -667,7 +667,11 @@ def _sort_by_expert(idx, wt, E, host=True):
     """host=False skips the counts read-back (counts, bounds = None) for paths that stay on device."""
     ntok, top_k = idx.shape
     flat_t = torch.arange(ntok, device=idx.device).unsqueeze(1).expand_as(idx).flatten()
-    sorted_e, order = idx.flatten().sort()
+    # int16 keys + an explicit STABLE sort: the same permutation the int64 default sort produced
+    # (a stable radix sort at this size), in 2 radix passes instead of 8. parity_expert_counts
+    # asserts the permutation is identical.
+    kd = torch.int16 if E <= 32767 else torch.int32
+    sorted_e, order = idx.flatten().to(kd).sort(stable=True)
     counts_dev = expert_counts(sorted_e, E)
     counts, bounds = _host_bounds(counts_dev) if host else (None, None)
     return flat_t[order], wt.flatten()[order], order, counts, bounds, counts_dev

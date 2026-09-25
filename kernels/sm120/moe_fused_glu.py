@@ -307,13 +307,10 @@ def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False, b_rows=None)
     it_n = torch.where(valid, (cnt[ie] - j * CH).clamp(0, CH), 0)
     it_slot = torch.where(valid & (nch[ie] > 1), i, -1)
     it_e = torch.where(valid, ie, -1)
-    # heaviest first, without a sort: every chunk but an expert's last is exactly CH rows, so a
-    # stable PARTITION (full chunks, then the tails in expert order) is the useful part of LPT.
-    # argsort here was ~15 radix-sort launches per call, 9 ms per board step.
-    full = it_n == CH
-    nfull = full.sum()
-    pos = torch.where(full, torch.cumsum(full, 0) - 1, nfull + torch.cumsum(~full, 0) - 1)
-    order = torch.empty_like(pos).scatter_(0, pos, i)
+    # heaviest chunks first (LPT). A partition that left the tails in expert order measured 24%
+    # SLOWER (grad_down 1.46 vs 1.18 ms): the tails are what balances the last wave. int16 keys
+    # (chunk sizes <= CH <= 32767) cut the radix passes of the int64 sort.
+    order = torch.argsort(it_n.to(torch.int16), descending=True, stable=True)
     if out is None:
         out = torch.empty(E, N1, N2, device=dev, dtype=a.dtype)
     assert out.shape == (E, N1, N2) and out.is_contiguous(), (out.shape, (E, N1, N2))
