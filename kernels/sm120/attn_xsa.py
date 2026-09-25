@@ -316,7 +316,7 @@ class AttnXSA(torch.autograd.Function):
         _bwd_dkdv[(nkb, B * HKV)](
             q, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wq_, wk_, S, H, HKV, float(scale),
             q_scale, k_scale, eps, W, GROUP=G, D=D, BM=BM, BN=BN, WINDOW=window is not None,
-            XSA=xsa, QK_NORM=qk_norm, num_warps=8, num_stages=2)
+            XSA=xsa, QK_NORM=qk_norm, num_warps=8, num_stages=1)   # 2 stages: 124 KB smem > 101 KB
         DQ = torch.empty_like(q)
         nqb = triton.cdiv(S, BM)
         PWQ = torch.empty(B * HKV * nqb, D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
