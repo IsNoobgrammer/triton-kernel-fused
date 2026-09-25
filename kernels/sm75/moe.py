@@ -570,15 +570,28 @@ def _codes_list(act_codes):
     return v
 
 
-def _sort_by_expert(idx, wt, E):
-    ntok, top_k = idx.shape
-    flat_t = torch.arange(ntok, device=idx.device).unsqueeze(1).expand_as(idx).flatten()
-    sorted_e, order = idx.flatten().sort()
-    counts_dev = torch.bincount(sorted_e, minlength=E)
+def expert_counts(e, E):
+    """torch.bincount(e, minlength=E) without its host sync: bincount reads max(e) back to size
+    its output, a GPU drain per call. Integer atomics, so the counts are exact and identical."""
+    return torch.zeros(E, dtype=torch.long, device=e.device).scatter_add_(0, e, torch.ones_like(e))
+
+
+def _host_bounds(counts_dev):
+    """Per-expert row counts and cumulative bounds as Python lists: ONE host sync."""
     counts = counts_dev.tolist()
     bounds = [0]
     for c in counts:
         bounds.append(bounds[-1] + c)
+    return counts, bounds
+
+
+def _sort_by_expert(idx, wt, E, host=True):
+    """host=False skips the counts read-back (counts, bounds = None) for paths that stay on device."""
+    ntok, top_k = idx.shape
+    flat_t = torch.arange(ntok, device=idx.device).unsqueeze(1).expand_as(idx).flatten()
+    sorted_e, order = idx.flatten().sort()
+    counts_dev = expert_counts(sorted_e, E)
+    counts, bounds = _host_bounds(counts_dev) if host else (None, None)
     return flat_t[order], wt.flatten()[order], order, counts, bounds, counts_dev
 
 
@@ -645,7 +658,7 @@ def moe_grouped_cublas(hidden, top_k_indices, top_k_weights, gate_up_proj, down_
     sorted_e, order = top_k_indices.flatten().sort()
     st = flat_t[order]
     sw = top_k_weights.flatten()[order]
-    counts = torch.bincount(sorted_e, minlength=E)
+    counts = expert_counts(sorted_e, E)
     offs = counts.cumsum(0).to(torch.int32)
     row_act = torch.repeat_interleave(act_codes, counts).to(torch.int32)
     x_s = hidden[st].contiguous()
@@ -731,7 +744,13 @@ class _PerExpertMoE(torch.autograd.Function):
         E = act_codes.shape[0]
         codes = _codes_list(act_codes)
         top_k = idx.shape[1]; dev = hidden.device
-        st, sw, order, counts, bounds, counts_t = _sort_by_expert(idx, wt, E)
+        # The batched (gmm) path never needs the counts on the host: tile maps are built on the
+        # device (build_tile_map(None, ...)) and torch._grouped_mm takes device offsets. Reading
+        # them back was one GPU drain per MoE layer per micro-batch; only the per-expert loop
+        # paths below still do it.
+        _gmm_ok = (hasattr(torch, "_grouped_mm") and hidden.dtype in (torch.bfloat16, torch.float16)
+                   and all(c <= 2 or c >= 6 for c in codes) and os.environ.get("BIBO_MOE_FORCE_LOOP") != "1")
+        st, sw, order, counts, bounds, counts_t = _sort_by_expert(idx, wt, E, host=not _gmm_ok)
         x_s = hidden.index_select(0, st)
         M_rows = idx.numel()
         row_act = torch.repeat_interleave(act_codes, counts_t, output_size=M_rows).to(torch.int32)
@@ -773,6 +792,9 @@ class _PerExpertMoE(torch.autograd.Function):
                                                  output_size=M_rows)
         use_gmm = (uniform and hasattr(torch, "_grouped_mm")
                    and hidden.dtype in (torch.bfloat16, torch.float16))
+        assert use_gmm == _gmm_ok, "use_gmm and _gmm_ok must agree (host counts were skipped)"
+        if counts is None and not use_gmm:
+            counts, bounds = _host_bounds(counts_t)
         # which branch ran, for tests. A parity check that cannot prove the candidate took the NEW
         # path passes trivially when both arms fall down the same one -- that exact failure has
         # already shipped here once (kernel parity green while the feature was inert).
@@ -794,10 +816,10 @@ class _PerExpertMoE(torch.autograd.Function):
                       f"H={gate_up_proj.shape[2]}", flush=True)
             if _FG is not None and _FG.tiles_supported(x_s):
                 tile_map_gg = _FG.build_tile_map(counts, counts_t, dev,
-                                                        bm=_FG._GG[0])
+                                                        bm=_FG._GG[0], m_rows=M_rows)
             gu_all = it_all = None
             if tile_map_gg is not None and _FG.gemm_supported(x_s, gate_up_proj, codes):
-                tm = _FG.build_tile_map(counts, counts_t, dev)
+                tm = _FG.build_tile_map(counts, counts_t, dev, m_rows=M_rows)
                 # the GEMM+GLU fusion has no theta argument, so it must not apply the activation
                 # when one exists -- the GEMM half is still used, only the act is deferred to
                 # _glu_fwd, which does take row_alpha
@@ -807,7 +829,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 # separate _glu_fwd pass (1.222 ms/call at N=65536 -- a pure DRAM round trip).
                 if (ap32 is not None and hasattr(_FG, "radial_supported")
                         and _FG.radial_supported(x_s, gate_up_proj, codes)):
-                    rtm = _FG.build_tile_map(counts, counts_t, dev, bm=_FG._RBM)
+                    rtm = _FG.build_tile_map(counts, counts_t, dev, bm=_FG._RBM, m_rows=M_rows)
                     gu_all, it_all = _FG.fused_gate_up_radial(x_s, gate_up_proj, rtm, row_alpha)
                 else:
                     gu_all, it_all = _FG.fused_gate_up_glu(x_s, gate_up_proj, tm, codes[0],
@@ -815,7 +837,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 if act:
                     tile_map = tm
                     tile_map_bw = _FG.build_tile_map(counts, counts_t, dev,
-                                                            bm=_FG._BBM)
+                                                            bm=_FG._BBM, m_rows=M_rows)
             if gu_all is None:
                 gu_all = torch._grouped_mm(x_s, gate_up_proj.transpose(1, 2), offs=offs)
             if it_all is None:

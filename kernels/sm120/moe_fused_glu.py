@@ -62,12 +62,33 @@ def fused_supported(hidden, gate_up_proj, codes):
     return gemm_supported(hidden, gate_up_proj, codes) and codes[0] == 0
 
 
-def build_tile_map(counts, counts_t, device, bm=None):
+def build_tile_map(counts, counts_t, device, bm=None, m_rows=None):
+    """(TE, TS, TM): expert, first row and row count of every BM-row tile of the expert-sorted rows.
+
+    counts=None builds it entirely on the device, with NO host sync: the grid is sized by the upper
+    bound ceil(M/bm) + E (each expert pads at most one partial tile), and the tiles past the real
+    count get TM = 0 with TE clamped to a valid expert. Every kernel masks rows by TM, so those
+    tiles load and store nothing; the first `total` entries equal the host-built map exactly.
+    """
     bm = _BM if bm is None else bm
+    if counts is None:
+        E = counts_t.numel()
+        nt = (counts_t + (bm - 1)) // bm
+        t_end = torch.cumsum(nt, 0)
+        t = torch.arange((m_rows + bm - 1) // bm + E, device=device)
+        te = torch.searchsorted(t_end, t, right=True)
+        valid = te < E
+        te = te.clamp_max(E - 1)
+        within = t - (t_end - nt)[te]
+        ts = (torch.cumsum(counts_t, 0) - counts_t)[te] + within * bm
+        tm = torch.where(valid, torch.clamp(counts_t[te] - within * bm, max=bm), 0)
+        return te.to(torch.int32), torch.where(valid, ts, 0).to(torch.int32), tm.to(torch.int32)
     ntile = [(c + bm - 1) // bm for c in counts]
     total = sum(ntile)
     nt = ((counts_t + (bm - 1)) // bm).to(torch.int32)
-    te = torch.repeat_interleave(torch.arange(len(counts), device=device, dtype=torch.int32), nt)
+    # output_size: without it repeat_interleave reads nt.sum() back to the host (a GPU drain)
+    te = torch.repeat_interleave(torch.arange(len(counts), device=device, dtype=torch.int32), nt,
+                                 output_size=total)
     start = torch.cumsum(nt, 0) - nt
     within = torch.arange(total, device=device, dtype=torch.int32) - start[te]
     bnd = torch.cumsum(counts_t, 0) - counts_t
