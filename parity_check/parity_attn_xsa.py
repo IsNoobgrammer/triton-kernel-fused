@@ -201,33 +201,76 @@ def scale():
     print("== seq-len scaling, global causal, 65536 tokens/batch (ms: fwd | fwd+bwd | peak MiB)")
     for S in (512, 1024, 2048, 4096, 8192, 16384):
         B = max(1, 65536 // S)
-        ins, go = _inputs(B, S, norm=False)
-        pure = [
-            ("ours (attention only)", lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, xsa=False)),
-            ("sdpa flash (repeat_kv)", lambda q, k, v, a, wq, wk: F.scaled_dot_product_attention(
-                q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1), is_causal=True, scale=SC)),
-            ("sdpa flash (enable_gqa)", lambda q, k, v, a, wq, wk: F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, scale=SC, enable_gqa=True)),
+        ins, go = _inputs(B, S, norm=True)
+        rows = [
+            ("ours: attention only", lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, xsa=False), False),
+            ("flash (enable_gqa)", lambda q, k, v, a, wq, wk: F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=SC, enable_gqa=True), False),
+            ("flash, deterministic mode", lambda q, k, v, a, wq, wk: F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=SC, enable_gqa=True), True),
             ("flex causal", lambda q, k, v, a, wq, wk: _FLEX(q, k, v, block_mask=block_mask(S, S), scale=SC,
-                                                             enable_gqa=True)),
+                                                             enable_gqa=True), False),
+            ("ours: qk-norm + attn + xsa", lambda q, k, v, a, wq, wk: attn_xsa(
+                q, k, v, scale=SC, alpha=a, q_norm_w=wq, k_norm_w=wk), False),
+            ("rmsnorm + flash + xsa", lambda q, k, v, a, wq, wk: production(
+                q, k, v, a, wq, wk, None, True, 1.0, 1.0, None, None, "flash"), False),
         ]
         print(f"   S={S:5d} B={B:3d}")
-        for name, fn in pure:
+        for name, fn, det in rows:
             try:
+                torch.use_deterministic_algorithms(det)
                 tf, tfb = _time(fn, ins, go, n=5)
-                print(f"     {name:28s} {tf:8.3f} | {tfb:8.3f} | {_peak(fn, ins, go):8.0f}", flush=True)
+                mem = _peak(fn, ins, go)
+                print(f"     {name:28s} {tf:8.3f} | {tfb:8.3f} | {mem:8.0f}", flush=True)
             except Exception as ex:
                 print(f"     {name:28s} FAILED {type(ex).__name__}: {str(ex).splitlines()[0][:80]}", flush=True)
-            torch._dynamo.reset() if name == "flex causal" else None
+            finally:
+                torch.use_deterministic_algorithms(False)
         if S <= 4096:                                   # accuracy vs fp64 at this length (B=1)
             q1, k1, v1 = (t[:1].detach() for t in ins[:3])
             r = attn_xsa_reference(q1, k1, v1, scale=SC, xsa=False, dtype=torch.float64)
             o = attn_xsa(q1, k1, v1, scale=SC, xsa=False)
-            f = F.scaled_dot_product_attention(q1, k1, v1, is_causal=True, scale=SC, enable_gqa=True)
-            print(f"     fwd rel err vs fp64: ours {rel(o, r):.2e}  flash {rel(f, r):.2e}", flush=True)
+            f_ = F.scaled_dot_product_attention(q1, k1, v1, is_causal=True, scale=SC, enable_gqa=True)
+            print(f"     fwd rel err vs fp64: ours {rel(o, r):.2e}  flash {rel(f_, r):.2e}", flush=True)
 
 
-_BASE_CFG = {m: {k: dict(v) for k, v in c.items()} for m, c in AX.CFG.items()}
+def sweep_long(S=4096):
+    """Tile sweep for PURE causal attention at a long sequence (the causal CFG is shared with the
+    board's global layers, so the winner must not regress the board shape -- checked after)."""
+    torch.manual_seed(0)
+    B = 65536 // S
+    ins, go = _inputs(B, S, norm=False)
+    fn = lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, xsa=False)
+    space = {
+        "fwd": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
+                ((64, 32, 8, 3), (64, 64, 8, 2), (64, 64, 4, 2), (64, 64, 8, 3), (64, 32, 4, 3), (32, 64, 4, 3),
+                 (64, 128, 8, 2))],
+        "dkdv": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
+                 ((64, 32, 8, 1), (32, 32, 4, 2), (32, 64, 8, 2), (64, 64, 8, 1), (32, 64, 4, 2), (64, 32, 8, 2),
+                  (32, 128, 8, 1), (64, 128, 8, 1))],
+        "dq": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
+               ((64, 32, 8, 2), (64, 64, 8, 2), (64, 64, 8, 1), (32, 64, 4, 2), (64, 32, 8, 3), (32, 32, 4, 3),
+                (64, 64, 4, 2))],
+    }
+    print(f"== long sweep, pure causal S={S} B={B}")
+    for part in ("fwd", "dkdv", "dq"):
+        best = None
+        for cfg in space[part]:
+            AX.CFG["causal"][part] = cfg
+            AX._FIT.clear()
+            try:
+                tf, tfb = _time(fn, ins, go, n=5)
+            except Exception as ex:
+                print(f"   {part:5s} {cfg} FAILED {type(ex).__name__}: {str(ex).splitlines()[0][:70]}", flush=True)
+                continue
+            t = tf if part == "fwd" else tfb
+            print(f"   {part:5s} {cfg}  {t:7.3f} ms", flush=True)
+            if best is None or t < best[0]:
+                best = (t, cfg)
+        AX.CFG["causal"][part] = best[1]
+        AX._FIT.clear()
+        print(f"   -> {part} best {best[1]} {best[0]:.3f} ms", flush=True)
+    print(f"   FINAL causal: {AX.CFG['causal']}", flush=True)
 
 
 def sweep():
@@ -254,6 +297,7 @@ def sweep():
             best = None
             for cfg in space[part]:
                 AX.CFG[mode][part] = cfg
+                AX._FIT.clear()
                 try:
                     tf, tfb = _time(fn, ins, go, n=5)
                 except Exception as ex:
@@ -275,6 +319,8 @@ def sweep():
 if __name__ == "__main__":
     if "--sweep" in sys.argv:
         sweep()
+    if "--sweep_long" in sys.argv:
+        sweep_long()
     good = main()
     if "--bench" in sys.argv:
         bench()
