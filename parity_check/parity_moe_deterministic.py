@@ -61,7 +61,8 @@ check("dX gemm + combine", lambda: FG.grouped_gemm_gather(dgu, W1, inv, tile_gg,
 row_expert = torch.repeat_interleave(torch.arange(E, device=dev), counts_t, output_size=M)
 da = torch.randn(M, device=dev)
 check("per-expert theta grad", lambda: M75._ap_grad_from_rows(da, row_expert, E, (E,), dev),
-      lambda: torch.zeros(E, device=dev).index_add_(0, row_expert, da), 1e-6)
+      lambda: torch.zeros(E, device=dev, dtype=torch.float64).index_add_(0, row_expert, da.double()).float(),
+      1e-6)   # fp64 reference: the fp32 atomic index_add_ is itself ~1e-6 off over ~6k rows per expert
 
 x = torch.randn(N, H, device=dev).to(bf)
 dh = torch.randn(N, H, device=dev).to(bf)
