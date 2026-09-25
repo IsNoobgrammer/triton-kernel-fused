@@ -275,6 +275,9 @@ def sweep_long(S=4096):
     print(f"   FINAL causal: {AX.CFG['causal']}", flush=True)
 
 
+_BASE_CFG = {m: {k: dict(v) for k, v in c.items()} for m, c in AX.CFG.items()}
+
+
 def sweep():
     """Greedy per-kernel tile sweep at the board shape (global and SWA configs)."""
     torch.manual_seed(0)
