@@ -61,7 +61,7 @@ def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, S, H, HKV, sm_scale, q_scale, k_scale, e
     wq = tl.load(WQ + d).to(tl.float32)     # a dummy pointer without QK_NORM; unused then
     wk = tl.load(WK + d).to(tl.float32)
     q = tl.load(Q + qrow[:, None] * D + d[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
-    q, _ = _norm(q, wq, q_scale, eps, D, QK_NORM)
+    q, _rq = _norm(q, wq, q_scale, eps, D, QK_NORM)
     q = q.to(tl.bfloat16)
     m_i = tl.full((GROUP * BM,), float("-inf"), tl.float32)
     l_i = tl.zeros((GROUP * BM,), tl.float32)
@@ -74,7 +74,7 @@ def _fwd(Q, K, V, O, Z, LSE, A, WQ, WK, S, H, HKV, sm_scale, q_scale, k_scale, e
         n = n0 + tl.arange(0, BN)
         nmask = n < S
         k = tl.load(K + (kvbase + n)[:, None] * D + d[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
-        k, _ = _norm(k, wk, k_scale, eps, D, QK_NORM)
+        k, _rk = _norm(k, wk, k_scale, eps, D, QK_NORM)
         v = tl.load(V + (kvbase + n)[:, None] * D + d[None, :], mask=nmask[:, None], other=0.0)
         qk = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
         valid = (n[None, :] <= s[:, None]) & nmask[None, :]
@@ -188,7 +188,7 @@ def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WQ, WK,
         for jj in tl.static_range(GROUP):
             row = (b * H + kvh * GROUP + jj).to(tl.int64) * S + s
             q = tl.load(Q + row[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(tl.float32)
-            q, _ = _norm(q, wq, q_scale, eps, D, QK_NORM)
+            q, _rq = _norm(q, wq, q_scale, eps, D, QK_NORM)
             qb = q.to(tl.bfloat16)
             do = tl.load(DO + row[:, None] * D + d[None, :], mask=smask[:, None], other=0.0)
             lse = tl.load(LSE + row, mask=smask, other=0.0)
@@ -244,7 +244,7 @@ def _bwd_dq(Q, K, DO, LSE, DELTA, V, DQ, PWQ, WQ, WK, S, H, HKV, sm_scale, q_sca
         n = n0 + tl.arange(0, BN)
         nmask = n < S
         k = tl.load(K + (kvbase + n)[:, None] * D + d[None, :], mask=nmask[:, None], other=0.0).to(tl.float32)
-        k, _ = _norm(k, wk, k_scale, eps, D, QK_NORM)
+        k, _rk = _norm(k, wk, k_scale, eps, D, QK_NORM)
         kb = k.to(tl.bfloat16)
         v = tl.load(V + (kvbase + n)[:, None] * D + d[None, :], mask=nmask[:, None], other=0.0)
         qk = tl.dot(qb, tl.trans(kb)) * sm_scale
