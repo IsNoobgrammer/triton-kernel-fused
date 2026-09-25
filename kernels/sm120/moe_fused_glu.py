@@ -196,38 +196,102 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
     return c
 
 
-_DW = (64, 64, 64, 4, 3)
+# Grouped weight gradient  out[e] = a[rows_e]^T @ b[rows_e]  (the MoE dW GEMMs), one launch, no host
+# sync. Replaces torch._grouped_mm for the 2D x 2D (K-grouped) case, which on sm120 is a HOST LOOP
+# of E cuBLAS GEMMs: it reads the offsets back (one sync per call, 80 per board step) and each
+# per-expert GEMM is ~24 output tiles, so the GPU runs a quarter full (163-210 TFLOPS).
+#
+# Work = (expert chunk of <= CH rows) x (BM x BN output tile), all in one grid, heaviest chunks
+# first. An expert with more than CH rows is SPLIT: each chunk writes an fp32 partial and
+# _wg_reduce sums them in chunk order, so the result is deterministic (no atomics). Experts with
+# no rows get one empty chunk, which stores zeros -- the same as torch._grouped_mm.
+_WG = dict(CH=8192, BM=128, BN=128, BK=32, num_warps=8, num_stages=3)
 
 
 @triton.jit
-def _dw_kernel(A, B, C, ROW0, ROWN, N1: tl.constexpr, N2: tl.constexpr,
+def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, N1, N2, sa, sb,
+               NT2: tl.constexpr, NTILE: tl.constexpr,
                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    e = tl.program_id(0)
-    p1 = tl.program_id(1)
-    p2 = tl.program_id(2)
-    r0 = tl.load(ROW0 + e)
-    nr = tl.load(ROWN + e)
-    r1 = p1 * BM + tl.arange(0, BM)
-    r2 = p2 * BN + tl.arange(0, BN)
+    pid = tl.program_id(0)
+    item = tl.load(ORDER + pid // NTILE)
+    e = tl.load(IT_E + item)
+    if e < 0:
+        return
+    tile = pid % NTILE
+    r1 = (tile // NT2) * BM + tl.arange(0, BM)
+    r2 = (tile % NT2) * BN + tl.arange(0, BN)
+    s0 = tl.load(IT_S + item).to(tl.int64)
+    n = tl.load(IT_N + item)
     acc = tl.zeros((BM, BN), tl.float32)
-    for k0 in range(0, nr, BK):
-        rk = k0 + tl.arange(0, BK)
-        mk = rk < nr
-        a = tl.load(A + (r0 + rk[:, None]) * N1 + r1[None, :], mask=mk[:, None], other=0.0)
-        b = tl.load(B + (r0 + rk[:, None]) * N2 + r2[None, :], mask=mk[:, None], other=0.0)
+    rk = tl.arange(0, BK)
+    for k0 in tl.range(0, n, BK):
+        mk = (k0 + rk) < n
+        rows = s0 + k0 + rk
+        a = tl.load(A + rows[:, None] * sa + r1[None, :], mask=mk[:, None], other=0.0)
+        b = tl.load(B + rows[:, None] * sb + r2[None, :], mask=mk[:, None], other=0.0)
         acc = tl.dot(tl.trans(a), b, acc)
-    tl.store(C + e.to(tl.int64) * (N1 * N2) + r1[:, None] * N2 + r2[None, :], acc.to(tl.bfloat16))
+    slot = tl.load(IT_SLOT + item)
+    off = r1[:, None] * N2 + r2[None, :]
+    if slot < 0:
+        tl.store(C + e.to(tl.int64) * N1 * N2 + off, acc.to(C.dtype.element_ty))
+    else:
+        tl.store(P + slot.to(tl.int64) * N1 * N2 + off, acc)
 
 
-def grouped_dw(a, b, row0, rown, E):
-    N1 = a.shape[1]; N2 = b.shape[1]
-    BM, BN, BK, w, st = _DW
-    if N1 % BM or N2 % BN:
+@triton.jit
+def _wg_reduce(P, C, FIRST, NCH, NN, BLOCK: tl.constexpr):
+    e = tl.program_id(0)
+    nch = tl.load(NCH + e)
+    if nch <= 1:
+        return
+    first = tl.load(FIRST + e).to(tl.int64)
+    o = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = o < NN
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for j in range(0, nch):                      # chunk order: deterministic
+        acc += tl.load(P + (first + j) * NN + o, mask=m, other=0.0)
+    tl.store(C + e.to(tl.int64) * NN + o, acc.to(C.dtype.element_ty), mask=m)
+
+
+def grouped_wgrad(a, b, offs, cfg=None):
+    """out (E, N1, N2) = per expert a[s:t]^T @ b[s:t], with offs the int32 END row offsets exactly as
+    torch._grouped_mm(a.t(), b, offs=offs) takes them. a (M, N1), b (M, N2), same dtype. Returns
+    None when the shape is not tileable (caller falls back)."""
+    c = dict(_WG, **(cfg or {}))
+    CH, BM, BN, BK = c["CH"], c["BM"], c["BN"], c["BK"]
+    M, N1 = a.shape
+    N2 = b.shape[1]
+    E = offs.numel()
+    if N1 % BM or N2 % BN or a.stride(1) != 1 or b.stride(1) != 1:
         return None
-    c = torch.empty(E, N1, N2, device=a.device, dtype=a.dtype)
-    _dw_kernel[(E, N1 // BM, N2 // BN)](a, b, c, row0, rown, N1, N2,
-                                        BM, BN, BK, num_warps=w, num_stages=st)
-    return c
+    dev = a.device
+    end = offs.to(torch.int64)
+    cnt = end - torch.cat((end.new_zeros(1), end[:-1]))
+    nch = ((cnt + CH - 1) // CH).clamp_min(1)             # an empty expert still stores its zeros
+    cend = torch.cumsum(nch, 0)
+    NI = (M + CH - 1) // CH + E                            # static upper bound on chunk count
+    i = torch.arange(NI, device=dev)
+    ie = torch.searchsorted(cend, i, right=True)
+    valid = ie < E
+    ie = ie.clamp_max(E - 1)
+    j = i - (cend - nch)[ie]
+    it_s = (end - cnt)[ie] + j * CH
+    it_n = torch.where(valid, (cnt[ie] - j * CH).clamp(0, CH), 0)
+    it_slot = torch.where(valid & (nch[ie] > 1), i, -1)
+    it_e = torch.where(valid, ie, -1)
+    order = torch.argsort(it_n, descending=True, stable=True)   # heaviest chunks launch first
+    out = torch.empty(E, N1, N2, device=dev, dtype=a.dtype)
+    part = torch.empty(NI, N1, N2, device=dev, dtype=torch.float32)
+    nt2 = N2 // BN
+    ntile = (N1 // BM) * nt2
+    _wg_kernel[(NI * ntile,)](a, b, out, part, it_e.to(torch.int32), it_s, it_n.to(torch.int32),
+                              it_slot.to(torch.int32), order, N1, N2, a.stride(0), b.stride(0),
+                              NT2=nt2, NTILE=ntile, BM=BM, BN=BN, BK=BK,
+                              num_warps=c["num_warps"], num_stages=c["num_stages"])
+    RB = 1024
+    _wg_reduce[(E, triton.cdiv(N1 * N2, RB))](part, out, (cend - nch), nch, N1 * N2, BLOCK=RB,
+                                              num_warps=4)
+    return out
 
 
 @triton.jit
