@@ -227,15 +227,18 @@ def scale():
             print(f"     fwd rel err vs fp64: ours {rel(o, r):.2e}  flash {rel(f, r):.2e}", flush=True)
 
 
+_BASE_CFG = {m: {k: dict(v) for k, v in c.items()} for m, c in AX.CFG.items()}
+
+
 def sweep():
     """Greedy per-kernel tile sweep at the board shape (global and SWA configs)."""
     torch.manual_seed(0)
     B, S = 64, 1024
     space = {
         "fwd": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
-                ((64, 64, 8, 2), (64, 64, 4, 2), (32, 64, 4, 3), (64, 32, 8, 3), (32, 32, 4, 3), (64, 64, 8, 3))],
+                ((64, 64, 8, 2), (64, 32, 8, 2), (64, 32, 8, 3), (32, 64, 4, 3), (32, 32, 4, 3), (64, 32, 4, 2))],
         "dkdv": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
-                 ((32, 32, 4, 2), (32, 32, 4, 3), (32, 32, 8, 2), (16, 32, 4, 3), (32, 64, 8, 1), (64, 32, 8, 1))],
+                 ((32, 32, 4, 2), (32, 32, 4, 3), (32, 32, 8, 2), (64, 32, 8, 1), (64, 32, 8, 2), (32, 64, 8, 1))],
         "dq": [dict(BM=bm, BN=bn, warps=w, stages=st) for bm, bn, w, st in
                ((64, 32, 8, 2), (32, 32, 4, 2), (32, 32, 4, 3), (64, 32, 4, 3), (32, 64, 4, 2), (64, 64, 8, 1))],
     }
@@ -245,22 +248,28 @@ def sweep():
         fn = lambda q, k, v, a, wq, wk: attn_xsa(q, k, v, scale=SC, window=window, alpha=a, q_norm_w=wq,
                                                  k_norm_w=wk, cos=cos, sin=sin)
         print(f"== sweep, {'global' if window is None else f'window {window} + rope'}")
+        mode = "window" if window is not None else "causal"
+        base = _BASE_CFG[mode]
         for part in ("fwd", "dkdv", "dq"):
             best = None
             for cfg in space[part]:
-                AX.CFG[part] = cfg
+                AX.CFG[mode][part] = cfg
                 try:
                     tf, tfb = _time(fn, ins, go, n=5)
                 except Exception as ex:
-                    print(f"   {part:5s} {cfg} FAILED {type(ex).__name__}", flush=True)
+                    print(f"   {part:5s} {cfg} FAILED {type(ex).__name__}: {str(ex).splitlines()[0][:70]}", flush=True)
                     continue
                 t = tf if part == "fwd" else tfb
                 print(f"   {part:5s} {cfg}  {t:7.3f} ms", flush=True)
                 if best is None or t < best[0]:
                     best = (t, cfg)
-            AX.CFG[part] = best[1]
+            if best is None:
+                print(f"   -> {part}: every config failed, keeping {base[part]}", flush=True)
+                AX.CFG[mode][part] = base[part]
+                continue
+            AX.CFG[mode][part] = best[1]
             print(f"   -> {part} best {best[1]} {best[0]:.3f} ms", flush=True)
-        print(f"   FINAL {AX.CFG}", flush=True)
+        print(f"   FINAL {mode}: {AX.CFG[mode]}", flush=True)
 
 
 if __name__ == "__main__":

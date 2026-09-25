@@ -10,7 +10,8 @@ projection views transposed to (B, H, S, D) are read in place, and z / dq / dk /
 the SAME layout as their input, so no .contiguous() copy happens on either side of attention.
   qk norm   q_norm_w / k_norm_w (D,) -> q' = q_scale * RMSNorm(q) * w_q (same for k). None = no
             norm (q_scale / k_scale still multiply). The scalars are fixed hyperparameters.
-  rope      cos / sin (S, D) or (B, S, D), HF rotate_half convention, applied AFTER the norm.
+  rope      cos / sin (S, D) or (B, S, D), HF rotate_half convention (tables are cat(f, f), so only
+            the first half is read), applied AFTER the norm.
   window    None = causal over the whole sequence; W = key j visible to query i iff i-W < j <= i.
   xsa       z = o - a * (o.v_i / |v_i|^2) v_i with v_i the query position's own value row and
             a = tanh(alpha[h]) (alpha None -> a = 1). xsa=False returns o.
@@ -35,8 +36,13 @@ import triton.language as tl
 __all__ = ["attn_xsa", "AttnXSA", "attn_xsa_reference", "CFG"]
 
 # Per-kernel tiles (swept at the board shape with parity_check/parity_attn_xsa.py --sweep).
-CFG = {"fwd": dict(BM=64, BN=64, warps=8, stages=2), "pre": dict(BM=64, warps=4),
-       "dkdv": dict(BM=32, BN=32, warps=4, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=2)}
+# Keyed by mode: "causal" (global layers) and "window" (SWA layers, usually with RoPE).
+CFG = {
+    "causal": {"fwd": dict(BM=64, BN=32, warps=8, stages=3), "pre": dict(BM=64, warps=4),
+               "dkdv": dict(BM=64, BN=32, warps=8, stages=1), "dq": dict(BM=64, BN=32, warps=8, stages=2)},
+    "window": {"fwd": dict(BM=64, BN=32, warps=8, stages=2), "pre": dict(BM=64, warps=4),
+               "dkdv": dict(BM=32, BN=32, warps=4, stages=2), "dq": dict(BM=64, BN=32, warps=8, stages=2)},
+}
 
 
 @triton.jit
@@ -54,14 +60,12 @@ def _qk_in(P, off, msk, pos, WN, COS, SIN, csb, css, cbase, scale, eps,
     else:
         y1 = x1 * scale
         y2 = x2 * scale
-    if ROPE:
+    if ROPE:                   # half tables: HF cos/sin are cat(f, f), both halves identical
         co = cbase + pos.to(tl.int64) * css
-        c1 = tl.load(COS + co[:, None] + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
-        c2 = tl.load(COS + co[:, None] + HD + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
-        s1 = tl.load(SIN + co[:, None] + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
-        s2 = tl.load(SIN + co[:, None] + HD + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
-        z1 = y1 * c1 - y2 * s1
-        z2 = y2 * c2 + y1 * s2
+        c = tl.load(COS + co[:, None] + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
+        sn = tl.load(SIN + co[:, None] + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
+        z1 = y1 * c - y2 * sn
+        z2 = y2 * c + y1 * sn
     else:
         z1 = y1
         z2 = y2
@@ -73,14 +77,12 @@ def _qk_back(g1, g2, x1, x2, r, pos, msk, WN, COS, SIN, cbase, css, scale,
              D: tl.constexpr, HD: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
     """Grad w.r.t. the transformed halves -> grad w.r.t. the raw halves + norm-weight grad terms."""
     dh = tl.arange(0, HD)
-    if ROPE:                   # z1 = y1 c1 - y2 s1, z2 = y2 c2 + y1 s2
+    if ROPE:                   # z1 = y1 c - y2 s, z2 = y2 c + y1 s  (transpose of the rotation)
         co = cbase + pos.to(tl.int64) * css
-        c1 = tl.load(COS + co[:, None] + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
-        c2 = tl.load(COS + co[:, None] + HD + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
-        s1 = tl.load(SIN + co[:, None] + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
-        s2 = tl.load(SIN + co[:, None] + HD + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
-        d1 = g1 * c1 + g2 * s2
-        d2 = g2 * c2 - g1 * s1
+        c = tl.load(COS + co[:, None] + dh[None, :], mask=msk[:, None], other=1.0).to(tl.float32)
+        sn = tl.load(SIN + co[:, None] + dh[None, :], mask=msk[:, None], other=0.0).to(tl.float32)
+        d1 = g1 * c + g2 * sn
+        d2 = g2 * c - g1 * sn
     else:
         d1 = g1
         d2 = g2
@@ -370,7 +372,8 @@ class AttnXSA(torch.autograd.Function):
         wq = q_norm_w.contiguous() if qk_norm else q
         wk = k_norm_w.contiguous() if qk_norm else q
         if rope:
-            cos, sin = cos.contiguous(), sin.contiguous()
+            # HF tables are cat(freqs, freqs): the kernel reads ONE half (S, D/2) and uses it for both
+            cos, sin = cos[..., : D // 2].contiguous(), sin[..., : D // 2].contiguous()
             csb, css = (cos.stride(0), cos.stride(1)) if cos.dim() == 3 else (0, cos.stride(0))
         else:
             cos = sin = q
@@ -379,7 +382,8 @@ class AttnXSA(torch.autograd.Function):
         Z = _like(q)
         LSE = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         W = int(window) if window is not None else 0
-        c = CFG["fwd"]
+        cf = CFG["window" if window is not None else "causal"]
+        c = cf["fwd"]
         _fwd[(triton.cdiv(S, c["BM"]), B * HKV)](
             q, k, v, O, Z, LSE, A if A is not None else q, wq, wk, cos, sin,
             *_st(q), *_st(k), *_st(v), csb, css, S, H, HKV, float(scale), float(q_scale), float(k_scale),
@@ -407,7 +411,8 @@ class AttnXSA(torch.autograd.Function):
         DELTA = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         GA = torch.empty(B, H, S, device=q.device, dtype=torch.float32) if (xsa and has_a) else DELTA
         GVS = torch.empty(B, HKV, S, D, device=q.device, dtype=torch.float32) if xsa else DELTA
-        c = CFG["pre"]
+        cf = CFG["window" if window is not None else "causal"]
+        c = cf["pre"]
         _bwd_pre[(triton.cdiv(S, c["BM"]), B * HKV)](
             O, dZ, v, A if has_a else q, DO, DELTA, GA, GVS, *_st(dZ), *_st(v), S, H, HKV,
             GROUP=G, D=D, BM=c["BM"], XSA=xsa, HAS_A=has_a, num_warps=c["warps"])
@@ -415,7 +420,7 @@ class AttnXSA(torch.autograd.Function):
         wk_ = wk if qk_norm else q
         common = (*_st(q), *_st(k), *_st(v), csb, css, S, H, HKV, float(scale), q_scale, k_scale, eps, W)
         DK, DV = _like(k), _like(v)
-        c = CFG["dkdv"]
+        c = cf["dkdv"]
         nkb = triton.cdiv(S, c["BN"])
         PWK = torch.empty(B * HKV * nkb, D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         _bwd_dkdv[(nkb, B * HKV)](
@@ -423,7 +428,7 @@ class AttnXSA(torch.autograd.Function):
             GROUP=G, D=D, BM=c["BM"], BN=c["BN"], WINDOW=window is not None, XSA=xsa,
             QK_NORM=qk_norm, ROPE=rope, num_warps=c["warps"], num_stages=c["stages"])
         DQ = _like(q)
-        c = CFG["dq"]
+        c = cf["dq"]
         nqb = triton.cdiv(S, c["BM"])
         PWQ = torch.empty(B * HKV * nqb, D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         _bwd_dq[(nqb, B * HKV)](
