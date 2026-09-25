@@ -501,7 +501,7 @@ class _Archive(torch.autograd.Function):
         ctx.store.acc[ctx.k] = None
         if acc is None:
             return g, None, None
-        acc = acc.to(ctx.store.blocks[ctx.k].dtype)
+        acc = acc.to(ctx.store.dtype)
         return (acc if g is None else g + acc), None, None
 
 
@@ -565,6 +565,7 @@ class BlockStore:
 
     def __init__(self):
         self.blocks, self.refs, self.acc = [], [], []
+        self.dtype = None
 
     def __len__(self):
         return len(self.blocks)
@@ -575,12 +576,21 @@ class BlockStore:
         if self.blocks:
             assert x.dtype == self.blocks[0].dtype and x.shape == self.blocks[0].shape
         k = len(self.blocks)
+        self.dtype = x.dtype
         self.blocks.append(x)
         self.acc.append(None)
         self.refs.append(_Archive.apply(x, self, k))
         return self
 
+    def close(self):
+        """Drop the tensor references once the forward's last read is done. REQUIRED: the archived
+        views' autograd nodes point back at this store, so while it also points at them the whole
+        graph (and every ctx attribute in it -- MoE keeps GBs there) is a reference cycle that
+        only Python's GC frees. Measured: 94.9 GB OOM at step 0 without this. Backward needs only
+        self.acc and self.dtype."""
+        self.blocks, self.refs = [], []
+
     def mix(self, prefix_sum, score_weight, eps=1e-6, score_mode=0, topk=0):
         n = len(self.blocks)
-        assert n > 0
+        assert n > 0, "mix() on an empty or closed BlockStore"
         return _ListMix.apply(prefix_sum, score_weight, eps, score_mode, topk, self, n, *self.refs[:n])

@@ -41,6 +41,7 @@ def run(mode, seed=0, dtype=None):
             while len(st) < n:
                 st.archive(blocks[len(st)])
             outs.append(st.mix(p, w, 1e-6))
+        st.close()
     else:
         for n, p, w in zip(NREAD, ps, ws):
             br = torch.stack(blocks[:n], dim=1)
