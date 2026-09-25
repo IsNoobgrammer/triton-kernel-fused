@@ -128,9 +128,9 @@ _ROWFUSE_MAX_I = 1024
 
 
 @triton.jit
-def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, I,
+def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, W_ptr, I,
                         s_gu_m, s_gu_i, s_o_m, s_o_i, s_ap,
-                        EPS: tl.constexpr, BLOCK_I: tl.constexpr):
+                        EPS: tl.constexpr, BLOCK_I: tl.constexpr, HAS_W: tl.constexpr = False):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_I)
     msk = offs < I
@@ -147,14 +147,18 @@ def _glu_fwd_row_kernel(GateUp_ptr, Act_ptr, Alpha_ptr, Out_ptr, I,
     sig = 1.0 / (1.0 + tl.exp(-z))
     f = z * sig
     act = tl.where((at == 8) | (at == 10), rp * f, f)
-    tl.store(Out_ptr + row * s_o_m + offs * s_o_i, (act * up).to(Out_ptr.dtype.element_ty), mask=msk)
+    o = act * up
+    if HAS_W:
+        o = o * tl.load(W_ptr + row)
+    tl.store(Out_ptr + row * s_o_m + offs * s_o_i, o.to(Out_ptr.dtype.element_ty), mask=msk)
 
 
 @triton.jit
 def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
-                        GradGateUp_ptr, DA_ptr, I,
+                        GradGateUp_ptr, DA_ptr, W_ptr, DW_ptr, I,
                         s_go_m, s_go_i, s_gu_m, s_gu_i, s_ggu_m, s_ggu_i, s_ap,
-                        EPS: tl.constexpr, WANT_AP: tl.constexpr, BLOCK_I: tl.constexpr):
+                        EPS: tl.constexpr, WANT_AP: tl.constexpr, BLOCK_I: tl.constexpr,
+                        HAS_W: tl.constexpr = False):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_I)
     msk = offs < I
@@ -176,6 +180,10 @@ def _glu_bwd_row_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
     f = z * sig
     df = sig * (1.0 + z * (1.0 - sig))
     act = tl.where((at == 8) | (at == 10), rp * f, f)
+    if HAS_W:
+        # incoming grad is w.r.t. w * act*up: d_w = <go, act*up>, then the rest sees go * w
+        tl.store(DW_ptr + row, tl.sum(go * act * up))
+        go = go * tl.load(W_ptr + row)
     gu_ = go * up
     S = tl.sum(tl.where(is_norm, gu_ * df * gn, 0.0))
     T = tl.sum(tl.where((at == 8) | (at == 10), gu_ * f, 0.0))
@@ -371,7 +379,7 @@ def _needs_row(row_act, code_hint, row_alpha):
     return True
 
 
-def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
+def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None, row_w=None):
     M, twoI = gate_up.shape; I = twoI // 2
     if code_hint in (8, 10) and row_alpha is None:
         raise ValueError(
@@ -383,11 +391,13 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
     looped, BLOCK_I, nw = _row_tiling(I)
     if not looped:
         if M > 0:
-            _glu_fwd_row_kernel[(M,)](gate_up, row_act, ra, out, I,
+            _glu_fwd_row_kernel[(M,)](gate_up, row_act, ra, out, ra if row_w is None else row_w, I,
                                       gate_up.stride(0), gate_up.stride(1), out.stride(0), out.stride(1),
                                       _ap_stride(row_alpha),
-                                      EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=nw)
+                                      EPS=_NS_EPS, BLOCK_I=BLOCK_I, num_warps=nw,
+                                      HAS_W=row_w is not None)
         return out
+    assert row_w is None, "row_w needs the unlooped row kernel (_row_tiling(I)[0] False)"
     if _needs_row(row_act, code_hint, row_alpha):
         if M > 0:
             _glu_fwd_rowloop_kernel[(M,)](gate_up, row_act, ra, out, I,
@@ -405,7 +415,8 @@ def _glu_fwd(gate_up, row_act, code_hint=None, row_alpha=None):
     return out
 
 
-def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_act_grads=False):
+def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_act_grads=False,
+             row_w=None):
     M, twoI = gate_up.shape; I = twoI // 2
     if code_hint in (8, 10) and row_alpha is None:
         raise ValueError(
@@ -421,13 +432,18 @@ def _glu_bwd(grad_out, gate_up, row_act, code_hint=None, row_alpha=None, want_ac
         else:
             da = gate_up
         if M > 0:
-            _glu_bwd_row_kernel[(M,)](grad_out, gate_up, row_act, ra, ggu, da, I,
+            dw = torch.empty(M, device=gate_up.device, dtype=torch.float32) if row_w is not None else ra
+            _glu_bwd_row_kernel[(M,)](grad_out, gate_up, row_act, ra, ggu, da,
+                                      ra if row_w is None else row_w, dw, I,
                                       grad_out.stride(0), grad_out.stride(1),
                                       gate_up.stride(0), gate_up.stride(1), ggu.stride(0), ggu.stride(1),
                                       _ap_stride(row_alpha),
                                       EPS=_NS_EPS, WANT_AP=want_act_grads, BLOCK_I=BLOCK_I,
-                                      num_warps=nw)
+                                      num_warps=nw, HAS_W=row_w is not None)
+        if row_w is not None:
+            return (ggu, da, dw) if want_act_grads else (ggu, dw)
         return (ggu, da) if want_act_grads else ggu
+    assert row_w is None, "row_w needs the unlooped row kernel (_row_tiling(I)[0] False)"
     if _needs_row(row_act, code_hint, row_alpha):
         ggu = torch.empty_like(gate_up)
         if want_act_grads:
@@ -785,10 +801,11 @@ def _ap_grad_from_rows(da, row_expert, E, ap_shape, device):
 DENSE_ALL_ACTIVE = os.environ.get("TKF_MOE_DENSE", "1") != "0"
 
 
-def _dense_ok(hidden, idx, codes, E):
+def _dense_ok(hidden, idx, codes, E, I):
     return (DENSE_ALL_ACTIVE and idx.shape[1] == E and hidden.is_cuda
             and hidden.dtype in (torch.bfloat16, torch.float16)
             and len(set(codes)) == 1 and codes[0] not in (3, 4)
+            and not _row_tiling(I)[0]            # the row-scaled GLU needs the unlooped kernel
             and os.environ.get("BIBO_MOE_FORCE_LOOP") != "1")
 
 
@@ -802,10 +819,9 @@ def _dense_fwd(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes, ap32, a
     wgu = gate_up_proj.reshape(E * twoI, H)
     wd = down_proj.transpose(1, 2).reshape(E * I, H)              # rows e*I+i = down_proj[e, :, i]
     gu = torch.mm(hidden, wgu.t()).view(N * E, twoI)
-    it = _glu_fwd(gu, row_act, code_hint=codes[0], row_alpha=row_alpha)
-    its = (it.float() * w.view(-1, 1)).to(it.dtype)
+    its = _glu_fwd(gu, row_act, code_hint=codes[0], row_alpha=row_alpha, row_w=w.view(-1))
     out = torch.mm(its.view(N, E * I), wd)
-    ctx.save_for_backward(hidden, idx, w, gate_up_proj, down_proj, gu, it, row_act,
+    ctx.save_for_backward(hidden, idx, w, gate_up_proj, down_proj, gu, its, row_act,
                           row_alpha if row_alpha is not None else torch.empty(0))
     ctx.dense = True
     ctx.shapes = (N, H, E, I)
@@ -814,20 +830,23 @@ def _dense_fwd(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes, ap32, a
 
 
 def _dense_bwd(ctx, grad_out):
-    hidden, idx, w, gate_up_proj, down_proj, gu, it, row_act, row_alpha = ctx.saved_tensors
+    hidden, idx, w, gate_up_proj, down_proj, gu, its, row_act, row_alpha = ctx.saved_tensors
     N, H, E, I = ctx.shapes
     row_alpha = row_alpha if ctx.has_ap else None
     go = grad_out.to(hidden.dtype).contiguous()
     wd = down_proj.transpose(1, 2).reshape(E * I, H)
-    its = (it.float() * w.view(-1, 1)).to(it.dtype)               # recomputed, bitwise the forward's
+    one = torch.full((1,), N, device=go.device, dtype=torch.int32)   # a single group of N rows
     d_its = torch.mm(go, wd.t()).view(N * E, I)
-    grad_down = torch.mm(its.view(N, E * I).t(), go).view(E, I, H).transpose(1, 2).contiguous()
-    d_w = (d_its.float() * it.float()).sum(-1).view(N, E)
-    d_it = (d_its.float() * w.view(-1, 1)).to(it.dtype)
+    _FG = _fused_glu()
+    gdn = _FG.grouped_wgrad(its.view(N, E * I), go, one) if _FG is not None else None
+    if gdn is None:
+        gdn = torch.mm(its.view(N, E * I).t(), go)[None]
+    grad_down = gdn[0].view(E, I, H).transpose(1, 2).contiguous()
     grad_ap = None
+    rw = w.view(-1)
     if ctx.has_ap and ctx.needs_input_grad[6]:
-        dgu, da = _glu_bwd(d_it, gu, row_act, code_hint=ctx.codes[0], row_alpha=row_alpha,
-                           want_act_grads=True)
+        dgu, da, d_w = _glu_bwd(d_its, gu, row_act, code_hint=ctx.codes[0], row_alpha=row_alpha,
+                                want_act_grads=True, row_w=rw)
         per_e = da.reshape(N, E).double().sum(0).float()          # fixed-order, deterministic
         if len(ctx.ap_shape) == 1:
             grad_ap = per_e
@@ -836,9 +855,12 @@ def _dense_bwd(ctx, grad_out):
             grad_ap[:, 0] = per_e
             grad_ap = grad_ap[:, :ctx.ap_shape[1]]
     else:
-        dgu = _glu_bwd(d_it, gu, row_act, code_hint=ctx.codes[0], row_alpha=row_alpha)
+        dgu, d_w = _glu_bwd(d_its, gu, row_act, code_hint=ctx.codes[0], row_alpha=row_alpha,
+                            row_w=rw)
+    d_w = d_w.view(N, E)
     dgu2 = dgu.view(N, E * 2 * I)
-    grad_gu = torch.mm(dgu2.t(), hidden).view(E, 2 * I, H)
+    ggu = _FG.grouped_wgrad(dgu2, hidden, one) if _FG is not None else None
+    grad_gu = (ggu[0] if ggu is not None else torch.mm(dgu2.t(), hidden)).view(E, 2 * I, H)
     grad_hidden = torch.mm(dgu2, gate_up_proj.reshape(E * 2 * I, H))
     grad_wt = d_w.gather(1, idx).to(grad_out.dtype)
     return grad_hidden, None, grad_wt, grad_gu, grad_down, None, grad_ap
@@ -854,7 +876,7 @@ class _PerExpertMoE(torch.autograd.Function):
         codes = _codes_list(act_codes)
         top_k = idx.shape[1]; dev = hidden.device
         ctx.dense = False
-        if _dense_ok(hidden, idx, codes, E):
+        if _dense_ok(hidden, idx, codes, E, gate_up_proj.shape[1] // 2):
             ap32 = act_params.float().contiguous() if act_params is not None else None
             ap_shape = ap32.shape if ap32 is not None else None
             if ap32 is not None and ap32.ndim == 1:

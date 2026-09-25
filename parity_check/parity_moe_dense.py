@@ -50,7 +50,14 @@ def run(mode, seed=0):
 
 def syncs(mode):
     n = [0]
-    warnings.showwarning = lambda msg, *a, **k: n.__setitem__(0, n[0] + ("called a synchronizing" in str(msg)))
+    import traceback
+
+    def _w(msg, *a, **k):
+        if "called a synchronizing" in str(msg):
+            n[0] += 1
+            fr = [x for x in traceback.extract_stack()[:-1] if "kernels" in x.filename or "parity" in x.filename]
+            print(f"      sync ({mode}): " + " <- ".join(f"{x.filename.split('/')[-1]}:{x.lineno} {x.line}" for x in fr[-2:][::-1])[:220])
+    warnings.showwarning = _w
     warnings.simplefilter("always")
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("warn")

@@ -1,0 +1,2 @@
+MoE h=384 i=768 E=5 blocks=3 steps=3000 seeds=(0, 1)
+  aurora@0.01    lr 5.0e-04  id_acc 0.9143  ood_acc 0.4825  id 0.5385  train 0.0762
