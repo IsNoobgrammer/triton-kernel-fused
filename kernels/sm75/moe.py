@@ -41,9 +41,32 @@ _FUSED_GLU_TRIED = False
 WGRAD = os.environ.get("TKF_MOE_WGRAD", "triton")
 
 
-def _wgrad(a, b, offs):
-    """Per-expert a[rows_e]^T @ b[rows_e] (== torch._grouped_mm(a.t(), b, offs=offs))."""
+# The expert dW is written STRAIGHT INTO the fp32 master param's .grad (and accumulated there across
+# micro-batches) instead of being returned to autograd as bf16, which the engine then cast to fp32
+# (a full copy) and AccumulateGrad added (another read-read-write). TKF_MOE_ACC_GRAD=0 restores the
+# autograd return. Only for leaf fp32 contiguous Parameters with no grad hooks.
+ACC_GRAD = os.environ.get("TKF_MOE_ACC_GRAD", "1") != "0"
+
+
+def _acc_target(p):
+    return (p if (ACC_GRAD and isinstance(p, torch.nn.Parameter) and p.is_leaf and p.requires_grad
+                  and p.dtype == torch.float32 and p.is_contiguous() and not p._backward_hooks
+                  and not getattr(p, "_post_accumulate_grad_hooks", None))
+            else None)
+
+
+def _wgrad(a, b, offs, acc=None, shape=None):
+    """Per-expert a[rows_e]^T @ b[rows_e] (== torch._grouped_mm(a.t(), b, offs=offs)).
+    acc = a Parameter: accumulate into acc.grad and return None (autograd gets no grad for it)."""
     g = _fused_glu() if WGRAD == "triton" else None
+    if acc is not None and g is not None and hasattr(g, "grouped_wgrad"):
+        fresh = acc.grad is None
+        buf = torch.empty_like(acc) if fresh else acc.grad
+        view = buf.view(shape) if shape is not None else buf       # dense path: (1, E*2I, H)
+        if g.grouped_wgrad(a, b, offs, out=view, accumulate=not fresh) is not None:
+            if fresh:
+                acc.grad = buf
+            return None
     out = g.grouped_wgrad(a, b, offs) if g is not None and hasattr(g, "grouped_wgrad") else None
     return out if out is not None else torch._grouped_mm(a.t(), b, offs=offs)
 
@@ -859,8 +882,9 @@ def _dense_bwd(ctx, grad_out):
                             row_w=rw)
     d_w = d_w.view(N, E)
     dgu2 = dgu.view(N, E * 2 * I)
-    ggu = _FG.grouped_wgrad(dgu2, hidden, one) if _FG is not None else None
-    grad_gu = (ggu[0] if ggu is not None else torch.mm(dgu2.t(), hidden)).view(E, 2 * I, H)
+    grad_gu = _wgrad(dgu2, hidden, one, acc=ctx.acc[0], shape=(1, E * 2 * I, H))
+    if grad_gu is not None:
+        grad_gu = grad_gu.view(E, 2 * I, H)
     grad_hidden = torch.mm(dgu2, gate_up_proj.reshape(E * 2 * I, H))
     grad_wt = d_w.gather(1, idx).to(grad_out.dtype)
     return grad_hidden, None, grad_wt, grad_gu, grad_down, None, grad_ap
@@ -870,6 +894,7 @@ class _PerExpertMoE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes, act_params=None):
+        ctx.acc = (_acc_target(gate_up_proj), _acc_target(down_proj))   # BEFORE the bf16 cast
         hidden, wt, gate_up_proj, down_proj = _amp_cast(hidden, wt, gate_up_proj, down_proj)
         N, H = hidden.shape
         E = act_codes.shape[0]
@@ -1055,7 +1080,7 @@ class _PerExpertMoE(torch.autograd.Function):
             want_ap = ctx.has_ap and ctx.needs_input_grad[6]
             grad_ap = None
             ge_all, gw_all = _combine_bwd(grad_out, eo_all, sw, st)
-            grad_down_proj = _wgrad(ge_all, it_all, offs)
+            grad_down_proj = _wgrad(ge_all, it_all, offs, acc=ctx.acc[1])
             hint = codes[0] if len(set(codes)) == 1 else None
             if ctx.tile_map is not None:
                 grad_gate_up = _fused_glu().fused_dinter_glu_bwd(
@@ -1076,7 +1101,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 else:
                     grad_gate_up = _glu_bwd(grad_inter, gu_all, row_act, code_hint=hint,
                                             row_alpha=ctx.row_alpha)
-            grad_gate_up_proj = _wgrad(grad_gate_up, x_s, offs)
+            grad_gate_up_proj = _wgrad(grad_gate_up, x_s, offs, acc=ctx.acc[0])
             grad_hidden = None
             if ctx.tile_map_gg is not None:
                 if ctx.inv is not None:

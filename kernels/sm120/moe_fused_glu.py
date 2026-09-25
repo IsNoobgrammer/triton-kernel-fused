@@ -213,7 +213,7 @@ _WG = dict(CH=16384, BM=128, BN=128, BK=32, num_warps=4, num_stages=4)
 @triton.jit
 def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, N1, N2, sa, sb,
                NT2: tl.constexpr, NTILE: tl.constexpr,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr):
     pid = tl.program_id(0)
     item = tl.load(ORDER + pid // NTILE)
     e = tl.load(IT_E + item)
@@ -235,13 +235,16 @@ def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, N1, N2, sa, sb,
     slot = tl.load(IT_SLOT + item)
     off = r1[:, None] * N2 + r2[None, :]
     if slot < 0:
-        tl.store(C + e.to(tl.int64) * N1 * N2 + off, acc.to(C.dtype.element_ty))
+        cp = C + e.to(tl.int64) * N1 * N2 + off
+        if ACC:                                  # += into an existing fp32 grad, one add per call
+            acc += tl.load(cp).to(tl.float32)
+        tl.store(cp, acc.to(C.dtype.element_ty))
     else:
         tl.store(P + slot.to(tl.int64) * N1 * N2 + off, acc)
 
 
 @triton.jit
-def _wg_reduce(P, C, FIRST, NCH, NN, BLOCK: tl.constexpr):
+def _wg_reduce(P, C, FIRST, NCH, NN, BLOCK: tl.constexpr, ACC: tl.constexpr):
     e = tl.program_id(0)
     nch = tl.load(NCH + e)
     if nch <= 1:
@@ -250,15 +253,19 @@ def _wg_reduce(P, C, FIRST, NCH, NN, BLOCK: tl.constexpr):
     o = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = o < NN
     acc = tl.zeros((BLOCK,), tl.float32)
+    if ACC:
+        acc += tl.load(C + e.to(tl.int64) * NN + o, mask=m, other=0.0).to(tl.float32)
     for j in range(0, nch):                      # chunk order: deterministic
         acc += tl.load(P + (first + j) * NN + o, mask=m, other=0.0)
     tl.store(C + e.to(tl.int64) * NN + o, acc.to(C.dtype.element_ty), mask=m)
 
 
-def grouped_wgrad(a, b, offs, cfg=None):
+def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False):
     """out (E, N1, N2) = per expert a[s:t]^T @ b[s:t], with offs the int32 END row offsets exactly as
     torch._grouped_mm(a.t(), b, offs=offs) takes them. a (M, N1), b (M, N2), same dtype. Returns
-    None when the shape is not tileable (caller falls back)."""
+    None when the shape is not tileable (caller falls back).
+    out: a contiguous (E, N1, N2) buffer to write (any float dtype, e.g. a param's fp32 .grad);
+    accumulate=True adds into it instead (fp32 accumulate, fixed order, deterministic)."""
     c = dict(_WG, **(cfg or {}))
     M, N1 = a.shape
     N2 = b.shape[1]
@@ -285,17 +292,19 @@ def grouped_wgrad(a, b, offs, cfg=None):
     it_slot = torch.where(valid & (nch[ie] > 1), i, -1)
     it_e = torch.where(valid, ie, -1)
     order = torch.argsort(it_n, descending=True, stable=True)   # heaviest chunks launch first
-    out = torch.empty(E, N1, N2, device=dev, dtype=a.dtype)
+    if out is None:
+        out = torch.empty(E, N1, N2, device=dev, dtype=a.dtype)
+    assert out.shape == (E, N1, N2) and out.is_contiguous(), (out.shape, (E, N1, N2))
     part = torch.empty(NI, N1, N2, device=dev, dtype=torch.float32)
     nt2 = N2 // BN
     ntile = (N1 // BM) * nt2
     _wg_kernel[(NI * ntile,)](a, b, out, part, it_e.to(torch.int32), it_s, it_n.to(torch.int32),
                               it_slot.to(torch.int32), order, N1, N2, a.stride(0), b.stride(0),
-                              NT2=nt2, NTILE=ntile, BM=BM, BN=BN, BK=BK,
+                              NT2=nt2, NTILE=ntile, BM=BM, BN=BN, BK=BK, ACC=bool(accumulate),
                               num_warps=c["num_warps"], num_stages=c["num_stages"])
     RB = 1024
     _wg_reduce[(E, triton.cdiv(N1 * N2, RB))](part, out, (cend - nch), nch, N1 * N2, BLOCK=RB,
-                                              num_warps=4)
+                                              ACC=bool(accumulate), num_warps=4)
     return out
 
 
