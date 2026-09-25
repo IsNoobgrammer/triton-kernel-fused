@@ -47,6 +47,8 @@ WGRAD = os.environ.get("TKF_MOE_WGRAD", "triton")
 # autograd return. Only for leaf fp32 contiguous Parameters with no grad hooks.
 ACC_GRAD = os.environ.get("TKF_MOE_ACC_GRAD", "1") != "0"
 GATHER_X = os.environ.get("TKF_MOE_GATHER", "1") != "0"
+# dX row buffer before the deterministic k-way sum: fp32 (default) or bf16 (half the traffic)
+DX_ROWS = {"fp32": torch.float32, "bf16": torch.bfloat16}[os.environ.get("TKF_MOE_DX_ROWS", "fp32")]
 
 
 def _acc_target(p):
@@ -1066,7 +1068,9 @@ class _PerExpertMoE(torch.autograd.Function):
         inv = None
         if DETERMINISTIC and _FGc is not None:
             inv = _FGc.inverse_order(order)
-            out = _FGc.combine_gather(eo_all, inv, N, top_k, w=sw_eff)
+            # stored in the stream dtype straight from the fp32 sum: the separate .to() below was
+            # a full (N, H) fp32 read + bf16 write for the same single rounding
+            out = _FGc.combine_gather(eo_all, inv, N, top_k, w=sw_eff, out_dtype=hidden.dtype)
         else:
             out = torch.zeros(N, H, device=dev, dtype=torch.float32)
             _combine_scatter(eo_all, sw_eff, st, out)
@@ -1123,7 +1127,9 @@ class _PerExpertMoE(torch.autograd.Function):
             if ctx.tile_map_gg is not None:
                 if ctx.inv is not None:
                     gh32 = _fused_glu().grouped_gemm_gather(grad_gate_up, gate_up_proj, ctx.inv,
-                                                            ctx.tile_map_gg, N, top_k)
+                                                            ctx.tile_map_gg, N, top_k,
+                                                            out_dtype=grad_out.dtype,
+                                                            rows_dtype=DX_ROWS)
                 else:
                     gh32 = _fused_glu().grouped_gemm_scatter(grad_gate_up, gate_up_proj, st,
                                                            ctx.tile_map_gg, N)

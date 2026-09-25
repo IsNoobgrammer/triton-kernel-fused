@@ -307,7 +307,13 @@ def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False, b_rows=None)
     it_n = torch.where(valid, (cnt[ie] - j * CH).clamp(0, CH), 0)
     it_slot = torch.where(valid & (nch[ie] > 1), i, -1)
     it_e = torch.where(valid, ie, -1)
-    order = torch.argsort(it_n, descending=True, stable=True)   # heaviest chunks launch first
+    # heaviest first, without a sort: every chunk but an expert's last is exactly CH rows, so a
+    # stable PARTITION (full chunks, then the tails in expert order) is the useful part of LPT.
+    # argsort here was ~15 radix-sort launches per call, 9 ms per board step.
+    full = it_n == CH
+    nfull = full.sum()
+    pos = torch.where(full, torch.cumsum(full, 0) - 1, nfull + torch.cumsum(~full, 0) - 1)
+    order = torch.empty_like(pos).scatter_(0, pos, i)
     if out is None:
         out = torch.empty(E, N1, N2, device=dev, dtype=a.dtype)
     assert out.shape == (E, N1, N2) and out.is_contiguous(), (out.shape, (E, N1, N2))
@@ -515,10 +521,12 @@ def combine_gather(rows, inv, n_tok, k, w=None, out=None, out_dtype=torch.float3
     return out
 
 
-def grouped_gemm_gather(a, b_enk, inv, tile_map, n_tok, k):
-    """Deterministic grouped_gemm_scatter: the per-row GEMM result goes to an fp32 row buffer, then
-    combine_gather sums each token's k rows in slot order. Costs one extra fp32 (M, N) write+read."""
-    rows = torch.empty(a.shape[0], b_enk.shape[2], device=a.device, dtype=torch.float32)
+def grouped_gemm_gather(a, b_enk, inv, tile_map, n_tok, k, out_dtype=torch.float32,
+                        rows_dtype=torch.float32):
+    """Deterministic grouped_gemm_scatter: the per-row GEMM result goes to a row buffer, then
+    combine_gather sums each token's k rows in slot order (fp32) and stores out_dtype directly.
+    rows_dtype=bf16 halves the (M, N) round trip at the cost of rounding each of the k terms."""
+    rows = torch.empty(a.shape[0], b_enk.shape[2], device=a.device, dtype=rows_dtype)
     if grouped_gemm(a, b_enk, tile_map, out=rows) is None:
         return None
-    return combine_gather(rows, inv, n_tok, k)
+    return combine_gather(rows, inv, n_tok, k, out_dtype=out_dtype)
