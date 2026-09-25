@@ -502,7 +502,12 @@ class AttnXSA(torch.autograd.Function):
             # HF tables are cat(freqs, freqs): the kernels read ONE half (S, D/2) for both halves
             cos = cos[..., : D // 2].to(q.dtype).contiguous()
             sin = sin[..., : D // 2].to(q.dtype).contiguous()
-            csb, css = (cos.stride(0), cos.stride(1)) if cos.dim() == 3 else (0, cos.stride(0))
+            if cos.shape[-2] < S or (cos.dim() == 3 and cos.shape[0] not in (1, B)):
+                raise ValueError(f"cos/sin {tuple(cos.shape)} do not cover (B={B}, S={S})")
+            # a batch dim of 1 (one position table for the whole batch, as the model passes it)
+            # broadcasts: stride 0, never index b into it
+            csb = cos.stride(0) if (cos.dim() == 3 and cos.shape[0] > 1) else 0
+            css = cos.stride(-2)
         else:
             cos = sin = q
             csb = css = 0
