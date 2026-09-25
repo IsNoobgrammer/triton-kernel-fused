@@ -586,10 +586,27 @@ def _codes_list(act_codes):
     return v
 
 
+@triton.jit
+def _hist_kernel(X, OUT, n, E, NB: tl.constexpr, BLOCK: tl.constexpr):
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + o, mask=o < n, other=E).to(tl.int32)       # padding lanes land in bin E
+    h = tl.histogram(x, NB)
+    b = tl.arange(0, NB)
+    tl.atomic_add(OUT + b, h.to(tl.int64), mask=b < E)
+
+
 def expert_counts(e, E):
-    """torch.bincount(e, minlength=E) without its host sync: bincount reads max(e) back to size
-    its output, a GPU drain per call. Integer atomics, so the counts are exact and identical."""
-    return torch.zeros(E, dtype=torch.long, device=e.device).scatter_add_(0, e, torch.ones_like(e))
+    """torch.bincount(e, minlength=E) without its host sync (bincount reads max(e) back to size its
+    output). A block-local histogram, then E integer atomics per block: scatter_add_ put ~393k
+    atomics on 64 addresses and cost 25 ms/board step. Integer, so exact and order-free."""
+    out = torch.zeros(E, dtype=torch.long, device=e.device)
+    n = e.numel()
+    if n and e.is_cuda:
+        BLOCK = 4096
+        _hist_kernel[(triton.cdiv(n, BLOCK),)](e.reshape(-1), out, n, E,
+                                               NB=triton.next_power_of_2(E + 1), BLOCK=BLOCK)
+        return out
+    return out.scatter_add_(0, e.reshape(-1), torch.ones_like(e.reshape(-1)))
 
 
 def _host_bounds(counts_dev):
