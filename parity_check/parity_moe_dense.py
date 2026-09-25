@@ -10,7 +10,8 @@ import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-import kernels.sm75.moe as M
+import importlib
+M = importlib.import_module("kernels.sm75.moe")   # the package re-exports a `moe` function over the module name
 
 dev = "cuda"
 N, H, E, I = 65536, 512, 8, 576
