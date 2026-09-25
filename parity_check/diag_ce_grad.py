@@ -68,3 +68,24 @@ nz = (d != 0)
 print(f"g elements differing ours vs eager-bf16: {nz.float().mean().item():.4%}; "
       f"where they differ, mean |ours-truth| {((Go.double() - G64)[nz]).abs().mean().item():.3e} "
       f"vs eager {((Ge.double() - G64)[nz]).abs().mean().item():.3e}")
+
+# ---- the parity_ce_lse setup exactly: fp32 LEAVES under autocast. Where does d_hidden diverge?
+x0, w0 = x.float().clone(), w.float().clone()
+ref_x = x0.clone().requires_grad_(); ref_w = w0.clone().requires_grad_()
+F.cross_entropy(ref_x @ ref_w.t(), lab, ignore_index=-100).backward()
+ea_x = x0.clone().requires_grad_(); ea_w = w0.clone().requires_grad_()
+with torch.autocast("cuda", dtype=bf):
+    le = ea_x @ ea_w.t()
+    loss_e = F.cross_entropy(le, lab, ignore_index=-100)
+loss_e.backward()
+ou_x = x0.clone().requires_grad_(); ou_w = w0.clone().requires_grad_()
+with torch.autocast("cuda", dtype=bf):
+    loss_o = CE.fused_linear_cross_entropy(ou_x, ou_w, lab, -100, 256 * 1024 * 1024)
+loss_o.backward()
+print(f"fp32-leaf setup: logits dtype under autocast {le.dtype}; eager grad dtype {ea_x.grad.dtype}")
+print(f"   d_hidden vs fp32 ref: eager {rel(ea_x.grad, ref_x.grad.double()):.3e}  ours {rel(ou_x.grad, ref_x.grad.double()):.3e}"
+      f"   ours vs eager rel diff {rel(ou_x.grad, ea_x.grad.double()):.3e}")
+print(f"   d_weight vs fp32 ref: eager {rel(ea_w.grad, ref_w.grad.double()):.3e}  ours {rel(ou_w.grad, ref_w.grad.double()):.3e}")
+# is eager's d_hidden really bf16-rounded?
+print(f"   eager d_hidden exactly bf16-representable: {bool((ea_x.grad == ea_x.grad.to(bf).float()).all())}"
+      f"   ours: {bool((ou_x.grad == ou_x.grad.to(bf).float()).all())}")
