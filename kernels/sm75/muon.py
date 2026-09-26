@@ -167,7 +167,8 @@ class FusedMuon(optim.Optimizer):
         u = gv.add_(mom_c, alpha=momentum) if nesterov else mom_c
         step_a = -lr * _scaling.RMS_TARGET * max(r, c) ** 0.5 if self.scale == "adam" else -lr
         v.add_(self._polar(u).float(), alpha=step_a)
-        _scaling.muown_adam_g(gg, st["m"], st["s"], grad_g, lr, self._step_count, var.betas, var.eps)
+        _scaling.muown_adam_g(gg, st["m"], st["s"], grad_g, lr * _scaling.MUOWN_GAIN_LR_MULT,
+                              self._step_count, var.betas, var.eps)
         W_new, vn_new = _scaling.muown_compose(v, gg)
         vn.copy_(vn_new)
         if wd != 0:

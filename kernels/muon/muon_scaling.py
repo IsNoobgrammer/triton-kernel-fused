@@ -280,6 +280,10 @@ def spectral_wd_mult(u, e_ema, gamma, beta=0.99, eps=1e-12):
 # (n, r, c) stacks; g / vn / m / s are (n, r). Reference names: v_norm -> vn, m_g -> m, v_g -> s.
 MUOWN_BETAS = (0.9, 0.95)
 MUOWN_EPS = 1e-8
+# lr multiplier for the per-row GAIN's Adam step (the paper uses the Muon lr for both). A diagnostic
+# knob: TKF_MUOWN_GAIN_LR_MULT=0.1 gives the gains 1/10 of the direction's lr.
+import os as _os
+MUOWN_GAIN_LR_MULT = float(_os.environ.get("TKF_MUOWN_GAIN_LR_MULT", "1.0"))
 
 
 def muown_state(W):

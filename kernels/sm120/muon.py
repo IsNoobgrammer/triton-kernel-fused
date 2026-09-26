@@ -65,7 +65,8 @@ class FusedMuon(_FusedMuon75):
         out = self._polar(gbuf if nesterov else mom_c)
         step_a = -lr * _scaling.RMS_TARGET * max(r, c) ** 0.5 if self.scale == "adam" else -lr
         for p, o, n in members:
-            muown_post(p.view(n, r, c), out[o:o + n], _scaling.slice_state(st, o, n), dg[o:o + n], step_a, lr,
+            muown_post(p.view(n, r, c), out[o:o + n], _scaling.slice_state(st, o, n), dg[o:o + n], step_a,
+                       lr * _scaling.MUOWN_GAIN_LR_MULT,
                        var.betas, var.eps, self._step_count, lr * wd)
 
     def _polar(self, u):
