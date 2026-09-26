@@ -173,7 +173,7 @@ class FusedMuon(optim.Optimizer):
         vn.copy_(vn_new)
         if wd != 0:
             W_new.add_(W, alpha=-lr * wd)
-            gg.copy_(torch.linalg.vector_norm(W_new, dim=-1))
+            gg.copy_(_scaling.muown_row_norm(W_new))
         for p, o, n in members:
             p.copy_(W_new[o:o + n].reshape(p.shape))
 

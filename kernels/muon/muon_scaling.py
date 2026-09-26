@@ -293,8 +293,10 @@ def muown_state(W):
 
 
 def muown_split(W, G, g, vn):
-    """(W, dL/dW) -> (v, dL/dg, dL/dv). Reference `_wn_pre_ns`, same op order."""
-    u = W / g.unsqueeze(-1)
+    """(W, dL/dW) -> (v, dL/dg, dL/dv). Reference `_wn_pre_ns`, same op order. A row with g == 0
+    exactly has no direction: u = 0 there instead of 0/0 (other rows bit-identical)."""
+    gz = (g == 0).unsqueeze(-1)
+    u = torch.where(gz, torch.zeros((), device=W.device, dtype=W.dtype), W / torch.where(gz, 1.0, g.unsqueeze(-1)))
     grad_g = (G * u).sum(dim=-1)
     grad_v = (g / vn).unsqueeze(-1) * (G - u * grad_g.unsqueeze(-1))
     return u * vn.unsqueeze(-1), grad_g, grad_v
@@ -305,6 +307,14 @@ def muown_adam_g(g, m, s, grad_g, lr, t, betas=MUOWN_BETAS, eps=MUOWN_EPS):
     m.mul_(b1).add_(grad_g, alpha=1 - b1)
     s.mul_(b2).addcmul_(grad_g, grad_g, value=1 - b2)
     g.addcdiv_(m / (1 - b1 ** t), (s / (1 - b2 ** t)).sqrt().add_(eps), value=-lr)
+
+
+def muown_row_norm(W):
+    """Row norm for the wd gain resync, underflow-safe: rows whose plain sum of squares is below 2^-100
+    use a 2^40-rescaled sum (exact), so a ~1e-19 row keeps g ~1e-19 instead of flushing to 0."""
+    n = torch.linalg.vector_norm(W, dim=-1)
+    # unconditional where: a .any() branch would be a host sync every step
+    return torch.where(n.pow(2) < 2.0 ** -100, torch.linalg.vector_norm(W * 2.0 ** 40, dim=-1) * 2.0 ** -40, n)
 
 
 def muown_compose(v_new, g):

@@ -107,6 +107,10 @@ def _muown_pre_kernel(W, G, GG, VN, DG, M, U, R, C, mu,
     ridx = b * R + rows
     g = tl.load(GG + ridx, mask=rm, other=1.0)
     vn = tl.load(VN + ridx, mask=rm, other=1.0)
+    # A gain of exactly 0 (the wd resync can underflow to it) must not become 0/0: that row has no
+    # direction left, so u = 0. Rows with g != 0 divide by g exactly as before (bit-identical).
+    gz = g == 0.0
+    gs = tl.where(gz, 1.0, g)
     base = ridx[:, None] * C
     acc = tl.zeros([BR], dtype=tl.float32)
     for c0 in range(0, C, BC):
@@ -114,7 +118,7 @@ def _muown_pre_kernel(W, G, GG, VN, DG, M, U, R, C, mu,
         msk = rm[:, None] & (cols[None, :] < C)
         w = tl.load(W + base + cols[None, :], mask=msk, other=0.0).to(tl.float32)
         gr = tl.load(G + base + cols[None, :], mask=msk, other=0.0).to(tl.float32)
-        acc += tl.sum(gr * tl.math.div_rn(w, g[:, None]), axis=1)
+        acc += tl.sum(gr * tl.where(gz[:, None], 0.0, tl.math.div_rn(w, gs[:, None])), axis=1)
     tl.store(DG + ridx, acc, mask=rm)
     k = tl.math.div_rn(g, vn)
     for c0 in range(0, C, BC):
@@ -123,7 +127,7 @@ def _muown_pre_kernel(W, G, GG, VN, DG, M, U, R, C, mu,
         off = base + cols[None, :]
         w = tl.load(W + off, mask=msk, other=0.0).to(tl.float32)
         gr = tl.load(G + off, mask=msk, other=0.0).to(tl.float32)
-        u_ = tl.math.div_rn(w, g[:, None])
+        u_ = tl.where(gz[:, None], 0.0, tl.math.div_rn(w, gs[:, None]))
         gv = (k[:, None] * (gr - u_ * acc[:, None])).to(M.dtype.element_ty).to(tl.float32)
         m = tl.load(M + off, mask=msk, other=0.0).to(tl.float32)
         m = (m * mu).to(M.dtype.element_ty).to(tl.float32)
@@ -150,6 +154,8 @@ def _muown_post_kernel(P, O, GG, VN, MS, SS, DG, R, C, sob, sor, soc,
     ridx = b * R + rows
     g = tl.load(GG + ridx, mask=rm, other=1.0)
     vn = tl.load(VN + ridx, mask=rm, other=1.0)
+    gz = g == 0.0                                   # see _muown_pre_kernel
+    gs = tl.where(gz, 1.0, g)
     dg = tl.load(DG + ridx, mask=rm, other=0.0)
     m = tl.load(MS + ridx, mask=rm, other=0.0) * b1 + omb1 * dg
     s = tl.load(SS + ridx, mask=rm, other=0.0) * b2 + omb2 * (dg * dg)
@@ -165,10 +171,11 @@ def _muown_post_kernel(P, O, GG, VN, MS, SS, DG, R, C, sob, sor, soc,
             o = tl.trans(tl.load(O + obase + cols[:, None] * soc + rows[None, :] * sor, mask=tl.trans(msk), other=0.0))
         else:
             o = tl.load(O + obase + rows[:, None] * sor + cols[None, :] * soc, mask=msk, other=0.0)
-        v = tl.math.div_rn(w, g[:, None]) * vn[:, None] + step_a * o.to(tl.float32)
+        v = tl.where(gz[:, None], 0.0, tl.math.div_rn(w, gs[:, None])) * vn[:, None] + step_a * o.to(tl.float32)
         acc += tl.sum(v * v, axis=1)
     vn_new = tl.math.sqrt_rn(acc)
     acc2 = tl.zeros([BR], dtype=tl.float32)
+    acc3 = tl.zeros([BR], dtype=tl.float32)        # same sum at x 2^40: underflow-safe for tiny rows
     for c0 in range(0, C, BC):
         cols = c0 + tl.arange(0, BC)
         msk = rm[:, None] & (cols[None, :] < C)
@@ -178,14 +185,21 @@ def _muown_post_kernel(P, O, GG, VN, MS, SS, DG, R, C, sob, sor, soc,
             o = tl.trans(tl.load(O + obase + cols[:, None] * soc + rows[None, :] * sor, mask=tl.trans(msk), other=0.0))
         else:
             o = tl.load(O + obase + rows[:, None] * sor + cols[None, :] * soc, mask=msk, other=0.0)
-        v = tl.math.div_rn(w, g[:, None]) * vn[:, None] + step_a * o.to(tl.float32)
+        v = tl.where(gz[:, None], 0.0, tl.math.div_rn(w, gs[:, None])) * vn[:, None] + step_a * o.to(tl.float32)
         wn = g_new[:, None] * tl.math.div_rn(v, vn_new[:, None])
         if HAS_WD:
             wn = wn - lr_wd * w
             acc2 += tl.sum(wn * wn, axis=1)
+            wb = wn * 1099511627776.0                  # 2^40, exact
+            acc3 += tl.sum(wb * wb, axis=1)
         tl.store(P + off, wn.to(P.dtype.element_ty), mask=msk)
     if HAS_WD:
-        g_new = tl.math.sqrt_rn(acc2)
+        # The resynced gain is the row norm. For a row near 1e-19 the squares underflow fp32 and the
+        # plain sum is 0 -> g = 0 -> the next step's W/g was 0/0 (muown wd 0.1 NaN, step 884). Below
+        # 2^-100 use the 2^40-scaled sum (exact power-of-two rescale); every other row keeps the
+        # plain sqrt bit for bit.
+        g_new = tl.where(acc2 < 7.888609052210118e-31, tl.math.sqrt_rn(acc3) * 9.094947017729282e-13,
+                         tl.math.sqrt_rn(acc2))
     tl.store(GG + ridx, g_new, mask=rm)
     tl.store(VN + ridx, vn_new, mask=rm)
     tl.store(MS + ridx, m, mask=rm)
