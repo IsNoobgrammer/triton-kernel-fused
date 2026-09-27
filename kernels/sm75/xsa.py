@@ -5,9 +5,12 @@ import triton.language as tl
 __all__ = ["fused_xsa", "FusedXSA"]
 
 
-def _cfgs():
-    return [triton.Config({"XBLOCK": xb}, num_warps=w)
-            for xb in (1, 2, 4, 8, 16, 32, 64, 128, 256) for w in (2, 4, 8)]
+# PINNED, not autotuned. num_warps changes the intra-row tl.sum reduction tree, so every config
+# gives DIFFERENT bits, and autotune picks per process by timing -> val loss drifted in the 4th
+# decimal across boxes/processes while training (fused attn_xsa, not this kernel) stayed exact.
+# XBLOCK=4 / 4 warps was the fastest over B=2 (eval) and B=64 on sm120 (11.7 us / 130.4 us); every
+# config is within ~10% below XBLOCK=128.
+_XBLOCK, _WARPS = 4, 4
 
 
 # key EXCLUDES S. S only sets the grid size (n_rows = B*Hkv*S); it does not change the work per
@@ -15,7 +18,6 @@ def _cfgs():
 # configs for every distinct sequence length: measured 5.37 s per new S, which turned the
 # variable-length eval into a 17.7 min stall vs 4.3 min without XSA (training, always S=1024,
 # never showed it). B is excluded for the same reason.
-@triton.autotune(configs=_cfgs(), key=["D", "H", "Hkv"])
 @triton.jit
 def _xsa_fwd_kernel(Y, V, Z, A, n_rows, S, D, H, Hkv, GROUP: tl.constexpr,
                     HAS_A: tl.constexpr, BLOCK_D: tl.constexpr, XBLOCK: tl.constexpr):
@@ -50,7 +52,6 @@ def _xsa_fwd_kernel(Y, V, Z, A, n_rows, S, D, H, Hkv, GROUP: tl.constexpr,
 # configs for every distinct sequence length: measured 5.37 s per new S, which turned the
 # variable-length eval into a 17.7 min stall vs 4.3 min without XSA (training, always S=1024,
 # never showed it). B is excluded for the same reason.
-@triton.autotune(configs=_cfgs(), key=["D", "H", "Hkv"], reset_to_zero=["GA"])
 @triton.jit
 def _xsa_bwd_kernel(GZ, Y, V, GY, GV, A, GA, n_rows, S, D, H, Hkv, GROUP: tl.constexpr,
                     HAS_A: tl.constexpr, BLOCK_D: tl.constexpr, XBLOCK: tl.constexpr):
@@ -100,9 +101,10 @@ class FusedXSA(torch.autograd.Function):
         Z = torch.empty_like(Y)
         BLOCK_D = triton.next_power_of_2(D)
         n_rows = B * Hkv * S
-        grid = lambda meta: (triton.cdiv(n_rows, meta["XBLOCK"]),)
+        grid = (triton.cdiv(n_rows, _XBLOCK),)
         _xsa_fwd_kernel[grid](Y, V, Z, A if A is not None else Y, n_rows, S, D, H, Hkv,
-                              GROUP=group, HAS_A=A is not None, BLOCK_D=BLOCK_D)
+                              GROUP=group, HAS_A=A is not None, BLOCK_D=BLOCK_D,
+                              XBLOCK=_XBLOCK, num_warps=_WARPS)
         ctx.save_for_backward(Y, V, A if A is not None else Y.new_zeros(0), alpha
                               if alpha is not None else Y.new_zeros(0))
         ctx.has_a = alpha is not None
@@ -118,9 +120,10 @@ class FusedXSA(torch.autograd.Function):
         GV = torch.empty_like(V)
         GA = torch.empty(B * H * S, device=Y.device, dtype=torch.float32) if ctx.has_a else None
         n_rows = B * Hkv * S
-        grid = lambda meta: (triton.cdiv(n_rows, meta["XBLOCK"]),)
+        grid = (triton.cdiv(n_rows, _XBLOCK),)
         _xsa_bwd_kernel[grid](gZ, Y, V, GY, GV, A if ctx.has_a else Y, GA if ctx.has_a else Y,
-                              n_rows, S, D, H, Hkv, GROUP=group, HAS_A=ctx.has_a, BLOCK_D=BLOCK_D)
+                              n_rows, S, D, H, Hkv, GROUP=group, HAS_A=ctx.has_a, BLOCK_D=BLOCK_D,
+                              XBLOCK=_XBLOCK, num_warps=_WARPS)
         if not ctx.has_a:
             return GY, GV, None
         GA = GA.view(B, H, S).sum(dim=(0, 2))        # per-row terms -> per head, fixed order
