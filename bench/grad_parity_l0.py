@@ -19,15 +19,18 @@ def run(mode, x0, idx, w, gu0, dn0, codes, th0):
         y = K75.moe_per_expert(x, idx, w, gu, dn, codes, act_params=th)
     gy = torch.randn(y.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(1)).to(y.dtype)
     (y.float() * gy.float()).sum().backward()
-    return [t.grad.float() for t in (x, gu, dn, th)]
+    return [y.detach().float()] + [t.grad.float() for t in (x, gu, dn, th)]
 
 
 def main():
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 16384
-    H, E, I = 512, 8, 576
+    layer = sys.argv[2] if len(sys.argv) > 2 else "l0"
+    H = 512
+    E, K, I = (8, 8, 576) if layer == "l0" else (64, 6, 768)
     g = torch.Generator(device=dev).manual_seed(0)
     x0 = torch.randn(N, H, device=dev, generator=g).to(torch.bfloat16)
-    w, idx = torch.softmax(torch.randn(N, E, device=dev, generator=g), -1).topk(E, -1)
+    w, idx = torch.softmax(torch.randn(N, E, device=dev, generator=g), -1).topk(K, -1)
+    w = w / w.sum(-1, keepdim=True)
     w = w.float()
     # weights pre-rounded to bf16 so the fp32 reference sees exactly the operands the kernels see
     gu0 = (torch.randn(E, 2 * I, H, device=dev, generator=g) * H ** -0.5).bfloat16().float()
@@ -42,11 +45,14 @@ def main():
     y = K75.moe_eager(x, idx, w, gu, dn, codes, act_params=th)
     gy = torch.randn(y.shape, device=dev, generator=torch.Generator(device=dev).manual_seed(1)).to(torch.bfloat16)
     (y * gy.float()).sum().backward()
-    ref = [t.grad for t in (x, gu, dn, th)]
+    ref = [y.detach()] + [t.grad for t in (x, gu, dn, th)]
     rel = lambda a, r: ((a - r).norm() / r.norm()).item()
-    print(f"L0 all-active N={N} E={E} I={I}: gradient error vs fp32 eager (relative Frobenius)")
-    for nm, o, n, r in zip(("d_x", "d_gate_up", "d_down", "d_theta"), old, new, ref):
-        print(f"  {nm:10s} old triton {rel(o, r):.3e} | new cublas {rel(n, r):.3e} | old vs new {rel(n, o):.2e}")
+    print(f"{layer} N={N} E={E} top{K} I={I}: error vs fp32 eager (relative Frobenius), fwd output + all grads")
+    for nm, o, n, r in zip(("y (fwd)", "d_x", "d_gate_up", "d_down", "d_theta"), old, new, ref):
+        if r is None:
+            print(f"  {nm:10s} (fp32 eager gives no grad) | old vs new {rel(n, o):.2e}")
+            continue
+        print(f"  {nm:10s} old path {rel(o, r):.3e} | new path {rel(n, r):.3e} | old vs new {rel(n, o):.2e}")
     print("  new run-to-run bitwise:", all(torch.equal(a, b) for a, b in zip(new, new2)))
     print("GRADPAR_DONE")
 
