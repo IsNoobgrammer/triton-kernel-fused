@@ -125,9 +125,31 @@ def _combine_kernel(PA, PB, LSE, MX, CROW, NT, BT: tl.constexpr, STORE_E: tl.con
 
 
 @triton.jit
-def _scatter_kernel(GW, LABS, ROWS, HV, n, V, H, BH: tl.constexpr):
-    # gw[label] -= sum of its rows' w*h. Labels sorted (stable); the first row of each run sums the
-    # run in order. Deterministic, no atomics. Ignored rows carry the sentinel label V.
+def _scale_rows_kernel(X, S, OUT, H, HS, BH: tl.constexpr):
+    # OUT = bf16(X * (S[r] * HS)), one read + one write of the (C, H) chunk
+    r = tl.program_id(0)
+    cols = tl.program_id(1) * BH + tl.arange(0, BH)
+    mc = cols < H
+    sv = tl.load(S + r) * HS
+    x = tl.load(X + r.to(tl.int64) * H + cols, mask=mc, other=0.0).to(tl.float32)
+    tl.store(OUT + r.to(tl.int64) * H + cols, (x * sv).to(OUT.dtype.element_ty), mask=mc)
+
+
+@triton.jit
+def _gh_epi_kernel(G, S, W, SAFE, WR, OUT, H, BH: tl.constexpr):
+    # gh = bf16(G * s - w * W[label]); G = E @ W in fp32 from cuBLAS
+    r = tl.program_id(0)
+    cols = tl.program_id(1) * BH + tl.arange(0, BH)
+    mc = cols < H
+    g = tl.load(G + r.to(tl.int64) * H + cols, mask=mc, other=0.0) * tl.load(S + r)
+    wrow = tl.load(W + tl.load(SAFE + r).to(tl.int64) * H + cols, mask=mc, other=0.0).to(tl.float32)
+    tl.store(OUT + r.to(tl.int64) * H + cols, (g - wrow * tl.load(WR + r)).to(OUT.dtype.element_ty), mask=mc)
+
+
+@triton.jit
+def _scatter_kernel(GW, LABS, ROWS, X, WR, n, V, H, BH: tl.constexpr):
+    # gw[label] -= sum of its rows' w*h (h read in bf16, w per row). Labels sorted (stable); the
+    # first row of each run sums the run in order. Deterministic, no atomics. Ignored rows carry the sentinel label V.
     i = tl.program_id(0)
     hb = tl.program_id(1)
     lab = tl.load(LABS + i)
@@ -139,7 +161,8 @@ def _scatter_kernel(GW, LABS, ROWS, HV, n, V, H, BH: tl.constexpr):
         j = i
         cur = lab
         while cur == lab:
-            acc += tl.load(HV + tl.load(ROWS + j).to(tl.int64) * H + cols, mask=mc, other=0.0)
+            row = tl.load(ROWS + j)
+            acc += tl.load(X + row.to(tl.int64) * H + cols, mask=mc, other=0.0).to(tl.float32) * tl.load(WR + row)
             j += 1
             cur = tl.load(LABS + j, mask=j < n, other=-1)
         ptr = GW + lab.to(tl.int64) * H + cols
@@ -216,17 +239,17 @@ class _FactoredCE(torch.autograd.Function):
             s = torch.exp(crow - lse) * w
             valid = lab != ignore_index
             safe = torch.where(valid, lab, 0)
-            g = torch.mm(Ec, weight, out_dtype=torch.float32).mul_(s[:, None])
-            g.sub_(weight[safe].float().mul_(w[:, None]))
-            gh[i:i + M] = g
+            BH = min(1024, triton.next_power_of_2(H))
+            rg = (M, triton.cdiv(H, BH))
+            g = torch.mm(Ec, weight, out_dtype=torch.float32)
+            _gh_epi_kernel[rg](g, s, weight, safe, w, gh[i:i + M], H, BH, num_warps=4)
             # s*h can sit far below bf16's normal range (s ~ e^-lse / n_valid): lift it by an exact
             # power of two and take it back through cuBLAS alpha
-            torch.addmm(gw, Ec.t(), (hc.float() * (s[:, None] * _HS)).to(hc.dtype), alpha=1.0 / _HS,
-                        out_dtype=torch.float32, out=gw)
+            hs = torch.empty_like(hc)
+            _scale_rows_kernel[rg](hc, s, hs, H, _HS, BH, num_warps=4)
+            torch.addmm(gw, Ec.t(), hs, alpha=1.0 / _HS, out_dtype=torch.float32, out=gw)
             labs, rows = torch.sort(torch.where(valid, lab, V), stable=True)
-            hv = hc.float() * w[:, None]
-            BH = min(1024, triton.next_power_of_2(H))
-            _scatter_kernel[(M, triton.cdiv(H, BH))](gw, labs, rows, hv, M, V, H, BH, num_warps=4)
+            _scatter_kernel[rg](gw, labs, rows, hc, w, M, V, H, BH, num_warps=4)
         ctx.save_for_backward(gh, gw)
         ctx.wdt = wdt
         ctx.mark_non_differentiable(nll)
