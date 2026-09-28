@@ -129,7 +129,8 @@ def _logits_and_lse(hc, weight, lse_out):
 
 
 def _chunk_rows(N, V, budget=None):
-    return max(512, min(N, (budget or _BWD_LOGITS_BUDGET) // (V * 2)))
+    # chunk * V must stay < 2**31: the Triton kernels index logits with int32 (8 GB at V=81920 crashed)
+    return max(512, min(N, (budget or _BWD_LOGITS_BUDGET) // (V * 2), (2**31 - 1) // V))
 
 
 class _CEFusedFwdBwd(torch.autograd.Function):
