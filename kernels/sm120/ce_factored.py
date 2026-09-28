@@ -32,6 +32,13 @@ _LCFG = (128, 128, 32, 8, 4, 4)         # BM, BN, BK, GROUP, warps, stages (swep
 # (m + ln V < 77). Lower: E's top entries stay normal, and s = e^-lse * w stays representable after _HS.
 _LO, _HI = -30.0, 64.0
 _HS = 2.0 ** 32                         # exact rescale of s*h into bf16's normal range
+# logits GEMM: the Triton kernel (stats in its epilogue) wins at small K; from this hidden size on,
+# cuBLAS + one in-place exp/stats pass wins (the Triton GEMM falls behind cuBLAS as K grows).
+CUBLAS_MIN_K = 2048
+
+
+def _use_cublas(K):
+    return K >= CUBLAS_MIN_K
 
 
 @triton.jit
@@ -141,6 +148,33 @@ def _scatter_kernel(GW, LABS, ROWS, HV, n, V, H, BH: tl.constexpr):
         tl.store(ptr, tl.load(ptr, mask=mc) - acc, mask=mc)
 
 
+@triton.jit
+def _exp_stats_kernel(E, PA, PB, TGT, LAB, M, V, NT, BM: tl.constexpr, BN: tl.constexpr,
+                      STORE_E: tl.constexpr, EVEN_V: tl.constexpr):
+    # large-H path: cuBLAS already wrote the bf16 logits into E; same epilogue as _logits_kernel,
+    # in place (E = exp(L), c = 0) when STORE_E, stats only otherwise.
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    mm = rm < M
+    mn = rn < V
+    ptr = E + rm[:, None].to(tl.int64) * V + rn[None, :]
+    xf = tl.load(ptr, mask=mm[:, None] & mn[None, :], other=-float("inf")).to(tl.float32)
+    mx = tl.max(xf, axis=1)
+    if STORE_E:
+        e = tl.exp(xf)
+        tl.store(ptr, e.to(tl.bfloat16), mask=mm[:, None] & mn[None, :])
+        tl.store(PA + rm * NT + pn, tl.sum(e, axis=1), mask=mm)
+    else:
+        tl.store(PA + rm * NT + pn, tl.sum(tl.exp(xf - mx[:, None]), axis=1), mask=mm)
+    tl.store(PB + rm * NT + pn, mx, mask=mm)
+    lab = tl.load(LAB + rm, mask=mm, other=-1)
+    hit = rn[None, :] == lab[:, None]
+    tl.store(TGT + rm, tl.sum(tl.where(hit, xf, 0.0), axis=1),
+             mask=mm & (lab >= pn * BN) & (lab < pn * BN + BN))
+
+
 def _chunk(N, V, budget):
     rows = max(512, min(N, (budget or _BUDGET) // (V * 2), (2 ** 31 - 1) // V))
     n = -(-N // rows)
@@ -162,8 +196,13 @@ def _stats(hc, W, lab, store_e, E=None):
     mx = torch.empty(M, device=dev, dtype=torch.float32)
     grid = (triton.cdiv(M, BM) * NT,)
     ev = dict(EVEN_K=K % BK == 0, EVEN_V=V % BN == 0, num_warps=nw, num_stages=ns)
-    _logits_kernel[grid](hc, W, E if store_e else PA, PA, PB, tgt, lab, lab, PA, M, V, NT, K,
-                         BM, BN, BK, G, store_e, False, **ev)
+    if _use_cublas(K):
+        torch.mm(hc, W.t(), out=E)
+        _exp_stats_kernel[(triton.cdiv(M, BM), NT)](E, PA, PB, tgt, lab, M, V, NT, BM, BN, store_e,
+                                                    V % BN == 0, num_warps=8)
+    else:
+        _logits_kernel[grid](hc, W, E if store_e else PA, PA, PB, tgt, lab, lab, PA, M, V, NT, K,
+                             BM, BN, BK, G, store_e, False, **ev)
     _combine_kernel[(M,)](PA, PB, lse, mx, PA, NT, triton.next_power_of_2(NT), store_e, False, num_warps=4)
     if not store_e:
         return lse, tgt, None
@@ -178,11 +217,18 @@ def _nll_nograd(hidden, weight, labels, budget):
     N = hidden.shape[0]
     V = weight.shape[0]
     NT = triton.cdiv(V, _LCFG[1])
-    rows = max(512, min(N, (budget or _BUDGET) // (NT * 8)))       # only (rows, NT) partials live
+    buf = None
+    if _use_cublas(hidden.shape[1]):                                  # needs a logits buffer
+        rows = _chunk(N, V, budget)
+        buf = torch.empty(rows, V, device=hidden.device, dtype=torch.bfloat16)
+    else:
+        rows = max(512, min(N, (budget or _BUDGET) // (NT * 8)))   # only (rows, NT) partials live
     lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
     tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
     for i in range(0, N, rows):
-        lse[i:i + rows], tgt[i:i + rows], _ = _stats(hidden[i:i + rows], weight, labels[i:i + rows], False)
+        hc = hidden[i:i + rows]
+        lse[i:i + rows], tgt[i:i + rows], _ = _stats(hc, weight, labels[i:i + rows], False,
+                                                     None if buf is None else buf[:hc.shape[0]])
     return lse - tgt
 
 

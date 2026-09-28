@@ -129,6 +129,31 @@ def parity():
         torch.cuda.empty_cache()
 
 
+def fixup():
+    """the out-of-window pass must be EXERCISED, not just present: force it onto every row"""
+    import kernels.sm120.ce_factored as cf
+    N, H, V = 32768, 512, 81920
+    for wscale in (0.05, 0.6):
+        h, W, y = make(N, H, V, wscale)
+        gt = ground_truth(h, W, y)
+        with torch.no_grad(), AMP:
+            mx = (h @ W.t()).float().amax(1)
+        n_out = int(((mx < cf._LO) | (mx > cf._HI)).sum())
+        base = step(fact_ce, h, W, y)()
+        base = [t.clone() for t in base]
+        lo, hi = cf._LO, cf._HI
+        cf._LO, cf._HI = float("inf"), float("-inf")          # every row out of window
+        try:
+            ms, _, (l, gh, gw) = timed(step(fact_ce, h, W, y), it=5)
+        finally:
+            cf._LO, cf._HI = lo, hi
+        print(f"  wscale {wscale}: {n_out}/{N} rows naturally out of window | ALL rows forced: {ms:.2f} ms, "
+              f"loss err {abs(l.item() - gt[0].item()):.1e} gh {rel(gh, gt[1]):.2e} gw {rel(gw, gt[2]):.2e} | "
+              f"vs normal path: gh {rel(gh, base[1].float()):.1e} gw {rel(gw, base[2]):.1e}", flush=True)
+        del h, W, y, gt
+        torch.cuda.empty_cache()
+
+
 def val():
     N, H, V = 32768, 512, 81920
     h, W, y = make(N, H, V)

@@ -86,8 +86,8 @@ def _logits_lse_kernel(X, W, L, PM, PS, M, V, NT, K: tl.constexpr,
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         rk = k0 + tl.arange(0, BK)
-        x = tl.load(X + rm[:, None] * K + rk[None, :], mask=mm[:, None], other=0.0)
-        w = tl.load(W + rn[:, None] * K + rk[None, :])
+        x = tl.load(X + rm[:, None].to(tl.int64) * K + rk[None, :], mask=mm[:, None], other=0.0)
+        w = tl.load(W + rn[:, None].to(tl.int64) * K + rk[None, :])
         acc = tl.dot(x, tl.trans(w), acc)
     lb = acc.to(tl.bfloat16)
     tl.store(L + rm[:, None].to(tl.int64) * V + rn[None, :], lb, mask=mm[:, None])
