@@ -1034,9 +1034,7 @@ class _PerExpertMoE(torch.autograd.Function):
                 it_all = _glu_fwd(gu_all, row_act, code_hint=hint, row_alpha=row_alpha)
             eo_all = None
             if tile_map_gg is not None:
-                eo_all = _fused_glu().grouped_gemm(it_all, down_proj.transpose(1, 2).contiguous()
-                                                 if not down_proj.transpose(1, 2).is_contiguous()
-                                                 else down_proj.transpose(1, 2), tile_map_gg)
+                eo_all = _fused_glu().grouped_gemm(it_all, down_proj.transpose(1, 2), tile_map_gg)
             if eo_all is None:
                 eo_all = torch._grouped_mm(it_all, down_proj.transpose(1, 2), offs=offs)
             gate_up_l = gu_all; inter_l = it_all

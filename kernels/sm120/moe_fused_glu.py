@@ -178,7 +178,7 @@ def fused_dinter_glu_bwd(ge, down_proj, gu, tile_map, code):
 
 
 @triton.jit
-def _grouped_gemm_kernel(A, B, C, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
+def _grouped_gemm_kernel(A, B, C, TE, TS, TM, sbe, sbk, sbn, K: tl.constexpr, N: tl.constexpr,
                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     pid = tl.program_id(0)
     t = pid // (N // BN)
@@ -191,12 +191,12 @@ def _grouped_gemm_kernel(A, B, C, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
     rm = r0 + tl.arange(0, BM)
     rn = pid_n * BN + tl.arange(0, BN)
     mask_m = tl.arange(0, BM) < mm
-    Bb = B + e.to(tl.int64) * (K * N)
+    Bb = B + e.to(tl.int64) * sbe
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         rk = k0 + tl.arange(0, BK)
         a = tl.load(A + rm[:, None] * K + rk[None, :], mask=mask_m[:, None], other=0.0)
-        b = tl.load(Bb + rk[:, None] * N + rn[None, :])
+        b = tl.load(Bb + rk[:, None] * sbk + rn[None, :] * sbn)
         acc = tl.dot(a, b, acc)
     tl.store(C + rm[:, None] * N + rn[None, :], acc.to(C.dtype.element_ty), mask=mask_m[:, None])
 
@@ -205,6 +205,9 @@ _GG = (128, 256, 64, 8, 3)
 
 
 def grouped_gemm(a, b_enk, tile_map, out=None):
+    """b_enk may be a strided VIEW (e.g. down_proj.transpose(1, 2)): the kernel takes B's strides, so
+    the forward no longer materializes a transposed copy of the down weight every call (50 MB,
+    0.27 ms per layer at the board shapes). Same values loaded, same bits."""
     TE, TS, TM = tile_map
     M, K = a.shape
     N = b_enk.shape[2]
@@ -212,7 +215,8 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
         return None
     c = torch.empty(M, N, device=a.device, dtype=a.dtype) if out is None else out
     BM, BN, BK, w, st = _GG
-    _grouped_gemm_kernel[(TE.numel() * (N // BN),)](a, b_enk, c, TE, TS, TM, K, N,
+    _grouped_gemm_kernel[(TE.numel() * (N // BN),)](a, b_enk, c, TE, TS, TM, b_enk.stride(0),
+                                                    b_enk.stride(1), b_enk.stride(2), K, N,
                                                 BM, BN, BK, num_warps=w, num_stages=st)
     return c
 
