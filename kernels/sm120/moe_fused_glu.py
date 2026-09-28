@@ -5,7 +5,12 @@ import triton.language as tl
 __all__ = ["fused_gate_up_glu", "fused_supported", "gemm_supported", "tiles_supported",
            "build_tile_map", "fused_gate_up_radial", "radial_supported"]
 
-_BM, _BN, _BK, _WARPS, _STAGES = 64, 256, 32, 8, 3
+# N-TILES FASTEST (1D grid, pid -> (row tile, n tile) with n varying fastest) in every grouped GEMM
+# below: the N tiles of one row tile then run back to back and its A rows are an L2 hit. Row tile
+# slowest re-read A from DRAM once per N tile (A is 0.4-1.2 GB, L2 is far smaller): 1.31 -> 0.98 ms
+# (down), 1.41 -> 1.04 (d_inter), 2.31 -> 1.77 (d_x) at the board shapes, bitwise identical
+# (bench_moe_gemm.py). Empty tiles of the device-built map (TM == 0) return before the K loop.
+_BM, _BN, _BK, _WARPS, _STAGES = 128, 128, 32, 8, 4       # swept: 2.315 vs 2.416 ms (64,256,32,8,3)
 
 
 @triton.jit
@@ -14,11 +19,14 @@ def _gate_up_glu_kernel(X, W, GU, IT, TE, TS, TM, XROWS,
                         WRITE_GU: tl.constexpr, ACT: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                         GATHER: tl.constexpr = False):
-    t = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    t = pid // (I // BN)
+    pid_n = pid % (I // BN)
+    mm = tl.load(TM + t)
+    if mm == 0:
+        return
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
-    mm = tl.load(TM + t)
     rm = r0 + tl.arange(0, BM)
     rn = pid_n * BN + tl.arange(0, BN)
     mask_m = tl.arange(0, BM) < mm
@@ -113,7 +121,7 @@ def fused_gate_up_glu(x_s, gate_up_proj, tile_map, code, want_gu=True, act=True,
     I = gate_up_proj.shape[1] // 2
     it = torch.empty(M, I, device=x_s.device, dtype=x_s.dtype) if act else None
     gu = torch.empty(M, 2 * I, device=x_s.device, dtype=x_s.dtype) if want_gu else it
-    _gate_up_glu_kernel[(TE.numel(), I // _BN)](
+    _gate_up_glu_kernel[(TE.numel() * (I // _BN),)](
         x_s, gate_up_proj, gu, it, TE, TS, TM, rows if rows is not None else TE, H, I, code,
         want_gu, act, _BM, _BN, _BK, num_warps=_WARPS, num_stages=_STAGES, GATHER=rows is not None)
     return gu, it
@@ -172,11 +180,14 @@ def fused_dinter_glu_bwd(ge, down_proj, gu, tile_map, code):
 @triton.jit
 def _grouped_gemm_kernel(A, B, C, TE, TS, TM, K: tl.constexpr, N: tl.constexpr,
                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    t = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    t = pid // (N // BN)
+    pid_n = pid % (N // BN)
+    mm = tl.load(TM + t)
+    if mm == 0:
+        return
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
-    mm = tl.load(TM + t)
     rm = r0 + tl.arange(0, BM)
     rn = pid_n * BN + tl.arange(0, BN)
     mask_m = tl.arange(0, BM) < mm
@@ -201,7 +212,7 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
         return None
     c = torch.empty(M, N, device=a.device, dtype=a.dtype) if out is None else out
     BM, BN, BK, w, st = _GG
-    _grouped_gemm_kernel[(TE.numel(), N // BN)](a, b_enk, c, TE, TS, TM, K, N,
+    _grouped_gemm_kernel[(TE.numel() * (N // BN),)](a, b_enk, c, TE, TS, TM, K, N,
                                                 BM, BN, BK, num_warps=w, num_stages=st)
     return c
 
@@ -288,6 +299,8 @@ def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False, b_rows=None)
     if cfg is None:                      # narrow tiles for widths that are not a 128 multiple (576)
         c["BM"] = c["BM"] if N1 % c["BM"] == 0 else 64
         c["BN"] = c["BN"] if N2 % c["BN"] == 0 else 64
+        # the wide dW_gate_up (N1 = 2I = 1536) wants 8 warps: 2.59 vs 2.79 ms, bitwise identical
+        c["num_warps"] = 8 if N1 >= 1024 else c["num_warps"]
     CH, BM, BN, BK = c["CH"], c["BM"], c["BN"], c["BK"]
     E = offs.numel()
     if N1 % BM or N2 % BN or a.stride(1) != 1 or b.stride(1) != 1:
