@@ -838,6 +838,26 @@ def _ap_grad_from_rows(da, row_expert, E, ap_shape, device):
 DENSE_ALL_ACTIVE = os.environ.get("TKF_MOE_DENSE", "1") != "0"
 
 
+# All-active (dense) layer weight grads: ONE group of N rows, so the grouped Triton kernel buys nothing
+# and runs at 165-195 TF; a single cuBLAS GEMM (fp32 out / fp32 accumulate into .grad) runs at
+# 360-370 TF: 1.88 -> 0.86 ms (dW_down) and 3.17 -> 1.67 ms (dW_gate_up) at 65536 x 8 x 576
+# (bench_moe_l0.py). Deterministic, not bitwise the Triton kernel. TKF_MOE_DENSE_WGRAD=triton reverts.
+DENSE_WGRAD = os.environ.get("TKF_MOE_DENSE_WGRAD", "cublas")
+
+
+def _dense_wgrad(a, b, acc=None, shape=None):
+    """a^T @ b for the single-group all-active case; into acc.grad (fp32, accumulated) when given."""
+    if acc is not None and acc.grad is not None:
+        g = acc.grad.view(a.shape[1], b.shape[1])
+        torch.addmm(g, a.t(), b, out_dtype=torch.float32, out=g)
+        return None
+    out = torch.mm(a.t(), b, out_dtype=torch.float32)
+    if acc is not None:
+        acc.grad = out.view(acc.shape)
+        return None
+    return out if shape is None else out.view(shape)
+
+
 def _dense_ok(hidden, idx, codes, E, I):
     return (DENSE_ALL_ACTIVE and idx.shape[1] == E and hidden.is_cuda
             and hidden.dtype in (torch.bfloat16, torch.float16)
@@ -875,7 +895,10 @@ def _dense_bwd(ctx, grad_out):
     one = torch.full((1,), N, device=go.device, dtype=torch.int32)   # a single group of N rows
     d_its = torch.mm(go, wd.t()).view(N * E, I)
     _FG = _fused_glu()
-    gdn = _FG.grouped_wgrad(its.view(N, E * I), go, one) if _FG is not None else None
+    if DENSE_WGRAD == "cublas":
+        gdn = _dense_wgrad(its.view(N, E * I), go)[None]
+    else:
+        gdn = _FG.grouped_wgrad(its.view(N, E * I), go, one) if _FG is not None else None
     if gdn is None:
         gdn = torch.mm(its.view(N, E * I).t(), go)[None]
     grad_down = gdn[0].view(E, I, H).transpose(1, 2).contiguous()
@@ -896,7 +919,9 @@ def _dense_bwd(ctx, grad_out):
                             row_w=rw)
     d_w = d_w.view(N, E)
     dgu2 = dgu.view(N, E * 2 * I)
-    grad_gu = _wgrad(dgu2, hidden, one, acc=ctx.acc[0], shape=(1, E * 2 * I, H))
+    grad_gu = (_dense_wgrad(dgu2, hidden, acc=ctx.acc[0], shape=(1, E * 2 * I, H))
+               if DENSE_WGRAD == "cublas" else
+               _wgrad(dgu2, hidden, one, acc=ctx.acc[0], shape=(1, E * 2 * I, H)))
     if grad_gu is not None:
         grad_gu = grad_gu.view(E, 2 * I, H)
     grad_hidden = torch.mm(dgu2, gate_up_proj.reshape(E * 2 * I, H))
