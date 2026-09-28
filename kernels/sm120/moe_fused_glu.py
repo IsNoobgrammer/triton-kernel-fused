@@ -228,14 +228,22 @@ def grouped_gemm(a, b_enk, tile_map, out=None):
 # no rows get one empty chunk, which stores zeros -- the same as torch._grouped_mm.
 # swept on the RTX PRO 6000 at the board shapes (bench_grouped_wgrad.py --sweep): grad_down 1.16 ms vs
 # torch 1.89 (1.63x), grad_gate_up 2.17 vs 2.95 (1.36x), L0 gate_up 2.30 vs 2.37. Fixed, not autotuned.
-_WG = dict(CH=16384, BM=128, BN=128, BK=32, num_warps=4, num_stages=4)
+_WG = dict(CH=16384, BM=128, BN=128, BK=32, num_warps=4, num_stages=4, TAIL=True, TLOAD=False)
+# Per-shape configs (bench_moe_wgrad.py, board shapes, all bitwise identical to the old kernel):
+#   N1 < 1024  (dW_down, 512 x 768)   A loaded (BM, BK) through TRANSPOSED POINTERS: 1.47 -> 1.07 ms.
+#              tl.trans of a (BK, BM) register tile was the cost, not the math.
+#   N1 >= 1024 (dW_gate_up, 1536 x 512, gathered B)   256x128x64, 2 stages: 2.71 -> 2.28 ms.
+#              Here the transposed-pointer load LOSES (2.39); the register transpose stays.
+# TAIL: unmasked main K loop + one masked tail step instead of masking every step.
+_WG_NARROW = dict(BM=128, BN=256, BK=32, num_warps=8, num_stages=3, TLOAD=True)
+_WG_WIDE = dict(BM=256, BN=128, BK=64, num_warps=8, num_stages=2, TLOAD=False)
 
 
 @triton.jit
 def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, BROWS, N1, N2, sa, sb,
                NT2: tl.constexpr, NTILE: tl.constexpr,
                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr,
-               GATHER_B: tl.constexpr):
+               GATHER_B: tl.constexpr, TAIL: tl.constexpr, TLOAD: tl.constexpr):
     pid = tl.program_id(0)
     item = tl.load(ORDER + pid // NTILE)
     e = tl.load(IT_E + item)
@@ -248,16 +256,32 @@ def _wg_kernel(A, B, C, P, IT_E, IT_S, IT_N, IT_SLOT, ORDER, BROWS, N1, N2, sa, 
     n = tl.load(IT_N + item)
     acc = tl.zeros((BM, BN), tl.float32)
     rk = tl.arange(0, BK)
-    for k0 in tl.range(0, n, BK):
+    nfull = (n // BK) * BK if TAIL else 0
+    for k0 in tl.range(0, nfull, BK):                      # full steps: no masks
+        rows = s0 + k0 + rk
+        if TLOAD:
+            a = tl.load(A + rows[None, :] * sa + r1[:, None])
+        else:
+            a = tl.trans(tl.load(A + rows[:, None] * sa + r1[None, :]))
+        if GATHER_B:
+            brow = tl.load(BROWS + rows).to(tl.int64)
+        else:
+            brow = rows
+        b = tl.load(B + brow[:, None] * sb + r2[None, :])
+        acc = tl.dot(a, b, acc)
+    for k0 in tl.range(nfull, n, BK):                      # the tail (or every step when not TAIL)
         mk = (k0 + rk) < n
         rows = s0 + k0 + rk
-        a = tl.load(A + rows[:, None] * sa + r1[None, :], mask=mk[:, None], other=0.0)
+        if TLOAD:
+            a = tl.load(A + rows[None, :] * sa + r1[:, None], mask=mk[None, :], other=0.0)
+        else:
+            a = tl.trans(tl.load(A + rows[:, None] * sa + r1[None, :], mask=mk[:, None], other=0.0))
         if GATHER_B:
             brow = tl.load(BROWS + rows, mask=mk, other=0).to(tl.int64)
         else:
             brow = rows
         b = tl.load(B + brow[:, None] * sb + r2[None, :], mask=mk[:, None], other=0.0)
-        acc = tl.dot(tl.trans(a), b, acc)
+        acc = tl.dot(a, b, acc)
     slot = tl.load(IT_SLOT + item)
     off = r1[:, None] * N2 + r2[None, :]
     if slot < 0:
@@ -296,11 +320,13 @@ def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False, b_rows=None)
     c = dict(_WG, **(cfg or {}))
     M, N1 = a.shape
     N2 = b.shape[1]
-    if cfg is None:                      # narrow tiles for widths that are not a 128 multiple (576)
-        c["BM"] = c["BM"] if N1 % c["BM"] == 0 else 64
-        c["BN"] = c["BN"] if N2 % c["BN"] == 0 else 64
-        # the wide dW_gate_up (N1 = 2I = 1536) wants 8 warps: 2.59 vs 2.79 ms, bitwise identical
-        c["num_warps"] = 8 if N1 >= 1024 else c["num_warps"]
+    if cfg is None:
+        pref = dict(c, **(_WG_WIDE if N1 >= 1024 else _WG_NARROW))
+        if N1 % pref["BM"] == 0 and N2 % pref["BN"] == 0:
+            c = pref
+        else:                            # narrow tiles for widths that are not a 128 multiple (576)
+            c["BM"] = c["BM"] if N1 % c["BM"] == 0 else 64
+            c["BN"] = c["BN"] if N2 % c["BN"] == 0 else 64
     CH, BM, BN, BK = c["CH"], c["BM"], c["BN"], c["BK"]
     E = offs.numel()
     if N1 % BM or N2 % BN or a.stride(1) != 1 or b.stride(1) != 1:
@@ -335,7 +361,7 @@ def grouped_wgrad(a, b, offs, cfg=None, out=None, accumulate=False, b_rows=None)
                               b_rows if b_rows is not None else order, N1, N2,
                               a.stride(0), b.stride(0),
                               NT2=nt2, NTILE=ntile, BM=BM, BN=BN, BK=BK, ACC=bool(accumulate),
-                              GATHER_B=b_rows is not None,
+                              GATHER_B=b_rows is not None, TAIL=c["TAIL"], TLOAD=c["TLOAD"],
                               num_warps=c["num_warps"], num_stages=c["num_stages"])
     RB = 1024
     _wg_reduce[(E, triton.cdiv(N1 * N2, RB))](part, out, (cend - nch), nch, N1 * N2, BLOCK=RB,
