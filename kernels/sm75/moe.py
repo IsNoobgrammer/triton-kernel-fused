@@ -1322,6 +1322,12 @@ def moe_eager(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act
         gate_up = hidden[rows] @ gate_up_proj[e].t()
         a, g = ((act_params[e, 0], act_params[e, 1]) if codes[e] == 5 and act_params is not None
                 else (1.0, 1.0))
+        # radial (8/10) reads its exponent LOGIT theta from act_params column 0. This used to fall
+        # through to a = 1.0, i.e. theta = 1 (p = 0.731) for every expert: invisible on random
+        # weights (gate rms r ~ 1, so r^p ~ 1 for any p), 36% off on a trained checkpoint, and
+        # theta got no gradient. Found by ablate/tools/moe_layer_parity.py on real layer-1 weights.
+        if codes[e] in (8, 10) and act_params is not None:
+            a = act_params[e, 0]
         inter = _act_eager(gate_up[:, :I], codes[e], a) * gate_up[:, I:]
         out[rows] += ((inter @ down_proj[e].t()) * w.unsqueeze(-1)).float()
     return out.to(hidden.dtype)
