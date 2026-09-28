@@ -12,17 +12,17 @@ for K in (512, 2048, 4096, 16384):
     W = (torch.randn(V, K, device="cuda") / K ** 0.5).to(torch.bfloat16)
     y = torch.randint(0, V, (C,), device="cuda")
     E = torch.empty(C, V, device="cuda", dtype=torch.bfloat16)
-    cf.CUBLAS_MIN_K = 1 << 30
     mc, _, _ = timed(lambda: torch.mm(h, W.t(), out=E), it=5)
     res = {True: [], False: []}
     for BM, BN, BK, G, nw, ns in itertools.product((128, 256), (128, 256), (32, 64), (8,), (4, 8), (2, 3, 4)):
         if BM * BN > 256 * 128:
             continue
-        cf._LCFG = (BM, BN, BK, G, nw, ns)
+        cfg = (BM, BN, BK, G, nw, ns)
+        cf._lcfg = lambda K, cfg=cfg: cfg
         for st in (True, False):
             try:
                 ms, _, _ = timed(lambda: cf._stats(h, W, y, st, E if st else None), it=5)
-                res[st].append((round(ms, 3), cf._LCFG))
+                res[st].append((round(ms, 3), cfg))
             except Exception:
                 pass
     for st in (True, False):
