@@ -299,5 +299,10 @@ def _cast(h, w):
 
 
 def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, bwd_logits_budget=None):
-    """Drop-in for kernels.sm120.cross_entropy.fused_linear_cross_entropy (mean over valid rows)."""
-    return fused_linear_cross_entropy_heads([hidden], weight, [labels], [1.0], ignore_index, bwd_logits_budget)[0]
+    """Drop-in for kernels.sm120.cross_entropy.fused_linear_cross_entropy (mean over valid rows).
+    Single head: straight to the kernel -- no concat, no per-head loss breakdown (that is MTP-only)."""
+    rw = _row_weights([labels], [1.0], ignore_index)
+    if torch.is_grad_enabled() and (weight.requires_grad or hidden.requires_grad):
+        return _FactoredCE.apply(hidden, weight, labels, rw, ignore_index, bwd_logits_budget)[0]
+    with torch.no_grad():
+        return (_nll_nograd(*_cast(hidden, weight), labels, bwd_logits_budget) * rw).sum()
