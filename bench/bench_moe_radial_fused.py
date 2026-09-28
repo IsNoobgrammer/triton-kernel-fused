@@ -173,18 +173,25 @@ def main():
     def f1():
         _f1_psq[(TE.numel() * NT,)](x, Wgu, gu_f, psq, TE, TS, TM, st, H, I, BM, BN, BK, num_warps=nw, num_stages=ns)
 
-    def f3(cfg=(GBM, GBN, GBK, gw, gs)):
+    def f3(cfg=(128, 256, 32, 8, 3)):
         bm, bn, bk, w_, s_ = cfg
-        te, ts, tmm = (TE2, TS2, TM2) if bm == GBM else FG.build_tile_map(None, counts_t, dev, bm=bm, m_rows=M)
+        te, ts, tmm = FG.build_tile_map(None, counts_t, dev, bm=bm, m_rows=M)
         _f3_act[(te.numel() * (H // bn),)](gu_f, psq, row_alpha, WdnT, eo_f, te, ts, tmm, WdnT.stride(0),
                                            WdnT.stride(1), WdnT.stride(2), I, H, NT, 1e-6, bm, bn, bk,
                                            num_warps=w_, num_stages=s_)
 
     f1(); f3()
     t_f1, t_f3 = timed(f1), timed(f3)
-    best3 = min(((timed(lambda c=c: f3(c), it=5), c) for c in [(128, 256, 64, 8, 3), (128, 256, 32, 8, 4),
-                                                            (128, 128, 32, 4, 4), (64, 256, 32, 8, 3),
-                                                            (128, 128, 64, 8, 3), (256, 128, 32, 8, 3)]))
+    def sweep(fn, cfgs):
+        out = []
+        for c in cfgs:
+            try:
+                out.append((timed(lambda c=c: fn(c), it=5), c))
+            except Exception:
+                pass
+        return min(out)
+    best3 = sweep(f3, [(128, 256, 32, 8, 3), (128, 256, 32, 8, 2), (128, 128, 32, 4, 4), (64, 256, 32, 8, 3),
+                       (128, 128, 64, 8, 2), (256, 128, 32, 8, 2), (128, 128, 32, 8, 3), (64, 128, 64, 4, 3)])
     # B2 with the act in its B load
     wgc = dict(FG._WG, **FG._WG_NARROW)
     CH, bm2, bn2, bk2 = wgc["CH"], wgc["BM"], wgc["BN"], wgc["BK"]
@@ -215,11 +222,10 @@ def main():
                                I, NT, 1e-6, nt2, ntile, bm, bn, bk, num_warps=w_, num_stages=s_)
         FG._wg_reduce[(E, triton.cdiv(H * I, 1024))](part, dW_f, (cend - nch), nch, H * I, BLOCK=1024,
                                                     ACC=False, num_warps=4)
-    b2()
-    t_b2 = timed(b2)
-    best2 = min(((timed(lambda c=c: b2(c), it=5), c) for c in [(128, 256, 32, 8, 3), (128, 128, 32, 4, 4),
-                                                            (128, 128, 32, 8, 4), (64, 256, 32, 8, 3),
-                                                            (128, 256, 64, 8, 2)]))
+    b2((128, 128, 32, 4, 4))
+    t_b2 = timed(lambda: b2((128, 128, 32, 4, 4)))
+    best2 = sweep(b2, [(128, 256, 32, 8, 3), (128, 128, 32, 4, 4), (128, 128, 32, 8, 4), (64, 256, 32, 8, 3),
+                       (128, 256, 64, 8, 2), (128, 256, 32, 8, 2), (64, 128, 32, 4, 4)])
 
     # ---- numerics vs fp32 reference of the chain
     with torch.no_grad():
