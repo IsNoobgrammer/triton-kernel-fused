@@ -1,4 +1,5 @@
 import os
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -101,12 +102,15 @@ def _fused_glu():
 
 
 def _cached_cast(t, dt):
+    # The weakref identity check matters: data_ptr + _version alone served a FREED model's casts to
+    # the next model loaded at the same address (every multi-checkpoint probe read garbage).
     key = t.untyped_storage().data_ptr()
     hit = _CAST_CACHE.get(key)
-    if hit is not None and hit[0] == t._version and hit[1] is dt and hit[2].shape == t.shape:
+    if (hit is not None and hit[3]() is t and hit[0] == t._version and hit[1] is dt
+            and hit[2].shape == t.shape):
         return hit[2]
     c = t.to(dt)
-    _CAST_CACHE[key] = (t._version, dt, c)
+    _CAST_CACHE[key] = (t._version, dt, c, weakref.ref(t))
     if len(_CAST_CACHE) > 256:
         for k in list(_CAST_CACHE)[:128]:
             _CAST_CACHE.pop(k, None)
