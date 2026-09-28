@@ -1018,7 +1018,12 @@ class _PerExpertMoE(torch.autograd.Function):
                         x_s = hidden.index_select(0, st)
                     rtm = _FG.build_tile_map(counts, counts_t, dev, bm=_FG._RBM, m_rows=M_rows)
                     gu_all, it_all = _FG.fused_gate_up_radial(x_s, gate_up_proj, rtm, row_alpha)
-                else:
+                elif not act and tile_map_gg[0] is not None and _FG._F1[0] == _FG._GG[0]:
+                    # activation applied separately (radial): gate and up need not share a program,
+                    # so F1 is one plain grouped GEMM over N = 2I (bitwise the paired kernel, faster)
+                    gu_all = _FG.grouped_gemm(x_s if x_s is not None else hidden, gate_up_proj.transpose(1, 2),
+                                              tile_map_gg, rows=None if x_s is not None else st, cfg=_FG._F1)
+                if gu_all is None:
                     gu_all, it_all = _FG.fused_gate_up_glu(
                         x_s if x_s is not None else hidden, gate_up_proj, tm, codes[0],
                         want_gu=True, act=act, rows=None if x_s is not None else st)

@@ -178,8 +178,8 @@ def fused_dinter_glu_bwd(ge, down_proj, gu, tile_map, code):
 
 
 @triton.jit
-def _grouped_gemm_kernel(A, B, C, TE, TS, TM, sbe, sbk, sbn, K: tl.constexpr, N: tl.constexpr,
-                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _grouped_gemm_kernel(A, B, C, TE, TS, TM, AROWS, sbe, sbk, sbn, K: tl.constexpr, N: tl.constexpr,
+                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GATHER: tl.constexpr):
     pid = tl.program_id(0)
     t = pid // (N // BN)
     pid_n = pid % (N // BN)
@@ -191,33 +191,45 @@ def _grouped_gemm_kernel(A, B, C, TE, TS, TM, sbe, sbk, sbn, K: tl.constexpr, N:
     rm = r0 + tl.arange(0, BM)
     rn = pid_n * BN + tl.arange(0, BN)
     mask_m = tl.arange(0, BM) < mm
+    if GATHER:                                   # row r of A is A[AROWS[r]] (unsorted hidden)
+        ar = tl.load(AROWS + rm, mask=mask_m, other=0).to(tl.int64)
+    else:
+        ar = rm
     Bb = B + e.to(tl.int64) * sbe
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         rk = k0 + tl.arange(0, BK)
-        a = tl.load(A + rm[:, None] * K + rk[None, :], mask=mask_m[:, None], other=0.0)
+        a = tl.load(A + ar[:, None] * K + rk[None, :], mask=mask_m[:, None], other=0.0)
         b = tl.load(Bb + rk[:, None] * sbk + rn[None, :] * sbn)
         acc = tl.dot(a, b, acc)
     tl.store(C + rm[:, None] * N + rn[None, :], acc.to(C.dtype.element_ty), mask=mask_m[:, None])
 
 
 _GG = (128, 256, 64, 8, 3)
+# F1 gate/up when the activation is NOT fused (radial): one plain grouped GEMM over N = 2I with the
+# token-row gather, instead of the paired gate/up kernel. 2.35 -> 2.06 ms at the board shapes,
+# bitwise identical (bench_moe_misc.py X1) -- level with a dense cuBLAS GEMM of the same size.
+_F1 = (128, 128, 32, 4, 4)
 
 
-def grouped_gemm(a, b_enk, tile_map, out=None):
+def grouped_gemm(a, b_enk, tile_map, out=None, rows=None, cfg=None):
     """b_enk may be a strided VIEW (e.g. down_proj.transpose(1, 2)): the kernel takes B's strides, so
     the forward no longer materializes a transposed copy of the down weight every call (50 MB,
     0.27 ms per layer at the board shapes). Same values loaded, same bits."""
     TE, TS, TM = tile_map
+    BM, BN, BK, w, st = cfg or _GG
     M, K = a.shape
+    if rows is not None:                         # a is then the UNSORTED (N_tok, K) input
+        M = rows.numel()
     N = b_enk.shape[2]
-    if N % _GG[1] or K % _GG[2] or TE is None:
+    if N % BN or K % BK or TE is None:
         return None
     c = torch.empty(M, N, device=a.device, dtype=a.dtype) if out is None else out
-    BM, BN, BK, w, st = _GG
-    _grouped_gemm_kernel[(TE.numel() * (N // BN),)](a, b_enk, c, TE, TS, TM, b_enk.stride(0),
+    _grouped_gemm_kernel[(TE.numel() * (N // BN),)](a, b_enk, c, TE, TS, TM,
+                                                    rows if rows is not None else TE, b_enk.stride(0),
                                                     b_enk.stride(1), b_enk.stride(2), K, N,
-                                                BM, BN, BK, num_warps=w, num_stages=st)
+                                                    BM, BN, BK, rows is not None,
+                                                    num_warps=w, num_stages=st)
     return c
 
 
