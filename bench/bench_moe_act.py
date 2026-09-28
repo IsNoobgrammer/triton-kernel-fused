@@ -10,7 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
-import kernels.sm75.moe as K75
+import importlib
+K75 = importlib.import_module("kernels.sm75.moe")
 from bench.bench_moe_gemm import timed
 
 dev = "cuda"
