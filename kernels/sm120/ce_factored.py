@@ -26,7 +26,7 @@ import triton.language as tl
 
 __all__ = ["fused_linear_cross_entropy", "fused_linear_cross_entropy_heads"]
 
-_BUDGET = 1 << 30                       # bytes of E per chunk
+_BUDGET = 4 << 30                       # bytes of E per chunk (4 GB: -5% vs 1 GB at H=512; +~3 GB peak)
 # c = 0 window on the row max logit m. Upper: V * e^m and E @ W stay < fp32 max up to V = 256k
 # (m + ln V < 77). Lower: E's top entries stay normal, and s = e^-lse * w stays representable after _HS.
 _LO, _HI = -30.0, 64.0
