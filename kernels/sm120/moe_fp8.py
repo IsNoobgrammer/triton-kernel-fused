@@ -31,7 +31,7 @@ FG = importlib.import_module("kernels.sm120.moe_fused_glu")
 
 STATS = None
 FUSED = True
-DX_ROWS = torch.float32   # B6 row buffer before the k-way sum (bf16 halves its traffic)
+DX_ROWS = torch.bfloat16  # B6 row buffer before the k-way sum: bf16 = -0.55 ms/layer (fp32 sum over k)
 _EPS = K75._NS_EPS
 
 
@@ -458,7 +458,6 @@ def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR,
         tt = tl.load(TW + rows, mask=mr, other=0.0) * tl.load(TGW + rows, mask=mr, other=0.0) / rp
     else:
         sa = tl.zeros((32,), tl.float32)
-        tt = tl.zeros((32,), tl.float32)
         for c0 in range(0, I, BC):
             cols = c0 + tl.arange(0, BC)
             go = tl.load(gob + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
@@ -466,9 +465,8 @@ def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR,
             u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
             gn = g / r[:, None]
             sig = 1.0 / (1.0 + tl.exp(-gn))
-            gu_ = go * u
-            sa += tl.sum(gu_ * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1)
-            tt += tl.sum(gu_ * gn * sig, axis=1)
+            sa += tl.sum(go * u * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1)
+        tt = tl.load(TW + rows, mask=mr, other=0.0) * tl.load(TGW + rows, mask=mr, other=0.0) / rp
     for c0 in range(0, I, BC):
         cols = c0 + tl.arange(0, BC)
         go = tl.load(gob + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
@@ -518,7 +516,7 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
     tl.store(GW + rows, gw, mask=mr)
 
 
-EPI_FUSE = True    # S partials in the B3 epilogue (+ T from the combine grad) -> one-pass radial bwd
+EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from the combine grad) -> one-pass radial bwd
 # (history: with bf16 GU and both S and T in the epilogue it was SLOWER; row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
