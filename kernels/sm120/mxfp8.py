@@ -205,7 +205,7 @@ def tile_map(counts_t, m_rows, bm):
 
 
 def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.bfloat16, cfg=None,
-                 epi=0, x1=None, x2=None, x3=None, x4=None, i2=0, np_=1):
+                 epi=0, x1=None, x2=None, x3=None, x4=None, i2=0, np_=0):
     """C (m_rows, N): row r = A[rows[r] if rows is given else r] @ B[expert(r)]^T. A is MXFP8 along
     K; B (E, N, K) e4m3 with scales (E, N, K/32). epi / x1..x3: see _mx_gg_kernel."""
     K = aq.shape[1]
