@@ -224,3 +224,49 @@ def grouped_wgrad(a, b, counts_t, out=None, accumulate=False, b_rows=None, cfg=N
         a, b, out, b_rows if b_rows is not None else start, start, end, N1, N2, BM, BN, BK,
         b_rows is not None, accumulate, num_warps=w, num_stages=st)
     return out
+
+
+# ------------------------------------------------------------------ weight gradients on K-MAJOR fp8 copies
+@triton.jit
+def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp, N1: tl.constexpr, N2: tl.constexpr,
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr):
+    """C[e] (N1, N2) fp32 (+)= A_e^T @ B_e with the TOKEN axis contiguous in memory: AT (N1, Mp) and
+    BT (N2, Mp) are e4m3, scales (N1 | N2, Mp/32) per 32 tokens. Expert e owns token columns
+    [PST[e], PST[e] + PCNT[e]) (32-aligned, zero-padded by the producer)."""
+    pid = tl.program_id(0)
+    TN: tl.constexpr = N2 // BN
+    TM: tl.constexpr = N1 // BM
+    e = pid // (TM * TN)
+    r = pid % (TM * TN)
+    rm = (r // TN) * BM + tl.arange(0, BM)
+    rn = (r % TN) * BN + tl.arange(0, BN)
+    p0 = tl.load(PST + e)
+    p1 = p0 + tl.load(PCNT + e)
+    KS = Mp // 32
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(p0, p1, BK):
+        rk = k0 + tl.arange(0, BK)
+        mk = rk < p1
+        rs = k0 // 32 + tl.arange(0, BK // 32)
+        ms = rs < p1 // 32
+        a = tl.load(AT + rm[:, None].to(tl.int64) * Mp + rk[None, :], mask=mk[None, :], other=0.0)
+        a_s = tl.load(ATS + rm[:, None].to(tl.int64) * KS + rs[None, :], mask=ms[None, :], other=127)
+        b = tl.load(BT + rn[None, :].to(tl.int64) * Mp + rk[:, None], mask=mk[:, None], other=0.0)
+        b_s = tl.load(BTS + rn[:, None].to(tl.int64) * KS + rs[None, :], mask=ms[None, :], other=127)
+        acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
+    cp = C + e.to(tl.int64) * (N1 * N2) + rm[:, None] * N2 + rn[None, :]
+    if ACC:
+        acc += tl.load(cp)
+    tl.store(cp, acc)
+
+
+def wgrad_kmajor(at, ats, bt, bts, pst, pcnt, E, out=None, accumulate=False, cfg=None):
+    N1, Mp = at.shape
+    N2 = bt.shape[0]
+    BM, BN, BK, w, st = cfg or (128, 128, 128, 4, 3)
+    if out is None:
+        out = torch.empty(E, N1, N2, device=at.device, dtype=torch.float32)
+        accumulate = False
+    _mx_wgrad_km_kernel[(E * (N1 // BM) * (N2 // BN),)](at, ats, bt, bts, out, pst, pcnt, Mp, N1, N2,
+                                                        BM, BN, BK, accumulate, num_warps=w, num_stages=st)
+    return out
