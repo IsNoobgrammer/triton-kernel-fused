@@ -356,13 +356,17 @@ def _qtok_store(v, cols, col0, QT, ST, Mp, C, TR: tl.constexpr = 32):
 
 
 @triton.jit
-def _ld_gu(GU, GUS, rows, cols, mr, TWO_I, GU8: tl.constexpr, BC: tl.constexpr):
+def _ld_gu(GU, GUS, rows, cols, mr, TWO_I, GU8: tl.constexpr, BC: tl.constexpr, DQ_GATHER: tl.constexpr = True):
     """a (32, BC) tile of GU as fp32: bf16 directly, or fp8 with its per-32 scales dequantized."""
     v = tl.load(GU + rows[:, None].to(tl.int64) * TWO_I + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
     if GU8:
-        sb = tl.min(cols, axis=0) // 32 + tl.arange(0, BC // 32)
-        sc = tl.load(GUS + rows[:, None].to(tl.int64) * (TWO_I // 32) + sb[None, :], mask=mr[:, None], other=127)
-        v = tl.reshape(tl.reshape(v, (v.shape[0], BC // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (v.shape[0], BC))
+        if DQ_GATHER:   # per-element scale lookup (L1 hits): no (rows, BC/32, 32) reshape / layout conversion
+            sc = tl.load(GUS + rows[:, None].to(tl.int64) * (TWO_I // 32) + (cols // 32)[None, :], mask=mr[:, None], other=127)
+            v = v * tl.exp2(sc.to(tl.float32) - 127.0)
+        else:
+            sb = tl.min(cols, axis=0) // 32 + tl.arange(0, BC // 32)
+            sc = tl.load(GUS + rows[:, None].to(tl.int64) * (TWO_I // 32) + sb[None, :], mask=mr[:, None], other=127)
+            v = tl.reshape(tl.reshape(v, (v.shape[0], BC // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (v.shape[0], BC))
     return v
 
 
