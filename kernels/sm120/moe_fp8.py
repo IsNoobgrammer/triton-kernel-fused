@@ -420,12 +420,13 @@ def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR,
     tl.store(ROUT + rows, r, mask=mr)
     p = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0, 1.0 / (1.0 + tl.exp(-aa)))
     rp = tl.exp(p * tl.log(r))
+    rinv = 1.0 / r
     for c0 in range(0, I, BC):
         cols = c0 + tl.arange(0, BC)
         g = _ld_gu(GU, GUS, rows, cols, mr, 2 * I, GU8, BC)
         u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
-        z = g / r[:, None]
-        v = tl.where(mr[:, None], rp[:, None] * (z * (1.0 / (1.0 + tl.exp(-z)))) * u, 0.0)
+        z = g * rinv[:, None]
+        v = tl.where(mr[:, None], rp[:, None] * (z * tl.sigmoid(z)) * u, 0.0)
         _qrow_store(v, rows, cols, mr, QR, SR, I, TR, BC)
         if TOK:
             _qtok_store(v, cols, col0, QT, STS, Mp, I, TR)
@@ -457,6 +458,7 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
     lr = tl.log(r)
     rp = tl.exp(p * lr)
     rpm1 = tl.exp((p - 1.0) * lr)
+    rinv = 1.0 / r
     if NP > 0:
         jj = tl.arange(0, NPP)
         pm = mr[:, None] & (jj < NP)[None, :]
@@ -471,8 +473,8 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
             go = _ld_gu(GO, GOS, rows, cols, mr, I, GO8, BC)
             g = _ld_gu(GU, GUS, rows, cols, mr, 2 * I, GU8, BC)
             u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
-            gn = g / r[:, None]
-            sig = 1.0 / (1.0 + tl.exp(-gn))
+            gn = g * rinv[:, None]
+            sig = tl.sigmoid(gn)
             sa += tl.sum(go * u * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1)
         tt = tl.load(TW + rows, mask=mr, other=0.0) * tl.load(TGW + rows, mask=mr, other=0.0) / rp
     for c0 in range(0, I, BC):
@@ -480,12 +482,12 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
         go = _ld_gu(GO, GOS, rows, cols, mr, I, GO8, BC)
         g = _ld_gu(GU, GUS, rows, cols, mr, 2 * I, GU8, BC)
         u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
-        gn = g / r[:, None]
-        sig = 1.0 / (1.0 + tl.exp(-gn))
+        gn = g * rinv[:, None]
+        sig = tl.sigmoid(gn)
         f = gn * sig
         df = sig * (1.0 + gn * (1.0 - sig))
         gu_ = go * u
-        gg = tl.where(mr[:, None], rpm1[:, None] * (gu_ * df - (gn / I) * (sa - p * tt)[:, None]), 0.0)
+        gg = tl.where(mr[:, None], rpm1[:, None] * (gu_ * df - (gn * (1.0 / I)) * (sa - p * tt)[:, None]), 0.0)
         gup = tl.where(mr[:, None], go * (rp[:, None] * f), 0.0)
         if ROWST:
             _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, TR, BC)
