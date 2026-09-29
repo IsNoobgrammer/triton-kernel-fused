@@ -495,7 +495,7 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
 
 @triton.jit
 def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT, STS, GW, Mp,
-                             H: tl.constexpr, BC: tl.constexpr):
+                             H: tl.constexpr, BC: tl.constexpr, EOS=None, EO8: tl.constexpr = False):
     """dO = w * grad_out[token], dw = <grad_out[token], eo> on 32 rows: row copy (B3 input) + token
     copy (B2 left operand)."""
     t = tl.program_id(0)
@@ -513,7 +513,7 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
     for c0 in range(0, H, BC):
         cols = c0 + tl.arange(0, BC)
         go = tl.load(GO + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-        eo = tl.load(EO + rows[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+        eo = _ld_gu(EO, EOS, rows, cols, mr, H, EO8, BC)
         gw += tl.sum(go * eo, axis=1)
         ge = go * w[:, None]
         _qrow_store(ge, rows, cols, mr, QR, SR, H, 32, BC)
@@ -526,10 +526,37 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
+EO_FP8 = True                       # F3 output EO in MXFP8 (combine fwd + combine bwd read it)
 DI_FP8 = True                       # B3 output d_inter in MXFP8 (the radial bwd reads it twice)
 _DEBUG_NO_TOK = False               # TIMING ONLY: skip the token-copy stores (wgrads then read garbage)
 KPAD = 128    # expert token ranges in the token copies are padded to this: the wgrad K loop runs UNMASKED
 #               (masked fp8 K loads were 2.8x slower than bf16; unmasked is 1.9-2.4x FASTER)
+
+
+@triton.jit
+def _combine_gather_q_kernel(RQ, RS, W, INV, OUT, NT, H: tl.constexpr, K: tl.constexpr,
+                             BT: tl.constexpr, BH: tl.constexpr):
+    """out[t] = sum_j w[r] * dequant(rows[r]), r = inv[t*K + j], j in order (deterministic)."""
+    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    h = tl.program_id(1) * BH + tl.arange(0, BH)
+    mt = t < NT
+    acc = tl.zeros((BT, BH), tl.float32)
+    for j in tl.static_range(K):
+        r = tl.load(INV + t.to(tl.int64) * K + j, mask=mt, other=0)
+        x = tl.load(RQ + r[:, None].to(tl.int64) * H + h[None, :], mask=mt[:, None], other=0.0).to(tl.float32)
+        sc = tl.load(RS + r[:, None].to(tl.int64) * (H // 32) + (tl.program_id(1) * (BH // 32) + tl.arange(0, BH // 32))[None, :],
+                     mask=mt[:, None], other=127)
+        x = tl.reshape(tl.reshape(x, (BT, BH // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (BT, BH))
+        acc += x * tl.load(W + r, mask=mt, other=0.0).to(tl.float32)[:, None]
+    tl.store(OUT + t.to(tl.int64)[:, None] * H + h[None, :], acc.to(OUT.dtype.element_ty), mask=mt[:, None])
+
+
+def combine_gather_q(rq, rs, inv, n_tok, k, w, out_dtype):
+    H = rq.shape[1]
+    out = torch.empty(n_tok, H, device=rq.device, dtype=out_dtype)
+    _combine_gather_q_kernel[(triton.cdiv(n_tok, 32), H // 128)](rq, rs, w, inv, out, n_tok, H, k, 32, 128,
+                                                                 num_warps=4)
+    return out
 
 
 def _tiles(counts_t, M, dev):
@@ -633,15 +660,21 @@ class _MoEFP8Full(torch.autograd.Function):
                                        RADIAL_BC or _bc(I), np1, triton.next_power_of_2(max(np1, 1)),
                                        num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
-        eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M)                     # F3 -> (M, H) bf16
         inv = FG.inverse_order(order)
-        out = FG.combine_gather(eo, inv, N, top_k, w=sw, out_dtype=hidden.dtype)
+        if EO_FP8:
+            eos = torch.empty(M, H // 32, device=dev, dtype=torch.uint8)
+            eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M, epi=3, x1=eos)    # F3 -> fp8
+            out = combine_gather_q(eo, eos, inv, N, top_k, sw, hidden.dtype)
+        else:
+            eos = sw
+            eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M)                 # F3 -> (M, H) bf16
+            out = FG.combine_gather(eo, inv, N, top_k, w=sw, out_dtype=hidden.dtype)
         if STATS is not None:
             STATS.setdefault("F3 in (act*up): exact-0 %", []).append(
                 (100 * (iq.float() == 0).float().mean().item(), 0.0))
 
         ctx.save_for_backward(st, sw, order, row_act, row_alpha, gu, eo, xT, xTs, iT, iTs, pcnt,
-                              pads, r, gus, *tiles)
+                              pads, r, gus, eos, *tiles)
         ctx.inv, ctx.counts_t, ctx.Mp, ctx.wq = inv, counts_t, Mp, (wgu, wdn)
         ctx.shapes = (N, H, top_k, E, M, I)
         ctx.ap_shape = ap_shape
@@ -649,7 +682,7 @@ class _MoEFP8Full(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        (st, sw, order, row_act, row_alpha, gu, eo, xT, xTs, iT, iTs, pcnt, pads, r, gus, *tiles) = ctx.saved_tensors
+        (st, sw, order, row_act, row_alpha, gu, eo, xT, xTs, iT, iTs, pcnt, pads, r, gus, eos, *tiles) = ctx.saved_tensors
         N, H, top_k, E, M, I = ctx.shapes
         wgu, wdn = ctx.wq
         Mp, dev = ctx.Mp, grad_out.device
@@ -660,7 +693,7 @@ class _MoEFP8Full(torch.autograd.Function):
         gT, gTs = _tok_buf(H, Mp, dev)
         gw = torch.empty(M, device=dev, dtype=torch.float32)
         _combine_bwd_tile_kernel[(nt,)](grad_out, eo, sw, st, *tiles, gq, gs, gT, gTs, gw, Mp, H, _bc(H),
-                                        num_warps=4)
+                                        eos, EO_FP8, num_warps=4)
         _pad(gT, gTs, pst, pads, pcnt, Mp)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
                                                                           out=out, accumulate=a, even=True))       # B2
