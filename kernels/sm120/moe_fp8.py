@@ -70,6 +70,42 @@ def _wstats(w, tag, qs):
         _stat(tag, w.reshape(-1, w.shape[-1]).float(), q.reshape(-1, q.shape[-1]), s.reshape(-1, s.shape[-1]))
 
 
+
+# ------------------------------------------------------------------ fp8 health (training diagnostics)
+HEALTH = None           # set to {} for ONE step: every fp8 tensor of every fp8 layer records a dict below
+_HSUB = 16384           # rows sampled (strided) for the outlier statistics
+
+
+@torch.no_grad()
+def _health(tag, q, s, src=None):
+    """Stats of one MXFP8 tensor (q (R, C) e4m3, s (R, C/32) e8m0). With `src` (the fp32 master, weights)
+    the flush rate is exact; otherwise it is the exact-zero rate of the fp8 values (real activations are
+    almost never exactly 0, so this bounds the flush rate tightly)."""
+    if HEALTH is None:
+        return
+    R = q.shape[0]
+    st = max(1, R // _HSUB)
+    qf = q[::st].float()
+    e = s[::st].float() - 127.0
+    d = {"zero_pct": 100 * (qf == 0).float().mean().item(),
+         "subnormal_pct": 100 * ((qf.abs() < 2.0 ** -6) & (qf != 0)).float().mean().item(),
+         "at_max_pct": 100 * (qf.abs() >= 448.0).float().mean().item(),
+         "scale_exp_min": e.min().item(), "scale_exp_mean": e.mean().item(), "scale_exp_max": e.max().item()}
+    deq = qf * torch.exp2(e).repeat_interleave(32, dim=-1)
+    blk = deq.abs().reshape(deq.shape[0], -1, 32)
+    bmax = blk.amax(-1)
+    brms = blk.pow(2).mean(-1).sqrt()
+    live = brms > 0
+    if live.any():
+        d["block_max_over_rms_p99"] = torch.quantile((bmax[live] / brms[live]).float()[:1_000_000], 0.99).item()
+    a2 = deq.pow(2).mean().clamp_min(1e-30)
+    d["amax_over_rms"] = (deq.abs().max() / a2.sqrt()).item()
+    d["kurtosis"] = (deq.pow(4).mean() / a2.pow(2)).item()
+    if src is not None:
+        fl, _ = MX.qstats(src.reshape(-1, src.shape[-1]).float(), q.reshape(-1, q.shape[-1]), s.reshape(-1, s.shape[-1]))
+        d["flush_pct"] = fl
+    HEALTH.setdefault(tag, []).append(d)
+
 # ------------------------------------------------------------------ fused producers (fp8 epilogues)
 @triton.jit
 def _q32(v, NB: tl.constexpr):
@@ -760,6 +796,9 @@ class _MoEFP8Full(torch.autograd.Function):
         ctx.acc = (K75._acc_target(gate_up_proj), K75._acc_target(down_proj))
         wgu, wdn = MX.quant_weight(gate_up_proj), MX.quant_weight(down_proj)
         _wstats(gate_up_proj, "W gate_up", wgu["rc"]); _wstats(down_proj, "W down", wdn["rc"])
+        if HEALTH is not None:
+            _health("W_gate_up", *wgu["rc"], src=gate_up_proj)
+            _health("W_down", *wdn["rc"], src=down_proj)
         hidden, = K75._amp_cast(hidden)
         hidden = hidden.contiguous()
         wt = wt.float()
@@ -807,6 +846,10 @@ class _MoEFP8Full(torch.autograd.Function):
             gus = row_alpha
             gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=rows_f1, epi=1 if EPI_FUSE else 0,
                                  x1=rss if EPI_FUSE else None, np_=max(np1, 1))       # F1 (+ sum g^2)
+        if HEALTH is not None:
+            _health("x_F1_in", xq, xs)
+            if GU_FP8:
+                _health("GU_F1_out", gu, gus)
         iq, is_ = _row_buf(M, I, dev)
         iT, iTs = _tok_buf(I, Mp, dev)
         r = torch.empty(M, device=dev, dtype=torch.float32)
@@ -814,11 +857,15 @@ class _MoEFP8Full(torch.autograd.Function):
                                        _div_bc(I, RADIAL_BC), np1, triton.next_power_of_2(max(np1, 1)),
                                        TR=TILE_ROWS, num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
+        if HEALTH is not None:
+            _health("act_up_F3_in", iq, is_)
         inv = FG.inverse_order(order)
         if EO_FP8:
             eos = torch.empty(M, H // 32, device=dev, dtype=torch.uint8)
             eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M, epi=3, x1=eos)    # F3 -> fp8
             out = combine_gather_q(eo, eos, inv, N, top_k, sw, hidden.dtype)
+            if HEALTH is not None:
+                _health("eo_F3_out", eo, eos)
         else:
             eos = sw
             eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M)                 # F3 -> (M, H) bf16
@@ -850,6 +897,8 @@ class _MoEFP8Full(torch.autograd.Function):
         _combine_bwd_tile_kernel[(nt,)](grad_out, eo, sw, st, *tiles, gq, gs, gT, gTs, gw, Mp, H, _bc(H),
                                         eos, EO_FP8, order, grad_wt, True, TR=TILE_ROWS, num_warps=4)
         _pad(gT, gTs, pst, pads, pcnt, Mp)
+        if HEALTH is not None:
+            _health("dO_B3_in", gq, gs)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
                                                                           out=out, accumulate=a, even=True))       # B2
         fuse_st = EPI_FUSE and GU_FP8
@@ -863,6 +912,8 @@ class _MoEFP8Full(torch.autograd.Function):
             d_inter = MX.grouped_gemm(gq, gs, *wdn["cr"], ctx.counts_t, M, epi=2 if fuse_st else 0,
                                       x1=part if fuse_st else None, x2=gu, x3=r, x4=gus, i2=I,
                                       np_=max(np3, 1))                              # B3 (+ S partials)
+        if HEALTH is not None and DI_FP8 and not fuse_st:
+            _health("d_inter_B3_out", d_inter, dis)
         want_ap = ctx.needs_input_grad[6]
         dq, ds = _row_buf(M, 2 * I, dev)
         dT, dTs = _tok_buf(2 * I, Mp, dev)
@@ -873,6 +924,8 @@ class _MoEFP8Full(torch.autograd.Function):
                                        triton.next_power_of_2(max(np3, 1)), TR=TILE_ROWS, num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, ROWST=not _DEBUG_NO_ROW, GO8=DI_FP8 and not fuse_st)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
+        if HEALTH is not None:
+            _health("dGU_B6_in", dq, ds)
         grad_ap = _ap_grad_seg(da, ctx.counts_t, E, ctx.ap_shape, TILE_ROWS) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
                                                                         out=out, accumulate=a, even=True))         # B5
@@ -880,6 +933,8 @@ class _MoEFP8Full(torch.autograd.Function):
             dxs = torch.empty(M, H // 32, device=dev, dtype=torch.uint8)
             dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, epi=3, x1=dxs)       # B6 -> fp8
             grad_hidden = combine_gather_q(dx_rows, dxs, ctx.inv, N, top_k, None, grad_out.dtype)
+            if HEALTH is not None:
+                _health("dx_rows_B6_out", dx_rows, dxs)
         else:
             if DX_SLOT:     # B6 stores each row at its (token, slot) position: the k-way sum reads contiguously
                 dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS, out_rows=order)
