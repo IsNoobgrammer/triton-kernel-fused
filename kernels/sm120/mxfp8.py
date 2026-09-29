@@ -231,7 +231,7 @@ def grouped_wgrad(a, b, counts_t, out=None, accumulate=False, b_rows=None, cfg=N
 def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl.constexpr, N2: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr):
     """C[e] (N1, N2) fp32 (+)= A_e^T @ B_e with the TOKEN axis contiguous in memory: AT (N1, Mp) and
-    BT (N2, Mp) are e4m3, scales (N1 | N2, Mp/32) per 32 tokens. Expert e owns token columns
+    BT (N2, Mp) are e4m3, scales (Mp/32, N1 | N2) per 32 tokens (token-block-major: contiguous per K step). Expert e owns token columns
     [PST[e], PST[e] + PCNT[e]) (32-aligned, zero-padded by the producer)."""
     pid = tl.program_id(0)
     TN: tl.constexpr = N2 // BN
@@ -251,9 +251,9 @@ def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl
         rs = k0 // 32 + tl.arange(0, BK // 32)
         ms = rs < p1 // 32
         a = tl.load(AT + rm[:, None].to(tl.int64) * Mp + rk[None, :], mask=mk[None, :], other=0.0)
-        a_s = tl.load(ATS + rm[:, None].to(tl.int64) * KS + rs[None, :], mask=ms[None, :], other=127)
+        a_s = tl.load(ATS + rs[None, :].to(tl.int64) * N1 + rm[:, None], mask=ms[None, :], other=127)
         b = tl.load(BT + rn[None, :].to(tl.int64) * Mp + rk[:, None], mask=mk[:, None], other=0.0)
-        b_s = tl.load(BTS + rn[:, None].to(tl.int64) * KS + rs[None, :], mask=ms[None, :], other=127)
+        b_s = tl.load(BTS + rs[None, :].to(tl.int64) * N2 + rn[:, None], mask=ms[None, :], other=127)
         acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
     cp = C + e.to(tl.int64) * (N1 * N2) + rm[:, None] * N2 + rn[None, :]
     if ACC:

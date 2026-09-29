@@ -342,13 +342,14 @@ def _qrow_store(v, rows, cols, mr, Q, S, LD, BR: tl.constexpr, BC: tl.constexpr)
 
 
 @triton.jit
-def _qtok_store(v, cols, col0, QT, ST, Mp):
+def _qtok_store(v, cols, col0, QT, ST, Mp, C):
     """token quant of a (32, BC) tile (32 tokens of ONE expert, masked rows already 0): one scale per
     column over the 32 tokens, stored TRANSPOSED at QT[col, col0 + j]."""
     ex = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(v), axis=0), 1e-30) / 448.0)), -127.0), 127.0)
     q = v * tl.exp2(-ex)[None, :]
     tl.store(QT + cols[:, None].to(tl.int64) * Mp + (col0 + tl.arange(0, 32))[None, :], tl.trans(q).to(tl.float8e4nv))
-    tl.store(ST + cols.to(tl.int64) * (Mp // 32) + col0 // 32, (ex + 127.0).to(tl.uint8))
+    # scales TOKEN-BLOCK-major (Mp/32, C): one K step of the wgrad reads a contiguous row of them
+    tl.store(ST + (col0 // 32).to(tl.int64) * C + cols, (ex + 127.0).to(tl.uint8))
 
 
 @triton.jit
@@ -367,7 +368,7 @@ def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, 
     for c0 in range(0, H, BC):
         cols = c0 + tl.arange(0, BC)
         x = tl.load(X + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-        _qtok_store(x, cols, col0, QT, STS, Mp)
+        _qtok_store(x, cols, col0, QT, STS, Mp, H)
 
 
 @triton.jit
@@ -400,7 +401,7 @@ def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, 
         z = g / r[:, None]
         v = tl.where(mr[:, None], rp[:, None] * (z * (1.0 / (1.0 + tl.exp(-z)))) * u, 0.0)
         _qrow_store(v, rows, cols, mr, QR, SR, I, 32, BC)
-        _qtok_store(v, cols, col0, QT, STS, Mp)
+        _qtok_store(v, cols, col0, QT, STS, Mp, I)
 
 
 @triton.jit
@@ -455,8 +456,8 @@ def _radial_bwd_tile_kernel(GO, GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, 
         gup = tl.where(mr[:, None], go * (rp[:, None] * f), 0.0)
         _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, 32, BC)
         _qrow_store(gup, rows, I + cols, mr, QR, SR, 2 * I, 32, BC)
-        _qtok_store(gg, cols, col0, QT, STS, Mp)
-        _qtok_store(gup, I + cols, col0, QT, STS, Mp)
+        _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I)
+        _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I)
     if WANT_AP:
         tl.store(DA + rows, tl.where(at == 10, 1.0 - p * p, p * (1.0 - p)) * rp * lr * tt, mask=mr)
 
@@ -485,7 +486,7 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
         gw += tl.sum(go * eo, axis=1)
         ge = go * w[:, None]
         _qrow_store(ge, rows, cols, mr, QR, SR, H, 32, BC)
-        _qtok_store(ge, cols, col0, QT, STS, Mp)
+        _qtok_store(ge, cols, col0, QT, STS, Mp, H)
     tl.store(GW + rows, gw, mask=mr)
 
 
@@ -504,7 +505,7 @@ def _row_buf(M, C, dev):
 
 
 def _tok_buf(C, Mp, dev):
-    return torch.empty(C, Mp, device=dev, dtype=MX.F8), torch.empty(C, Mp // 32, device=dev, dtype=torch.uint8)
+    return torch.empty(C, Mp, device=dev, dtype=MX.F8), torch.empty(Mp // 32, C, device=dev, dtype=torch.uint8)
 
 
 def _bc(C):
