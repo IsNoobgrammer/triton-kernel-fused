@@ -40,7 +40,8 @@ def _stat(tag, x, q, s):
         STATS.setdefault(tag, []).append(MX.qstats(x, q, s))
 
 
-WGRAD8 = True        # phase 2: B2 / B5 in MXFP8 (token-axis blocks quantized inside the GEMM)
+WGRAD8 = False       # B2 / B5 in MXFP8 (token-axis quant inside the GEMM). OFF: correct (dW err 5.4e-2 -> 6.6e-2) but the layer
+#                      goes 16.8 -> 29.4 ms -- fp8 MMA needs K(tokens)-major operands and ours are token-ROW-major
 
 
 def _wgrad(a, b, offs, counts_t, acc, b_rows=None):
