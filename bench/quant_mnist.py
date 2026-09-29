@@ -52,7 +52,8 @@ def fq(t, dim, fmt, scale, blk, tag):
     elif scale == "bf16":
         s = (amax / emax * (1 + 2 ** -7)).to(torch.bfloat16).float()
     r = xb / s
-    y = (r.to(dt).float() * s).reshape(*x.shape)
+    # saturate like the hardware cvt (satfinite); torch's own cast turns out-of-range into NaN
+    y = (r.clamp(-emax, emax).to(dt).float() * s).reshape(*x.shape)
     if pad:
         y = y[..., :K]
     if tag is not None:
@@ -170,6 +171,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--only", default="", help="substring filter on arm names, e.g. fp16")
     a = ap.parse_args()
     tr, te = data()
     arms = [("fp32", None, 0, False), ("bf16", None, 0, False)]
@@ -179,6 +181,8 @@ def main():
           f"{'x zero%':>8s} {'W zero%':>8s} {'dy zero%':>9s} {'dy sat%':>8s} {'s/run':>6s}", flush=True)
     base = None
     for fmt, scale, blk, w2d in arms:
+        if a.only and fmt != "fp32" and a.only not in f"{fmt} {scale} blk{blk}":
+            continue
         STATS.clear()
         res, t0 = [], time.time()
         for sd in range(a.seeds):
