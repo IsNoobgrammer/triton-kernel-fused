@@ -48,6 +48,7 @@ def fq(t, dim, fmt, scale, blk, tag):
         s = amax / emax
     elif scale == "fp16":
         s = (amax / emax * (1 + 2 ** -10)).to(torch.float16).float().clamp_min(2 ** -24)
+        bad = (~torch.isfinite(s)) | (s <= 2 ** -24)          # overflowed to inf / pinned at the floor
     elif scale == "bf16":
         s = (amax / emax * (1 + 2 ** -7)).to(torch.bfloat16).float()
     r = xb / s
@@ -56,10 +57,11 @@ def fq(t, dim, fmt, scale, blk, tag):
         y = y[..., :K]
     if tag is not None:
         nz = xb != 0
-        st = STATS.setdefault(tag, [0.0, 0.0, 0])
+        st = STATS.setdefault(tag, [0.0, 0.0, 0, 0.0])
         st[0] += ((y.reshape(xb.shape) == 0) & nz).float().sum().item() / max(nz.sum().item(), 1)
         st[1] += (r.abs() > emax * 1.0001).float().mean().item()
         st[2] += 1
+        st[3] += bad.float().mean().item() if scale == "fp16" else 0.0
     return y.reshape(shp).movedim(-1, dim)
 
 
@@ -181,17 +183,25 @@ def main():
         res, t0 = [], time.time()
         for sd in range(a.seeds):
             res.append(run((fmt, scale, blk, w2d), 1000 + sd, tr, te, a.epochs))
-        trl = statistics.mean(r[0] for r in res)
-        tel = statistics.mean(r[1] for r in res)
-        acc = statistics.mean(r[2] for r in res)
-        sd_tel = statistics.pstdev(r[1] for r in res)
+        ok = [r for r in res if not r[3]]
+        div = f"  DIVERGED {len(res) - len(ok)}/{len(res)} seeds" if len(ok) < len(res) else ""
+        if not ok:
+            print(f"{fmt} {scale} blk{blk}: all seeds diverged (NaN); fp16-scale bad blocks "
+                  f"x {100 * STATS.get('x', [0, 0, 1, 0])[3] / max(STATS.get('x', [0, 0, 1, 0])[2], 1):.3f}% "
+                  f"dy {100 * STATS.get('dy', [0, 0, 1, 0])[3] / max(STATS.get('dy', [0, 0, 1, 0])[2], 1):.3f}%", flush=True)
+            continue
+        trl = statistics.mean(r[0] for r in ok)
+        tel = statistics.mean(r[1] for r in ok)
+        acc = statistics.mean(r[2] for r in ok)
+        sd_tel = statistics.pstdev(r[1] for r in ok)
         if fmt == "fp32":
             base = tel
         st = lambda k, j: (100 * STATS[k][j] / STATS[k][2]) if k in STATS else float("nan")
         name = fmt if scale is None else f"{fmt} {scale} blk{blk}{' W2D' if w2d else ''}"
         print(f"{name:30s} {trl:11.4f} {tel:10.4f} {100 * acc:8.2f}% {st('x', 0):8.3f} {st('W', 0):8.3f} "
               f"{st('dy', 0):9.3f} {st('dy', 1):8.4f} {(time.time() - t0) / a.seeds:6.1f}"
-              + (f"   dtest {tel - base:+.4f} (seed sd {sd_tel:.4f})" if base is not None and fmt != "fp32" else ""),
+              + (f"   dtest {tel - base:+.4f} (seed sd {sd_tel:.4f})" if base is not None and fmt != "fp32" else "")
+              + (f"  fp16-scale bad blocks dy {st('dy', 3):.3f}% x {st('x', 3):.3f}%" if scale == "fp16" else "") + div,
               flush=True)
     print("QUANT_MNIST_DONE")
 
