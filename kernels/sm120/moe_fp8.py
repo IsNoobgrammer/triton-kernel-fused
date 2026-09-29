@@ -397,8 +397,8 @@ def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR,
     col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
     rows = r0 + tl.arange(0, 32)
     mr = tl.arange(0, 32) < mm
-    at = tl.load(ACT + rows, mask=mr, other=8)
-    aa = tl.load(ALPHA + rows, mask=mr, other=0.0).to(tl.float32)
+    at = tl.load(ACT + e)                              # per EXPERT: a tile never crosses one
+    aa = tl.load(ALPHA + e).to(tl.float32)
     base = GU + rows[:, None].to(tl.int64) * (2 * I)
     if NP > 0:
         jj = tl.arange(0, NPP)
@@ -440,8 +440,8 @@ def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR,
     col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
     rows = r0 + tl.arange(0, 32)
     mr = tl.arange(0, 32) < mm
-    at = tl.load(ACT + rows, mask=mr, other=8)
-    aa = tl.load(ALPHA + rows, mask=mr, other=0.0).to(tl.float32)
+    at = tl.load(ACT + e)                              # per EXPERT: a tile never crosses one
+    aa = tl.load(ALPHA + e).to(tl.float32)
     gub = GU + rows[:, None].to(tl.int64) * (2 * I)
     gob = GO + rows[:, None].to(tl.int64) * I
     r = tl.load(RIN + rows, mask=mr, other=1.0)             # saved by the forward
@@ -484,8 +484,9 @@ def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR,
         if TOK:
             _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I)
             _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I)
-    if WANT_AP:
-        tl.store(DA + rows, tl.where(at == 10, 1.0 - p * p, p * (1.0 - p)) * rp * lr * tt, mask=mr)
+    if WANT_AP:                                        # d(theta) summed over the tile: one value per tile
+        da = tl.where(mr, tl.where(at == 10, 1.0 - p * p, p * (1.0 - p)) * rp * lr * tt, 0.0)
+        tl.store(DA + t, tl.sum(da, axis=0))
 
 
 @triton.jit
@@ -597,13 +598,12 @@ class _MoEFP8Full(torch.autograd.Function):
         st, sw, order, _, _, counts_t = K75._sort_by_expert(idx, wt, E, host=False)
         M = idx.numel()
         I = gate_up_proj.shape[1] // 2
-        row_act = torch.repeat_interleave(act_codes, counts_t, output_size=M).to(torch.int32)
         ap32 = act_params.float().contiguous()
         ap_shape = ap32.shape
         if ap32.ndim == 1:
             ap32 = ap32[:, None].contiguous()
-        row_alpha = torch.repeat_interleave(ap32[:, 0].contiguous(), counts_t, output_size=M)
-        row_expert = torch.repeat_interleave(torch.arange(E, device=dev), counts_t, output_size=M)
+        row_act = act_codes.to(torch.int32).contiguous()          # per EXPERT (names kept for the kernels)
+        row_alpha = ap32[:, 0].contiguous()
         tiles, pcnt, Mp, pads = _tiles(counts_t, M, dev)
         nt = tiles[0].numel()
 
@@ -634,7 +634,7 @@ class _MoEFP8Full(torch.autograd.Function):
             STATS.setdefault("F3 in (act*up): exact-0 %", []).append(
                 (100 * (iq.float() == 0).float().mean().item(), 0.0))
 
-        ctx.save_for_backward(st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt,
+        ctx.save_for_backward(st, sw, order, row_act, row_alpha, gu, eo, xT, xTs, iT, iTs, pcnt,
                               pads, r, gus, *tiles)
         ctx.inv, ctx.counts_t, ctx.Mp, ctx.wq = inv, counts_t, Mp, (wgu, wdn)
         ctx.shapes = (N, H, top_k, E, M, I)
@@ -643,7 +643,7 @@ class _MoEFP8Full(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        (st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt, pads, r, gus, *tiles) = ctx.saved_tensors
+        (st, sw, order, row_act, row_alpha, gu, eo, xT, xTs, iT, iTs, pcnt, pads, r, gus, *tiles) = ctx.saved_tensors
         N, H, top_k, E, M, I = ctx.shapes
         wgu, wdn = ctx.wq
         Mp, dev = ctx.Mp, grad_out.device
@@ -667,14 +667,14 @@ class _MoEFP8Full(torch.autograd.Function):
         want_ap = ctx.needs_input_grad[6]
         dq, ds = _row_buf(M, 2 * I, dev)
         dT, dTs = _tok_buf(2 * I, Mp, dev)
-        da = torch.empty(M, device=dev, dtype=torch.float32) if want_ap else gw
+        da = torch.zeros(nt, device=dev, dtype=torch.float32) if want_ap else gw    # per TILE
         _radial_bwd_tile_kernel[(nt,)](d_inter, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part,
                                        sw, gw, Mp,
                                        I, _EPS, want_ap, RADIAL_BC or _bc(I), np3,
                                        triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
-        grad_ap = K75._ap_grad_from_rows(da, row_expert, E, ctx.ap_shape, dev) if want_ap else None
+        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
                                                                         out=out, accumulate=a, even=True))         # B5
         dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)      # B6
@@ -682,6 +682,21 @@ class _MoEFP8Full(torch.autograd.Function):
         grad_wt = torch.zeros(N * top_k, device=dev, dtype=grad_out.dtype)
         grad_wt[order] = gw.to(grad_out.dtype)
         return grad_hidden, None, grad_wt.view(N, top_k), grad_gu, grad_down, None, grad_ap
+
+
+def _ap_grad_from_tiles(da_t, counts_t, E, ap_shape):
+    """per-TILE d(theta) -> per EXPERT. Tiles are expert-sorted (32-row, never crossing an expert), so
+    each expert owns a contiguous run of ceil(count / 32) tiles: fixed-order fp64 prefix sums
+    differenced at the run ends -- deterministic, no atomics."""
+    nt_e = (counts_t + 31) // 32
+    end = torch.cumsum(nt_e, 0)
+    cs = torch.cat([da_t.new_zeros(1, dtype=torch.float64), da_t.double().cumsum(0)])
+    per_e = (cs[end] - cs[end - nt_e]).float()
+    if len(ap_shape) == 1:
+        return per_e
+    g = torch.zeros(E, 2, device=da_t.device, dtype=torch.float32)
+    g[:, 0] = per_e
+    return g[:, :ap_shape[1]]
 
 
 def _full_ok(hidden, act_codes, act_params, gate_up_proj):
