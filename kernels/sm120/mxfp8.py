@@ -135,6 +135,16 @@ def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, I2, K: tl.const
         b = tl.load(Bb + rn[None, :] * K + rk[:, None])
         b_s = tl.load(BSb + rn[:, None] * KS + rs[None, :])
         acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
+    if EPI == 3:
+        # output itself stored as MXFP8 (blocks of 32 along N, scales -> X1 (M, N/32)): the F1 output
+        # GU cached in fp8, as DeepSeek-V3 caches the SwiGLU input
+        vb = tl.reshape(acc, (BM, BN // 32, 32))
+        ex = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(vb), axis=2), 1e-30) / 448.0)), -127.0), 127.0)
+        q = tl.reshape(vb * tl.exp2(-ex)[:, :, None], (BM, BN))
+        tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], q.to(tl.float8e4nv), mask=mask_m[:, None])
+        sc = pid_n * (BN // 32) + tl.arange(0, BN // 32)
+        tl.store(X1 + rm[:, None].to(tl.int64) * (N // 32) + sc[None, :], (ex + 127.0).to(tl.uint8), mask=mask_m[:, None])
+        return
     out = acc.to(C.dtype.element_ty)
     tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], out, mask=mask_m[:, None])
     if EPI == 1:
@@ -195,7 +205,7 @@ def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.b
     while K % BK:
         BK //= 2
     TE, TS, TM = tile_map(counts_t, m_rows, BM)
-    c = torch.empty(m_rows, N, device=aq.device, dtype=out_dtype)
+    c = torch.empty(m_rows, N, device=aq.device, dtype=F8 if epi == 3 else out_dtype)
     grid = (TE.numel() * (N // BN),)
     d = x1 if x1 is not None else c
     _mx_gg_kernel[grid](aq, as_, bq, bs, c, TE, TS, TM, rows if rows is not None else TE,

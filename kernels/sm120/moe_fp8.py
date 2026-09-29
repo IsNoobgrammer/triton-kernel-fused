@@ -353,6 +353,17 @@ def _qtok_store(v, cols, col0, QT, ST, Mp, C):
 
 
 @triton.jit
+def _ld_gu(GU, GUS, rows, cols, mr, TWO_I, GU8: tl.constexpr, BC: tl.constexpr):
+    """a (32, BC) tile of GU as fp32: bf16 directly, or fp8 with its per-32 scales dequantized."""
+    v = tl.load(GU + rows[:, None].to(tl.int64) * TWO_I + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+    if GU8:
+        sb = tl.min(cols, axis=0) // 32 + tl.arange(0, BC // 32)
+        sc = tl.load(GUS + rows[:, None].to(tl.int64) * (TWO_I // 32) + sb[None, :], mask=mr[:, None], other=127)
+        v = tl.reshape(tl.reshape(v, (32, BC // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (32, BC))
+    return v
+
+
+@triton.jit
 def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, BC: tl.constexpr):
     """token copy of x in EXPERT order (gathered through the sort): the B5 right operand."""
     t = tl.program_id(0)
@@ -372,9 +383,10 @@ def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, 
 
 
 @triton.jit
-def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, RSS, ROUT, Mp,
+def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, RSS, ROUT, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, BC: tl.constexpr,
-                            NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True):
+                            NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True,
+                            GU8: tl.constexpr = False):
     """inter = r^p SiLU(g/r) u (codes 8/10) on 32 rows: row copy (F3 input) + token copy (B2 input)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -395,7 +407,7 @@ def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, 
     else:
         acc = tl.zeros((32,), tl.float32)
         for c0 in range(0, I, BC):
-            g = tl.load(base + c0 + tl.arange(0, BC)[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+            g = _ld_gu(GU, GUS, rows, c0 + tl.arange(0, BC), mr, 2 * I, GU8, BC)
             acc += tl.sum(g * g, axis=1)
         r = tl.sqrt(acc / I + EPS)
     tl.store(ROUT + rows, r, mask=mr)
@@ -403,8 +415,8 @@ def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, 
     rp = tl.exp(p * tl.log(r))
     for c0 in range(0, I, BC):
         cols = c0 + tl.arange(0, BC)
-        g = tl.load(base + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-        u = tl.load(base + I + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+        g = _ld_gu(GU, GUS, rows, cols, mr, 2 * I, GU8, BC)
+        u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
         z = g / r[:, None]
         v = tl.where(mr[:, None], rp[:, None] * (z * (1.0 / (1.0 + tl.exp(-z)))) * u, 0.0)
         _qrow_store(v, rows, cols, mr, QR, SR, I, 32, BC)
@@ -413,9 +425,10 @@ def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, 
 
 
 @triton.jit
-def _radial_bwd_tile_kernel(GO, GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, DA, RIN, PART, Mp,
+def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, DA, RIN, PART, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, WANT_AP: tl.constexpr, BC: tl.constexpr,
-                            NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True):
+                            NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True,
+                            GU8: tl.constexpr = False):
     """dGU of radial on 32 rows: row copy along 2I (B6 input) + token copy (B5 left operand)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -447,8 +460,8 @@ def _radial_bwd_tile_kernel(GO, GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, 
         for c0 in range(0, I, BC):
             cols = c0 + tl.arange(0, BC)
             go = tl.load(gob + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-            g = tl.load(gub + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-            u = tl.load(gub + I + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+            g = _ld_gu(GU, GUS, rows, cols, mr, 2 * I, GU8, BC)
+            u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
             gn = g / r[:, None]
             sig = 1.0 / (1.0 + tl.exp(-gn))
             gu_ = go * u
@@ -457,8 +470,8 @@ def _radial_bwd_tile_kernel(GO, GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, 
     for c0 in range(0, I, BC):
         cols = c0 + tl.arange(0, BC)
         go = tl.load(gob + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-        g = tl.load(gub + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-        u = tl.load(gub + I + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+        g = _ld_gu(GU, GUS, rows, cols, mr, 2 * I, GU8, BC)
+        u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
         gn = g / r[:, None]
         sig = 1.0 / (1.0 + tl.exp(-gn))
         f = gn * sig
@@ -506,6 +519,7 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
 EPI_FUSE = False   # row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
+GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
 _DEBUG_NO_TOK = False               # TIMING ONLY: skip the token-copy stores (wgrads then read garbage)
 KPAD = 128    # expert token ranges in the token copies are padded to this: the wgrad K loop runs UNMASKED
 #               (masked fp8 K loads were 2.8x slower than bf16; unmasked is 1.9-2.4x FASTER)
@@ -598,14 +612,19 @@ class _MoEFP8Full(torch.autograd.Function):
         _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
         np1 = I // MX.gemm_bn(H, 2 * I) if EPI_FUSE else 0
         rss = torch.empty(M, max(np1, 1), device=dev, dtype=torch.float32) if EPI_FUSE else row_alpha
-        gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=1 if EPI_FUSE else 0,
-                             x1=rss if EPI_FUSE else None, np_=max(np1, 1))           # F1 (+ sum g^2)
+        if GU_FP8:
+            gus = torch.empty(M, 2 * I // 32, device=dev, dtype=torch.uint8)
+            gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=3, x1=gus)   # F1 -> GU fp8
+        else:
+            gus = row_alpha
+            gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=1 if EPI_FUSE else 0,
+                                 x1=rss if EPI_FUSE else None, np_=max(np1, 1))       # F1 (+ sum g^2)
         iq, is_ = _row_buf(M, I, dev)
         iT, iTs = _tok_buf(I, Mp, dev)
         r = torch.empty(M, device=dev, dtype=torch.float32)
-        _radial_fwd_tile_kernel[(nt,)](gu, row_act, row_alpha, *tiles, iq, is_, iT, iTs, rss, r, Mp, I, _EPS,
+        _radial_fwd_tile_kernel[(nt,)](gu, gus, row_act, row_alpha, *tiles, iq, is_, iT, iTs, rss, r, Mp, I, _EPS,
                                        RADIAL_BC or _bc(I), np1, triton.next_power_of_2(max(np1, 1)),
-                                       num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK)
+                                       num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
         eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M)                     # F3 -> (M, H) bf16
         inv = FG.inverse_order(order)
@@ -615,7 +634,7 @@ class _MoEFP8Full(torch.autograd.Function):
                 (100 * (iq.float() == 0).float().mean().item(), 0.0))
 
         ctx.save_for_backward(st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt,
-                              pads, r, *tiles)
+                              pads, r, gus, *tiles)
         ctx.inv, ctx.counts_t, ctx.Mp, ctx.wq = inv, counts_t, Mp, (wgu, wdn)
         ctx.shapes = (N, H, top_k, E, M, I)
         ctx.ap_shape = ap_shape
@@ -623,7 +642,7 @@ class _MoEFP8Full(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        (st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt, pads, r, *tiles) = ctx.saved_tensors
+        (st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt, pads, r, gus, *tiles) = ctx.saved_tensors
         N, H, top_k, E, M, I = ctx.shapes
         wgu, wdn = ctx.wq
         Mp, dev = ctx.Mp, grad_out.device
@@ -646,10 +665,10 @@ class _MoEFP8Full(torch.autograd.Function):
         dq, ds = _row_buf(M, 2 * I, dev)
         dT, dTs = _tok_buf(2 * I, Mp, dev)
         da = torch.empty(M, device=dev, dtype=torch.float32) if want_ap else gw
-        _radial_bwd_tile_kernel[(nt,)](d_inter, gu, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part, Mp,
+        _radial_bwd_tile_kernel[(nt,)](d_inter, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part, Mp,
                                        I, _EPS, want_ap, RADIAL_BC or _bc(I), np3,
                                        triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_WARPS,
-                                       TOK=not _DEBUG_NO_TOK)
+                                       TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
         grad_ap = K75._ap_grad_from_rows(da, row_expert, E, ctx.ap_shape, dev) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
