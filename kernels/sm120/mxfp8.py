@@ -101,8 +101,13 @@ def quant_weight(w):
 
 # ------------------------------------------------------------------ grouped GEMM
 @triton.jit
-def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, K: tl.constexpr, N: tl.constexpr,
-                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GATHER: tl.constexpr):
+def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, I2, K: tl.constexpr, N: tl.constexpr,
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GATHER: tl.constexpr,
+                  EPI: tl.constexpr, NP: tl.constexpr):
+    """EPI 0: plain.  EPI 1 (F1): per-row partial sum of squares of the GATE columns (as stored, bf16)
+    -> X1 (M, NP): radial r without its own pass.  EPI 2 (B3): with X2 = GU (M, 2*I2) bf16 and X3 = r
+    (M,), per-row partials of S = sum go*u*df*gn and T = sum go*u*f -> X1 (M, 2*NP): the radial
+    backward then needs a single pass. Partials are summed in fixed order: deterministic."""
     pid = tl.program_id(0)
     t = pid // (N // BN)
     pid_n = pid % (N // BN)
@@ -130,7 +135,24 @@ def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, K: tl.constexpr, N: tl.cons
         b = tl.load(Bb + rn[None, :] * K + rk[:, None])
         b_s = tl.load(BSb + rn[:, None] * KS + rs[None, :])
         acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
-    tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], acc.to(C.dtype.element_ty), mask=mask_m[:, None])
+    out = acc.to(C.dtype.element_ty)
+    tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], out, mask=mask_m[:, None])
+    if EPI == 1:
+        if pid_n < NP:                                   # a gate tile (columns < I)
+            v = out.to(tl.float32)
+            tl.store(X1 + rm.to(tl.int64) * NP + pid_n, tl.sum(v * v, axis=1), mask=mask_m)
+    if EPI == 2:
+        go = out.to(tl.float32)
+        gub = X2 + rm[:, None].to(tl.int64) * (2 * I2)
+        g = tl.load(gub + rn[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
+        u = tl.load(gub + I2 + rn[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
+        r = tl.load(X3 + rm, mask=mask_m, other=1.0)
+        gn = g / r[:, None]
+        sig = 1.0 / (1.0 + tl.exp(-gn))
+        gu_ = go * u
+        pb = X1 + rm.to(tl.int64) * (2 * NP)
+        tl.store(pb + pid_n, tl.sum(gu_ * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1), mask=mask_m)
+        tl.store(pb + NP + pid_n, tl.sum(gu_ * gn * sig, axis=1), mask=mask_m)
 
 
 # swept at the board shapes (bench_quant_study / bench_quant_gemm --sweep), keyed by (K, N)
@@ -142,10 +164,29 @@ def _cfg(K, N):
     return (128, 128, 64, 4, 4) if K % 64 == 0 else (128, 128, 32, 4, 4)
 
 
-def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.bfloat16, cfg=None):
-    """C (m_rows, N): row r = A[rows[r] if rows is given else r] @ B[expert(r)]^T. A is MXFP8 along
-    K; B (E, N, K) e4m3 with scales (E, N, K/32)."""
+_TM_CACHE = {}
+
+
+def tile_map(counts_t, m_rows, bm):
+    """build_tile_map, memoized on the counts tensor object (the same counts serve every GEMM of the
+    layer, forward and backward: one build per BM instead of one per call)."""
     from kernels.sm120.moe_fused_glu import build_tile_map
+    key = (id(counts_t), counts_t._version, m_rows, bm)
+    hit = _TM_CACHE.get(key)
+    if hit is not None and hit[0] is counts_t:
+        return hit[1]
+    tm = build_tile_map(None, counts_t, counts_t.device, bm=bm, m_rows=m_rows)
+    _TM_CACHE[key] = (counts_t, tm)
+    if len(_TM_CACHE) > 64:
+        for k in list(_TM_CACHE)[:32]:
+            _TM_CACHE.pop(k, None)
+    return tm
+
+
+def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.bfloat16, cfg=None,
+                 epi=0, x1=None, x2=None, x3=None, i2=0, np_=1):
+    """C (m_rows, N): row r = A[rows[r] if rows is given else r] @ B[expert(r)]^T. A is MXFP8 along
+    K; B (E, N, K) e4m3 with scales (E, N, K/32). epi / x1..x3: see _mx_gg_kernel."""
     K = aq.shape[1]
     E, N, _ = bq.shape
     BM, BN, BK, w, st = cfg or _cfg(K, N)
@@ -153,12 +194,21 @@ def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.b
         BN //= 2
     while K % BK:
         BK //= 2
-    TE, TS, TM = build_tile_map(None, counts_t, aq.device, bm=BM, m_rows=m_rows)
+    TE, TS, TM = tile_map(counts_t, m_rows, BM)
     c = torch.empty(m_rows, N, device=aq.device, dtype=out_dtype)
     grid = (TE.numel() * (N // BN),)
-    _mx_gg_kernel[grid](aq, as_, bq, bs, c, TE, TS, TM, rows if rows is not None else TE, K, N,
-                        BM, BN, BK, rows is not None, num_warps=w, num_stages=st)
+    d = x1 if x1 is not None else c
+    _mx_gg_kernel[grid](aq, as_, bq, bs, c, TE, TS, TM, rows if rows is not None else TE,
+                        d, x2 if x2 is not None else d, x3 if x3 is not None else d, i2, K, N,
+                        BM, BN, BK, rows is not None, epi, np_, num_warps=w, num_stages=st)
     return c
+
+
+def gemm_bn(K, N):
+    BN = (_cfg(K, N))[1]
+    while N % BN:
+        BN //= 2
+    return BN
 
 
 # ------------------------------------------------------------------ weight gradients (K = tokens)
