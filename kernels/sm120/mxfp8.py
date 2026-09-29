@@ -101,7 +101,7 @@ def quant_weight(w):
 
 # ------------------------------------------------------------------ grouped GEMM
 @triton.jit
-def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, I2, K: tl.constexpr, N: tl.constexpr,
+def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, X4, I2, K: tl.constexpr, N: tl.constexpr,
                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GATHER: tl.constexpr,
                   EPI: tl.constexpr, NP: tl.constexpr):
     """EPI 0: plain.  EPI 1 (F1): per-row partial sum of squares of the GATE columns (as stored, bf16)
@@ -152,17 +152,23 @@ def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, I2, K: tl.const
             v = out.to(tl.float32)
             tl.store(X1 + rm.to(tl.int64) * NP + pid_n, tl.sum(v * v, axis=1), mask=mask_m)
     if EPI == 2:
+        # radial backward S partials: go = this output tile, g / u = GU (fp8 + scales X4) of the same
+        # rows and columns, r = X3. T needs no pass (T = w * gw / r^p, see moe_fp8).
         go = out.to(tl.float32)
         gub = X2 + rm[:, None].to(tl.int64) * (2 * I2)
         g = tl.load(gub + rn[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
         u = tl.load(gub + I2 + rn[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
+        sb = X4 + rm[:, None].to(tl.int64) * (2 * I2 // 32)
+        cs = pid_n * (BN // 32) + tl.arange(0, BN // 32)
+        sg = tl.exp2(tl.load(sb + cs[None, :], mask=mask_m[:, None], other=127).to(tl.float32) - 127.0)
+        su = tl.exp2(tl.load(sb + I2 // 32 + cs[None, :], mask=mask_m[:, None], other=127).to(tl.float32) - 127.0)
+        g = tl.reshape(tl.reshape(g, (BM, BN // 32, 32)) * sg[:, :, None], (BM, BN))
+        u = tl.reshape(tl.reshape(u, (BM, BN // 32, 32)) * su[:, :, None], (BM, BN))
         r = tl.load(X3 + rm, mask=mask_m, other=1.0)
         gn = g / r[:, None]
         sig = 1.0 / (1.0 + tl.exp(-gn))
-        gu_ = go * u
-        pb = X1 + rm.to(tl.int64) * (2 * NP)
-        tl.store(pb + pid_n, tl.sum(gu_ * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1), mask=mask_m)
-        tl.store(pb + NP + pid_n, tl.sum(gu_ * gn * sig, axis=1), mask=mask_m)
+        tl.store(X1 + rm.to(tl.int64) * NP + pid_n,
+                 tl.sum(go * u * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1), mask=mask_m)
 
 
 # swept at the board shapes (bench_quant_study / bench_quant_gemm --sweep), keyed by (K, N)
@@ -194,7 +200,7 @@ def tile_map(counts_t, m_rows, bm):
 
 
 def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.bfloat16, cfg=None,
-                 epi=0, x1=None, x2=None, x3=None, i2=0, np_=1):
+                 epi=0, x1=None, x2=None, x3=None, x4=None, i2=0, np_=1):
     """C (m_rows, N): row r = A[rows[r] if rows is given else r] @ B[expert(r)]^T. A is MXFP8 along
     K; B (E, N, K) e4m3 with scales (E, N, K/32). epi / x1..x3: see _mx_gg_kernel."""
     K = aq.shape[1]
@@ -209,7 +215,8 @@ def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.b
     grid = (TE.numel() * (N // BN),)
     d = x1 if x1 is not None else c
     _mx_gg_kernel[grid](aq, as_, bq, bs, c, TE, TS, TM, rows if rows is not None else TE,
-                        d, x2 if x2 is not None else d, x3 if x3 is not None else d, i2, K, N,
+                        d, x2 if x2 is not None else d, x3 if x3 is not None else d,
+                        x4 if x4 is not None else d, i2, K, N,
                         BM, BN, BK, rows is not None, epi, np_, num_warps=w, num_stages=st)
     return c
 

@@ -425,7 +425,8 @@ def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR,
 
 
 @triton.jit
-def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, DA, RIN, PART, Mp,
+def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, DA, RIN, PART,
+                            TW, TGW, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, WANT_AP: tl.constexpr, BC: tl.constexpr,
                             NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True,
                             GU8: tl.constexpr = False):
@@ -451,9 +452,10 @@ def _radial_bwd_tile_kernel(GO, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR,
     if NP > 0:
         jj = tl.arange(0, NPP)
         pm = mr[:, None] & (jj < NP)[None, :]
-        pb = PART + rows[:, None].to(tl.int64) * (2 * NP) + jj[None, :]
-        sa = tl.sum(tl.load(pb, mask=pm, other=0.0), axis=1)     # S and T partials from the B3 epilogue
-        tt = tl.sum(tl.load(pb + NP, mask=pm, other=0.0), axis=1)
+        sa = tl.sum(tl.load(PART + rows[:, None].to(tl.int64) * NP + jj[None, :], mask=pm, other=0.0), axis=1)
+        # T = sum go*u*f = <d_inter, inter> / r^p = <dO, eo> / r^p = w * gw / r^p   (gw = <grad_out, eo>,
+        # already computed by the combine backward): no pass over the row at all
+        tt = tl.load(TW + rows, mask=mr, other=0.0) * tl.load(TGW + rows, mask=mr, other=0.0) / rp
     else:
         sa = tl.zeros((32,), tl.float32)
         tt = tl.zeros((32,), tl.float32)
@@ -516,7 +518,8 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
     tl.store(GW + rows, gw, mask=mr)
 
 
-EPI_FUSE = False   # row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
+EPI_FUSE = True    # S partials in the B3 epilogue (+ T from the combine grad) -> one-pass radial bwd
+# (history: with bf16 GU and both S and T in the epilogue it was SLOWER; row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
@@ -610,8 +613,8 @@ class _MoEFP8Full(torch.autograd.Function):
         xT, xTs = _tok_buf(H, Mp, dev)
         _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), num_warps=4)
         _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
-        np1 = I // MX.gemm_bn(H, 2 * I) if EPI_FUSE else 0
-        rss = torch.empty(M, max(np1, 1), device=dev, dtype=torch.float32) if EPI_FUSE else row_alpha
+        np1 = I // MX.gemm_bn(H, 2 * I) if (EPI_FUSE and not GU_FP8) else 0   # fp8 GU: F1 runs epi 3
+        rss = torch.empty(M, max(np1, 1), device=dev, dtype=torch.float32) if np1 else row_alpha
         if GU_FP8:
             gus = torch.empty(M, 2 * I // 32, device=dev, dtype=torch.uint8)
             gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=3, x1=gus)   # F1 -> GU fp8
@@ -657,15 +660,18 @@ class _MoEFP8Full(torch.autograd.Function):
         _pad(gT, gTs, pst, pads, pcnt, Mp)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
                                                                           out=out, accumulate=a, even=True))       # B2
-        np3 = I // MX.gemm_bn(H, I) if EPI_FUSE else 0
-        part = torch.empty(M, 2 * max(np3, 1), device=dev, dtype=torch.float32) if EPI_FUSE else r
-        d_inter = MX.grouped_gemm(gq, gs, *wdn["cr"], ctx.counts_t, M, epi=2 if EPI_FUSE else 0,
-                                  x1=part if EPI_FUSE else None, x2=gu, x3=r, i2=I, np_=max(np3, 1))   # B3
+        fuse_st = EPI_FUSE and GU_FP8
+        np3 = I // MX.gemm_bn(H, I) if fuse_st else 0
+        part = torch.empty(M, max(np3, 1), device=dev, dtype=torch.float32) if fuse_st else r
+        d_inter = MX.grouped_gemm(gq, gs, *wdn["cr"], ctx.counts_t, M, epi=2 if fuse_st else 0,
+                                  x1=part if fuse_st else None, x2=gu, x3=r, x4=gus, i2=I,
+                                  np_=max(np3, 1))                                  # B3 (+ S partials)
         want_ap = ctx.needs_input_grad[6]
         dq, ds = _row_buf(M, 2 * I, dev)
         dT, dTs = _tok_buf(2 * I, Mp, dev)
         da = torch.empty(M, device=dev, dtype=torch.float32) if want_ap else gw
-        _radial_bwd_tile_kernel[(nt,)](d_inter, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part, Mp,
+        _radial_bwd_tile_kernel[(nt,)](d_inter, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part,
+                                       sw, gw, Mp,
                                        I, _EPS, want_ap, RADIAL_BC or _bc(I), np3,
                                        triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
