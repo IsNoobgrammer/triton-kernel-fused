@@ -144,6 +144,11 @@ def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, X4, I2, K: tl.c
         tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], q.to(tl.float8e4nv), mask=mask_m[:, None])
         sc = pid_n * (BN // 32) + tl.arange(0, BN // 32)
         tl.store(X1 + rm[:, None].to(tl.int64) * (N // 32) + sc[None, :], (ex + 127.0).to(tl.uint8), mask=mask_m[:, None])
+        if NP > 0:                    # F1: sum of squares of the dequantized gate columns (radial r)
+            if pid_n < NP:
+                dq = tl.reshape(tl.reshape(q.to(tl.float8e4nv).to(tl.float32), (BM, BN // 32, 32))
+                                * tl.exp2(ex)[:, :, None], (BM, BN))
+                tl.store(X2 + rm.to(tl.int64) * NP + pid_n, tl.sum(dq * dq, axis=1), mask=mask_m)
         return
     out = acc.to(C.dtype.element_ty)
     tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], out, mask=mask_m[:, None])
