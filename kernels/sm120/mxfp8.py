@@ -228,7 +228,7 @@ def grouped_wgrad(a, b, counts_t, out=None, accumulate=False, b_rows=None, cfg=N
 
 # ------------------------------------------------------------------ weight gradients on K-MAJOR fp8 copies
 @triton.jit
-def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp, N1: tl.constexpr, N2: tl.constexpr,
+def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl.constexpr, N2: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr):
     """C[e] (N1, N2) fp32 (+)= A_e^T @ B_e with the TOKEN axis contiguous in memory: AT (N1, Mp) and
     BT (N2, Mp) are e4m3, scales (N1 | N2, Mp/32) per 32 tokens. Expert e owns token columns
@@ -242,7 +242,8 @@ def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp, N1: tl.constexpr, N2
     rn = (r % TN) * BN + tl.arange(0, BN)
     p0 = tl.load(PST + e)
     p1 = p0 + tl.load(PCNT + e)
-    KS = Mp // 32
+    KS: tl.constexpr = Mp // 32
+    p0 = tl.multiple_of(p0, 32)
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(p0, p1, BK):
         rk = k0 + tl.arange(0, BK)
