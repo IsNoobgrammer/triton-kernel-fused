@@ -919,6 +919,9 @@ def _b6r_kernel(GO, GOS, GU, GUS, R, SP, TW, TGW, ACT, ALPHA, B, BS, C, TE, TS, 
 
 
 _FA_BM, _FA_BN, _FA_BK, _FA_W, _FA_ST = 128, 128, 64, 8, 3
+# (BM, BN, BK, warps, stages) for the prologue-fused GEMMs: a WIDE BN means fewer programs recompute
+# the same rows' activation (N / BN of them per row tile). BM <= KPAD, and BM < KPAD needs the pad kernel.
+FA_CFG = {"f3": (128, 128, 64, 8, 3), "b6": (128, 128, 64, 8, 3)}
 
 
 class _MoEFP8Act(torch.autograd.Function):
@@ -946,7 +949,7 @@ class _MoEFP8Act(torch.autograd.Function):
         alpha_e = ap32[:, 0].contiguous()
         tiles, pcnt, Mp, pads = _tiles(counts_t, M, dev)
         nt = tiles[0].numel()
-        tiles128 = MX.tile_map(counts_t, M, _FA_BM)
+        tiles128 = MX.tile_map(counts_t, M, FA_CFG["f3"][0])
         c = counts_t.to(torch.int32)
         t128 = (*tiles128, tiles[3], tiles[4])                     # (TE, TS, TM, START, PST) at 128 rows
 
@@ -961,9 +964,12 @@ class _MoEFP8Act(torch.autograd.Function):
         iT, iTs = _tok_buf(I, Mp, dev)
         r = torch.empty(M, device=dev, dtype=torch.float32)
         eo = torch.empty(M, H, device=dev, dtype=hidden.dtype)
-        _f3r_kernel[(tiles128[0].numel() * (H // _FA_BN),)](
+        BM, BN, BK, W, ST = FA_CFG["f3"]
+        _f3r_kernel[(tiles128[0].numel() * (H // BN),)](
             gu, gus, rss, act_e, alpha_e, *wdn["rc"], eo, *t128, iT, iTs, r, Mp, I, H, np1,
-            triton.next_power_of_2(np1), _EPS, _FA_BM, _FA_BN, _FA_BK, num_warps=_FA_W, num_stages=_FA_ST)
+            triton.next_power_of_2(np1), _EPS, BM, BN, BK, num_warps=W, num_stages=ST)
+        if BM < KPAD:
+            _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
         inv = FG.inverse_order(order)
         out = FG.combine_gather(eo, inv, N, top_k, w=sw, out_dtype=hidden.dtype)
         ctx.save_for_backward(st, sw, order, act_e, alpha_e, gu, gus, eo, xT, xTs, iT, iTs, pcnt, pads, r,
@@ -992,22 +998,28 @@ class _MoEFP8Act(torch.autograd.Function):
         _pad(gT, gTs, pst, pads, pcnt, Mp)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
                                                                           out=out, accumulate=a, even=True))  # B2
-        np3 = I // _FA_BN
+        np3 = I // 128
         sp = torch.empty(M, np3, device=dev, dtype=torch.float32)
         diq, dis = _row_buf(M, I, dev)
-        _b3s_kernel[(tiles128[0].numel() * (I // _FA_BN),)](
-            gq, gs, *wdn["cr"], diq, dis, gu, gus, r, sp, *tiles128, H, I, np3, _FA_BM, _FA_BN, 128,
-            num_warps=_FA_W, num_stages=_FA_ST)                                     # B3 -> fp8 + S partials
+        tb3 = MX.tile_map(ctx.counts_t, M, 128)
+        _b3s_kernel[(tb3[0].numel() * (I // 128),)](
+            gq, gs, *wdn["cr"], diq, dis, gu, gus, r, sp, *tb3, H, I, np3, 128, 128, 128,
+            num_warps=8, num_stages=3)                                              # B3 -> fp8 + S partials
         want_ap = ctx.needs_input_grad[6]
         dT, dTs = _tok_buf(2 * I, Mp, dev)
-        nt128 = tiles128[0].numel()
-        da = torch.zeros(nt128, device=dev, dtype=torch.float32) if want_ap else gw
+        BM, BN, BK, W, ST = FA_CFG["b6"]
+        tb6 = MX.tile_map(ctx.counts_t, M, BM)
+        t6 = (*tb6, tiles[3], tiles[4])
+        nt6 = tb6[0].numel()
+        da = torch.zeros(nt6, device=dev, dtype=torch.float32) if want_ap else gw
         dx_rows = torch.empty(M, H, device=dev, dtype=DX_ROWS)
-        _b6r_kernel[(nt128 * (H // _FA_BN),)](
-            diq, dis, gu, gus, r, sp, sw, gw, act_e, alpha_e, *wgu["cr"], dx_rows, *t128, dT, dTs, da,
-            Mp, I, H, np3, triton.next_power_of_2(np3), want_ap, _FA_BM, _FA_BN, _FA_BK,
-            num_warps=_FA_W, num_stages=_FA_ST)                                     # B6 (radial bwd inside)
-        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=_FA_BM) if want_ap else None
+        _b6r_kernel[(nt6 * (H // BN),)](
+            diq, dis, gu, gus, r, sp, sw, gw, act_e, alpha_e, *wgu["cr"], dx_rows, *t6, dT, dTs, da,
+            Mp, I, H, np3, triton.next_power_of_2(np3), want_ap, BM, BN, BK,
+            num_warps=W, num_stages=ST)                                             # B6 (radial bwd inside)
+        if BM < KPAD:
+            _pad(dT, dTs, pst, pads, pcnt, Mp)
+        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=BM) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
                                                                         out=out, accumulate=a, even=True))    # B5
         grad_hidden = FG.combine_gather(dx_rows, ctx.inv, N, top_k, out_dtype=grad_out.dtype)
@@ -1019,7 +1031,9 @@ class _MoEFP8Act(torch.autograd.Function):
 def moe_fp8(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params=None):
     if _full_ok(hidden, act_codes, act_params, gate_up_proj):
         I = gate_up_proj.shape[1] // 2
-        if FUSE_ACT and I % _FA_BN == 0 and hidden.shape[1] % _FA_BN == 0 and KPAD % _FA_BM == 0:
+        if (FUSE_ACT and I % 128 == 0 and hidden.shape[1] % FA_CFG["f3"][1] == 0
+                and hidden.shape[1] % FA_CFG["b6"][1] == 0 and KPAD % FA_CFG["f3"][0] == 0
+                and KPAD % FA_CFG["b6"][0] == 0):
             return _MoEFP8Act.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
                                     act_params)
         return _MoEFP8Full.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params)
