@@ -229,7 +229,8 @@ def grouped_wgrad(a, b, counts_t, out=None, accumulate=False, b_rows=None, cfg=N
 # ------------------------------------------------------------------ weight gradients on K-MAJOR fp8 copies
 @triton.jit
 def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl.constexpr, N2: tl.constexpr,
-                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr):
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ACC: tl.constexpr,
+                        EVEN: tl.constexpr):
     """C[e] (N1, N2) fp32 (+)= A_e^T @ B_e with the TOKEN axis contiguous in memory: AT (N1, Mp) and
     BT (N2, Mp) are e4m3, scales (Mp/32, N1 | N2) per 32 tokens (token-block-major: contiguous per K step). Expert e owns token columns
     [PST[e], PST[e] + PCNT[e]) (32-aligned, zero-padded by the producer)."""
@@ -250,10 +251,16 @@ def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl
         mk = rk < p1
         rs = k0 // 32 + tl.arange(0, BK // 32)
         ms = rs < p1 // 32
-        a = tl.load(AT + rm[:, None].to(tl.int64) * Mp + rk[None, :], mask=mk[None, :], other=0.0)
-        a_s = tl.load(ATS + rs[None, :].to(tl.int64) * N1 + rm[:, None], mask=ms[None, :], other=127)
-        b = tl.load(BT + rn[None, :].to(tl.int64) * Mp + rk[:, None], mask=mk[:, None], other=0.0)
-        b_s = tl.load(BTS + rs[None, :].to(tl.int64) * N2 + rn[:, None], mask=ms[None, :], other=127)
+        if EVEN:            # every expert range padded to a multiple of BK: no masks on the K axis
+            a = tl.load(AT + rm[:, None].to(tl.int64) * Mp + rk[None, :])
+            a_s = tl.load(ATS + rs[None, :].to(tl.int64) * N1 + rm[:, None])
+            b = tl.load(BT + rn[None, :].to(tl.int64) * Mp + rk[:, None])
+            b_s = tl.load(BTS + rs[None, :].to(tl.int64) * N2 + rn[:, None])
+        else:
+            a = tl.load(AT + rm[:, None].to(tl.int64) * Mp + rk[None, :], mask=mk[None, :], other=0.0)
+            a_s = tl.load(ATS + rs[None, :].to(tl.int64) * N1 + rm[:, None], mask=ms[None, :], other=127)
+            b = tl.load(BT + rn[None, :].to(tl.int64) * Mp + rk[:, None], mask=mk[:, None], other=0.0)
+            b_s = tl.load(BTS + rs[None, :].to(tl.int64) * N2 + rn[:, None], mask=ms[None, :], other=127)
         acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
     cp = C + e.to(tl.int64) * (N1 * N2) + rm[:, None] * N2 + rn[None, :]
     if ACC:
@@ -261,7 +268,7 @@ def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl
     tl.store(cp, acc)
 
 
-def wgrad_kmajor(at, ats, bt, bts, pst, pcnt, E, out=None, accumulate=False, cfg=None):
+def wgrad_kmajor(at, ats, bt, bts, pst, pcnt, E, out=None, accumulate=False, cfg=None, even=False):
     N1, Mp = at.shape
     N2 = bt.shape[0]
     BM, BN, BK, w, st = cfg or (128, 128, 128, 4, 3)
@@ -269,5 +276,5 @@ def wgrad_kmajor(at, ats, bt, bts, pst, pcnt, E, out=None, accumulate=False, cfg
         out = torch.empty(E, N1, N2, device=at.device, dtype=torch.float32)
         accumulate = False
     _mx_wgrad_km_kernel[(E * (N1 // BM) * (N2 // BN),)](at, ats, bt, bts, out, pst, pcnt, Mp, N1, N2,
-                                                        BM, BN, BK, accumulate, num_warps=w, num_stages=st)
+                                                        BM, BN, BK, accumulate, even, num_warps=w, num_stages=st)
     return out
