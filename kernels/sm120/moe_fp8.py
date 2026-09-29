@@ -545,6 +545,7 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
 RADIAL_BWD_WARPS, RADIAL_BWD_BC = 4, 64      # radial bwd: swept, 2.33 -> 2.13 ms (fwd keeps BC 128)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
+DX_SLOT = True                      # B6 rows scattered to (token, slot): contiguous k-way sum
 PREP_KERNEL = True                  # one Triton launch for tile maps / padded ranges (vs ~30 torch ops)
 DX8 = False                         # B6 per-row dx cached in MXFP8 before the k-way sum
 XTOK8 = False                       # x token copy (B5 operand) re-quantized from the fp8 row copy
@@ -872,8 +873,12 @@ class _MoEFP8Full(torch.autograd.Function):
             dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, epi=3, x1=dxs)       # B6 -> fp8
             grad_hidden = combine_gather_q(dx_rows, dxs, ctx.inv, N, top_k, None, grad_out.dtype)
         else:
-            dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)  # B6
-            grad_hidden = combine_gather_rows(dx_rows, ctx.inv, N, top_k, grad_out.dtype)
+            if DX_SLOT:     # B6 stores each row at its (token, slot) position: the k-way sum reads contiguously
+                dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS, out_rows=order)
+                grad_hidden = dx_rows.view(N, top_k, H).sum(1, dtype=torch.float32).to(grad_out.dtype)
+            else:
+                dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)  # B6
+                grad_hidden = combine_gather_rows(dx_rows, ctx.inv, N, top_k, grad_out.dtype)
         return grad_hidden, None, grad_wt.view(N, top_k), grad_gu, grad_down, None, grad_ap
 
 

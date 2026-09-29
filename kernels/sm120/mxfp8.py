@@ -103,7 +103,7 @@ def quant_weight(w):
 @triton.jit
 def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, X4, I2, K: tl.constexpr, N: tl.constexpr,
                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GATHER: tl.constexpr,
-                  EPI: tl.constexpr, NP: tl.constexpr):
+                  EPI: tl.constexpr, NP: tl.constexpr, OROWS=None, SCATTER: tl.constexpr = False):
     """EPI 0: plain.  EPI 1 (F1): per-row partial sum of squares of the GATE columns (as stored, bf16)
     -> X1 (M, NP): radial r without its own pass.  EPI 2 (B3): with X2 = GU (M, 2*I2) bf16 and X3 = r
     (M,), per-row partials of S = sum go*u*df*gn and T = sum go*u*f -> X1 (M, 2*NP): the radial
@@ -151,7 +151,11 @@ def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, X4, I2, K: tl.c
                 tl.store(X2 + rm.to(tl.int64) * NP + pid_n, tl.sum(dq * dq, axis=1), mask=mask_m)
         return
     out = acc.to(C.dtype.element_ty)
-    tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], out, mask=mask_m[:, None])
+    if SCATTER:     # row r -> output row OROWS[r] (e.g. its (token, slot) position for the k-way sum)
+        ro = tl.load(OROWS + rm, mask=mask_m, other=0)
+        tl.store(C + ro[:, None].to(tl.int64) * N + rn[None, :], out, mask=mask_m[:, None])
+    else:
+        tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], out, mask=mask_m[:, None])
     if EPI == 1:
         if pid_n < NP:                                   # a gate tile (columns < I)
             v = out.to(tl.float32)
@@ -205,7 +209,7 @@ def tile_map(counts_t, m_rows, bm):
 
 
 def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.bfloat16, cfg=None,
-                 epi=0, x1=None, x2=None, x3=None, x4=None, i2=0, np_=0):
+                 epi=0, x1=None, x2=None, x3=None, x4=None, i2=0, np_=0, out_rows=None):
     """C (m_rows, N): row r = A[rows[r] if rows is given else r] @ B[expert(r)]^T. A is MXFP8 along
     K; B (E, N, K) e4m3 with scales (E, N, K/32). epi / x1..x3: see _mx_gg_kernel."""
     K = aq.shape[1]
@@ -222,7 +226,8 @@ def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.b
     _mx_gg_kernel[grid](aq, as_, bq, bs, c, TE, TS, TM, rows if rows is not None else TE,
                         d, x2 if x2 is not None else d, x3 if x3 is not None else d,
                         x4 if x4 is not None else d, i2, K, N,
-                        BM, BN, BK, rows is not None, epi, np_, num_warps=w, num_stages=st)
+                        BM, BN, BK, rows is not None, epi, np_, out_rows if out_rows is not None else TE,
+                        out_rows is not None, num_warps=w, num_stages=st)
     return c
 
 
