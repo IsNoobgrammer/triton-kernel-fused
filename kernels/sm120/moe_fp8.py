@@ -364,8 +364,10 @@ def _ld_gu(GU, GUS, rows, cols, mr, TWO_I, GU8: tl.constexpr, BC: tl.constexpr):
 
 
 @triton.jit
-def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, BC: tl.constexpr):
-    """token copy of x in EXPERT order (gathered through the sort): the B5 right operand."""
+def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, BC: tl.constexpr,
+                  QR=None, SR=None, ROW: tl.constexpr = False):
+    """token copy of x in EXPERT order (gathered through the sort): the B5 right operand; with ROW
+    also the row-quantized copy in expert order, so F1 reads contiguously (no gather in the GEMM)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
     if mm == 0:
@@ -380,6 +382,8 @@ def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, 
         cols = c0 + tl.arange(0, BC)
         x = tl.load(X + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
         _qtok_store(x, cols, col0, QT, STS, Mp, H)
+        if ROW:
+            _qrow_store(x, rows, cols, mr, QR, SR, H, 32, BC)
 
 
 @triton.jit
@@ -608,19 +612,19 @@ class _MoEFP8Full(torch.autograd.Function):
         tiles, pcnt, Mp, pads = _tiles(counts_t, M, dev)
         nt = tiles[0].numel()
 
-        xq, xs = _q(hidden, "F1 in (x)")
         xT, xTs = _tok_buf(H, Mp, dev)
-        _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), num_warps=4)
+        xq, xs = _row_buf(M, H, dev)                      # x in EXPERT order, row-quantized
+        _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), xq, xs, True, num_warps=4)
         _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
         np1 = I // MX.gemm_bn(H, 2 * I) if (EPI_FUSE or GU_FP8) else 0
         rss = torch.empty(M, max(np1, 1), device=dev, dtype=torch.float32) if np1 else row_alpha
         if GU_FP8:
             gus = torch.empty(M, 2 * I // 32, device=dev, dtype=torch.uint8)
-            gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=3, x1=gus, x2=rss,
+            gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, epi=3, x1=gus, x2=rss,
                                  np_=np1)                     # F1 -> GU fp8 + per-row sum(g^2) partials
         else:
             gus = row_alpha
-            gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=1 if EPI_FUSE else 0,
+            gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, epi=1 if EPI_FUSE else 0,
                                  x1=rss if EPI_FUSE else None, np_=max(np1, 1))       # F1 (+ sum g^2)
         iq, is_ = _row_buf(M, I, dev)
         iT, iTs = _tok_buf(I, Mp, dev)

@@ -179,7 +179,7 @@ def _mx_gg_kernel(A, AS, B, BS, C, TE, TS, TM, ROWS, X1, X2, X3, X4, I2, K: tl.c
 # swept at the board shapes (bench_quant_study / bench_quant_gemm --sweep), keyed by (K, N)
 def _cfg(K, N):
     if K >= 1024:
-        return (256, 128, 64, 8, 3)
+        return (128, 128, 64, 4, 3)          # B6 at K=1536: 1.309 vs 1.390 ms for (256, 128, 64, 8, 3)
     if K % 128 == 0:
         return (128, 128, 128, 4, 2)
     return (128, 128, 64, 4, 4) if K % 64 == 0 else (128, 128, 32, 4, 4)
