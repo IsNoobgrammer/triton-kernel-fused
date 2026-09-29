@@ -271,7 +271,7 @@ def _mx_wgrad_km_kernel(AT, ATS, BT, BTS, C, PST, PCNT, Mp: tl.constexpr, N1: tl
 def wgrad_kmajor(at, ats, bt, bts, pst, pcnt, E, out=None, accumulate=False, cfg=None, even=False):
     N1, Mp = at.shape
     N2 = bt.shape[0]
-    BM, BN, BK, w, st = cfg or (128, 128, 128, 4, 3)
+    BM, BN, BK, w, st = cfg or (128, 128, 128, 4, 3)     # swept: 449 / 516 TF on B2 / B5 (unmasked)
     if out is None:
         out = torch.empty(E, N1, N2, device=at.device, dtype=torch.float32)
         accumulate = False

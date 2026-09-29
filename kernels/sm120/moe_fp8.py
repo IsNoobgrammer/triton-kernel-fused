@@ -490,14 +490,38 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
     tl.store(GW + rows, gw, mask=mr)
 
 
+KPAD = 128    # expert token ranges in the token copies are padded to this: the wgrad K loop runs UNMASKED
+#               (masked fp8 K loads were 2.8x slower than bf16; unmasked is 1.9-2.4x FASTER)
+
+
 def _tiles(counts_t, M, dev):
     TE, TS, TM = FG.build_tile_map(None, counts_t, dev, bm=32, m_rows=M)
-    c32 = counts_t.to(torch.int32)
-    start = (torch.cumsum(c32, 0) - c32).to(torch.int32)
-    pcnt = ((c32 + 31) // 32) * 32
+    c = counts_t.to(torch.int32)
+    start = (torch.cumsum(c, 0) - c).to(torch.int32)
+    c32 = ((c + 31) // 32) * 32
+    pcnt = ((c + KPAD - 1) // KPAD) * KPAD
     pst = (torch.cumsum(pcnt, 0) - pcnt).to(torch.int32)
-    Mp = M + 32 * counts_t.numel()
-    return (TE, TS, TM, start, pst), pcnt.to(torch.int32), Mp
+    Mp = M + KPAD * counts_t.numel()
+    return (TE, TS, TM, start, pst), pcnt.to(torch.int32), Mp, (pst + c32).to(torch.int32)
+
+
+@triton.jit
+def _pad_kernel(QT, STS, PST, PADS, PCNT, Mp, C: tl.constexpr, BC: tl.constexpr):
+    """zero the columns [PADS[e], PST[e] + PCNT[e]) the 32-row tiles never write, with scale 2^0.
+    (0xFF is NaN in e8m0, so the scales must be written too: 0 * NaN = NaN.)"""
+    e = tl.program_id(0)
+    cols = tl.program_id(1) * BC + tl.arange(0, BC)
+    j0 = tl.load(PADS + e)
+    j1 = tl.load(PST + e) + tl.load(PCNT + e)
+    for j in range(j0, j1, 32):
+        tl.store(QT + cols[:, None].to(tl.int64) * Mp + (j + tl.arange(0, 32))[None, :],
+                 tl.zeros((BC, 32), tl.float8e4nv))
+        tl.store(STS + (j // 32).to(tl.int64) * C + cols, tl.full((BC,), 127, tl.uint8))
+
+
+def _pad(qt, sts, pst, pads, pcnt, Mp):
+    C = qt.shape[0]
+    _pad_kernel[(pst.numel(), C // _bc(C))](qt, sts, pst, pads, pcnt, Mp, C, _bc(C), num_warps=4)
 
 
 def _row_buf(M, C, dev):
@@ -548,17 +572,19 @@ class _MoEFP8Full(torch.autograd.Function):
             ap32 = ap32[:, None].contiguous()
         row_alpha = torch.repeat_interleave(ap32[:, 0].contiguous(), counts_t, output_size=M)
         row_expert = torch.repeat_interleave(torch.arange(E, device=dev), counts_t, output_size=M)
-        tiles, pcnt, Mp = _tiles(counts_t, M, dev)
+        tiles, pcnt, Mp, pads = _tiles(counts_t, M, dev)
         nt = tiles[0].numel()
 
         xq, xs = _q(hidden, "F1 in (x)")
         xT, xTs = _tok_buf(H, Mp, dev)
         _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), num_warps=4)
+        _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
         gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st)            # F1 -> (M, 2I) bf16
         iq, is_ = _row_buf(M, I, dev)
         iT, iTs = _tok_buf(I, Mp, dev)
         _radial_fwd_tile_kernel[(nt,)](gu, row_act, row_alpha, *tiles, iq, is_, iT, iTs, Mp, I, _EPS,
                                        _bc(I), num_warps=4)
+        _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
         eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M)                     # F3 -> (M, H) bf16
         inv = FG.inverse_order(order)
         out = FG.combine_gather(eo, inv, N, top_k, w=sw, out_dtype=hidden.dtype)
@@ -567,7 +593,7 @@ class _MoEFP8Full(torch.autograd.Function):
                 (100 * (iq.float() == 0).float().mean().item(), 0.0))
 
         ctx.save_for_backward(st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt,
-                              *tiles)
+                              pads, *tiles)
         ctx.inv, ctx.counts_t, ctx.Mp, ctx.wq = inv, counts_t, Mp, (wgu, wdn)
         ctx.shapes = (N, H, top_k, E, M, I)
         ctx.ap_shape = ap_shape
@@ -575,7 +601,7 @@ class _MoEFP8Full(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        (st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt, *tiles) = ctx.saved_tensors
+        (st, sw, order, row_act, row_alpha, row_expert, gu, eo, xT, xTs, iT, iTs, pcnt, pads, *tiles) = ctx.saved_tensors
         N, H, top_k, E, M, I = ctx.shapes
         wgu, wdn = ctx.wq
         Mp, dev = ctx.Mp, grad_out.device
@@ -587,8 +613,9 @@ class _MoEFP8Full(torch.autograd.Function):
         gw = torch.empty(M, device=dev, dtype=torch.float32)
         _combine_bwd_tile_kernel[(nt,)](grad_out, eo, sw, st, *tiles, gq, gs, gT, gTs, gw, Mp, H, _bc(H),
                                         num_warps=4)
+        _pad(gT, gTs, pst, pads, pcnt, Mp)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
-                                                                          out=out, accumulate=a))       # B2
+                                                                          out=out, accumulate=a, even=True))       # B2
         d_inter = MX.grouped_gemm(gq, gs, *wdn["cr"], ctx.counts_t, M)             # B3 -> (M, I) bf16
         want_ap = ctx.needs_input_grad[6]
         dq, ds = _row_buf(M, 2 * I, dev)
@@ -596,9 +623,10 @@ class _MoEFP8Full(torch.autograd.Function):
         da = torch.empty(M, device=dev, dtype=torch.float32) if want_ap else gw
         _radial_bwd_tile_kernel[(nt,)](d_inter, gu, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, Mp, I,
                                        _EPS, want_ap, _bc(I), num_warps=4)
+        _pad(dT, dTs, pst, pads, pcnt, Mp)
         grad_ap = K75._ap_grad_from_rows(da, row_expert, E, ctx.ap_shape, dev) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
-                                                                        out=out, accumulate=a))         # B5
+                                                                        out=out, accumulate=a, even=True))         # B5
         dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)      # B6
         grad_hidden = FG.combine_gather(dx_rows, ctx.inv, N, top_k, out_dtype=grad_out.dtype)
         grad_wt = torch.zeros(N * top_k, device=dev, dtype=grad_out.dtype)
