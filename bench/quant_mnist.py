@@ -31,14 +31,14 @@ dev = "cuda"
 STATS = {}
 
 
-def emu_round(r, E, M, bias, maxv):
+def emu_round(r, E, M, bias, maxv, ceil=False):
     """Round-to-nearest-even onto a (1, E, M) float with exponent bias `bias`, subnormals, and
     saturation at maxv -- a bit-exact software stand-in for formats the hardware lacks (e3m4).
     Validated against torch's e4m3fn / e5m2 casts in bench/quant_emu.py."""
     a = r.abs().clamp(max=maxv)
     e = (torch.frexp(a)[1] - 1).float().clamp(min=1 - bias)   # exact floor(log2 a); subnormals share the min exponent
     step = torch.exp2(e - M)
-    q = (torch.round(a / step) * step).clamp(max=maxv)
+    q = ((torch.ceil(a / step) if ceil else torch.round(a / step)) * step).clamp(max=maxv)
     return torch.copysign(q, r)
 
 
@@ -46,7 +46,8 @@ def emu_round(r, E, M, bias, maxv):
 # 1 sign / 3 exponent / 4 mantissa, bias 3, "fn" convention like e4m3fn -> max 2^4 * 1.875 = 30.
 FMT = {"e4m3": (lambda r: r.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float(), 448.0, 2.0 ** -6),
        "e5m2": (lambda r: r.clamp(-57344.0, 57344.0).to(torch.float8_e5m2).float(), 57344.0, 2.0 ** -14),
-       "e3m4": (lambda r: emu_round(r, 3, 4, 3, 30.0), 30.0, 2.0 ** -2)}
+       "e3m4": (lambda r: emu_round(r, 3, 4, 3, 30.0), 30.0, 2.0 ** -2),
+       "e2m1": (lambda r: emu_round(r, 2, 1, 1, 6.0), 6.0, 1.0)}      # FP4 (MXFP4 / NVFP4 elements)
 
 
 def fq(t, dim, fmt, scale, blk, tag):
@@ -69,6 +70,10 @@ def fq(t, dim, fmt, scale, blk, tag):
         bad = (~torch.isfinite(s)) | (s <= 2 ** -24)          # overflowed to inf / pinned at the floor
     elif scale == "bf16":
         s = (amax / emax * (1 + 2 ** -7)).to(torch.bfloat16).float()
+    elif scale == "2L-e4m3":                 # NVFP4: fp32 per tensor x e4m3 per block (rounded up)
+        b = amax / emax
+        S = b.amax().clamp_min(1e-30) / 448.0
+        s = S * emu_round(b / S, 4, 3, 7, 448.0, ceil=True).clamp_min(2.0 ** -9)
     r = xb / s
     # saturate like the hardware cvt (satfinite); torch's own cast turns out-of-range into NaN
     y = (qf(r) * s).reshape(*x.shape)
