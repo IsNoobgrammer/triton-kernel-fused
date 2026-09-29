@@ -525,6 +525,7 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 # (history: with bf16 GU and both S and T in the epilogue it was SLOWER; row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
+RADIAL_BWD_WARPS, RADIAL_BWD_BC = None, None   # radial bwd only (None = RADIAL_*)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
 EO_FP8 = True                       # F3 output EO in MXFP8 (combine fwd + combine bwd read it)
@@ -721,8 +722,8 @@ class _MoEFP8Full(torch.autograd.Function):
         da = torch.zeros(nt, device=dev, dtype=torch.float32) if want_ap else gw    # per TILE
         _radial_bwd_tile_kernel[(nt,)](d_inter, dis, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part,
                                        sw, gw, Mp,
-                                       I, _EPS, want_ap, RADIAL_BC or _bc(I), np3,
-                                       triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_WARPS,
+                                       I, _EPS, want_ap, RADIAL_BWD_BC or RADIAL_BC or _bc(I), np3,
+                                       triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, GO8=DI_FP8 and not fuse_st)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
         grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape) if want_ap else None
