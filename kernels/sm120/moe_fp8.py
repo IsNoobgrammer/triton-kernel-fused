@@ -374,7 +374,7 @@ def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, 
 @triton.jit
 def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, RSS, ROUT, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, BC: tl.constexpr,
-                            NP: tl.constexpr, NPP: tl.constexpr):
+                            NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True):
     """inter = r^p SiLU(g/r) u (codes 8/10) on 32 rows: row copy (F3 input) + token copy (B2 input)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -408,13 +408,14 @@ def _radial_fwd_tile_kernel(GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, 
         z = g / r[:, None]
         v = tl.where(mr[:, None], rp[:, None] * (z * (1.0 / (1.0 + tl.exp(-z)))) * u, 0.0)
         _qrow_store(v, rows, cols, mr, QR, SR, I, 32, BC)
-        _qtok_store(v, cols, col0, QT, STS, Mp, I)
+        if TOK:
+            _qtok_store(v, cols, col0, QT, STS, Mp, I)
 
 
 @triton.jit
 def _radial_bwd_tile_kernel(GO, GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, DA, RIN, PART, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, WANT_AP: tl.constexpr, BC: tl.constexpr,
-                            NP: tl.constexpr, NPP: tl.constexpr):
+                            NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True):
     """dGU of radial on 32 rows: row copy along 2I (B6 input) + token copy (B5 left operand)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -467,8 +468,9 @@ def _radial_bwd_tile_kernel(GO, GU, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, 
         gup = tl.where(mr[:, None], go * (rp[:, None] * f), 0.0)
         _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, 32, BC)
         _qrow_store(gup, rows, I + cols, mr, QR, SR, 2 * I, 32, BC)
-        _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I)
-        _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I)
+        if TOK:
+            _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I)
+            _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I)
     if WANT_AP:
         tl.store(DA + rows, tl.where(at == 10, 1.0 - p * p, p * (1.0 - p)) * rp * lr * tt, mask=mr)
 
@@ -504,6 +506,7 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
 EPI_FUSE = False   # row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
+_DEBUG_NO_TOK = False               # TIMING ONLY: skip the token-copy stores (wgrads then read garbage)
 KPAD = 128    # expert token ranges in the token copies are padded to this: the wgrad K loop runs UNMASKED
 #               (masked fp8 K loads were 2.8x slower than bf16; unmasked is 1.9-2.4x FASTER)
 
@@ -602,7 +605,7 @@ class _MoEFP8Full(torch.autograd.Function):
         r = torch.empty(M, device=dev, dtype=torch.float32)
         _radial_fwd_tile_kernel[(nt,)](gu, row_act, row_alpha, *tiles, iq, is_, iT, iTs, rss, r, Mp, I, _EPS,
                                        RADIAL_BC or _bc(I), np1, triton.next_power_of_2(max(np1, 1)),
-                                       num_warps=RADIAL_WARPS)
+                                       num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK)
         _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
         eo = MX.grouped_gemm(iq, is_, *wdn["rc"], counts_t, M)                     # F3 -> (M, H) bf16
         inv = FG.inverse_order(order)
@@ -645,7 +648,8 @@ class _MoEFP8Full(torch.autograd.Function):
         da = torch.empty(M, device=dev, dtype=torch.float32) if want_ap else gw
         _radial_bwd_tile_kernel[(nt,)](d_inter, gu, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part, Mp,
                                        I, _EPS, want_ap, RADIAL_BC or _bc(I), np3,
-                                       triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_WARPS)
+                                       triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_WARPS,
+                                       TOK=not _DEBUG_NO_TOK)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
         grad_ap = K75._ap_grad_from_rows(da, row_expert, E, ctx.ap_shape, dev) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
