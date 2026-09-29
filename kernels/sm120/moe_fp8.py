@@ -729,7 +729,7 @@ def moe_fp8_full(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, 
 # act*up nor dGU is ever materialized as a row copy. The pid_n == 0 program of each row tile also
 # writes the token-major copy (B2 / B5 inputs): tiles are 128-row, expert-aligned (KPAD = 128), so a
 # tile covers exactly its own padded token range, zeros included.
-FUSE_ACT = True
+FUSE_ACT = False   # measured SLOWER: f3r 2.17 vs 1.67 ms, b6r 4.5 vs 3.58 ms (prologue ALU stalls the MMA pipeline)
 
 
 @triton.jit
