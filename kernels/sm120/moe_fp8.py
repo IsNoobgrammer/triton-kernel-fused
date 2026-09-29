@@ -31,6 +31,7 @@ FG = importlib.import_module("kernels.sm120.moe_fused_glu")
 
 STATS = None
 FUSED = True
+DX_ROWS = torch.float32   # B6 row buffer before the k-way sum (bf16 halves its traffic)
 _EPS = K75._NS_EPS
 
 
@@ -290,7 +291,7 @@ class _MoEFP8(torch.autograd.Function):
         if want_ap:
             grad_ap = K75._ap_grad_from_rows(da, ctx.row_expert, E, ctx.ap_shape, grad_out.device)
         grad_gu = K75._wgrad(dgu, hidden, ctx.offs, acc=ctx.acc[0], b_rows=st)      # B5 (bf16, phase 1)
-        dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=torch.float32)  # B6
+        dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)  # B6
         grad_hidden = FG.combine_gather(dx_rows, ctx.inv, N, top_k, out_dtype=grad_out.dtype)
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)
         grad_wt[order] = gw.to(grad_out.dtype)
