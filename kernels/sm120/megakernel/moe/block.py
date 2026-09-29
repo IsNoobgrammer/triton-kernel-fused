@@ -73,6 +73,10 @@ class _NormRouter(torch.autograd.Function):
         return d_x, d_nw, d_rw, None, None, None, None
 
 
+# MXFP8 experts (W8A8): set by BiBo --moe_fp8, or TKF_MOE_FP8=1
+FP8 = os.environ.get("TKF_MOE_FP8", "0") == "1"
+
+
 def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_routing=False,
                      want_gap=False):
     """Signature matches bench.eval_mlp_block.baseline_block so the frozen eval can score both.
@@ -105,6 +109,10 @@ def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_rou
     # the grouped path index_add_s into a bf16 buffer and rejects fp32 weights;
     # per_expert takes fp32, which is what the model's router emits
     tw = wgt.to(hn.dtype) if grouped else wgt.float()
-    out = (moe(hn, idx.long(), tw, w["gu"], w["dn"], codes) if grouped else
-           moe_per_expert(hn, idx.long(), tw, w["gu"], w["dn"], codes, act_params=act_params))
+    if FP8 and not grouped:        # MXFP8 expert path (kernels/sm120/moe_fp8.py): W8A8, fwd + bwd
+        from kernels.sm120.moe_fp8 import moe_fp8
+        out = moe_fp8(hn, idx.long(), tw, w["gu"], w["dn"], codes, act_params=act_params)
+    else:
+        out = (moe(hn, idx.long(), tw, w["gu"], w["dn"], codes) if grouped else
+               moe_per_expert(hn, idx.long(), tw, w["gu"], w["dn"], codes, act_params=act_params))
     return (out, idx, tw, gap) if return_routing else out

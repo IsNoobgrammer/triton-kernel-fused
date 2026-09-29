@@ -547,7 +547,7 @@ RADIAL_BWD_WARPS, RADIAL_BWD_BC = 4, 64      # radial bwd: swept, 2.33 -> 2.13 m
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
 DX_SLOT = False                     # B6 rows scattered to (token, slot): measured SLOWER (11.10 vs 10.85 ms)
 PREP_KERNEL = True                  # one Triton launch for tile maps / padded ranges (speed-neutral, fewer launches)
-DX8 = False                         # B6 per-row dx cached in MXFP8 before the k-way sum
+DX8 = True                          # B6 per-row dx cached in MXFP8 before the k-way sum (accepted: 1.42x, dx err +6%)
 XTOK8 = False                       # x token copy (B5 operand) re-quantized from the fp8 row copy
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
 EO_FP8 = True                       # F3 output EO in MXFP8 (combine fwd + combine bwd read it)
@@ -732,6 +732,11 @@ def _tok_buf(C, Mp, dev):
     return torch.empty(C, Mp, device=dev, dtype=MX.F8), torch.empty(Mp // 32, C, device=dev, dtype=torch.uint8)
 
 
+def _div_bc(C, want):
+    """a column chunk that divides C: `want` if it does, else _bc(C)."""
+    return want if (want and C % want == 0) else _bc(C)
+
+
 def _bc(C):
     return 128 if C % 128 == 0 else (64 if C % 64 == 0 else 32)
 
@@ -789,7 +794,10 @@ class _MoEFP8Full(torch.autograd.Function):
                 _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), TR=TILE_ROWS, num_warps=4)
             rows_f1 = st
         _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
-        np1 = I // MX.gemm_bn(H, 2 * I) if (EPI_FUSE or GU_FP8) else 0
+        bn1 = MX.gemm_bn(H, 2 * I)
+        # per-tile gate sum-of-squares only when no F1 tile straddles gate / up (I % BN == 0); else the
+        # radial kernel computes r itself (L0: I = 576)
+        np1 = I // bn1 if ((EPI_FUSE or GU_FP8) and I % bn1 == 0) else 0
         rss = torch.empty(M, max(np1, 1), device=dev, dtype=torch.float32) if np1 else row_alpha
         if GU_FP8:
             gus = torch.empty(M, 2 * I // 32, device=dev, dtype=torch.uint8)
@@ -803,7 +811,7 @@ class _MoEFP8Full(torch.autograd.Function):
         iT, iTs = _tok_buf(I, Mp, dev)
         r = torch.empty(M, device=dev, dtype=torch.float32)
         _radial_fwd_tile_kernel[(nt,)](gu, gus, row_act, row_alpha, *tiles, iq, is_, iT, iTs, rss, r, Mp, I, _EPS,
-                                       RADIAL_BC or _bc(I), np1, triton.next_power_of_2(max(np1, 1)),
+                                       _div_bc(I, RADIAL_BC), np1, triton.next_power_of_2(max(np1, 1)),
                                        TR=TILE_ROWS, num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
         inv = FG.inverse_order(order)
@@ -861,7 +869,7 @@ class _MoEFP8Full(torch.autograd.Function):
         da = torch.zeros(nt, device=dev, dtype=torch.float32) if want_ap else gw    # per TILE
         _radial_bwd_tile_kernel[(nt,)](d_inter, dis, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part,
                                        sw, gw, Mp,
-                                       I, _EPS, want_ap, RADIAL_BWD_BC or RADIAL_BC or _bc(I), np3,
+                                       I, _EPS, want_ap, _div_bc(I, RADIAL_BWD_BC or RADIAL_BC), np3,
                                        triton.next_power_of_2(max(np3, 1)), TR=TILE_ROWS, num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, ROWST=not _DEBUG_NO_ROW, GO8=DI_FP8 and not fuse_st)
         _pad(dT, dTs, pst, pads, pcnt, Mp)

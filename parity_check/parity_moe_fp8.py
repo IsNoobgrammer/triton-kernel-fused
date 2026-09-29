@@ -68,8 +68,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--N", type=int, default=16384)
     ap.add_argument("--time", action="store_true")
+    ap.add_argument("--E", type=int, default=64)
+    ap.add_argument("--k", type=int, default=6)
+    ap.add_argument("--I", type=int, default=768)
     a = ap.parse_args()
-    args = make(a.N)
+    args = make(a.N, E=a.E, k=a.k, I=a.I)
     ref = run("fp32", *args)
     bf = run("bf16", *args)
     F8.STATS = {}
@@ -77,7 +80,7 @@ def main():
     stats, F8.STATS = F8.STATS, None
     f8b = run("fp8", *args)
     rel = lambda u, v: ((u - v).norm() / v.norm()).item()
-    print(f"N={a.N} tokens, E=64 top-6, radial theta U(-2,2), gate rms ~3")
+    print(f"N={a.N} tokens, E={a.E} top-{a.k}, I={a.I}, radial theta U(-2,2), gate rms ~3")
     print(f"{'tensor':18s} {'bf16 vs fp32':>13s} {'fp8 vs fp32':>12s} {'fp8 / bf16':>11s}")
     ok = True
     for kk in ref:
