@@ -691,11 +691,11 @@ class _MoEFP8Full(torch.autograd.Function):
         return grad_hidden, None, grad_wt.view(N, top_k), grad_gu, grad_down, None, grad_ap
 
 
-def _ap_grad_from_tiles(da_t, counts_t, E, ap_shape):
+def _ap_grad_from_tiles(da_t, counts_t, E, ap_shape, bm=32):
     """per-TILE d(theta) -> per EXPERT. Tiles are expert-sorted (32-row, never crossing an expert), so
     each expert owns a contiguous run of ceil(count / 32) tiles: fixed-order fp64 prefix sums
     differenced at the run ends -- deterministic, no atomics."""
-    nt_e = (counts_t + 31) // 32
+    nt_e = (counts_t + bm - 1) // bm
     end = torch.cumsum(nt_e, 0)
     cs = torch.cat([da_t.new_zeros(1, dtype=torch.float64), da_t.double().cumsum(0)])
     per_e = (cs[end] - cs[end - nt_e]).float()
@@ -714,7 +714,313 @@ def _full_ok(hidden, act_codes, act_params, gate_up_proj):
             and (gate_up_proj.shape[1] // 2) % 32 == 0)
 
 
+def moe_fp8_full(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params=None):
+    if _full_ok(hidden, act_codes, act_params, gate_up_proj):
+        return _MoEFP8Full.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params)
+    return _MoEFP8.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params)
+
+
+# ================================================================== FUSE_ACT: radial inside the GEMM prologues
+# The radial activation needs a row-wide RMS, so it cannot live in the F1 EPILOGUE (a tile sees 128 of
+# 768 gate columns). It can live in the PROLOGUE of the GEMM that CONSUMES it: F3 loads GU (fp8) and r
+# (from the F1 epilogue partials), computes act*up in registers, quantizes along K and feeds the MMA.
+# Backward: B3 writes d_inter in fp8 plus S partials; B6 computes dGU in its prologue from d_inter,
+# GU, r, S and T (= w * gw / r^p). Neither the radial fwd nor the radial bwd kernel runs, and neither
+# act*up nor dGU is ever materialized as a row copy. The pid_n == 0 program of each row tile also
+# writes the token-major copy (B2 / B5 inputs): tiles are 128-row, expert-aligned (KPAD = 128), so a
+# tile covers exactly its own padded token range, zeros included.
+FUSE_ACT = True
+
+
+@triton.jit
+def _dq_tile(Q, S, rows, cols, mr, LD, BR: tl.constexpr, BC: tl.constexpr):
+    """(BR, BC) fp32 from an MXFP8 row-quantized matrix (Q (., LD) e4m3, S (., LD/32) e8m0)."""
+    q = tl.load(Q + rows[:, None].to(tl.int64) * LD + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+    sb = tl.min(cols, axis=0) // 32 + tl.arange(0, BC // 32)
+    s = tl.load(S + rows[:, None].to(tl.int64) * (LD // 32) + sb[None, :], mask=mr[:, None], other=127)
+    return tl.reshape(tl.reshape(q, (BR, BC // 32, 32)) * tl.exp2(s.to(tl.float32) - 127.0)[:, :, None], (BR, BC))
+
+
+@triton.jit
+def _qk(v, BR: tl.constexpr, BC: tl.constexpr):
+    """row quant along the K (column) axis: e4m3 values + (BR, BC/32) e8m0 scales, rounded up."""
+    vb = tl.reshape(v, (BR, BC // 32, 32))
+    ex = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(vb), axis=2), 1e-30) / 448.0)), -127.0), 127.0)
+    return tl.reshape(vb * tl.exp2(-ex)[:, :, None], (BR, BC)).to(tl.float8e4nv), (ex + 127.0).to(tl.uint8)
+
+
+@triton.jit
+def _tok_tile(v, kk, col0, QT, STS, Mp: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+    """token-major copy of a (BR, BC) tile (BR tokens of one expert, masked rows already 0): blocks of
+    32 tokens per column, stored transposed at QT[kk, col0 + j], scales at STS[(col0 + j) / 32, kk]."""
+    vt = tl.reshape(v, (BR // 32, 32, BC))
+    et = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(vt), axis=1), 1e-30) / 448.0)), -127.0), 127.0)
+    qt = tl.reshape(vt * tl.exp2(-et)[:, None, :], (BR, BC))
+    tl.store(QT + kk[:, None].to(tl.int64) * Mp + (col0 + tl.arange(0, BR))[None, :], tl.trans(qt).to(tl.float8e4nv))
+    tl.store(STS + (col0 // 32 + tl.arange(0, BR // 32))[:, None].to(tl.int64) * C + kk[None, :], (et + 127.0).to(tl.uint8))
+
+
+@triton.jit
+def _f3r_kernel(GU, GUS, RSS, ACT, ALPHA, B, BS, C, TE, TS, TM, START, PST, QT, STS, ROUT,
+                Mp: tl.constexpr, I: tl.constexpr, N: tl.constexpr, NP: tl.constexpr, NPP: tl.constexpr,
+                EPS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """EO = radial(GU) @ Wdn^T with the activation computed in the prologue (see FUSE_ACT)."""
+    pid = tl.program_id(0)
+    t = pid // (N // BN)
+    pid_n = pid % (N // BN)
+    mm = tl.load(TM + t)
+    if mm == 0:
+        return
+    e = tl.load(TE + t)
+    r0 = tl.load(TS + t)
+    rm = r0 + tl.arange(0, BM)
+    mr = tl.arange(0, BM) < mm
+    rn = pid_n * BN + tl.arange(0, BN)
+    jj = tl.arange(0, NPP)
+    ss = tl.load(RSS + rm[:, None].to(tl.int64) * NP + jj[None, :], mask=mr[:, None] & (jj < NP)[None, :], other=0.0)
+    r = tl.sqrt(tl.sum(ss, axis=1) / I + EPS)
+    at = tl.load(ACT + e)
+    aa = tl.load(ALPHA + e).to(tl.float32)
+    p = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0, 1.0 / (1.0 + tl.exp(-aa)))
+    rp = tl.exp(p * tl.log(r))
+    tok = pid_n == 0
+    if tok:
+        tl.store(ROUT + rm, r, mask=mr)
+    col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
+    KS: tl.constexpr = I // 32
+    Bb = B + e.to(tl.int64) * (N * I)
+    BSb = BS + e.to(tl.int64) * (N * KS)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, I, BK):
+        kk = k0 + tl.arange(0, BK)
+        g = _dq_tile(GU, GUS, rm, kk, mr, 2 * I, BM, BK)
+        u = _dq_tile(GU, GUS, rm, I + kk, mr, 2 * I, BM, BK)
+        z = g / r[:, None]
+        v = tl.where(mr[:, None], rp[:, None] * (z * (1.0 / (1.0 + tl.exp(-z)))) * u, 0.0)
+        a, a_s = _qk(v, BM, BK)
+        b = tl.load(Bb + rn[None, :] * I + kk[:, None])
+        b_s = tl.load(BSb + rn[:, None] * KS + (k0 // 32 + tl.arange(0, BK // 32))[None, :])
+        acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
+        if tok:
+            _tok_tile(v, kk, col0, QT, STS, Mp, I, BM, BK)
+    tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], acc.to(C.dtype.element_ty), mask=mr[:, None])
+
+
+@triton.jit
+def _b3s_kernel(A, AS, B, BS, CQ, CS, GU, GUS, R, SP, TE, TS, TM,
+                K: tl.constexpr, N: tl.constexpr, NP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                BK: tl.constexpr):
+    """d_inter = dO @ Wdn stored as MXFP8, plus per-row partials of S = sum go*u*df*gn over this tile
+    (go = the DEQUANTIZED stored value, so B6 sees exactly what S was computed from)."""
+    pid = tl.program_id(0)
+    t = pid // (N // BN)
+    pid_n = pid % (N // BN)
+    mm = tl.load(TM + t)
+    if mm == 0:
+        return
+    e = tl.load(TE + t)
+    r0 = tl.load(TS + t)
+    rm = r0 + tl.arange(0, BM)
+    mr = tl.arange(0, BM) < mm
+    rn = pid_n * BN + tl.arange(0, BN)
+    KS: tl.constexpr = K // 32
+    Bb = B + e.to(tl.int64) * (N * K)
+    BSb = BS + e.to(tl.int64) * (N * KS)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        rs = k0 // 32 + tl.arange(0, BK // 32)
+        a = tl.load(A + rm[:, None].to(tl.int64) * K + rk[None, :], mask=mr[:, None], other=0.0)
+        a_s = tl.load(AS + rm[:, None].to(tl.int64) * KS + rs[None, :], mask=mr[:, None], other=127)
+        b = tl.load(Bb + rn[None, :] * K + rk[:, None])
+        b_s = tl.load(BSb + rn[:, None] * KS + rs[None, :])
+        acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
+    vb = tl.reshape(acc, (BM, BN // 32, 32))
+    ex = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(vb), axis=2), 1e-30) / 448.0)), -127.0), 127.0)
+    q = tl.reshape(vb * tl.exp2(-ex)[:, :, None], (BM, BN)).to(tl.float8e4nv)
+    tl.store(CQ + rm[:, None].to(tl.int64) * N + rn[None, :], q, mask=mr[:, None])
+    tl.store(CS + rm[:, None].to(tl.int64) * (N // 32) + (pid_n * (BN // 32) + tl.arange(0, BN // 32))[None, :],
+             (ex + 127.0).to(tl.uint8), mask=mr[:, None])
+    go = tl.reshape(tl.reshape(q.to(tl.float32), (BM, BN // 32, 32)) * tl.exp2(ex)[:, :, None], (BM, BN))
+    g = _dq_tile(GU, GUS, rm, rn, mr, 2 * N, BM, BN)
+    u = _dq_tile(GU, GUS, rm, N + rn, mr, 2 * N, BM, BN)
+    r = tl.load(R + rm, mask=mr, other=1.0)
+    gn = g / r[:, None]
+    sig = 1.0 / (1.0 + tl.exp(-gn))
+    tl.store(SP + rm.to(tl.int64) * NP + pid_n, tl.sum(go * u * sig * (1.0 + gn * (1.0 - sig)) * gn, axis=1), mask=mr)
+
+
+@triton.jit
+def _b6r_kernel(GO, GOS, GU, GUS, R, SP, TW, TGW, ACT, ALPHA, B, BS, C, TE, TS, TM, START, PST, QT, STS, DA,
+                Mp: tl.constexpr, I: tl.constexpr, N: tl.constexpr, NP: tl.constexpr, NPP: tl.constexpr,
+                WANT_AP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """dx rows = dGU @ Wgu with dGU (radial backward) computed in the prologue; pid_n == 0 also writes
+    dGU token-major (B5 input) and the tile d(theta)."""
+    pid = tl.program_id(0)
+    t = pid // (N // BN)
+    pid_n = pid % (N // BN)
+    mm = tl.load(TM + t)
+    if mm == 0:
+        return
+    e = tl.load(TE + t)
+    r0 = tl.load(TS + t)
+    rm = r0 + tl.arange(0, BM)
+    mr = tl.arange(0, BM) < mm
+    rn = pid_n * BN + tl.arange(0, BN)
+    r = tl.load(R + rm, mask=mr, other=1.0)
+    at = tl.load(ACT + e)
+    aa = tl.load(ALPHA + e).to(tl.float32)
+    p = tl.where(at == 10, 2.0 / (1.0 + tl.exp(-2.0 * aa)) - 1.0, 1.0 / (1.0 + tl.exp(-aa)))
+    lr = tl.log(r)
+    rp = tl.exp(p * lr)
+    rpm1 = tl.exp((p - 1.0) * lr)
+    jj = tl.arange(0, NPP)
+    S_ = tl.sum(tl.load(SP + rm[:, None].to(tl.int64) * NP + jj[None, :], mask=mr[:, None] & (jj < NP)[None, :], other=0.0), axis=1)
+    T_ = tl.load(TW + rm, mask=mr, other=0.0) * tl.load(TGW + rm, mask=mr, other=0.0) / rp
+    tok = pid_n == 0
+    col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
+    K2: tl.constexpr = 2 * I
+    KS: tl.constexpr = K2 // 32
+    Bb = B + e.to(tl.int64) * (N * K2)
+    BSb = BS + e.to(tl.int64) * (N * KS)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, I, BK):                                   # gate half of dGU
+        kk = k0 + tl.arange(0, BK)
+        go = _dq_tile(GO, GOS, rm, kk, mr, I, BM, BK)
+        g = _dq_tile(GU, GUS, rm, kk, mr, K2, BM, BK)
+        u = _dq_tile(GU, GUS, rm, I + kk, mr, K2, BM, BK)
+        gn = g / r[:, None]
+        sig = 1.0 / (1.0 + tl.exp(-gn))
+        df = sig * (1.0 + gn * (1.0 - sig))
+        v = tl.where(mr[:, None], rpm1[:, None] * (go * u * df - (gn / I) * (S_ - p * T_)[:, None]), 0.0)
+        a, a_s = _qk(v, BM, BK)
+        b = tl.load(Bb + rn[None, :] * K2 + kk[:, None])
+        b_s = tl.load(BSb + rn[:, None] * KS + (k0 // 32 + tl.arange(0, BK // 32))[None, :])
+        acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
+        if tok:
+            _tok_tile(v, kk, col0, QT, STS, Mp, K2, BM, BK)
+    for k0 in range(0, I, BK):                                   # up half of dGU
+        kk = k0 + tl.arange(0, BK)
+        go = _dq_tile(GO, GOS, rm, kk, mr, I, BM, BK)
+        g = _dq_tile(GU, GUS, rm, kk, mr, K2, BM, BK)
+        gn = g / r[:, None]
+        v = tl.where(mr[:, None], go * (rp[:, None] * (gn * (1.0 / (1.0 + tl.exp(-gn))))), 0.0)
+        a, a_s = _qk(v, BM, BK)
+        b = tl.load(Bb + rn[None, :] * K2 + (I + kk)[:, None])
+        b_s = tl.load(BSb + rn[:, None] * KS + ((I + k0) // 32 + tl.arange(0, BK // 32))[None, :])
+        acc = tl.dot_scaled(a, a_s, "e4m3", b, b_s, "e4m3", acc)
+        if tok:
+            _tok_tile(v, I + kk, col0, QT, STS, Mp, K2, BM, BK)
+    tl.store(C + rm[:, None].to(tl.int64) * N + rn[None, :], acc.to(C.dtype.element_ty), mask=mr[:, None])
+    if WANT_AP:
+        if tok:
+            da = tl.where(mr, tl.where(at == 10, 1.0 - p * p, p * (1.0 - p)) * rp * lr * T_, 0.0)
+            tl.store(DA + t, tl.sum(da, axis=0))
+
+
+_FA_BM, _FA_BN, _FA_BK, _FA_W, _FA_ST = 128, 128, 64, 8, 3
+
+
+class _MoEFP8Act(torch.autograd.Function):
+    """FULL fp8 with the radial activation fused into the F3 / B6 prologues (FUSE_ACT)."""
+
+    @staticmethod
+    def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_codes, act_params):
+        ctx.acc = (K75._acc_target(gate_up_proj), K75._acc_target(down_proj))
+        wgu, wdn = MX.quant_weight(gate_up_proj), MX.quant_weight(down_proj)
+        hidden, = K75._amp_cast(hidden)
+        hidden = hidden.contiguous()
+        wt = wt.float()
+        N, H = hidden.shape
+        E = act_codes.shape[0]
+        top_k = idx.shape[1]
+        dev = hidden.device
+        st, sw, order, _, _, counts_t = K75._sort_by_expert(idx, wt, E, host=False)
+        M = idx.numel()
+        I = gate_up_proj.shape[1] // 2
+        ap32 = act_params.float().contiguous()
+        ap_shape = ap32.shape
+        if ap32.ndim == 1:
+            ap32 = ap32[:, None].contiguous()
+        act_e = act_codes.to(torch.int32).contiguous()
+        alpha_e = ap32[:, 0].contiguous()
+        tiles, pcnt, Mp, pads = _tiles(counts_t, M, dev)
+        nt = tiles[0].numel()
+        tiles128 = MX.tile_map(counts_t, M, _FA_BM)
+        c = counts_t.to(torch.int32)
+        t128 = (*tiles128, tiles[3], tiles[4])                     # (TE, TS, TM, START, PST) at 128 rows
+
+        xq, xs = _q(hidden, "F1 in (x)")
+        xT, xTs = _tok_buf(H, Mp, dev)
+        _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), num_warps=4)
+        _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
+        np1 = I // MX.gemm_bn(H, 2 * I)
+        rss = torch.empty(M, np1, device=dev, dtype=torch.float32)
+        gus = torch.empty(M, 2 * I // 32, device=dev, dtype=torch.uint8)
+        gu = MX.grouped_gemm(xq, xs, *wgu["rc"], counts_t, M, rows=st, epi=3, x1=gus, x2=rss, np_=np1)
+        iT, iTs = _tok_buf(I, Mp, dev)
+        r = torch.empty(M, device=dev, dtype=torch.float32)
+        eo = torch.empty(M, H, device=dev, dtype=hidden.dtype)
+        _f3r_kernel[(tiles128[0].numel() * (H // _FA_BN),)](
+            gu, gus, rss, act_e, alpha_e, *wdn["rc"], eo, *t128, iT, iTs, r, Mp, I, H, np1,
+            triton.next_power_of_2(np1), _EPS, _FA_BM, _FA_BN, _FA_BK, num_warps=_FA_W, num_stages=_FA_ST)
+        inv = FG.inverse_order(order)
+        out = FG.combine_gather(eo, inv, N, top_k, w=sw, out_dtype=hidden.dtype)
+        ctx.save_for_backward(st, sw, order, act_e, alpha_e, gu, gus, eo, xT, xTs, iT, iTs, pcnt, pads, r,
+                              *tiles, *tiles128)
+        ctx.inv, ctx.counts_t, ctx.Mp, ctx.wq = inv, counts_t, Mp, (wgu, wdn)
+        ctx.shapes = (N, H, top_k, E, M, I)
+        ctx.ap_shape = ap_shape
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (st, sw, order, act_e, alpha_e, gu, gus, eo, xT, xTs, iT, iTs, pcnt, pads, r, *tt) = ctx.saved_tensors
+        tiles, tiles128 = tuple(tt[:5]), tuple(tt[5:])
+        N, H, top_k, E, M, I = ctx.shapes
+        wgu, wdn = ctx.wq
+        Mp, dev = ctx.Mp, grad_out.device
+        nt = tiles[0].numel()
+        pst = tiles[4]
+        t128 = (*tiles128, tiles[3], tiles[4])
+        grad_out = grad_out.contiguous()
+        gq, gs = _row_buf(M, H, dev)
+        gT, gTs = _tok_buf(H, Mp, dev)
+        gw = torch.empty(M, device=dev, dtype=torch.float32)
+        _combine_bwd_tile_kernel[(nt,)](grad_out, eo, sw, st, *tiles, gq, gs, gT, gTs, gw, Mp, H, _bc(H),
+                                        num_warps=4)
+        _pad(gT, gTs, pst, pads, pcnt, Mp)
+        grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
+                                                                          out=out, accumulate=a, even=True))  # B2
+        np3 = I // _FA_BN
+        sp = torch.empty(M, np3, device=dev, dtype=torch.float32)
+        diq, dis = _row_buf(M, I, dev)
+        _b3s_kernel[(tiles128[0].numel() * (I // _FA_BN),)](
+            gq, gs, *wdn["cr"], diq, dis, gu, gus, r, sp, *tiles128, H, I, np3, _FA_BM, _FA_BN, 128,
+            num_warps=_FA_W, num_stages=_FA_ST)                                     # B3 -> fp8 + S partials
+        want_ap = ctx.needs_input_grad[6]
+        dT, dTs = _tok_buf(2 * I, Mp, dev)
+        nt128 = tiles128[0].numel()
+        da = torch.zeros(nt128, device=dev, dtype=torch.float32) if want_ap else gw
+        dx_rows = torch.empty(M, H, device=dev, dtype=DX_ROWS)
+        _b6r_kernel[(nt128 * (H // _FA_BN),)](
+            diq, dis, gu, gus, r, sp, sw, gw, act_e, alpha_e, *wgu["cr"], dx_rows, *t128, dT, dTs, da,
+            Mp, I, H, np3, triton.next_power_of_2(np3), want_ap, _FA_BM, _FA_BN, _FA_BK,
+            num_warps=_FA_W, num_stages=_FA_ST)                                     # B6 (radial bwd inside)
+        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=_FA_BM) if want_ap else None
+        grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
+                                                                        out=out, accumulate=a, even=True))    # B5
+        grad_hidden = FG.combine_gather(dx_rows, ctx.inv, N, top_k, out_dtype=grad_out.dtype)
+        grad_wt = torch.zeros(N * top_k, device=dev, dtype=grad_out.dtype)
+        grad_wt[order] = gw.to(grad_out.dtype)
+        return grad_hidden, None, grad_wt.view(N, top_k), grad_gu, grad_down, None, grad_ap
+
+
 def moe_fp8(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params=None):
     if _full_ok(hidden, act_codes, act_params, gate_up_proj):
+        I = gate_up_proj.shape[1] // 2
+        if FUSE_ACT and I % _FA_BN == 0 and hidden.shape[1] % _FA_BN == 0 and KPAD % _FA_BM == 0:
+            return _MoEFP8Act.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes,
+                                    act_params)
         return _MoEFP8Full.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params)
     return _MoEFP8.apply(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj, act_codes, act_params)
