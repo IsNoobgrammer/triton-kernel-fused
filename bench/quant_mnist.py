@@ -12,7 +12,8 @@ reduction dim (1D blocks, never across tokens):
   fwd   y  = q(x  | blocks along in)  @ q(W  | along in)^T
   dgrad dx = q(dy | along out)        @ q(W  | along out)
   wgrad dW = q(dy^T | along tokens)   @ q(x^T | along tokens)
-Grid: element e4m3 / e5m2 x scale e8m0 (power of two, rounded up) / fp32 / fp16 x block 32 / 64 / 128,
+Grid: element e4m3 / e5m2 (hardware casts) / e3m4 (EMULATED, emu_round) x scale e8m0 (power of two,
+rounded up) / fp32 / bf16 / fp16 x block 32 / 64 / 128,
 plus fp32 and bf16 baselines and one 2D-weight arm. Reported: final train loss (mean of the last
 100 steps), test loss / accuracy (mean over seeds), and per-operand underflow (non-zero value ->
 0) and saturation (|x / s| > max) rates averaged over training.
@@ -27,13 +28,30 @@ import torch
 import torch.nn.functional as F
 
 dev = "cuda"
-FMT = {"e4m3": (torch.float8_e4m3fn, 448.0), "e5m2": (torch.float8_e5m2, 57344.0)}
 STATS = {}
+
+
+def emu_round(r, E, M, bias, maxv):
+    """Round-to-nearest-even onto a (1, E, M) float with exponent bias `bias`, subnormals, and
+    saturation at maxv -- a bit-exact software stand-in for formats the hardware lacks (e3m4).
+    Validated against torch's e4m3fn / e5m2 casts in bench/quant_emu.py."""
+    a = r.abs().clamp(max=maxv)
+    e = (torch.frexp(a)[1] - 1).float().clamp(min=1 - bias)   # exact floor(log2 a); subnormals share the min exponent
+    step = torch.exp2(e - M)
+    q = (torch.round(a / step) * step).clamp(max=maxv)
+    return torch.copysign(q, r)
+
+
+# name -> (quantize fn on already-scaled values, max, min normal). e3m4 is EMULATED (no sm120 MMA):
+# 1 sign / 3 exponent / 4 mantissa, bias 3, "fn" convention like e4m3fn -> max 2^4 * 1.875 = 30.
+FMT = {"e4m3": (lambda r: r.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float(), 448.0, 2.0 ** -6),
+       "e5m2": (lambda r: r.clamp(-57344.0, 57344.0).to(torch.float8_e5m2).float(), 57344.0, 2.0 ** -14),
+       "e3m4": (lambda r: emu_round(r, 3, 4, 3, 30.0), 30.0, 2.0 ** -2)}
 
 
 def fq(t, dim, fmt, scale, blk, tag):
     """Fake-quantize t with 1D blocks of `blk` along `dim`."""
-    dt, emax = FMT[fmt]
+    qf, emax, _ = FMT[fmt]
     x = t.float().movedim(dim, -1)
     shp = x.shape
     K = shp[-1]
@@ -53,7 +71,7 @@ def fq(t, dim, fmt, scale, blk, tag):
         s = (amax / emax * (1 + 2 ** -7)).to(torch.bfloat16).float()
     r = xb / s
     # saturate like the hardware cvt (satfinite); torch's own cast turns out-of-range into NaN
-    y = (r.clamp(-emax, emax).to(dt).float() * s).reshape(*x.shape)
+    y = (qf(r) * s).reshape(*x.shape)
     if pad:
         y = y[..., :K]
     if tag is not None:
@@ -70,10 +88,10 @@ def fq2d(t, fmt, scale, blk):
     """2D blk x blk blocks (weights): W and W^T quantize to the SAME values."""
     R, C = t.shape
     xb = t.float().reshape(R // blk, blk, C // blk, blk)
-    dt, emax = FMT[fmt]
+    qf, emax, _ = FMT[fmt]
     amax = xb.abs().amax((1, 3), keepdim=True).clamp_min(1e-30)
     s = torch.exp2(torch.ceil(torch.log2(amax / emax)).clamp(-127, 127)) if scale == "e8m0" else amax / emax
-    return ((xb / s).to(dt).float() * s).reshape(R, C)
+    return (qf(xb / s) * s).reshape(R, C)
 
 
 class QLinearFn(torch.autograd.Function):
@@ -176,6 +194,8 @@ def main():
     tr, te = data()
     arms = [("fp32", None, 0, False), ("bf16", None, 0, False)]
     arms += [(f, s, b, False) for f, s, b in itertools.product(("e4m3", "e5m2"), ("e8m0", "fp32", "fp16"), (32, 64, 128))]
+    arms += [("e4m3", "bf16", b, False) for b in (32, 64, 128)]
+    arms += [("e3m4", s, b, False) for s, b in itertools.product(("e8m0", "fp32", "bf16", "fp16"), (32, 64, 128))]
     arms += [("e4m3", "e8m0", 32, True)]
     print(f"{'arm':30s} {'train loss':>11s} {'test loss':>10s} {'test acc':>9s} "
           f"{'x zero%':>8s} {'W zero%':>8s} {'dy zero%':>9s} {'dy sat%':>8s} {'s/run':>6s}", flush=True)
