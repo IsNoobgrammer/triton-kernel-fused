@@ -716,7 +716,7 @@ def _prep(counts_t, M, bm_b, dev):
                                                       start, pst, pcnt, pads, E, triton.next_power_of_2(E),
                                                       TILE_ROWS, bm_b, KPAD, BLOCK, num_warps=4)
     for bm, tm in ((TILE_ROWS, (TEa, TSa, TMa)), (bm_b, (TEb, TSb, TMb))):
-        MX._TM_CACHE[(id(counts_t), counts_t._version, M, bm)] = (counts_t, tm)
+        MX.tm_put((id(counts_t), counts_t._version, M, bm), counts_t, tm)
     Mp = M + KPAD * E
     return (TEa, TSa, TMa, start, pst), pcnt, Mp, pads
 

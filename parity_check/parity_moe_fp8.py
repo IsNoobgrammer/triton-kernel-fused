@@ -91,6 +91,18 @@ def main():
         print(f"{kk:18s} {eb:13.2e} {e8:12.2e} {e8 / max(eb, 1e-12):10.1f}x")
     det = all(torch.equal(f8[kk], f8b[kk]) for kk in f8)
     print(f"fp8 two runs bitwise identical: {det}")
+    # leak: every call caches tile maps; 40 calls (80 inserts) must stay under the 64-entry cap with flat
+    # allocated memory (the pre-fill in _prep once bypassed eviction: +6.8 MB/step in training)
+    small = make(4096, E=a.E, k=a.k, I=a.I)
+    mem = []
+    for _ in range(40):
+        run("fp8", *small)
+        torch.cuda.synchronize(); mem.append(torch.cuda.memory_allocated())
+    MX = importlib.import_module("kernels.sm120.mxfp8")
+    leak_ok = len(MX._TM_CACHE) <= 64 and mem[-1] - mem[9] < 2 ** 20
+    print(f"leak: tile-map cache {len(MX._TM_CACHE)} entries (cap 64), allocated drift calls 10->40 "
+          f"{(mem[-1] - mem[9]) / 2 ** 20:+.2f} MiB -> {'ok' if leak_ok else 'LEAK'}")
+    ok &= leak_ok
     print("fp8 operands: flushed-to-0 % / saturated % (mean over calls)")
     for tag, v in stats.items():
         print(f"   {tag:18s} {statistics.mean(x[0] for x in v):8.4f} / {statistics.mean(x[1] for x in v):.4f}")

@@ -201,11 +201,17 @@ def tile_map(counts_t, m_rows, bm):
     if hit is not None and hit[0] is counts_t:
         return hit[1]
     tm = build_tile_map(None, counts_t, counts_t.device, bm=bm, m_rows=m_rows)
+    tm_put(key, counts_t, tm)
+    return tm
+
+
+def tm_put(key, counts_t, tm):
+    """Every insert goes through here so the cache stays bounded: moe_fp8._prep pre-fills it, after which
+    tile_map() only ever HITS -- evicting on the miss path alone leaked every step's maps (~6.8 MB/step)."""
     _TM_CACHE[key] = (counts_t, tm)
     if len(_TM_CACHE) > 64:
         for k in list(_TM_CACHE)[:32]:
             _TM_CACHE.pop(k, None)
-    return tm
 
 
 def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.bfloat16, cfg=None,
