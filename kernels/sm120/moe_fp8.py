@@ -436,7 +436,8 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
                             TW, TGW, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, WANT_AP: tl.constexpr, BC: tl.constexpr,
                             NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True,
-                            GU8: tl.constexpr = False, GO8: tl.constexpr = False, TR: tl.constexpr = 32):
+                            GU8: tl.constexpr = False, GO8: tl.constexpr = False, TR: tl.constexpr = 32,
+                            ROWST: tl.constexpr = True):
     """dGU of radial on 32 rows: row copy along 2I (B6 input) + token copy (B5 left operand)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -486,8 +487,9 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
         gu_ = go * u
         gg = tl.where(mr[:, None], rpm1[:, None] * (gu_ * df - (gn / I) * (sa - p * tt)[:, None]), 0.0)
         gup = tl.where(mr[:, None], go * (rp[:, None] * f), 0.0)
-        _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, TR, BC)
-        _qrow_store(gup, rows, I + cols, mr, QR, SR, 2 * I, TR, BC)
+        if ROWST:
+            _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, TR, BC)
+            _qrow_store(gup, rows, I + cols, mr, QR, SR, 2 * I, TR, BC)
         if TOK:
             _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I, TR)
             _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I, TR)
@@ -533,7 +535,8 @@ GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3:
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
 EO_FP8 = True                       # F3 output EO in MXFP8 (combine fwd + combine bwd read it)
 DI_FP8 = True                       # B3 output d_inter in MXFP8 (the radial bwd reads it twice)
-_DEBUG_NO_TOK = False               # TIMING ONLY: skip the token-copy stores (wgrads then read garbage)
+_DEBUG_NO_TOK = False
+_DEBUG_NO_ROW = False               # TIMING ONLY: skip the radial-bwd row stores               # TIMING ONLY: skip the token-copy stores (wgrads then read garbage)
 KPAD = 128    # expert token ranges in the token copies are padded to this: the wgrad K loop runs UNMASKED
 #               (masked fp8 K loads were 2.8x slower than bf16; unmasked is 1.9-2.4x FASTER)
 
@@ -727,7 +730,7 @@ class _MoEFP8Full(torch.autograd.Function):
                                        sw, gw, Mp,
                                        I, _EPS, want_ap, RADIAL_BWD_BC or RADIAL_BC or _bc(I), np3,
                                        triton.next_power_of_2(max(np3, 1)), TR=TILE_ROWS, num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
-                                       TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, GO8=DI_FP8 and not fuse_st)
+                                       TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, ROWST=not _DEBUG_NO_ROW, GO8=DI_FP8 and not fuse_st)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
         grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=TILE_ROWS) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
