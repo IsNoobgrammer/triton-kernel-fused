@@ -545,8 +545,8 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
 RADIAL_BWD_WARPS, RADIAL_BWD_BC = 4, 64      # radial bwd: swept, 2.33 -> 2.13 ms (fwd keeps BC 128)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
-DX_SLOT = True                      # B6 rows scattered to (token, slot): contiguous k-way sum
-PREP_KERNEL = True                  # one Triton launch for tile maps / padded ranges (vs ~30 torch ops)
+DX_SLOT = False                     # B6 rows scattered to (token, slot): measured SLOWER (11.10 vs 10.85 ms)
+PREP_KERNEL = True                  # one Triton launch for tile maps / padded ranges (speed-neutral, fewer launches)
 DX8 = False                         # B6 per-row dx cached in MXFP8 before the k-way sum
 XTOK8 = False                       # x token copy (B5 operand) re-quantized from the fp8 row copy
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
