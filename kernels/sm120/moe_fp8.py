@@ -328,6 +328,7 @@ def moe_fp8_phase1(hidden, top_k_indices, top_k_weights, gate_up_proj, down_proj
 # rounded up to 32 (the pad is written as zeros by the tile that owns it). Mp = M + 32 E is a static
 # bound, so nothing is read back to the host.
 FULL = True
+TILE_ROWS = 32      # rows per producer tile (a multiple of 32 dividing KPAD)
 
 
 @triton.jit
@@ -342,14 +343,16 @@ def _qrow_store(v, rows, cols, mr, Q, S, LD, BR: tl.constexpr, BC: tl.constexpr)
 
 
 @triton.jit
-def _qtok_store(v, cols, col0, QT, ST, Mp, C):
-    """token quant of a (32, BC) tile (32 tokens of ONE expert, masked rows already 0): one scale per
-    column over the 32 tokens, stored TRANSPOSED at QT[col, col0 + j]."""
-    ex = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(v), axis=0), 1e-30) / 448.0)), -127.0), 127.0)
-    q = v * tl.exp2(-ex)[None, :]
-    tl.store(QT + cols[:, None].to(tl.int64) * Mp + (col0 + tl.arange(0, 32))[None, :], tl.trans(q).to(tl.float8e4nv))
+def _qtok_store(v, cols, col0, QT, ST, Mp, C, TR: tl.constexpr = 32):
+    """token quant of a (TR, BC) tile (TR tokens of ONE expert, masked rows already 0): one scale per
+    column per 32 tokens, stored TRANSPOSED at QT[col, col0 + j]; scales token-block-major."""
+    BC: tl.constexpr = v.shape[1]
+    vt = tl.reshape(v, (TR // 32, 32, BC))
+    ex = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(vt), axis=1), 1e-30) / 448.0)), -127.0), 127.0)
+    q = tl.reshape(vt * tl.exp2(-ex)[:, None, :], (TR, BC))
+    tl.store(QT + cols[:, None].to(tl.int64) * Mp + (col0 + tl.arange(0, TR))[None, :], tl.trans(q).to(tl.float8e4nv))
     # scales TOKEN-BLOCK-major (Mp/32, C): one K step of the wgrad reads a contiguous row of them
-    tl.store(ST + (col0 // 32).to(tl.int64) * C + cols, (ex + 127.0).to(tl.uint8))
+    tl.store(ST + (col0 // 32 + tl.arange(0, TR // 32))[:, None].to(tl.int64) * C + cols[None, :], (ex + 127.0).to(tl.uint8))
 
 
 @triton.jit
@@ -359,13 +362,13 @@ def _ld_gu(GU, GUS, rows, cols, mr, TWO_I, GU8: tl.constexpr, BC: tl.constexpr):
     if GU8:
         sb = tl.min(cols, axis=0) // 32 + tl.arange(0, BC // 32)
         sc = tl.load(GUS + rows[:, None].to(tl.int64) * (TWO_I // 32) + sb[None, :], mask=mr[:, None], other=127)
-        v = tl.reshape(tl.reshape(v, (32, BC // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (32, BC))
+        v = tl.reshape(tl.reshape(v, (v.shape[0], BC // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (v.shape[0], BC))
     return v
 
 
 @triton.jit
 def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, BC: tl.constexpr,
-                  QR=None, SR=None, ROW: tl.constexpr = False):
+                  QR=None, SR=None, ROW: tl.constexpr = False, TR: tl.constexpr = 32):
     """token copy of x in EXPERT order (gathered through the sort): the B5 right operand; with ROW
     also the row-quantized copy in expert order, so F1 reads contiguously (no gather in the GEMM)."""
     t = tl.program_id(0)
@@ -375,22 +378,22 @@ def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, 
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
     col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
-    rows = r0 + tl.arange(0, 32)
-    mr = tl.arange(0, 32) < mm
+    rows = r0 + tl.arange(0, TR)
+    mr = tl.arange(0, TR) < mm
     tok = tl.load(SRT + rows, mask=mr, other=0)
     for c0 in range(0, H, BC):
         cols = c0 + tl.arange(0, BC)
         x = tl.load(X + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
-        _qtok_store(x, cols, col0, QT, STS, Mp, H)
+        _qtok_store(x, cols, col0, QT, STS, Mp, H, TR)
         if ROW:
-            _qrow_store(x, rows, cols, mr, QR, SR, H, 32, BC)
+            _qrow_store(x, rows, cols, mr, QR, SR, H, TR, BC)
 
 
 @triton.jit
 def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR, QT, STS, RSS, ROUT, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, BC: tl.constexpr,
                             NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True,
-                            GU8: tl.constexpr = False):
+                            GU8: tl.constexpr = False, TR: tl.constexpr = 32):
     """inter = r^p SiLU(g/r) u (codes 8/10) on 32 rows: row copy (F3 input) + token copy (B2 input)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -399,8 +402,8 @@ def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR,
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
     col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
-    rows = r0 + tl.arange(0, 32)
-    mr = tl.arange(0, 32) < mm
+    rows = r0 + tl.arange(0, TR)
+    mr = tl.arange(0, TR) < mm
     at = tl.load(ACT + e)                              # per EXPERT: a tile never crosses one
     aa = tl.load(ALPHA + e).to(tl.float32)
     base = GU + rows[:, None].to(tl.int64) * (2 * I)
@@ -409,7 +412,7 @@ def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR,
         ss = tl.load(RSS + rows[:, None].to(tl.int64) * NP + jj[None, :], mask=mr[:, None] & (jj < NP)[None, :], other=0.0)
         r = tl.sqrt(tl.sum(ss, axis=1) / I + EPS)    # sum of squares from the F1 epilogue: no extra pass
     else:
-        acc = tl.zeros((32,), tl.float32)
+        acc = tl.zeros((TR,), tl.float32)
         for c0 in range(0, I, BC):
             g = _ld_gu(GU, GUS, rows, c0 + tl.arange(0, BC), mr, 2 * I, GU8, BC)
             acc += tl.sum(g * g, axis=1)
@@ -423,9 +426,9 @@ def _radial_fwd_tile_kernel(GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST, QR, SR,
         u = _ld_gu(GU, GUS, rows, I + cols, mr, 2 * I, GU8, BC)
         z = g / r[:, None]
         v = tl.where(mr[:, None], rp[:, None] * (z * (1.0 / (1.0 + tl.exp(-z)))) * u, 0.0)
-        _qrow_store(v, rows, cols, mr, QR, SR, I, 32, BC)
+        _qrow_store(v, rows, cols, mr, QR, SR, I, TR, BC)
         if TOK:
-            _qtok_store(v, cols, col0, QT, STS, Mp, I)
+            _qtok_store(v, cols, col0, QT, STS, Mp, I, TR)
 
 
 @triton.jit
@@ -433,7 +436,7 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
                             TW, TGW, Mp,
                             I: tl.constexpr, EPS: tl.constexpr, WANT_AP: tl.constexpr, BC: tl.constexpr,
                             NP: tl.constexpr, NPP: tl.constexpr, TOK: tl.constexpr = True,
-                            GU8: tl.constexpr = False, GO8: tl.constexpr = False):
+                            GU8: tl.constexpr = False, GO8: tl.constexpr = False, TR: tl.constexpr = 32):
     """dGU of radial on 32 rows: row copy along 2I (B6 input) + token copy (B5 left operand)."""
     t = tl.program_id(0)
     mm = tl.load(TM + t)
@@ -442,8 +445,8 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
     col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
-    rows = r0 + tl.arange(0, 32)
-    mr = tl.arange(0, 32) < mm
+    rows = r0 + tl.arange(0, TR)
+    mr = tl.arange(0, TR) < mm
     at = tl.load(ACT + e)                              # per EXPERT: a tile never crosses one
     aa = tl.load(ALPHA + e).to(tl.float32)
     gub = GU + rows[:, None].to(tl.int64) * (2 * I)
@@ -461,7 +464,7 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
         # already computed by the combine backward): no pass over the row at all
         tt = tl.load(TW + rows, mask=mr, other=0.0) * tl.load(TGW + rows, mask=mr, other=0.0) / rp
     else:
-        sa = tl.zeros((32,), tl.float32)
+        sa = tl.zeros((TR,), tl.float32)
         for c0 in range(0, I, BC):
             cols = c0 + tl.arange(0, BC)
             go = _ld_gu(GO, GOS, rows, cols, mr, I, GO8, BC)
@@ -483,11 +486,11 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
         gu_ = go * u
         gg = tl.where(mr[:, None], rpm1[:, None] * (gu_ * df - (gn / I) * (sa - p * tt)[:, None]), 0.0)
         gup = tl.where(mr[:, None], go * (rp[:, None] * f), 0.0)
-        _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, 32, BC)
-        _qrow_store(gup, rows, I + cols, mr, QR, SR, 2 * I, 32, BC)
+        _qrow_store(gg, rows, cols, mr, QR, SR, 2 * I, TR, BC)
+        _qrow_store(gup, rows, I + cols, mr, QR, SR, 2 * I, TR, BC)
         if TOK:
-            _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I)
-            _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I)
+            _qtok_store(gg, cols, col0, QT, STS, Mp, 2 * I, TR)
+            _qtok_store(gup, I + cols, col0, QT, STS, Mp, 2 * I, TR)
     if WANT_AP:                                        # d(theta) summed over the tile: one value per tile
         da = tl.where(mr, tl.where(at == 10, 1.0 - p * p, p * (1.0 - p)) * rp * lr * tt, 0.0)
         tl.store(DA + t, tl.sum(da, axis=0))
@@ -495,7 +498,7 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
 
 @triton.jit
 def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT, STS, GW, Mp,
-                             H: tl.constexpr, BC: tl.constexpr, EOS=None, EO8: tl.constexpr = False):
+                             H: tl.constexpr, BC: tl.constexpr, EOS=None, EO8: tl.constexpr = False, TR: tl.constexpr = 32):
     """dO = w * grad_out[token], dw = <grad_out[token], eo> on 32 rows: row copy (B3 input) + token
     copy (B2 left operand)."""
     t = tl.program_id(0)
@@ -505,19 +508,19 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
     e = tl.load(TE + t)
     r0 = tl.load(TS + t)
     col0 = tl.load(PST + e) + (r0 - tl.load(START + e))
-    rows = r0 + tl.arange(0, 32)
-    mr = tl.arange(0, 32) < mm
+    rows = r0 + tl.arange(0, TR)
+    mr = tl.arange(0, TR) < mm
     tok = tl.load(SRT + rows, mask=mr, other=0)
     w = tl.load(W + rows, mask=mr, other=0.0).to(tl.float32)
-    gw = tl.zeros((32,), tl.float32)
+    gw = tl.zeros((TR,), tl.float32)
     for c0 in range(0, H, BC):
         cols = c0 + tl.arange(0, BC)
         go = tl.load(GO + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
         eo = _ld_gu(EO, EOS, rows, cols, mr, H, EO8, BC)
         gw += tl.sum(go * eo, axis=1)
         ge = go * w[:, None]
-        _qrow_store(ge, rows, cols, mr, QR, SR, H, 32, BC)
-        _qtok_store(ge, cols, col0, QT, STS, Mp, H)
+        _qrow_store(ge, rows, cols, mr, QR, SR, H, TR, BC)
+        _qtok_store(ge, cols, col0, QT, STS, Mp, H, TR)
     tl.store(GW + rows, gw, mask=mr)
 
 
@@ -562,7 +565,7 @@ def combine_gather_q(rq, rs, inv, n_tok, k, w, out_dtype):
 
 
 def _tiles(counts_t, M, dev):
-    TE, TS, TM = FG.build_tile_map(None, counts_t, dev, bm=32, m_rows=M)
+    TE, TS, TM = MX.tile_map(counts_t, M, TILE_ROWS)
     c = counts_t.to(torch.int32)
     start = (torch.cumsum(c, 0) - c).to(torch.int32)
     c32 = ((c + 31) // 32) * 32
@@ -644,11 +647,11 @@ class _MoEFP8Full(torch.autograd.Function):
         xT, xTs = _tok_buf(H, Mp, dev)
         if X_SORTED:                                      # x row copy in EXPERT order (F1 without gather)
             xq, xs = _row_buf(M, H, dev)
-            _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), xq, xs, True, num_warps=4)
+            _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), xq, xs, True, TR=TILE_ROWS, num_warps=4)
             rows_f1 = None
         else:                                             # quantize the N unsorted tokens once, F1 gathers
             xq, xs = _q(hidden, "F1 in (x)")
-            _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), num_warps=4)
+            _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), TR=TILE_ROWS, num_warps=4)
             rows_f1 = st
         _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
         np1 = I // MX.gemm_bn(H, 2 * I) if (EPI_FUSE or GU_FP8) else 0
@@ -666,7 +669,7 @@ class _MoEFP8Full(torch.autograd.Function):
         r = torch.empty(M, device=dev, dtype=torch.float32)
         _radial_fwd_tile_kernel[(nt,)](gu, gus, row_act, row_alpha, *tiles, iq, is_, iT, iTs, rss, r, Mp, I, _EPS,
                                        RADIAL_BC or _bc(I), np1, triton.next_power_of_2(max(np1, 1)),
-                                       num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
+                                       TR=TILE_ROWS, num_warps=RADIAL_WARPS, TOK=not _DEBUG_NO_TOK, GU8=GU_FP8)
         _pad(iT, iTs, tiles[4], pads, pcnt, Mp)
         inv = FG.inverse_order(order)
         if EO_FP8:
@@ -701,7 +704,7 @@ class _MoEFP8Full(torch.autograd.Function):
         gT, gTs = _tok_buf(H, Mp, dev)
         gw = torch.empty(M, device=dev, dtype=torch.float32)
         _combine_bwd_tile_kernel[(nt,)](grad_out, eo, sw, st, *tiles, gq, gs, gT, gTs, gw, Mp, H, _bc(H),
-                                        eos, EO_FP8, num_warps=4)
+                                        eos, EO_FP8, TR=TILE_ROWS, num_warps=4)
         _pad(gT, gTs, pst, pads, pcnt, Mp)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
                                                                           out=out, accumulate=a, even=True))       # B2
@@ -723,10 +726,10 @@ class _MoEFP8Full(torch.autograd.Function):
         _radial_bwd_tile_kernel[(nt,)](d_inter, dis, gu, gus, row_act, row_alpha, *tiles, dq, ds, dT, dTs, da, r, part,
                                        sw, gw, Mp,
                                        I, _EPS, want_ap, RADIAL_BWD_BC or RADIAL_BC or _bc(I), np3,
-                                       triton.next_power_of_2(max(np3, 1)), num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
+                                       triton.next_power_of_2(max(np3, 1)), TR=TILE_ROWS, num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, GO8=DI_FP8 and not fuse_st)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
-        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape) if want_ap else None
+        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=TILE_ROWS) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
                                                                         out=out, accumulate=a, even=True))         # B5
         dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)      # B6
