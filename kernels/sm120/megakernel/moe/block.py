@@ -75,6 +75,7 @@ class _NormRouter(torch.autograd.Function):
 
 # MXFP8 experts (W8A8): set by BiBo --moe_fp8, or TKF_MOE_FP8=1
 FP8 = os.environ.get("TKF_MOE_FP8", "0") == "1"
+FP8_ALL_ACTIVE = False     # also route all-active layers (top_k == E) through fp8
 
 
 def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_routing=False,
@@ -109,7 +110,9 @@ def megakernel_block(x, w, codes, top_k=6, eps=1e-6, act_params=None, return_rou
     # the grouped path index_add_s into a bf16 buffer and rejects fp32 weights;
     # per_expert takes fp32, which is what the model's router emits
     tw = wgt.to(hn.dtype) if grouped else wgt.float()
-    if FP8 and not grouped:        # MXFP8 expert path (kernels/sm120/moe_fp8.py): W8A8, fwd + bwd
+    # all-active layers (top_k == E, the L0 ensemble) stay bf16: moe_per_expert has a DENSE path there
+    # (no sort / routing) that fp8 loses to -- measured 0.93-0.99x at E=8, I=576
+    if FP8 and not grouped and (FP8_ALL_ACTIVE or idx.shape[1] < codes.numel()):  # MXFP8 experts, W8A8 fwd+bwd
         from kernels.sm120.moe_fp8 import moe_fp8
         out = moe_fp8(hn, idx.long(), tw, w["gu"], w["dn"], codes, act_params=act_params)
     else:
