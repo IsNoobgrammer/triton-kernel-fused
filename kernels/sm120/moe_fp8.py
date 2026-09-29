@@ -525,7 +525,7 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 # (history: with bf16 GU and both S and T in the epilogue it was SLOWER; row reductions in the F1/B3 epilogues: measured SLOWER (B3 +0.9 ms reading G/U,
 #                    radial bwd unchanged at 2.55 ms) -- the radial kernels are not pass-bound
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
-RADIAL_BWD_WARPS, RADIAL_BWD_BC = None, None   # radial bwd only (None = RADIAL_*)
+RADIAL_BWD_WARPS, RADIAL_BWD_BC = 4, 64      # radial bwd: swept, 2.33 -> 2.13 ms (fwd keeps BC 128)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
 EO_FP8 = True                       # F3 output EO in MXFP8 (combine fwd + combine bwd read it)
