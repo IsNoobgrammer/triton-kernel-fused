@@ -509,7 +509,8 @@ def _radial_bwd_tile_kernel(GO, GOS, GU, GUS, ACT, ALPHA, TE, TS, TM, START, PST
 
 @triton.jit
 def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT, STS, GW, Mp,
-                             H: tl.constexpr, BC: tl.constexpr, EOS=None, EO8: tl.constexpr = False, TR: tl.constexpr = 32):
+                             H: tl.constexpr, BC: tl.constexpr, EOS=None, EO8: tl.constexpr = False,
+                             ORDER=None, GWO=None, DIRECT: tl.constexpr = False, TR: tl.constexpr = 32):
     """dO = w * grad_out[token], dw = <grad_out[token], eo> on 32 rows: row copy (B3 input) + token
     copy (B2 left operand)."""
     t = tl.program_id(0)
@@ -533,6 +534,9 @@ def _combine_bwd_tile_kernel(GO, EO, W, SRT, TE, TS, TM, START, PST, QR, SR, QT,
         _qrow_store(ge, rows, cols, mr, QR, SR, H, TR, BC)
         _qtok_store(ge, cols, col0, QT, STS, Mp, H, TR)
     tl.store(GW + rows, gw, mask=mr)
+    if DIRECT:      # d(router weight) straight into the (N, k) grad at slot order[row]: no zeros + scatter
+        slot = tl.load(ORDER + rows, mask=mr, other=0)
+        tl.store(GWO + slot, gw.to(GWO.dtype.element_ty), mask=mr)
 
 
 EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from the combine grad) -> one-pass radial bwd
@@ -541,6 +545,7 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
 RADIAL_BWD_WARPS, RADIAL_BWD_BC = 4, 64      # radial bwd: swept, 2.33 -> 2.13 ms (fwd keeps BC 128)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
+PREP_KERNEL = True                  # one Triton launch for tile maps / padded ranges (vs ~30 torch ops)
 DX8 = False                         # B6 per-row dx cached in MXFP8 before the k-way sum
 XTOK8 = False                       # x token copy (B5 operand) re-quantized from the fp8 row copy
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
@@ -590,6 +595,103 @@ def combine_gather_rows(rows, inv, n_tok, k, out_dtype):
         rows, rows, inv, out, n_tok, H, rows.stride(0), out.stride(0), K=k, HAS_W=False, BT=32, BH=BH, num_warps=4)
     return out
 
+
+
+@triton.jit
+def _prep_kernel(COUNTS, TE_A, TS_A, TM_A, NT_A, TE_B, TS_B, TM_B, NT_B, START, PST, PCNT, PADS,
+                 E: tl.constexpr, EP: tl.constexpr, BM_A: tl.constexpr, BM_B: tl.constexpr,
+                 KPAD_: tl.constexpr, BLOCK: tl.constexpr):
+    """ONE launch for all routing bookkeeping of the FULL path: tile maps at BM_A and BM_B rows
+    (== FG.build_tile_map: invalid tiles get TE = E-1, TS = 0, TM = 0) plus the expert start rows and
+    the KPAD-padded token ranges of the token copies. Replaces ~30 tiny torch kernels."""
+    pid = tl.program_id(0)
+    ee = tl.arange(0, EP)
+    me = ee < E
+    c = tl.load(COUNTS + ee, mask=me, other=0).to(tl.int32)
+    rend = tl.cumsum(c, 0)
+    rst = rend - c
+    t = pid * BLOCK + tl.arange(0, BLOCK)
+    for which in tl.static_range(2):
+        if which == 0:
+            bm = BM_A
+        else:
+            bm = BM_B
+        nt = (c + bm - 1) // bm
+        tend = tl.cumsum(nt, 0)
+        tstart = tend - nt
+        # expert of tile t: number of experts whose tile range ends at or before t
+        te = tl.sum((t[:, None] >= tend[None, :]).to(tl.int32) & me[None, :].to(tl.int32), axis=1)
+        valid = te < E
+        tec = tl.minimum(te, E - 1)
+        sel = (ee[None, :] == tec[:, None])
+        ts0 = tl.sum(tl.where(sel, tstart[None, :], 0), axis=1)
+        rs0 = tl.sum(tl.where(sel, rst[None, :], 0), axis=1)
+        ce = tl.sum(tl.where(sel, c[None, :], 0), axis=1)
+        within = t - ts0
+        ts = tl.where(valid, rs0 + within * bm, 0)
+        tm = tl.where(valid, tl.minimum(ce - within * bm, bm), 0)
+        if which == 0:
+            mt = t < NT_A
+            tl.store(TE_A + t, tec, mask=mt)
+            tl.store(TS_A + t, ts, mask=mt)
+            tl.store(TM_A + t, tm, mask=mt)
+        else:
+            mt = t < NT_B
+            tl.store(TE_B + t, tec, mask=mt)
+            tl.store(TS_B + t, ts, mask=mt)
+            tl.store(TM_B + t, tm, mask=mt)
+    if pid == 0:
+        pc = ((c + KPAD_ - 1) // KPAD_) * KPAD_
+        pst = tl.cumsum(pc, 0) - pc
+        tl.store(START + ee, rst, mask=me)
+        tl.store(PCNT + ee, pc, mask=me)
+        tl.store(PST + ee, pst, mask=me)
+        tl.store(PADS + ee, pst + ((c + 31) // 32) * 32, mask=me)
+
+
+@triton.jit
+def _seg_sum_kernel(DA, COUNTS, OUT, E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr, MAXT: tl.constexpr):
+    """per-expert sum of the per-tile d(theta), tiles in order: deterministic, one launch."""
+    e = tl.program_id(0)
+    ee = tl.arange(0, EP)
+    c = tl.load(COUNTS + ee, mask=ee < E, other=0).to(tl.int32)
+    nt = (c + BM - 1) // BM
+    tend = tl.cumsum(nt, 0)
+    t0 = tl.sum(tl.where(ee == e, tend - nt, 0), axis=0)
+    n = tl.sum(tl.where(ee == e, nt, 0), axis=0)
+    acc = tl.zeros((), tl.float32)
+    for j in range(0, n):
+        acc += tl.load(DA + t0 + j)
+    tl.store(OUT + e, acc)
+
+
+def _prep(counts_t, M, bm_b, dev):
+    """tiles at TILE_ROWS and at bm_b (inserted into MX.tile_map's cache), start, pst, pcnt, pads."""
+    E = counts_t.numel()
+    ntA = (M + TILE_ROWS - 1) // TILE_ROWS + E
+    ntB = (M + bm_b - 1) // bm_b + E
+    i32 = torch.int32
+    TEa, TSa, TMa = (torch.empty(ntA, device=dev, dtype=i32) for _ in range(3))
+    TEb, TSb, TMb = (torch.empty(ntB, device=dev, dtype=i32) for _ in range(3))
+    start, pst, pcnt, pads = (torch.empty(E, device=dev, dtype=i32) for _ in range(4))
+    BLOCK = 256
+    _prep_kernel[(triton.cdiv(max(ntA, ntB), BLOCK),)](counts_t, TEa, TSa, TMa, ntA, TEb, TSb, TMb, ntB,
+                                                      start, pst, pcnt, pads, E, triton.next_power_of_2(E),
+                                                      TILE_ROWS, bm_b, KPAD, BLOCK, num_warps=4)
+    for bm, tm in ((TILE_ROWS, (TEa, TSa, TMa)), (bm_b, (TEb, TSb, TMb))):
+        MX._TM_CACHE[(id(counts_t), counts_t._version, M, bm)] = (counts_t, tm)
+    Mp = M + KPAD * E
+    return (TEa, TSa, TMa, start, pst), pcnt, Mp, pads
+
+
+def _ap_grad_seg(da_t, counts_t, E, ap_shape, bm):
+    per_e = torch.empty(E, device=da_t.device, dtype=torch.float32)
+    _seg_sum_kernel[(E,)](da_t, counts_t, per_e, E, triton.next_power_of_2(E), bm, 0, num_warps=1)
+    if len(ap_shape) == 1:
+        return per_e
+    g = torch.zeros(E, 2, device=da_t.device, dtype=torch.float32)
+    g[:, 0] = per_e
+    return g[:, :ap_shape[1]]
 
 def _tiles(counts_t, M, dev):
     TE, TS, TM = MX.tile_map(counts_t, M, TILE_ROWS)
@@ -668,7 +770,8 @@ class _MoEFP8Full(torch.autograd.Function):
             ap32 = ap32[:, None].contiguous()
         row_act = act_codes.to(torch.int32).contiguous()          # per EXPERT (names kept for the kernels)
         row_alpha = ap32[:, 0].contiguous()
-        tiles, pcnt, Mp, pads = _tiles(counts_t, M, dev)
+        tiles, pcnt, Mp, pads = (_prep(counts_t, M, MX._cfg(H, 2 * I)[0], dev) if PREP_KERNEL
+                                 else _tiles(counts_t, M, dev))
         nt = tiles[0].numel()
 
         xT, xTs = _tok_buf(H, Mp, dev)
@@ -734,8 +837,9 @@ class _MoEFP8Full(torch.autograd.Function):
         gq, gs = _row_buf(M, H, dev)
         gT, gTs = _tok_buf(H, Mp, dev)
         gw = torch.empty(M, device=dev, dtype=torch.float32)
+        grad_wt = torch.empty(N * top_k, device=dev, dtype=grad_out.dtype)
         _combine_bwd_tile_kernel[(nt,)](grad_out, eo, sw, st, *tiles, gq, gs, gT, gTs, gw, Mp, H, _bc(H),
-                                        eos, EO_FP8, TR=TILE_ROWS, num_warps=4)
+                                        eos, EO_FP8, order, grad_wt, True, TR=TILE_ROWS, num_warps=4)
         _pad(gT, gTs, pst, pads, pcnt, Mp)
         grad_down = _acc_wgrad(ctx.acc[1], lambda out, a: MX.wgrad_kmajor(gT, gTs, iT, iTs, pst, pcnt, E,
                                                                           out=out, accumulate=a, even=True))       # B2
@@ -760,7 +864,7 @@ class _MoEFP8Full(torch.autograd.Function):
                                        triton.next_power_of_2(max(np3, 1)), TR=TILE_ROWS, num_warps=RADIAL_BWD_WARPS or RADIAL_WARPS,
                                        TOK=not _DEBUG_NO_TOK, GU8=GU_FP8, ROWST=not _DEBUG_NO_ROW, GO8=DI_FP8 and not fuse_st)
         _pad(dT, dTs, pst, pads, pcnt, Mp)
-        grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=TILE_ROWS) if want_ap else None
+        grad_ap = _ap_grad_seg(da, ctx.counts_t, E, ctx.ap_shape, TILE_ROWS) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
                                                                         out=out, accumulate=a, even=True))         # B5
         if DX8:
@@ -770,8 +874,6 @@ class _MoEFP8Full(torch.autograd.Function):
         else:
             dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)  # B6
             grad_hidden = combine_gather_rows(dx_rows, ctx.inv, N, top_k, grad_out.dtype)
-        grad_wt = torch.zeros(N * top_k, device=dev, dtype=grad_out.dtype)
-        grad_wt[order] = gw.to(grad_out.dtype)
         return grad_hidden, None, grad_wt.view(N, top_k), grad_gu, grad_down, None, grad_ap
 
 
