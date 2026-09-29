@@ -372,7 +372,7 @@ def _ld_gu(GU, GUS, rows, cols, mr, TWO_I, GU8: tl.constexpr, BC: tl.constexpr, 
 
 @triton.jit
 def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, BC: tl.constexpr,
-                  QR=None, SR=None, ROW: tl.constexpr = False, TR: tl.constexpr = 32):
+                  QR=None, SR=None, ROW: tl.constexpr = False, XS=None, X8: tl.constexpr = False, TR: tl.constexpr = 32):
     """token copy of x in EXPERT order (gathered through the sort): the B5 right operand; with ROW
     also the row-quantized copy in expert order, so F1 reads contiguously (no gather in the GEMM)."""
     t = tl.program_id(0)
@@ -387,7 +387,10 @@ def _x_tok_kernel(X, SRT, TE, TS, TM, START, PST, QT, STS, Mp, H: tl.constexpr, 
     tok = tl.load(SRT + rows, mask=mr, other=0)
     for c0 in range(0, H, BC):
         cols = c0 + tl.arange(0, BC)
-        x = tl.load(X + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
+        if X8:      # from the fp8 row copy (1 byte / value read): a second rounding, B5 operand only
+            x = _ld_gu(X, XS, tok, cols, mr, H, True, BC)
+        else:
+            x = tl.load(X + tok[:, None].to(tl.int64) * H + cols[None, :], mask=mr[:, None], other=0.0).to(tl.float32)
         _qtok_store(x, cols, col0, QT, STS, Mp, H, TR)
         if ROW:
             _qrow_store(x, rows, cols, mr, QR, SR, H, TR, BC)
@@ -538,6 +541,8 @@ EPI_FUSE = False   # (measured a wash) S partials in the B3 epilogue (+ T from t
 RADIAL_WARPS, RADIAL_BC = 4, None   # tuning knobs (None = _bc)
 RADIAL_BWD_WARPS, RADIAL_BWD_BC = 4, 64      # radial bwd: swept, 2.33 -> 2.13 ms (fwd keeps BC 128)
 GU_FP8 = True                       # F1 output GU cached in MXFP8 (DeepSeek-V3: SwiGLU input in fp8)
+DX8 = False                         # B6 per-row dx cached in MXFP8 before the k-way sum
+XTOK8 = False                       # x token copy (B5 operand) re-quantized from the fp8 row copy
 X_SORTED = False                    # True: x row copy in expert order (+0.22 ms x_tok, -0.12 ms F1: net loss)
 EO_FP8 = True                       # F3 output EO in MXFP8 (combine fwd + combine bwd read it)
 DI_FP8 = True                       # B3 output d_inter in MXFP8 (the radial bwd reads it twice)
@@ -549,7 +554,7 @@ KPAD = 128    # expert token ranges in the token copies are padded to this: the 
 
 @triton.jit
 def _combine_gather_q_kernel(RQ, RS, W, INV, OUT, NT, H: tl.constexpr, K: tl.constexpr,
-                             BT: tl.constexpr, BH: tl.constexpr):
+                             BT: tl.constexpr, BH: tl.constexpr, HAS_W: tl.constexpr = True):
     """out[t] = sum_j w[r] * dequant(rows[r]), r = inv[t*K + j], j in order (deterministic)."""
     t = tl.program_id(0) * BT + tl.arange(0, BT)
     h = tl.program_id(1) * BH + tl.arange(0, BH)
@@ -561,15 +566,28 @@ def _combine_gather_q_kernel(RQ, RS, W, INV, OUT, NT, H: tl.constexpr, K: tl.con
         sc = tl.load(RS + r[:, None].to(tl.int64) * (H // 32) + (tl.program_id(1) * (BH // 32) + tl.arange(0, BH // 32))[None, :],
                      mask=mt[:, None], other=127)
         x = tl.reshape(tl.reshape(x, (BT, BH // 32, 32)) * tl.exp2(sc.to(tl.float32) - 127.0)[:, :, None], (BT, BH))
-        acc += x * tl.load(W + r, mask=mt, other=0.0).to(tl.float32)[:, None]
+        if HAS_W:
+            x = x * tl.load(W + r, mask=mt, other=0.0).to(tl.float32)[:, None]
+        acc += x
     tl.store(OUT + t.to(tl.int64)[:, None] * H + h[None, :], acc.to(OUT.dtype.element_ty), mask=mt[:, None])
 
 
 def combine_gather_q(rq, rs, inv, n_tok, k, w, out_dtype):
     H = rq.shape[1]
+    BH = 512 if H % 512 == 0 else 128                     # swept: 0.229 -> 0.216 ms at H = 512
     out = torch.empty(n_tok, H, device=rq.device, dtype=out_dtype)
-    _combine_gather_q_kernel[(triton.cdiv(n_tok, 32), H // 128)](rq, rs, w, inv, out, n_tok, H, k, 32, 128,
-                                                                 num_warps=4)
+    _combine_gather_q_kernel[(triton.cdiv(n_tok, 32), H // BH)](rq, rs, w if w is not None else rs, inv, out, n_tok,
+                                                                H, k, 32, BH, w is not None, num_warps=8)
+    return out
+
+
+def combine_gather_rows(rows, inv, n_tok, k, out_dtype):
+    """FG.combine_gather (unweighted) with the swept tile: BT 32, BH 256 (0.392 -> 0.368 ms)."""
+    H = rows.shape[1]
+    out = torch.empty(n_tok, H, device=rows.device, dtype=out_dtype)
+    BH = 256 if H % 256 == 0 else 128
+    FG._combine_gather_kernel[(triton.cdiv(n_tok, 32), triton.cdiv(H, BH))](
+        rows, rows, inv, out, n_tok, H, rows.stride(0), out.stride(0), K=k, HAS_W=False, BT=32, BH=BH, num_warps=4)
     return out
 
 
@@ -660,7 +678,11 @@ class _MoEFP8Full(torch.autograd.Function):
             rows_f1 = None
         else:                                             # quantize the N unsorted tokens once, F1 gathers
             xq, xs = _q(hidden, "F1 in (x)")
-            _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), TR=TILE_ROWS, num_warps=4)
+            if XTOK8:
+                _x_tok_kernel[(nt,)](xq, st, *tiles, xT, xTs, Mp, H, _bc(H), XS=xs, X8=True, TR=TILE_ROWS,
+                                     num_warps=4)
+            else:
+                _x_tok_kernel[(nt,)](hidden, st, *tiles, xT, xTs, Mp, H, _bc(H), TR=TILE_ROWS, num_warps=4)
             rows_f1 = st
         _pad(xT, xTs, tiles[4], pads, pcnt, Mp)
         np1 = I // MX.gemm_bn(H, 2 * I) if (EPI_FUSE or GU_FP8) else 0
@@ -741,8 +763,13 @@ class _MoEFP8Full(torch.autograd.Function):
         grad_ap = _ap_grad_from_tiles(da, ctx.counts_t, E, ctx.ap_shape, bm=TILE_ROWS) if want_ap else None
         grad_gu = _acc_wgrad(ctx.acc[0], lambda out, a: MX.wgrad_kmajor(dT, dTs, xT, xTs, pst, pcnt, E,
                                                                         out=out, accumulate=a, even=True))         # B5
-        dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)      # B6
-        grad_hidden = FG.combine_gather(dx_rows, ctx.inv, N, top_k, out_dtype=grad_out.dtype)
+        if DX8:
+            dxs = torch.empty(M, H // 32, device=dev, dtype=torch.uint8)
+            dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, epi=3, x1=dxs)       # B6 -> fp8
+            grad_hidden = combine_gather_q(dx_rows, dxs, ctx.inv, N, top_k, None, grad_out.dtype)
+        else:
+            dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)  # B6
+            grad_hidden = combine_gather_rows(dx_rows, ctx.inv, N, top_k, grad_out.dtype)
         grad_wt = torch.zeros(N * top_k, device=dev, dtype=grad_out.dtype)
         grad_wt[order] = gw.to(grad_out.dtype)
         return grad_hidden, None, grad_wt.view(N, top_k), grad_gu, grad_down, None, grad_ap
