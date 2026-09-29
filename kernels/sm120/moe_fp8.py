@@ -40,6 +40,23 @@ def _stat(tag, x, q, s):
         STATS.setdefault(tag, []).append(MX.qstats(x, q, s))
 
 
+WGRAD8 = True        # phase 2: B2 / B5 in MXFP8 (token-axis blocks quantized inside the GEMM)
+
+
+def _wgrad(a, b, offs, counts_t, acc, b_rows=None):
+    """K75._wgrad contract: acc = the fp32 master Parameter -> accumulate into acc.grad, return None."""
+    if not WGRAD8:
+        return K75._wgrad(a, b, offs, acc=acc, b_rows=b_rows)
+    if acc is not None:
+        fresh = acc.grad is None
+        buf = torch.empty_like(acc) if fresh else acc.grad
+        MX.grouped_wgrad(a, b, counts_t, out=buf, accumulate=not fresh, b_rows=b_rows)
+        if fresh:
+            acc.grad = buf
+        return None
+    return MX.grouped_wgrad(a, b, counts_t, b_rows=b_rows)
+
+
 def _q(x, tag):
     q, s = MX.quant_rows(x.contiguous())
     _stat(tag, x, q, s)
@@ -276,7 +293,7 @@ class _MoEFP8(torch.autograd.Function):
         else:
             ge, gw = K75._combine_bwd(grad_out, eo, sw, st)
             gq, gs = _q(ge, "B3 in (dO)")
-        grad_down = K75._wgrad(ge, inter, ctx.offs, acc=ctx.acc[1])                 # B2 (bf16, phase 1)
+        grad_down = _wgrad(ge, inter, ctx.offs, ctx.counts_t, ctx.acc[1])            # B2
         d_inter = MX.grouped_gemm(gq, gs, *wdn["cr"], ctx.counts_t, M)             # B3 (M, I)
         grad_ap = None
         want_ap = ctx.row_alpha is not None and ctx.needs_input_grad[6]
@@ -290,7 +307,7 @@ class _MoEFP8(torch.autograd.Function):
             dq, ds = _q(dgu, "B6 in (dGU)")
         if want_ap:
             grad_ap = K75._ap_grad_from_rows(da, ctx.row_expert, E, ctx.ap_shape, grad_out.device)
-        grad_gu = K75._wgrad(dgu, hidden, ctx.offs, acc=ctx.acc[0], b_rows=st)      # B5 (bf16, phase 1)
+        grad_gu = _wgrad(dgu, hidden, ctx.offs, ctx.counts_t, ctx.acc[0], b_rows=st)  # B5
         dx_rows = MX.grouped_gemm(dq, ds, *wgu["cr"], ctx.counts_t, M, out_dtype=DX_ROWS)  # B6
         grad_hidden = FG.combine_gather(dx_rows, ctx.inv, N, top_k, out_dtype=grad_out.dtype)
         grad_wt = torch.zeros(N * top_k, device=grad_out.device, dtype=grad_out.dtype)

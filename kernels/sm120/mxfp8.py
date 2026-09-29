@@ -159,3 +159,68 @@ def grouped_gemm(aq, as_, bq, bs, counts_t, m_rows, rows=None, out_dtype=torch.b
     _mx_gg_kernel[grid](aq, as_, bq, bs, c, TE, TS, TM, rows if rows is not None else TE, K, N,
                         BM, BN, BK, rows is not None, num_warps=w, num_stages=st)
     return c
+
+
+# ------------------------------------------------------------------ weight gradients (K = tokens)
+@triton.jit
+def _mx_wgrad_kernel(A, B, C, ROWS, START, END, N1: tl.constexpr, N2: tl.constexpr,
+                     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                     GATHER: tl.constexpr, ACC: tl.constexpr):
+    """C[e] (N1, N2) fp32 (+)= A[rows_e]^T @ B[rows_e], reduction over the expert's TOKENS.
+    A (M, N1) / B (M or N_tok, N2) are bf16; each tile is quantized to MXFP8 IN REGISTERS along the
+    token axis (32-token blocks counted from the expert's first row; rows past its end load as 0,
+    which cannot raise a block max), then fed to the block-scaled MMA. No quant pass, no padding."""
+    pid = tl.program_id(0)
+    TN: tl.constexpr = N2 // BN
+    TM: tl.constexpr = N1 // BM
+    e = pid // (TM * TN)
+    r = pid % (TM * TN)
+    pm = r // TN
+    pn = r % TN
+    s0 = tl.load(START + e)
+    s1 = tl.load(END + e)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), tl.float32)
+    NB: tl.constexpr = BK // 32
+    for k0 in range(s0, s1, BK):
+        rk = k0 + tl.arange(0, BK)
+        mk = rk < s1
+        a = tl.load(A + rk[None, :].to(tl.int64) * N1 + rm[:, None], mask=mk[None, :], other=0.0).to(tl.float32)
+        if GATHER:
+            rb = tl.load(ROWS + rk, mask=mk, other=0)
+        else:
+            rb = rk
+        b = tl.load(B + rb[:, None].to(tl.int64) * N2 + rn[None, :], mask=mk[:, None], other=0.0).to(tl.float32)
+        ab = tl.reshape(a, (BM, NB, 32))
+        ea = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(ab), axis=2), 1e-30) / 448.0)), -127.0), 127.0)
+        aq = tl.reshape(ab * tl.exp2(-ea)[:, :, None], (BM, BK)).to(tl.float8e4nv)
+        bb = tl.reshape(b, (NB, 32, BN))
+        eb = tl.minimum(tl.maximum(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(bb), axis=1), 1e-30) / 448.0)), -127.0), 127.0)
+        bq = tl.reshape(bb * tl.exp2(-eb)[:, None, :], (BK, BN)).to(tl.float8e4nv)
+        acc = tl.dot_scaled(aq, (ea + 127.0).to(tl.uint8), "e4m3", bq, tl.trans((eb + 127.0).to(tl.uint8)), "e4m3", acc)
+    cp = C + e.to(tl.int64) * (N1 * N2) + rm[:, None] * N2 + rn[None, :]
+    if ACC:
+        acc += tl.load(cp)
+    tl.store(cp, acc)
+
+
+_WG8 = {"narrow": (128, 128, 64, 4, 3), "wide": (128, 128, 64, 8, 3)}
+
+
+def grouped_wgrad(a, b, counts_t, out=None, accumulate=False, b_rows=None, cfg=None):
+    """out (E, N1, N2) fp32 = per expert a[rows_e]^T @ b[rows_e] in MXFP8 (token-axis blocks)."""
+    M, N1 = a.shape
+    N2 = b.shape[1]
+    E = counts_t.numel()
+    BM, BN, BK, w, st = cfg or _WG8["wide" if N1 >= 1024 else "narrow"]
+    assert N1 % BM == 0 and N2 % BN == 0 and a.stride(1) == 1 and b.stride(1) == 1
+    end = torch.cumsum(counts_t, 0).to(torch.int32)
+    start = (end - counts_t.to(torch.int32)).to(torch.int32)
+    if out is None:
+        out = torch.empty(E, N1, N2, device=a.device, dtype=torch.float32)
+        accumulate = False
+    _mx_wgrad_kernel[(E * (N1 // BM) * (N2 // BN),)](
+        a, b, out, b_rows if b_rows is not None else start, start, end, N1, N2, BM, BN, BK,
+        b_rows is not None, accumulate, num_warps=w, num_stages=st)
+    return out
