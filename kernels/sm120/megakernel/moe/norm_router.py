@@ -167,6 +167,10 @@ def norm_router_forward(x, norm_weight, router_weight, bias, top_k, eps=1e-6,
     assert top_k <= E, f"top_k={top_k} > E={E}"
     assert H & (H - 1) == 0, f"H={H} must be a power of two for the block load"
     assert E & (E - 1) == 0, f"E={E} must be a power of two for the block load"
+    # the [BLOCK_H, E] fp32 router tile (x pipeline stages) is what fills shared memory: E=128 at
+    # BLOCK_H=128 asked for 164.9 KB of the 101 KB limit. Hold BLOCK_H*E fixed at the E=64 size, so
+    # E <= 64 keeps its exact tiling (and bits) and E=128 halves the H tile.
+    block_h = min(block_h, max(16, (128 * 64) // E))
 
     hn = torch.empty((T, H), device=x.device, dtype=out_dtype) if write_hn else x  # dummy ptr
     idx = torch.empty((T, top_k), device=x.device, dtype=torch.int32)
