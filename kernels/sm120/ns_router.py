@@ -7,7 +7,7 @@ No backend wins every shape (measured on an RTX PRO 6000, ns8 bf16):
 and gram's ERROR depends on the shape and on WHERE its restarts sit. So FusedMuon routes per shape
 bucket. For the first `probe_steps` times a (shape, dtype) reaches the router, the cuBLAS result is
 what the optimizer applies (so probing never changes training), and every candidate -- including
-every gram restart placement in GRAM_PLACEMENTS -- is timed and scored against an fp32 NS of that
+every gram restart placement in gram_placements(len(coeffs)) -- is timed and scored against an fp32 NS of that
 step's actual momentum. After the window, the fastest candidate whose mean error is within `tol` x
 cuBLAS's is locked in for the rest of the run. A run therefore mixes backends per shape.
 
@@ -27,6 +27,15 @@ from kernels.sm120.newton_schulz_gram import newton_schulz_gram
 FAMILIES = ("cublas", "epi", "symepi", "symmul", "gram")
 # gram restart placements tried by "gram" (1-based iteration after which to re-orthogonalize; () = none)
 GRAM_PLACEMENTS = ((), (2,), (3,), (4,), (5,), (6,), (2, 4), (3, 5), (4, 6), (2, 5), (3, 6), (4, 5), (2, 4, 6))
+
+
+def gram_placements(n_iters):
+    """GRAM_PLACEMENTS (written for the 8-step ns8) adapted to an n-step schedule: placements that sit at or past
+    the last iteration are dropped (a restart there is a no-op that only duplicates another candidate), and a
+    longer schedule also gets every placement shifted by n - 8, so restarts near ITS tail are tried too. ns8
+    gets exactly GRAM_PLACEMENTS, so its routing (and every logged ns8 run) is unchanged."""
+    shifted = tuple(tuple(r + n_iters - 8 for r in p) for p in GRAM_PLACEMENTS if p) if n_iters > 8 else ()
+    return tuple(dict.fromkeys(p for p in GRAM_PLACEMENTS + shifted if not p or max(p) < n_iters))
 
 
 def _name(family, restarts=None):
@@ -92,7 +101,7 @@ class NSRouter:
         bad = set(candidates) - set(FAMILIES)
         if bad:
             raise ValueError(f"unknown NS backend(s) {sorted(bad)}; choose from {FAMILIES}")
-        placements = GRAM_PLACEMENTS if gram_restarts is None else (tuple(gram_restarts),)
+        placements = gram_placements(len(coeffs)) if gram_restarts is None else (tuple(gram_restarts),)
         self.fns = _backends(coeffs, ns_dtype, set(candidates) | {"cublas"}, placements)
         self.order = [n for n in self.fns if n.split("@")[0] in candidates]
         self.coeffs, self.tol, self.margin = coeffs, float(tol), float(margin)
