@@ -20,6 +20,7 @@ SCALES = ("adam", "none")
 _KJ = (3.4445, -4.7750, 2.0315)      # Keller Jordan quintic: fast growth of small singular values
 _PIN = (2.0, -1.5, 0.5)              # finishing step: pulls the singular values onto 1
 NS_PRESETS = {
+    "ns6": (_KJ,) * 4 + (_PIN,) * 2,                 # rule: N-2 quintics + 2 finishing steps
     "ns8": (_KJ,) * 6 + (_PIN,) * 2,                 # BiBo board default
     "dsv4": (_KJ,) * 8 + (_PIN,) * 2,                # DeepSeek-V4 10-step schedule
     "quintic5": (_KJ,) * 5,                          # Keller Jordan / Muown reference
