@@ -79,6 +79,11 @@ NS_PRESETS.update({
                        (2.245503932403, -2.443826979899, 0.963091710461),
                        (2.256537145403, -2.166840097229, 0.929501253245)), 1.05),
 })
+# bf16 rounding lets sigma / ||X||_F reach ~1.03 on a near-rank-1 momentum. These schedules diverge (pe8, cans4, anvil6:
+# 1e20+ at 1.01) or flip sign (the CANS cubics have a root at 1.0) there -- pe8 went NaN within 60 steps on MNIST-1D. A 1.03
+# input margin keeps all of them bounded and positive on [0, 1.03]; the KJ/ns*/you6/pe5 schedules are already safe.
+for _k in ("pe8", "cans4", "cans7c", "cans9c", "anvil6"):
+    NS_PRESETS[_k] = _margin(NS_PRESETS[_k], 1.03)
 
 PERROW_BETA2 = 0.95
 PERROW_EPS = 1e-8
