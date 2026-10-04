@@ -189,7 +189,7 @@ def _attn_fwd(Q, K, V, O, Z, LSE, A,
         k1 = tl.load(K + koff[:, None] + dh[None, :], mask=nmask[:, None], other=0.0)
         k2 = tl.load(K + koff[:, None] + HD + dh[None, :], mask=nmask[:, None], other=0.0)
         v = tl.load(V + vb0 + n.to(tl.int64)[:, None] * vss + d[None, :], mask=nmask[:, None], other=0.0)
-        qk = tl.dot(q2, tl.trans(k2), tl.dot(q1, tl.trans(k1))) * sm_scale   # base 2: log2e in sm_scale
+        qk = tl.dot(q2, tl.trans(k2), tl.dot(q1, tl.trans(k1)))     # RAW scores: shift by the max, THEN scale
         edge = (n0 + BN > m0) | (n0 + BN > S)            # diagonal / tail blocks need a mask
         if WINDOW:
             edge = edge | (n0 < m0 + BM - W)              # ... and the window's lower edge
@@ -200,15 +200,18 @@ def _attn_fwd(Q, K, V, O, Z, LSE, A,
             qk = tl.where(valid, qk, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        corr = tl.exp2(m_i - m_safe)
-        p = tl.exp2(qk - m_safe[:, None])
+        corr = tl.exp2((m_i - m_safe) * sm_scale)
+        p = tl.exp2((qk - m_safe[:, None]) * sm_scale)     # exact at the max: the largest p is exactly 1
         l_i = l_i * corr + tl.sum(p, axis=1)
         acc = tl.dot(p.to(tl.bfloat16), v, acc * corr[:, None])
         m_i = m_new
     l_safe = tl.where(l_i > 0.0, l_i, 1.0)
     o = acc / l_safe[:, None]
     irow = (b * H + h).to(tl.int64) * S + s
-    tl.store(LSE + irow, m_i + tl.log2(l_safe), mask=rmask)                   # base-2 LSE
+    # row max (raw score units) and log2 of the row sum kept as TWO numbers: folded into one fp32 c*m + log2 l, a
+    # large c*m rounds log2 l away and the backward's recomputed P stops summing to 1 (KohakuFA bug 1)
+    tl.store(LSE + 2 * irow, tl.where(m_i == float("-inf"), 0.0, m_i), mask=rmask)
+    tl.store(LSE + 2 * irow + 1, tl.log2(l_safe), mask=rmask)
     ooff = b.to(tl.int64) * osb + h.to(tl.int64) * osh + s.to(tl.int64) * oss
     tl.store(O + ooff[:, None] + d[None, :], o.to(O.dtype.element_ty), mask=rmask[:, None])
     if XSA:
@@ -313,10 +316,11 @@ def _attn_bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN
             irow = (b * H + h).to(tl.int64) * S + s
             dooff = b.to(tl.int64) * dsb + h.to(tl.int64) * dsh + s.to(tl.int64) * dss
             do = tl.load(DO + dooff[:, None] + d[None, :], mask=smask[:, None], other=0.0)
-            lse = tl.load(LSE + irow, mask=smask, other=0.0)
+            mrow = tl.load(LSE + 2 * irow, mask=smask, other=0.0)
+            l2 = tl.load(LSE + 2 * irow + 1, mask=smask, other=0.0)
             dl = tl.load(DELTA + irow, mask=smask, other=0.0)
-            st = tl.dot(k2, tl.trans(q2), tl.dot(k1, tl.trans(q1))) * sm_scale   # (BN, BM) = S^T
-            p = tl.exp2(st - lse[None, :])
+            st = tl.dot(k2, tl.trans(q2), tl.dot(k1, tl.trans(q1)))      # (BN, BM) = S^T, raw
+            p = tl.exp2((st - mrow[None, :]) * sm_scale - l2[None, :])  # shift, scale, normalise: one sub + one fma
             if edge:
                 valid = (n[:, None] <= s[None, :]) & smask[None, :] & nmask[:, None]
                 if WINDOW:
@@ -383,7 +387,8 @@ def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
     irow = (b * H + h).to(tl.int64) * S + s
     dooff = b.to(tl.int64) * dsb + h.to(tl.int64) * dsh + s.to(tl.int64) * dss
     do = tl.load(DO + dooff[:, None] + d[None, :], mask=rmask[:, None], other=0.0)
-    lse = tl.load(LSE + irow, mask=rmask, other=0.0)
+    mrow = tl.load(LSE + 2 * irow, mask=rmask, other=0.0)
+    l2 = tl.load(LSE + 2 * irow + 1, mask=rmask, other=0.0)
     dl = tl.load(DELTA + irow, mask=rmask, other=0.0)
     kb0 = b.to(tl.int64) * ksb + kvh.to(tl.int64) * ksh
     vb0 = b.to(tl.int64) * vsb + kvh.to(tl.int64) * vsh
@@ -404,8 +409,8 @@ def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
         k1 = tl.load(KN + koff[:, None] + dh[None, :], mask=nmask[:, None], other=0.0)
         k2 = tl.load(KN + koff[:, None] + HD + dh[None, :], mask=nmask[:, None], other=0.0)
         v = tl.load(V + vb0 + n.to(tl.int64)[:, None] * vss + d[None, :], mask=nmask[:, None], other=0.0)
-        qk = tl.dot(q2, tl.trans(k2), tl.dot(q1, tl.trans(k1))) * sm_scale
-        p = tl.exp2(qk - lse[:, None])
+        qk = tl.dot(q2, tl.trans(k2), tl.dot(q1, tl.trans(k1)))
+        p = tl.exp2((qk - mrow[:, None]) * sm_scale - l2[:, None])
         edge = (n0 + BN > m0) | (n0 + BN > S)
         if WINDOW:
             edge = edge | (n0 < m0 + BM - W)
@@ -529,7 +534,7 @@ class AttnXSA(torch.autograd.Function):
         kn = _prepped(k, wk, cos, sin, csb, css, eps, qk_norm, rope)
         Z = _like(q)
         O = torch.empty(B, H, S, D, device=q.device, dtype=q.dtype) if xsa else Z   # no XSA: z IS o
-        LSE = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
+        LSE = torch.empty(B, H, S, 2, device=q.device, dtype=torch.float32)   # (row max raw, log2 row sum)
         W = int(window) if window is not None else 0
         mode = "window" if window is not None else "causal"
         sm = float(scale) * float(q_scale) * float(k_scale)          # the scalars fold into the logits
