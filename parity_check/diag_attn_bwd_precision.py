@@ -18,6 +18,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 
+import kernels.sm120.attn_xsa as AX
 from kernels.sm120.attn_xsa import attn_xsa, attn_xsa_reference
 
 DEV = "cuda"
@@ -29,8 +30,10 @@ def rel(a, b):
 
 def run_impl(name, q, k, v, do, scale, flex=None):
     q, k, v = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
-    if name == "ours":
+    if name.startswith("ours"):                       # ours / ours:tf32 / ours:split / ours:gproj (AX.DS_PREC)
+        AX.DS_PREC = name.split(":")[1] if ":" in name else "bf16"
         o = attn_xsa(q, k, v, scale=scale, xsa=False)
+        AX.DS_PREC = "bf16"
     elif name == "flex":
         o = flex(q, k, v)
     elif name == "sdpa":
@@ -59,7 +62,10 @@ def main():
     ap.add_argument("--gains", default="1,4,16,32")
     ap.add_argument("--offsets", default="0,1,4,16")
     ap.add_argument("--impls", default="ours,flex,sdpa,fp32")
+    ap.add_argument("--bench", action="store_true", help="time fwd+bwd of each dS mode on the 1B board's attention shape")
     a = ap.parse_args()
+    if a.bench:
+        return bench()
     B, H, HKV, S, D = 1, a.H, a.HKV, a.S, a.D
     scale = D ** -0.5
     impls = a.impls.split(",")
@@ -86,6 +92,32 @@ def main():
                 except Exception as ex:                       # a backend that cannot run this config
                     cells.append(f"{'n/a: ' + type(ex).__name__:^31}")
             print(f"{g:4g} {c:4g} {mx:8.1f}  " + "  ".join(cells), flush=True)
+
+
+def bench():
+    """fwd+bwd ms per dS mode, board shape: micro-batch 64 x S 1024, 4 q / 2 kv heads, D 128, qk-norm + XSA,
+    global and window-128 layers. Same inputs per mode; also checks bf16 mode is bitwise the old path's twin."""
+    from triton.testing import do_bench
+    B, H, HKV, S, D = 64, 4, 2, 1024, 128
+    g0 = torch.Generator(device=DEV).manual_seed(0)
+    q = torch.randn(B, H, S, D, device=DEV, generator=g0).bfloat16().requires_grad_(True)
+    k = torch.randn(B, HKV, S, D, device=DEV, generator=g0).bfloat16().requires_grad_(True)
+    v = torch.randn(B, HKV, S, D, device=DEV, generator=g0).bfloat16().requires_grad_(True)
+    wq = torch.ones(D, device=DEV, requires_grad=True); wk = torch.ones(D, device=DEV, requires_grad=True)
+    al = torch.zeros(H, device=DEV, requires_grad=True)
+    dz = torch.randn(B, H, S, D, device=DEV, generator=g0).bfloat16()
+    for window in (None, 128):
+        row = []
+        for m in ("bf16", "tf32", "split", "gproj"):
+            AX.DS_PREC = m
+            def step():
+                z = attn_xsa(q, k, v, scale=D ** -0.5, window=window, xsa=True, alpha=al, q_norm_w=wq, k_norm_w=wk)
+                z.backward(dz)
+            ms = do_bench(step, warmup=5, rep=40)
+            row.append((m, ms))
+        AX.DS_PREC = "bf16"
+        base = row[0][1]
+        print(f"{'global' if window is None else 'w128':6} fwd+bwd ms: " + "  ".join(f"{m} {t:.2f} ({t / base:.3f}x)" for m, t in row), flush=True)
 
 
 if __name__ == "__main__":

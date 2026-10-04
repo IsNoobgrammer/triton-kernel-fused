@@ -38,6 +38,16 @@ __all__ = ["attn_xsa", "AttnXSA", "attn_xsa_reference", "CFG"]
 
 LOG2E = 1.4426950408889634
 
+# Precision of the score gradient dS in the two backward matmuls (dQ = dS K, dK = dS^T Q). Exact dS sums to zero along
+# every row, so dQ is blind to the mean key; rounding dS to bf16 (and delta = dO . O with a bf16 O) breaks the zero sum
+# and the mean key leaks into dQ (GProj, arxiv 2609.34272). parity_check/diag_attn_bwd_precision.py measures it.
+#   bf16   round dS to bf16 (default; every number below is measured against this)
+#   tf32   keep dS fp32, tf32 MMA (10-bit mantissa operands)
+#   split  dS = hi + lo, two bf16 MMAs (~16-bit mantissa)
+#   gproj  bf16 dS, then dQ -= r_i * (P K)_i with r_i = sum_j bf16(dS)_ij: restores the zero row sum exactly (dQ only)
+DS_PREC = "bf16"
+_DS_MODE = {"bf16": 0, "tf32": 1, "split": 2, "gproj": 3}
+
 # Per-kernel tiles by mode and sequence length: [(max_S, cfg), ...], first entry with S <= max_S
 # wins. Chosen by SHAPE only (never by timing), so a run's numerics never depend on a benchmark.
 # Swept with parity_check/parity_attn_xsa.py --sweep (S=1024) / --sweep_long (S=4096).
@@ -265,7 +275,8 @@ def _attn_bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN
               qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
               S, H, HKV, sm_scale, nat_scale, eps, W,
               GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-              WINDOW: tl.constexpr, XSA: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
+              WINDOW: tl.constexpr, XSA: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr,
+              DS_MODE: tl.constexpr = 0):
     HD: tl.constexpr = D // 2
     pid_n = tl.program_id(0)
     pid = tl.program_id(1)
@@ -313,9 +324,19 @@ def _attn_bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN
                 p = tl.where(valid, p, 0.0)
             dv = tl.dot(p.to(tl.bfloat16), do, dv)
             dp = tl.dot(v, tl.trans(do))
-            ds = (p * (dp - dl[None, :])).to(tl.bfloat16)
-            dk1 = tl.dot(ds, q1, dk1)
-            dk2 = tl.dot(ds, q2, dk2)
+            ds = p * (dp - dl[None, :])
+            if DS_MODE == 1:
+                dk1 = tl.dot(ds, q1.to(tl.float32), dk1, input_precision="tf32")
+                dk2 = tl.dot(ds, q2.to(tl.float32), dk2, input_precision="tf32")
+            elif DS_MODE == 2:
+                hi = ds.to(tl.bfloat16)
+                lo2 = (ds - hi.to(tl.float32)).to(tl.bfloat16)
+                dk1 = tl.dot(lo2, q1, tl.dot(hi, q1, dk1))
+                dk2 = tl.dot(lo2, q2, tl.dot(hi, q2, dk2))
+            else:
+                dsb = ds.to(tl.bfloat16)
+                dk1 = tl.dot(dsb, q1, dk1)
+                dk2 = tl.dot(dsb, q2, dk2)
     dk1 = dk1 * nat_scale
     dk2 = dk2 * nat_scale
     if QK_NORM or ROPE:
@@ -343,7 +364,7 @@ def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
             qsb, qsh, qss, ksb, ksh, kss, rsb, rsh, rss, vsb, vsh, vss, dsb, dsh, dss, csb, css,
             S, H, HKV, sm_scale, nat_scale, eps, W,
             GROUP: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-            WINDOW: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr):
+            WINDOW: tl.constexpr, QK_NORM: tl.constexpr, ROPE: tl.constexpr, DS_MODE: tl.constexpr = 0):
     HD: tl.constexpr = D // 2
     pid_m = tl.num_programs(0) - 1 - tl.program_id(0)      # longest-first (see _fwd)
     pid = tl.program_id(1)
@@ -368,6 +389,10 @@ def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
     vb0 = b.to(tl.int64) * vsb + kvh.to(tl.int64) * vsh
     dq1 = tl.zeros((GROUP * BM, HD), tl.float32)
     dq2 = tl.zeros((GROUP * BM, HD), tl.float32)
+    if DS_MODE == 3:                                       # GProj: row sum of the rounded dS and P K
+        rsum = tl.zeros((GROUP * BM,), tl.float32)
+        pk1 = tl.zeros((GROUP * BM, HD), tl.float32)
+        pk2 = tl.zeros((GROUP * BM, HD), tl.float32)
     lo = 0
     if WINDOW:
         lo = tl.maximum(m0 - W + 1, 0) // BN * BN
@@ -390,9 +415,27 @@ def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
                 valid = valid & ((s[:, None] - n[None, :]) < W)
             p = tl.where(valid, p, 0.0)
         dp = tl.dot(do, tl.trans(v))
-        ds = (p * (dp - dl[:, None])).to(tl.bfloat16)
-        dq1 = tl.dot(ds, k1, dq1)
-        dq2 = tl.dot(ds, k2, dq2)
+        ds = p * (dp - dl[:, None])
+        if DS_MODE == 1:
+            dq1 = tl.dot(ds, k1.to(tl.float32), dq1, input_precision="tf32")
+            dq2 = tl.dot(ds, k2.to(tl.float32), dq2, input_precision="tf32")
+        elif DS_MODE == 2:
+            hi = ds.to(tl.bfloat16)
+            lo2 = (ds - hi.to(tl.float32)).to(tl.bfloat16)
+            dq1 = tl.dot(lo2, k1, tl.dot(hi, k1, dq1))
+            dq2 = tl.dot(lo2, k2, tl.dot(hi, k2, dq2))
+        else:
+            dsb = ds.to(tl.bfloat16)
+            dq1 = tl.dot(dsb, k1, dq1)
+            dq2 = tl.dot(dsb, k2, dq2)
+            if DS_MODE == 3:
+                rsum += tl.sum(dsb.to(tl.float32), axis=1)
+                pb = p.to(tl.bfloat16)
+                pk1 = tl.dot(pb, k1, pk1)
+                pk2 = tl.dot(pb, k2, pk2)
+    if DS_MODE == 3:                                       # dS' = bf16(dS) - r p  ->  sum_j dS'_ij = 0
+        dq1 = dq1 - rsum[:, None] * pk1
+        dq2 = dq2 - rsum[:, None] * pk2
     dq1 = dq1 * nat_scale
     dq2 = dq2 * nat_scale
     roff = b.to(tl.int64) * rsb + h.to(tl.int64) * rsh + s.to(tl.int64) * rss
@@ -514,7 +557,8 @@ class AttnXSA(torch.autograd.Function):
         W = int(window) if window is not None else 0
         mode = "window" if window is not None else "causal"
         cf = cfg_for(mode, S)
-        key = (mode, S if mode == "causal" else 0, D, G, q.dtype, window is not None, xsa, has_a, qk_norm, rope)
+        dsm = _DS_MODE[DS_PREC]
+        key = (mode, S if mode == "causal" else 0, D, G, q.dtype, window is not None, xsa, has_a, qk_norm, rope, dsm)
         DO = torch.empty(B, H, S, D, device=q.device, dtype=q.dtype) if xsa else dZ   # no XSA: dO = dZ
         DELTA = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
         GA = torch.empty(B, H, S, device=q.device, dtype=torch.float32) if (xsa and has_a) else DELTA
@@ -535,14 +579,15 @@ class AttnXSA(torch.autograd.Function):
         c = _launch(_attn_bwd_dkdv, lambda c: (triton.cdiv(S, c["BN"]), B * HKV), cf["dkdv"], ("dkdv",) + key,
                     qn, kn, k, v, DO, LSE, DELTA, GVS, DK, DV, PWK, wk_ if qk_norm else q, cos, sin,
                     *_st(qn), *_st(kn), *_st(k), *_st(v), *_st(DO), *common,
-                    GROUP=G, D=D, WINDOW=window is not None, XSA=xsa, QK_NORM=qk_norm, ROPE=rope)
+                    GROUP=G, D=D, WINDOW=window is not None, XSA=xsa, QK_NORM=qk_norm, ROPE=rope,
+                    DS_MODE=dsm if dsm != 3 else 0)
         nkb = triton.cdiv(S, c["BN"])
         DQ = _like(q)
         PWQ = torch.empty(B * HKV * triton.cdiv(S, 16), D, device=q.device, dtype=torch.float32) if qk_norm else DELTA
         c = _launch(_attn_bwd_dq, lambda c: (triton.cdiv(S, c["BM"]), B * HKV), cf["dq"], ("dq",) + key,
                     qn, kn, q, v, DO, LSE, DELTA, DQ, PWQ, wq_ if qk_norm else q, cos, sin,
                     *_st(qn), *_st(kn), *_st(q), *_st(v), *_st(DO), *common,
-                    GROUP=G, D=D, WINDOW=window is not None, QK_NORM=qk_norm, ROPE=rope)
+                    GROUP=G, D=D, WINDOW=window is not None, QK_NORM=qk_norm, ROPE=rope, DS_MODE=dsm)
         nqb = triton.cdiv(S, c["BM"])
         d_alpha = None
         if xsa and has_a:
