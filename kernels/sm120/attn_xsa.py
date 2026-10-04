@@ -329,14 +329,14 @@ def _attn_bwd_dkdv(QN, KN, KR, V, DO, LSE, DELTA, GVS, DK, DV, PWK, WK, COS, SIN
                 dk1 = tl.dot(ds, q1.to(tl.float32), dk1, input_precision="tf32")
                 dk2 = tl.dot(ds, q2.to(tl.float32), dk2, input_precision="tf32")
             elif DS_MODE == 2:
-                hi = ds.to(tl.bfloat16)
-                lo2 = (ds - hi.to(tl.float32)).to(tl.bfloat16)
-                dk1 = tl.dot(lo2, q1, tl.dot(hi, q1, dk1))
-                dk2 = tl.dot(lo2, q2, tl.dot(hi, q2, dk2))
+                ds_hi = ds.to(tl.bfloat16)
+                ds_lo = (ds - ds_hi.to(tl.float32)).to(tl.bfloat16)
+                dk1 = tl.dot(ds_lo, q1, tl.dot(ds_hi, q1, dk1))
+                dk2 = tl.dot(ds_lo, q2, tl.dot(ds_hi, q2, dk2))
             else:
-                dsb = ds.to(tl.bfloat16)
-                dk1 = tl.dot(dsb, q1, dk1)
-                dk2 = tl.dot(dsb, q2, dk2)
+                ds16 = ds.to(tl.bfloat16)
+                dk1 = tl.dot(ds16, q1, dk1)
+                dk2 = tl.dot(ds16, q2, dk2)
     dk1 = dk1 * nat_scale
     dk2 = dk2 * nat_scale
     if QK_NORM or ROPE:
@@ -420,16 +420,16 @@ def _attn_bwd_dq(QN, KN, QR, V, DO, LSE, DELTA, DQ, PWQ, WQ, COS, SIN,
             dq1 = tl.dot(ds, k1.to(tl.float32), dq1, input_precision="tf32")
             dq2 = tl.dot(ds, k2.to(tl.float32), dq2, input_precision="tf32")
         elif DS_MODE == 2:
-            hi = ds.to(tl.bfloat16)
-            lo2 = (ds - hi.to(tl.float32)).to(tl.bfloat16)
-            dq1 = tl.dot(lo2, k1, tl.dot(hi, k1, dq1))
-            dq2 = tl.dot(lo2, k2, tl.dot(hi, k2, dq2))
+            ds_hi = ds.to(tl.bfloat16)
+            ds_lo = (ds - ds_hi.to(tl.float32)).to(tl.bfloat16)
+            dq1 = tl.dot(ds_lo, k1, tl.dot(ds_hi, k1, dq1))
+            dq2 = tl.dot(ds_lo, k2, tl.dot(ds_hi, k2, dq2))
         else:
-            dsb = ds.to(tl.bfloat16)
-            dq1 = tl.dot(dsb, k1, dq1)
-            dq2 = tl.dot(dsb, k2, dq2)
+            ds16 = ds.to(tl.bfloat16)
+            dq1 = tl.dot(ds16, k1, dq1)
+            dq2 = tl.dot(ds16, k2, dq2)
             if DS_MODE == 3:
-                rsum += tl.sum(dsb.to(tl.float32), axis=1)
+                rsum += tl.sum(ds16.to(tl.float32), axis=1)
                 pb = p.to(tl.bfloat16)
                 pk1 = tl.dot(pb, k1, pk1)
                 pk2 = tl.dot(pb, k2, pk2)
