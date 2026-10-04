@@ -32,8 +32,7 @@ def run_impl(name, q, k, v, do, scale, flex=None):
     q, k, v = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
     if name.startswith("ours"):                       # ours / ours:tf32 / ours:split / ours:gproj (AX.DS_PREC)
         AX.DS_PREC = name.split(":")[1] if ":" in name else "bf16"
-        o = attn_xsa(q, k, v, scale=scale, xsa=False)
-        AX.DS_PREC = "bf16"
+        o = attn_xsa(q, k, v, scale=scale, xsa=False)       # DS_PREC is read in the BACKWARD: reset after it
     elif name == "flex":
         o = flex(q, k, v)
     elif name == "sdpa":
@@ -43,6 +42,7 @@ def run_impl(name, q, k, v, do, scale, flex=None):
     elif name == "fp64":
         o = attn_xsa_reference(q, k, v, scale=scale, xsa=False, dtype=torch.float64)
     o.backward(do.to(o.dtype))
+    AX.DS_PREC = "bf16"
     return o.detach(), q.grad, k.grad, v.grad
 
 
