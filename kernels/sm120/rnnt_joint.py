@@ -232,7 +232,9 @@ def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, r0, M, VS, BLANK, BR: tl.
     gb = tl.load(GB + r, mask=mi, other=0.0)
     gy = tl.load(GY + r, mask=mi, other=0.0)
     tot = gb + gy
-    live = mi & (tot > 0.0)
+    # lattice points with occupancy < 1e-30 exist (7.6e-43 seen at V=4097, T=40): 1/tot of a denormal is inf -> NaN.
+    # Such a row's whole gradient is < 1e-30, far under any bf16 gradient it sums with: leave its E unfolded.
+    live = mi & (tot > 1e-30)
     c = tl.load(CROW + r, mask=mi, other=0.0)
     big = tl.exp(tl.load(LSE + r, mask=mi, other=0.0) - c)
     inv = tl.where(live, 1.0 / tot, 0.0)
