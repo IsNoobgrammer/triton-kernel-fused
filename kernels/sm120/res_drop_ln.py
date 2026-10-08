@@ -90,9 +90,14 @@ def _bwd(DROUT, DY, RIN, W, MEAN, RSTD, DRES, DX, DWP, DBP, R, C, seed, p, scale
     tl.store(DBP + pid * C + cols, tl.sum(dy, axis=0), mask=mc)
 
 
-def _cfg(C):
+_CFG = {"fwd": None, "bwd": None}                 # (rows per program, warps) override for bench_res_drop_ln.py
+
+
+def _cfg(C, which):
     BC = triton.next_power_of_2(C)
-    return max(1, min(16, 8192 // BC)), BC
+    if _CFG[which]:
+        return _CFG[which][0], BC, _CFG[which][1]
+    return (max(1, min(16, 8192 // BC)), BC, 4) if which == "fwd" else (max(1, min(4, 2048 // BC)), BC, 4)
 
 
 class _ResDropLN(torch.autograd.Function):
@@ -107,11 +112,11 @@ class _ResDropLN(torch.autograd.Function):
         y = torch.empty(res2.shape, device=res.device, dtype=ydt or res.dtype)
         mean = torch.empty(R, device=res.device, dtype=torch.float32)
         rstd = torch.empty_like(mean)
-        BR, BC = _cfg(C)
+        BR, BC, NW = _cfg(C, "fwd")
         drop = x is not None and p > 0
         _fwd[(triton.cdiv(R, BR),)](res2, x2, w, b, rout, y, mean, rstd, R, C, eps, seed, p, 1.0 / (1.0 - p),
                                     factor, BR=BR, BC=BC, HAS_X=x is not None, DROP=drop, SCALE_F=factor != 1.0,
-                                    num_warps=4)
+                                    num_warps=NW)
         ctx.save_for_backward(rout, w, mean, rstd)
         ctx.cfg = (shp, x is not None, x.dtype if x is not None else None, p, factor, seed, w.dtype, b.dtype)
         return rout.view(shp), y.view(shp)
@@ -121,7 +126,7 @@ class _ResDropLN(torch.autograd.Function):
         rout, w, mean, rstd = ctx.saved_tensors
         shp, has_x, xdt, p, factor, seed, wdt, bdt = ctx.cfg
         R, C = rout.shape
-        BR, BC = _cfg(C)
+        BR, BC, NW = _cfg(C, "bwd")
         nb = triton.cdiv(R, BR)
         dy = dy.reshape(-1, C).contiguous() if dy is not None else torch.zeros_like(rout)
         has_dr = drout is not None
@@ -132,7 +137,7 @@ class _ResDropLN(torch.autograd.Function):
         dbp = torch.empty_like(dwp)
         _bwd[(nb,)](dr_in, dy, rout, w, mean, rstd, dres, dx, dwp, dbp, R, C, seed, p, 1.0 / (1.0 - p), factor,
                     BR=BR, BC=BC, HAS_X=has_x, HAS_DROUT=has_dr, DROP=has_x and p > 0, SCALE_F=factor != 1.0,
-                    num_warps=4)
+                    num_warps=NW)
         return (dres.view(shp), dx.view(shp) if has_x else None, dwp.sum(0).to(wdt), dbp.sum(0).to(bdt),
                 None, None, None, None, None)
 
