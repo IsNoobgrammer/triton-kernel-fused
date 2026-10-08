@@ -1,6 +1,6 @@
 """relpos_attention vs NeMo's rel_pos attention core (fp32, TF32 matmuls: what the run1 model runs), fwd and bwd,
 at the Lhotse 1200 s bucket shapes (12.5 frames/s, 8 heads x 64), context [70, 13] (training's first choice), with
-attention dropout 0.1. Tile sizes via RPA_BM / RPA_BN.
+attention dropout 0.1. bf16 inputs (what the model feeds it under autocast).
 
     python bench/bench_relpos_attn.py
 """
