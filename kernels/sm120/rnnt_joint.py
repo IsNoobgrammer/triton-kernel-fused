@@ -30,7 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
-from kernels.sm120.ce_factored import _HI, _HS, _LO, _combine_kernel, _lcfg
+from kernels.sm120.ce_factored import _HI, _HS, _LO, _lcfg
 
 __all__ = ["rnnt_joint_loss"]
 
@@ -247,54 +247,62 @@ def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, r0, M, VS, BLANK, BR: tl.
 
 
 @triton.jit
-def _df_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, seed, p, scale, T, U1, Hd, K,
-               BU: tl.constexpr, BH: tl.constexpr, DROP: tl.constexpr):
-    # per (b, t, h-block): dX = s (E' @ W) read straight from the GEMM output; dropout + relu backward written back
-    # in place (dg reads it); df[b, t] = sum over u
+def _dfg_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NTB, Hd, K,
+                TB: tl.constexpr, BU: tl.constexpr, BH: tl.constexpr, DROP: tl.constexpr):
+    # per (b, block of TB frames, h-block), every u at once: dX = s (E' @ W) read ONCE from the GEMM output,
+    # relu + dropout backward, df[b, t] = sum over u (complete per t), dg partial over this block's t (summed after)
     b = tl.program_id(0)
-    t = tl.program_id(1)
-    if t >= tl.load(TLEN + b):
+    tbi = tl.program_id(1)
+    tb = tl.load(TLEN + b).to(tl.int32)
+    t0 = tbi * TB
+    if t0 >= tb:
         return
     ub1 = tl.load(YLEN + b).to(tl.int32) + 1
-    row0 = tl.load(OFF + b) + t * ub1
+    base = tl.load(OFF + b)
     cols = tl.program_id(2) * BH + tl.arange(0, BH)
     mc = cols < Hd
-    fv = tl.load(F + (b * T + t).to(tl.int64) * Hd + cols, mask=mc, other=0.0).to(tl.float32)
-    acc = tl.zeros([BH], tl.float32)
-    for u0 in range(0, ub1, BU):
-        u = u0 + tl.arange(0, BU)
-        mu = u < ub1
-        rows = row0 + u
-        m2 = mu[:, None] & mc[None, :]
-        gv = tl.load(G + (b * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+    u = tl.arange(0, BU)
+    mu = u < ub1
+    m2 = mu[:, None] & mc[None, :]
+    gv = tl.load(G + (b * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+    accg = tl.zeros([BU, BH], tl.float32)
+    for t in range(t0, tl.minimum(t0 + TB, tb)):
+        rows = base + t * ub1 + u
+        fv = tl.load(F + (b * T + t).to(tl.int64) * Hd + cols, mask=mc, other=0.0).to(tl.float32)
         x = (fv[None, :] + gv).to(tl.bfloat16).to(tl.float32)
-        ptr = GM + rows[:, None].to(tl.int64) * K + cols[None, :]
         sr = tl.load(S + rows, mask=mu, other=0.0)
-        d = tl.where(x > 0.0, tl.load(ptr, mask=m2, other=0.0) * sr[:, None], 0.0)
+        d = tl.load(GM + rows[:, None].to(tl.int64) * K + cols[None, :], mask=m2, other=0.0) * sr[:, None]
+        d = tl.where(m2 & (x > 0.0), d, 0.0)
         if DROP:
             r = tl.rand(seed, (rows[:, None] * Hd + cols[None, :]).to(tl.int32))
             d = tl.where(r >= p, d * scale, 0.0)
-        tl.store(ptr, d, mask=m2)
-        acc += tl.sum(tl.where(m2, d, 0.0), axis=0)
-    tl.store(DF + (b * T + t).to(tl.int64) * Hd + cols, acc, mask=mc)
+        tl.store(DF + (b * T + t).to(tl.int64) * Hd + cols, tl.sum(d, axis=0), mask=mc)
+        accg += d
+    tl.store(DGP + ((b * NTB + tbi) * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], accg, mask=m2)
 
 
 @triton.jit
-def _dg_kernel(DH, OFF, TLEN, YLEN, DG, U1, Hd, K, BH: tl.constexpr):
-    # per (b, u, h-block): dg[b, u] = sum over t, in t order (deterministic)
-    b = tl.program_id(0)
-    u = tl.program_id(1)
-    ub1 = tl.load(YLEN + b).to(tl.int32) + 1
-    if u >= ub1:
-        return
-    tb = tl.load(TLEN + b).to(tl.int32)
-    row = tl.load(OFF + b) + u
-    cols = tl.program_id(2) * BH + tl.arange(0, BH)
-    mc = cols < Hd
-    acc = tl.zeros([BH], tl.float32)
-    for t in range(0, tb):
-        acc += tl.load(DH + (row + t * ub1).to(tl.int64) * K + cols, mask=mc, other=0.0)
-    tl.store(DG + (b * U1 + u).to(tl.int64) * Hd + cols, acc, mask=mc)
+def _combine_rows_kernel(PA, PB, LSE, MX, CROW, M, NT, BR: tl.constexpr, BT: tl.constexpr,
+                         STORE_E: tl.constexpr, FIX: tl.constexpr):
+    # ce_factored._combine_kernel, BR rows per program (one row per program was 1.18M programs: 1.9 ms -> ~0.3)
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    mr = r < M
+    t = tl.arange(0, BT)
+    m2 = mr[:, None] & (t[None, :] < NT)
+    off = r[:, None].to(tl.int64) * NT + t[None, :]
+    a = tl.load(PA + off, mask=m2, other=0.0)
+    if STORE_E:
+        if FIX:
+            lse = tl.load(CROW + r, mask=mr, other=0.0) + tl.log(tl.sum(a, 1))
+        else:
+            lse = tl.log(tl.sum(a, 1))
+    else:
+        b = tl.load(PB + off, mask=m2, other=-float("inf"))
+        mx = tl.max(b, 1)
+        lse = mx + tl.log(tl.sum(a * tl.exp(b - mx[:, None]), 1))
+    tl.store(LSE + r, lse, mask=mr)
+    if not FIX:
+        tl.store(MX + r, tl.max(tl.load(PB + off, mask=m2, other=-float("inf")), 1), mask=mr)
 
 
 def _stats(X, Wa, lab, blank, store_e, E=None):
@@ -316,13 +324,16 @@ def _stats(X, Wa, lab, blank, store_e, E=None):
     ev = dict(EVEN_K=K % BK == 0, EVEN_V=V % BN == 0, num_warps=nw, num_stages=ns)
     _logits_kernel[grid](X, Wa, E if store_e else PA, PA, PB, tgt, blk, lab, lab, PA, M, V, VS, NT, K, blank,
                          BM, BN, BK, G, store_e, False, **ev)
-    _combine_kernel[(M,)](PA, PB, lse, mx, PA, NT, triton.next_power_of_2(NT), store_e, False, num_warps=4)
+    cgrid = (triton.cdiv(M, 128),)
+    _combine_rows_kernel[cgrid](PA, PB, lse, mx, PA, M, NT, 128, triton.next_power_of_2(NT), store_e, False,
+                                num_warps=4)
     crow = torch.where((mx < _LO) | (mx > _HI), mx, torch.zeros_like(mx))
     if store_e:
         order = torch.argsort((crow != 0).to(torch.int8), descending=True, stable=True)
         _logits_kernel[grid](X, Wa, E, PA, PB, tgt, blk, lab, order, crow, M, V, VS, NT, K, blank,
                              BM, BN, BK, G, True, True, **ev)
-        _combine_kernel[(M,)](PA, PB, lse, mx, crow, NT, triton.next_power_of_2(NT), True, True, num_warps=4)
+        _combine_rows_kernel[cgrid](PA, PB, lse, mx, crow, M, NT, 128, triton.next_power_of_2(NT), True, True,
+                                    num_warps=4)
     return lse, tgt, blk, crow
 
 
@@ -410,11 +421,14 @@ class _RNNTJoint(torch.autograd.Function):
                 _stats(X[i:i + M], Wa, LAB[i:i + M], V - 1, True, Ebuf[:M])
                 grads(Ebuf[:M], i, M)
         df = torch.zeros(B, T, Hd, device=dev, dtype=torch.float32)
-        dg = torch.zeros(B, U1, Hd, device=dev, dtype=torch.float32)
-        BH = 128
-        _df_kernel[(B, T, triton.cdiv(Hd, BH))](GM, S, f, g, off, tlen, ylen, df, seed, p, 1.0 / (1.0 - p), T, U1, Hd,
-                                               K, BU=BU, BH=BH, DROP=p > 0, num_warps=4)
-        _dg_kernel[(B, U1, triton.cdiv(Hd, BH))](GM, off, tlen, ylen, dg, U1, Hd, K, BH, num_warps=4)
+        BUg = triton.next_power_of_2(U1)
+        BH = max(16, min(128, 8192 // BUg))                     # the (u, h) dg accumulator stays in registers
+        TB = 16
+        NTB = triton.cdiv(T, TB)
+        dgp = torch.zeros(B, NTB, U1, Hd, device=dev, dtype=torch.float32)
+        _dfg_kernel[(B, NTB, triton.cdiv(Hd, BH))](GM, S, f, g, off, tlen, ylen, df, dgp, seed, p, 1.0 / (1.0 - p),
+                                                  T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
+        dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
                 None, None, None, None, None, None, None)
 
