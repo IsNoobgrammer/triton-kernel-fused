@@ -84,6 +84,8 @@ def timeit(fn, args, iters):
         if i >= 3:
             fw.append(ev[0].elapsed_time(ev[1]))
             bw.append(ev[1].elapsed_time(ev[2]))
+    bad = [n for n, t in zip("f g W b".split(), args[:4]) if not torch.isfinite(t.grad).all()]
+    assert not bad, f"non-finite grads: {bad}"                     # a fast NaN is not a result
     med = lambda x: sorted(x)[len(x) // 2]
     return med(fw), med(bw), torch.cuda.max_memory_allocated() / 2 ** 30, loss.item()
 
