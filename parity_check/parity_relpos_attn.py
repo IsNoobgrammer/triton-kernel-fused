@@ -23,7 +23,6 @@ from kernels.sm120.relpos_attn import relpos_attention
 
 dev = "cuda"
 PREC = os.environ.get("RPA_PREC", "tf32x3")
-PRECG = os.environ.get("RPA_PRECG") or None
 ok = True
 
 
@@ -78,10 +77,12 @@ def data(B, T, H, D, seed=0):
     return [q, k, v, p, u, vb], lengths, W
 
 
-def grads(fn, xs, W, dtype):
-    xs = [x.detach().to(dtype).clone().requires_grad_() for x in xs]
-    o = fn(*xs)
-    (o * W.to(o.dtype)).sum().backward()
+def grads(fn, xs, W, dtype, bias_dtype=None, amp=False):
+    """q, k, v, p in dtype; the two biases in bias_dtype (fp32 parameters in the model) -- default dtype."""
+    xs = [x.detach().to(dtype if i < 4 else (bias_dtype or dtype)).clone().requires_grad_() for i, x in enumerate(xs)]
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        o = fn(*xs)
+    (o.float() * W).sum().backward()
     return [o.detach()] + [x.grad for x in xs]
 
 
@@ -96,26 +97,30 @@ NAMES = ["o", "dq", "dk", "dv", "dp", "du", "dv_bias"]
 def main():
     B, T, H, D = 3, 150, 8, 64
     xs, lengths, W = data(B, T, H, D)
-    for left, right in ((70, 13), (70, 6), (70, 1), (70, 0)):
-        print(f"\n== context [{left}, {right}], B={B} T={T} H={H} D={D}, lengths {lengths.tolist()}", flush=True)
-        mask = nemo_mask(T, lengths, left, right)
-        gt = grads(lambda *a: nemo_core(*a, mask), xs, W, torch.float64)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        nf = grads(lambda *a: nemo_core(*a, mask), xs, W, torch.float32)
-        torch.backends.cuda.matmul.allow_tf32 = False
-        ours = lambda *a: relpos_attention(*a, lengths, left, right, prec=PREC, precg=PRECG)
-        ou = grads(ours, xs, W, torch.float32)
-        bad = []
-        for n, a, e, g in zip(NAMES, ou, nf, gt):
-            if rel(a, g) > max(1.1 * rel(e, g), 2e-4):
-                bad.append(f"{n} ours {rel(a, g):.2e} nemo-fp32 {rel(e, g):.2e}")
-        worst = max(zip(NAMES, ou, nf, gt), key=lambda t: rel(t[1], t[3]))
-        check("1 vs fp64 <= NeMo fp32", not bad, "; ".join(bad) if bad else
-              f"worst {worst[0]}: ours {rel(worst[1], worst[3]):.1e} nemo-fp32 {rel(worst[2], worst[3]):.1e}")
-        ou2 = grads(ours, xs, W, torch.float32)
-        check("2 repeatable", all(torch.equal(a, b) for a, b in zip(ou, ou2)), "bitwise")
-        padrows = torch.arange(T, device=dev)[None, :] >= lengths[:, None]
-        check("4 padding rows = 0", bool((ou[0][padrows] == 0).all()), f"{int(padrows.sum())} rows")
+    for mode in ("bf16", "fp32"):
+        for left, right in ((70, 13), (70, 6), (70, 1), (70, 0)):
+            print(f"\n== {mode}: context [{left}, {right}], B={B} T={T} H={H} D={D}, lengths {lengths.tolist()}",
+                  flush=True)
+            mask = nemo_mask(T, lengths, left, right)
+            dt = torch.bfloat16 if mode == "bf16" else torch.float32
+            xs_m = [x.to(dt) if i < 4 else x for i, x in enumerate(xs)]      # the values both sides see
+            gt = grads(lambda *a: nemo_core(*a, mask), xs_m, W, torch.float64)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            # NeMo's real path: bf16 tensors under bf16 autocast, or fp32 with TF32 matmuls
+            nf = grads(lambda *a: nemo_core(*a, mask), xs_m, W, dt, torch.float32, amp=mode == "bf16")
+            torch.backends.cuda.matmul.allow_tf32 = False
+            ours = lambda *a: relpos_attention(*a, lengths, left, right, prec=PREC)
+            ou = grads(ours, xs_m, W, dt, torch.float32)
+            slack, floor = (1.25, 1e-3) if mode == "bf16" else (1.1, 2e-4)
+            bad = [f"{n} ours {rel(a, g):.2e} nemo {rel(e, g):.2e}" for n, a, e, g in zip(NAMES, ou, nf, gt)
+                   if rel(a, g) > max(slack * rel(e, g), floor)]
+            worst = max(zip(NAMES, ou, nf, gt), key=lambda t: rel(t[1], t[3]) / max(rel(t[2], t[3]), 1e-12))
+            check(f"1 vs fp64 <= NeMo {mode} x{slack}", not bad, "; ".join(bad) if bad else
+                  f"worst {worst[0]}: ours {rel(worst[1], worst[3]):.1e} nemo {rel(worst[2], worst[3]):.1e}")
+            ou2 = grads(ours, xs_m, W, dt, torch.float32)
+            check("2 repeatable", all(torch.equal(a, b) for a, b in zip(ou, ou2)), "bitwise")
+            padrows = torch.arange(T, device=dev)[None, :] >= lengths[:, None]
+            check("4 padding rows = 0", bool((ou[0][padrows] == 0).all()), f"{int(padrows.sum())} rows")
 
     print("\n== dropout 0.1, context [70, 13], IEEE dots", flush=True)
     f = lambda *a: relpos_attention(*a, lengths, 70, 13, dropout=0.1, seed=99, prec="ieee")
