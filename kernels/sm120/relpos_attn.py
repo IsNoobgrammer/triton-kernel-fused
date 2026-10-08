@@ -109,8 +109,9 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
            PREC: tl.constexpr, PRECG: tl.constexpr, WIDE: tl.constexpr,
            SKIP: tl.constexpr = 0, PRECP: tl.constexpr = "tf32x3"):
-    # query-major: dq (u path and v path separately), and per key tile its partial of d p, each in its own slot
-    # (written once: a load-add-store per tile behind a barrier made this kernel 4x the key-major one)
+    # query-major: dq (u path and v path separately); every scaled ds tile is stored (its own slot) for _dp_diag.
+    # Computing d p here (dg^T @ qv on a GATHERED tile) was 75% of this kernel: the gathered layout must be
+    # converted before the MMA, whatever the precision.
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
     nm = tl.num_programs(0)
@@ -134,7 +135,7 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
         ci1 = (tl.minimum(i0 + BM, L) - 1) // CH
         jlo = tl.maximum(0, (ci0 - LC) * CH)
         jhi = tl.minimum(L, (ci1 + 1) * CH)
-        dbase = DPQ + (bh * nm + pid_m).to(tl.int64) * NT * BP * D
+        dbase = DPQ + (bh * nm + pid_m).to(tl.int64) * NT * BM * BN
         for j0 in range(jlo, jhi, BN):
             s, ok, k, pband = _scores(qu, qv, K, P, b, h, i0, j0, T, L, CH, LC, scale, sqb, sqt, sqh, spr, sph,
                                       BM, BN, BP, D, PREC)
@@ -157,18 +158,10 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
                 dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
             if SKIP < 2:
                 dqv += tl.dot(dg, pband, input_precision=PRECG)
-            if SKIP < 1:
-                # dg^T gathered directly from ds^T (axis 0): tl.trans of the gathered dg before the dot was 75% of
-                # this kernel; ds^T is a plain register tile
-                mt = tl.arange(0, BP)[:, None] - (BM - 1) + tl.arange(0, BM)[None, :]          # (BP, BM)
-                dgt = tl.where((mt >= 0) & (mt < BN),
-                               tl.gather(tl.trans(ds), tl.minimum(tl.maximum(mt, 0), BN - 1), axis=0), 0.0)
-                dpb = tl.dot(dgt, qv, input_precision=PRECP)                 # (BP, D) rows rbase .. rbase+BP-1
+            if SKIP < 1:                                                     # ds tile for _dp_diag (dp)
                 t = (j0 - jlo) // BN
-                if SKIP == -1:                                               # debug: the dot without its store
-                    dqv += tl.sum(dpb, 0)[None, :] * 1e-30
-                else:
-                    tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
+                tl.store(dbase + (t * BM + tl.arange(0, BM)[:, None]) * BN + tl.arange(0, BN)[None, :], ds,
+                         mask=t < NT)
     tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
     tl.store(DQV + qp, dqv, mask=offs_m[:, None] < T)
 
@@ -224,23 +217,36 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
 
 
 @triton.jit
-def _dp_reduce(PART, DP, T, H, NM, NT, CH, LC, BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr,
-               BR: tl.constexpr, D: tl.constexpr):
-    # dp[r, h] = sum over (query block m, key tile t) of part[h, m, t, r - off(m) - t BN]; fixed order
+def _dp_diag(DSB, Q, VB, LEN, DPP, T, H, NM, NT, CH, LC, sqb, sqt, sqh,
+             BM: tl.constexpr, BN: tl.constexpr, BR: tl.constexpr, D: tl.constexpr, PREC: tl.constexpr):
+    # dp[b, r] = sum_i ds[i, j = i + r - (T-1)] (q+v)_i : ds read straight from its tiles along the diagonal, loaded
+    # in the (r, i) orientation the dot wants (no register gather, no layout conversion)
     pid_r = tl.program_id(0)
     h = tl.program_id(1)
+    b = tl.program_id(2)
+    bh = b * H + h
+    L = tl.load(LEN + b)
     r = pid_r * BR + tl.arange(0, BR)
     offs_d = tl.arange(0, D)
     acc = tl.zeros([BR, D], tl.float32)
     for m in range(0, NM):
         i0 = m * BM
-        off = tl.maximum(0, (i0 // CH - LC) * CH) - i0 - (BM - 1) + T - 1
-        for t in range(0, NT):
-            rr = r - off - t * BN
-            ok = (rr >= 0) & (rr < BP) & (r < 2 * T - 1)
-            ptr = PART + (((h * NM + m) * NT + t) * BP + rr[:, None]).to(tl.int64) * D + offs_d[None, :]
-            acc += tl.load(ptr, mask=ok[:, None], other=0.0)
-    tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
+        if i0 < L:
+            i = i0 + tl.arange(0, BM)
+            jlo = tl.maximum(0, (i0 // CH - LC) * CH)
+            jhi = tl.minimum(L, ((tl.minimum(i0 + BM, L) - 1) // CH + 1) * CH)
+            nt = (jhi - jlo + BN - 1) // BN                                   # tiles _bwd_q wrote for this block
+            j = i[None, :] + r[:, None] - (T - 1)                             # (BR, BM)
+            rel = j - jlo
+            t = rel // BN
+            ok = (rel >= 0) & (t < nt) & (j < L) & (i[None, :] < L) & (r[:, None] < 2 * T - 1)
+            ptr = DSB + ((bh * NM + m).to(tl.int64) * NT + t) * (BM * BN) + (i[None, :] - i0) * BN + rel % BN
+            dsd = tl.load(ptr, mask=ok, other=0.0)
+            qv = tl.load(Q + b * sqb + i[:, None] * sqt + h * sqh + offs_d[None, :], mask=(i < L)[:, None], other=0.0)
+            qv += tl.load(VB + h * D + offs_d)[None, :]
+            acc += tl.dot(dsd, qv, input_precision=PREC)
+    tl.store(DPP + ((b * (2 * T - 1) + r[:, None]) * H + h).to(tl.int64) * D + offs_d[None, :], acc,
+             mask=(r < 2 * T - 1)[:, None])
 
 
 _WIDE = __import__("os").environ.get("RPA_WIDE", "1") == "1"
@@ -280,7 +286,7 @@ class _RelPosAttn(torch.autograd.Function):
         jspan = (LC + 2) * CH + _BM            # widest key range of one query block (it can straddle BM/CH + 1 chunks)
         NT = min(triton.cdiv(jspan, _BN), triton.cdiv(T, _BN)) + 1   # key tiles per query block (short clips: few)
         dqu, dqv, dk, dv = (torch.empty_like(q) for _ in range(4))
-        dpq = torch.zeros(B * H * NM * NT * BP * D, device=q.device, dtype=torch.float32)
+        dpq = torch.empty(B * H * NM * NT * _BM * _BN, device=q.device, dtype=torch.float32)  # ds tiles
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
@@ -289,11 +295,11 @@ class _RelPosAttn(torch.autograd.Function):
                             PRECP=__import__("os").environ.get("RPA_PRECP", precg), **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
                                               H, CH, LC, D ** -0.5, *st, num_warps=_WKV, **common)
-        part = dpq.view(B, H * NM * NT * BP * D).sum(0)                # deterministic sum over b
-        dp = torch.empty_like(p)
+        dpp = torch.empty(B, 2 * T - 1, H, D, device=q.device, dtype=torch.float32)
         BR = 32
-        _dp_reduce[(triton.cdiv(2 * T - 1, BR), H)](part, dp, T, H, NM, NT, CH, LC, BM=_BM, BN=_BN, BP=BP, BR=BR, D=D,
-                                                    num_warps=4)
+        _dp_diag[(triton.cdiv(2 * T - 1, BR), H, B)](dpq, q, vb, lengths, dpp, T, H, NM, NT, CH, LC, *st[:3],
+                                                     BM=_BM, BN=_BN, BR=BR, D=D, PREC=precg, num_warps=4)
+        dp = dpp.sum(0)                                                    # deterministic sum over b
         du = dqu.sum((0, 1))
         dvb = dqv.sum((0, 1))
         return dqu + dqv, dk, dv, dp, du, dvb, None, None, None, None, None, None, None
