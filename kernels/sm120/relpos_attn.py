@@ -165,7 +165,10 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
                                tl.gather(tl.trans(ds), tl.minimum(tl.maximum(mt, 0), BN - 1), axis=0), 0.0)
                 dpb = tl.dot(dgt, qv, input_precision=PRECG)                 # (BP, D) rows rbase .. rbase+BP-1
                 t = (j0 - jlo) // BN
-                tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
+                if SKIP == -1:                                               # debug: the dot without its store
+                    dqv += tl.sum(dpb, 0)[None, :] * 1e-30
+                else:
+                    tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
     tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
     tl.store(DQV + qp, dqv, mask=offs_m[:, None] < T)
 
