@@ -107,7 +107,8 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
 def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, T, H, CH, LC, scale, NT,
            sqb, sqt, sqh, spr, sph,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-           PREC: tl.constexpr, PRECG: tl.constexpr, WIDE: tl.constexpr):
+           PREC: tl.constexpr, PRECG: tl.constexpr, WIDE: tl.constexpr,
+           SKIP: tl.constexpr = 0):
     # query-major: dq (u path and v path separately), and per key tile its partial of d p, each in its own slot
     # (written once: a load-add-store per tile behind a barrier made this kernel 4x the key-major one)
     pid_m = tl.program_id(0)
@@ -154,10 +155,12 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
                 dg = tl.gather(wide, tl.where((mm >= 0) & (mm < BN), 2 * mm, 1), axis=1)
             else:
                 dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
-            dqv += tl.dot(dg, pband, input_precision=PRECG)
-            dpb = tl.dot(tl.trans(dg), qv, input_precision=PRECG)            # (BP, D) rows rbase .. rbase+BP-1
-            t = (j0 - jlo) // BN
-            tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
+            if SKIP < 2:
+                dqv += tl.dot(dg, pband, input_precision=PRECG)
+            if SKIP < 1:
+                dpb = tl.dot(tl.trans(dg), qv, input_precision=PRECG)        # (BP, D) rows rbase .. rbase+BP-1
+                t = (j0 - jlo) // BN
+                tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
     tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
     tl.store(DQV + qp, dqv, mask=offs_m[:, None] < T)
 
@@ -273,7 +276,8 @@ class _RelPosAttn(torch.autograd.Function):
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
-                            D ** -0.5, NT, *st, num_warps=_WQ, WIDE=_WIDE and BP == 2 * _BN, **common)
+                            D ** -0.5, NT, *st, num_warps=_WQ, WIDE=_WIDE and BP == 2 * _BN,
+                            SKIP=int(__import__("os").environ.get("RPA_SKIP", 0)), **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
                                               H, CH, LC, D ** -0.5, *st, num_warps=_WKV, **common)
         part = dpq.view(B, H * NM * NT * BP * D).sum(0)                # deterministic sum over b
