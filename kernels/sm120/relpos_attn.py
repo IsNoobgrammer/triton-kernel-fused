@@ -227,6 +227,8 @@ def _dp_reduce(PART, DP, T, H, NM, NT, CH, LC, BM: tl.constexpr, BN: tl.constexp
     tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
 
 
+_WQ = int(__import__("os").environ.get("RPA_WQ", 4))
+_WKV = int(__import__("os").environ.get("RPA_WKV", 4))
 _BM, _BN = int(__import__("os").environ.get("RPA_BM", 32)), int(__import__("os").environ.get("RPA_BN", 32))
 
 
@@ -259,15 +261,15 @@ class _RelPosAttn(torch.autograd.Function):
         BP = triton.next_power_of_2(_BM + _BN - 1)
         NM = triton.cdiv(T, _BM)
         jspan = (LC + 2) * CH + _BM            # widest key range of one query block (it can straddle BM/CH + 1 chunks)
-        NT = triton.cdiv(jspan, _BN) + 1
+        NT = min(triton.cdiv(jspan, _BN), triton.cdiv(T, _BN)) + 1   # key tiles per query block (short clips: few)
         dqu, dqv, dk, dv = (torch.empty_like(q) for _ in range(4))
         dpq = torch.zeros(B * H * NM * NT * BP * D, device=q.device, dtype=torch.float32)
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
-        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_warps=4, num_stages=1)
+        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
-                            D ** -0.5, NT, *st, **common)
+                            D ** -0.5, NT, *st, num_warps=_WQ, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
-                                              H, CH, LC, D ** -0.5, *st, **common)
+                                              H, CH, LC, D ** -0.5, *st, num_warps=_WKV, **common)
         part = dpq.view(B, H * NM * NT * BP * D).sum(0)                # deterministic sum over b
         dp = torch.empty_like(p)
         BR = 32
