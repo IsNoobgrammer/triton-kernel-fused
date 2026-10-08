@@ -97,14 +97,14 @@ def _cfg(C):
 
 class _ResDropLN(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, res, x, w, b, eps, p, factor, seed):
+    def forward(ctx, res, x, w, b, eps, p, factor, seed, ydt):
         shp = res.shape
         C = shp[-1]
         res2 = res.reshape(-1, C).contiguous()
         R = res2.shape[0]
         x2 = x.reshape(-1, C).contiguous() if x is not None else res2
         rout = torch.empty_like(res2) if x is not None else res2.clone()      # an output, never the input itself
-        y = torch.empty_like(res2)
+        y = torch.empty(res2.shape, device=res.device, dtype=ydt or res.dtype)
         mean = torch.empty(R, device=res.device, dtype=torch.float32)
         rstd = torch.empty_like(mean)
         BR, BC = _cfg(C)
@@ -134,12 +134,13 @@ class _ResDropLN(torch.autograd.Function):
                     BR=BR, BC=BC, HAS_X=has_x, HAS_DROUT=has_dr, DROP=has_x and p > 0, SCALE_F=factor != 1.0,
                     num_warps=4)
         return (dres.view(shp), dx.view(shp) if has_x else None, dwp.sum(0).to(wdt), dbp.sum(0).to(bdt),
-                None, None, None, None)
+                None, None, None, None, None)
 
 
-def res_dropout_layernorm(residual, x, weight, bias, eps, p=0.0, factor=1.0, seed=None):
+def res_dropout_layernorm(residual, x, weight, bias, eps, p=0.0, factor=1.0, seed=None, y_dtype=None):
     """(residual + dropout(x) * factor, LayerNorm(that)); x=None: (residual, LayerNorm(residual)). p = the caller's
-    (0 outside training). Rows = all leading dims, LN over the last."""
+    (0 outside training). Rows = all leading dims, LN over the last. y_dtype: the LN output dtype (fp32 under autocast,
+    whatever the residual's; default = the residual's)."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))
-    return _ResDropLN.apply(residual, x, weight, bias, float(eps), float(p), float(factor), seed)
+    return _ResDropLN.apply(residual, x, weight, bias, float(eps), float(p), float(factor), seed, y_dtype)
