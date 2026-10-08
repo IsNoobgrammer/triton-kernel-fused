@@ -36,6 +36,7 @@ __all__ = ["rnnt_joint_loss"]
 _E_BUDGET = 24 << 30                    # bytes of E kept from forward to backward (N * V * 2)
 _G_BUDGET = 2 << 30                     # bytes of the fp32 (chunk, K) E @ W product in the backward
 _NEG = float("-inf")
+_LCFG = None                            # (BM, BN, BK, GROUP, warps, stages) override for bench/bench_rnnt_lcfg.py
 
 
 @triton.jit
@@ -71,10 +72,11 @@ def _hidden_kernel(F, G, Y, OFF, TLEN, YLEN, X, LAB, seed, p, scale, T, U1, YS, 
 
 
 @triton.jit
-def _logits_kernel(X, W, E, PA, PB, TGT, BLK, LAB, ORDER, CROW, M, V, NT, K, BLANK,
+def _logits_kernel(X, W, E, PA, PB, TGT, BLK, LAB, ORDER, CROW, M, V, VS, NT, K, BLANK,
                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP: tl.constexpr,
                    STORE_E: tl.constexpr, FIX: tl.constexpr, EVEN_K: tl.constexpr, EVEN_V: tl.constexpr):
-    # ce_factored._logits_kernel plus the blank logit. FIX: second pass over the out-of-window rows only.
+    # ce_factored._logits_kernel plus the blank logit, E rows padded to VS (zeros past V: 16-byte aligned rows keep
+    # cuBLAS on its sm120 kernels -- V = 4097 dropped it to cutlass_75 align1). FIX: out-of-window rows only.
     pid = tl.program_id(0)
     nm = tl.cdiv(M, BM)
     width = GROUP * NT
@@ -122,8 +124,8 @@ def _logits_kernel(X, W, E, PA, PB, TGT, BLK, LAB, ORDER, CROW, M, V, NT, K, BLA
             e = tl.exp(xf - c[:, None])
         else:
             e = tl.exp(xf)
-        tl.store(E + rm[:, None].to(tl.int64) * V + rn[None, :], e.to(tl.bfloat16),
-                 mask=mm[:, None] & mn[None, :])
+        tl.store(E + rm[:, None].to(tl.int64) * VS + rn[None, :], e.to(tl.bfloat16),
+                 mask=mm[:, None] & (rn[None, :] < VS))
         tl.store(PA + rm * NT + pn, tl.sum(e, axis=1), mask=mm)
     else:
         tl.store(PA + rm * NT + pn, tl.sum(tl.exp(xf - mx[:, None]), axis=1), mask=mm)
@@ -278,9 +280,10 @@ def _stats(X, Wa, lab, blank, store_e, E=None):
     """logits pass -> (lse, logit[label], logit[blank], crow). With store_e, E = exp(L - crow) is filled and the
     out-of-window rows got a second, exact pass; without it crow is what that pass WOULD use (for a recompute)."""
     M, K = X.shape
-    V = Wa.shape[0]
-    BM, BN, BK, G, nw, ns = _lcfg(K)
-    NT = triton.cdiv(V, BN)
+    VS = Wa.shape[0]
+    V = blank + 1
+    BM, BN, BK, G, nw, ns = _LCFG or _lcfg(K)
+    NT = triton.cdiv(VS, BN)
     dev = X.device
     PA = torch.empty(M, NT, device=dev, dtype=torch.float32)
     PB = torch.empty(M, NT, device=dev, dtype=torch.float32)
@@ -290,13 +293,13 @@ def _stats(X, Wa, lab, blank, store_e, E=None):
     mx = torch.empty(M, device=dev, dtype=torch.float32)
     grid = (triton.cdiv(M, BM) * NT,)
     ev = dict(EVEN_K=K % BK == 0, EVEN_V=V % BN == 0, num_warps=nw, num_stages=ns)
-    _logits_kernel[grid](X, Wa, E if store_e else PA, PA, PB, tgt, blk, lab, lab, PA, M, V, NT, K, blank,
+    _logits_kernel[grid](X, Wa, E if store_e else PA, PA, PB, tgt, blk, lab, lab, PA, M, V, VS, NT, K, blank,
                          BM, BN, BK, G, store_e, False, **ev)
     _combine_kernel[(M,)](PA, PB, lse, mx, PA, NT, triton.next_power_of_2(NT), store_e, False, num_warps=4)
     crow = torch.where((mx < _LO) | (mx > _HI), mx, torch.zeros_like(mx))
     if store_e:
         order = torch.argsort((crow != 0).to(torch.int8), descending=True, stable=True)
-        _logits_kernel[grid](X, Wa, E, PA, PB, tgt, blk, lab, order, crow, M, V, NT, K, blank,
+        _logits_kernel[grid](X, Wa, E, PA, PB, tgt, blk, lab, order, crow, M, V, VS, NT, K, blank,
                              BM, BN, BK, G, True, True, **ev)
         _combine_kernel[(M,)](PA, PB, lse, mx, crow, NT, triton.next_power_of_2(NT), True, True, num_warps=4)
     return lse, tgt, blk, crow
@@ -329,12 +332,12 @@ class _RNNTJoint(torch.autograd.Function):
         tlen, ylen = tlen.to(torch.int64), ylen.to(torch.int64)
         X, LAB, off, N = _pack(f, g, y.to(torch.int64), tlen, ylen, p, seed)
         K = X.shape[1]
-        Wa = torch.zeros(V, K, device=f.device, dtype=torch.bfloat16)
-        Wa[:, :Hd] = weight
-        Wa[:, Hd] = bias
+        Wa = torch.zeros(triton.cdiv(V, 64) * 64, K, device=f.device, dtype=torch.bfloat16)
+        Wa[:V, :Hd] = weight
+        Wa[:V, Hd] = bias
         need = any(ctx.needs_input_grad[:4])
         store_e = need and N * V * 2 <= e_budget
-        E = torch.empty(N, V, device=f.device, dtype=torch.bfloat16) if store_e else None
+        E = torch.empty(N, Wa.shape[0], device=f.device, dtype=torch.bfloat16) if store_e else None
         lse, tgt, blk, crow = _stats(X, Wa, LAB, V - 1, store_e, E)
         lpb = blk - lse
         lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
@@ -346,18 +349,18 @@ class _RNNTJoint(torch.autograd.Function):
         nll = -(1.0 + lam) * ll                                 # NeMo's numba reports cost (1 + lambda) * -ll
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, lpb, lpy, alpha, beta, ll)
-            ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed)
+            ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V)
         ctx.mark_non_differentiable(nll)
         return nll.mean(), nll
 
     @staticmethod
     def backward(ctx, gout, _g_nll):
         f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, lpb, lpy, alpha, beta, ll = ctx.saved_tensors
-        fdt, gdt, wdt, bdt, lam, p, seed = ctx.cfg
+        fdt, gdt, wdt, bdt, lam, p, seed, V = ctx.cfg
         B, T, Hd = f.shape
         U1 = g.shape[1]
         N, K = X.shape
-        V = Wa.shape[0]
+        VS = Wa.shape[0]
         dev = f.device
         w = (gout.float() / B).reshape(1)                       # mean_batch, no host sync
         GB, GY, S = (torch.empty(N, device=dev, dtype=torch.float32) for _ in range(3))
@@ -365,11 +368,11 @@ class _RNNTJoint(torch.autograd.Function):
         _rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, ll, w, lse, crow, off, tlen, ylen, GB, GY, S, 1.0 + lam,
                                 BU=BU, num_warps=4)
         DH = torch.empty(N, Hd, device=dev, dtype=torch.float32)
-        gw = torch.zeros(V, K, device=dev, dtype=torch.float32)
+        gw = torch.zeros(VS, K, device=dev, dtype=torch.float32)
         C = max(1024, min(N, _G_BUDGET // (K * 4)))
         if E is None:
-            C = max(1024, min(C, _E_BUDGET // (V * 2)))
-            Ebuf = torch.empty(min(C, N), V, device=dev, dtype=torch.bfloat16)
+            C = max(1024, min(C, _E_BUDGET // (VS * 2)))
+            Ebuf = torch.empty(min(C, N), VS, device=dev, dtype=torch.bfloat16)
         BH = 128
         for i in range(0, N, C):
             Xc, Lc = X[i:i + C], LAB[i:i + C]
@@ -395,7 +398,7 @@ class _RNNTJoint(torch.autograd.Function):
         _df_kernel[(B, T, triton.cdiv(Hd, BH))](DH, f, g, off, tlen, ylen, df, seed, p, 1.0 / (1.0 - p), T, U1, Hd,
                                                BU=BU, BH=BH, DROP=p > 0, num_warps=4)
         _dg_kernel[(B, U1, triton.cdiv(Hd, BH))](DH, off, tlen, ylen, dg, U1, Hd, BH, num_warps=4)
-        return (df.to(fdt), dg.to(gdt), gw[:, :Hd].to(wdt), gw[:, Hd].to(bdt),
+        return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
                 None, None, None, None, None, None, None)
 
 
