@@ -14,8 +14,9 @@ syncs the host for the max lengths. Here the logits never exist:
   grads    NeMo's numba gradient, FastEmit included, factored per row:
               dL/dlogit = p * (gb + gy) - gb * [v = blank] - gy * [v = label]
               gb = w e^(alpha + lp_blank + beta(t+1,u) - ll),   gy = w (1 + lambda) e^(alpha + lp_label + beta(t,u+1) - ll)
-           so the backward is ce_factored's: gX = s (E @ W) - gb W[blank] - gy W[label], gW = E^T (s X) - scatter,
-           s = (gb + gy) e^(c - lse). Then dropout/relu backward and two segment sums give df (over u) and dg (over t).
+           Both one-hot terms are folded into E itself (E'[y] = e^(L_y - c) - gy/s, E'[blank] likewise, fp32 then one
+           bf16 rounding), s = (gb + gy) e^(c - lse), so the backward is two cuBLAS GEMMs and nothing else:
+           gX = s (E' @ W), gW = E'^T (s X). Then dropout/relu backward and two segment sums give df (over u), dg (over t).
 
 The forward stores E for the whole batch when it fits `e_budget` (the user's "keep the logits, online softmax"
 plan: 3 GEMMs per step); above that the backward recomputes E per chunk (4 GEMMs). Deterministic: no atomics.
@@ -29,12 +30,11 @@ import torch
 import triton
 import triton.language as tl
 
-from kernels.sm120.ce_factored import _HI, _HS, _LO, _combine_kernel, _lcfg, _scale_rows_kernel, _scatter_kernel
+from kernels.sm120.ce_factored import _HI, _HS, _LO, _combine_kernel, _lcfg
 
 __all__ = ["rnnt_joint_loss"]
 
 _E_BUDGET = 24 << 30                    # bytes of E kept from forward to backward (N * V * 2)
-_G_BUDGET = 2 << 30                     # bytes of the fp32 (chunk, K) E @ W product in the backward
 _NEG = float("-inf")
 _LCFG = None                            # (BM, BN, BK, GROUP, warps, stages) override for bench/bench_rnnt_lcfg.py
 
@@ -186,9 +186,9 @@ def _lattice_kernel(LPB, LPY, OFF, TLEN, YLEN, ALPHA, BETA, LL, BU: tl.constexpr
 
 
 @triton.jit
-def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, GB, GY, S, lam1,
-                    BU: tl.constexpr):
-    # per (b, t): the two lattice weights of every row and the softmax scale s = (gb + gy) e^(c - lse)
+def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, GB, GY, S, X, XS, lam1, K, HS,
+                    BU: tl.constexpr, BK: tl.constexpr):
+    # per (b, t): the two lattice weights of every row, s = (gb + gy) e^(c - lse), and XS = bf16(X s HS) for dW
     b = tl.program_id(0)
     t = tl.program_id(1)
     tb = tl.load(TLEN + b).to(tl.int32)
@@ -212,25 +212,43 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
         tl.store(GB + rows, gb, mask=mu)
         tl.store(GY + rows, gy, mask=mu)
         tl.store(S + rows, s, mask=mu)
+        sh = s * HS
+        for k0 in range(0, K, BK):
+            k = k0 + tl.arange(0, BK)
+            m2 = mu[:, None] & (k[None, :] < K)
+            off = rows[:, None].to(tl.int64) * K + k[None, :]
+            x = tl.load(X + off, mask=m2, other=0.0).to(tl.float32)
+            tl.store(XS + off, (x * sh[:, None]).to(tl.bfloat16), mask=m2)
 
 
 @triton.jit
-def _gh_kernel(GM, S, W, LAB, GB, GY, DH, Hd, K, BLANK, BH: tl.constexpr):
-    # dX[:, :H] = s (E @ W) - gb W[blank] - gy W[label]; GM = E @ W_aug in fp32 from cuBLAS
-    r = tl.program_id(0)
-    cols = tl.program_id(1) * BH + tl.arange(0, BH)
-    mc = cols < Hd
-    g = tl.load(GM + r.to(tl.int64) * K + cols, mask=mc, other=0.0) * tl.load(S + r)
-    lab = tl.load(LAB + r)
-    wy = tl.load(W + tl.maximum(lab, 0) * K + cols, mask=mc, other=0.0).to(tl.float32)
-    wb = tl.load(W + BLANK * K + cols, mask=mc, other=0.0).to(tl.float32)
-    tl.store(DH + r.to(tl.int64) * Hd + cols, g - tl.load(GY + r) * wy - tl.load(GB + r) * wb, mask=mc)
+def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, r0, M, VS, BLANK, BR: tl.constexpr):
+    # fold the one-hot terms into E so the two GEMMs give the whole gradient (no scatter, no GEMV):
+    #   s E'[r, v] = s E[r, v] - gy [v = label] - gb [v = blank],  E'[y] = e^(L_y - c) - (gy / (gb + gy)) e^(lse - c)
+    # computed in fp32 from the bf16 logit and rounded ONCE (NeMo rounds its fp32 dlogits to bf16 the same way)
+    i = tl.program_id(0) * BR + tl.arange(0, BR)
+    mi = i < M
+    r = r0 + i
+    gb = tl.load(GB + r, mask=mi, other=0.0)
+    gy = tl.load(GY + r, mask=mi, other=0.0)
+    tot = gb + gy
+    live = mi & (tot > 0.0)
+    c = tl.load(CROW + r, mask=mi, other=0.0)
+    big = tl.exp(tl.load(LSE + r, mask=mi, other=0.0) - c)
+    inv = tl.where(live, 1.0 / tot, 0.0)
+    erow = E + i.to(tl.int64) * VS
+    lab = tl.load(LAB + r, mask=mi, other=-1)
+    ey = tl.exp(tl.load(TGT + r, mask=mi, other=0.0) - c) - gy * inv * big
+    eb = tl.exp(tl.load(BLK + r, mask=mi, other=0.0) - c) - gb * inv * big
+    tl.store(erow + tl.maximum(lab, 0), ey.to(tl.bfloat16), mask=live & (lab >= 0))
+    tl.store(erow + BLANK, eb.to(tl.bfloat16), mask=live)
 
 
 @triton.jit
-def _df_kernel(DH, F, G, OFF, TLEN, YLEN, DF, seed, p, scale, T, U1, Hd,
+def _df_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, seed, p, scale, T, U1, Hd, K,
                BU: tl.constexpr, BH: tl.constexpr, DROP: tl.constexpr):
-    # per (b, t, h-block): dropout + relu backward in place on dX, df[b, t] = sum over u
+    # per (b, t, h-block): dX = s (E' @ W) read straight from the GEMM output; dropout + relu backward written back
+    # in place (dg reads it); df[b, t] = sum over u
     b = tl.program_id(0)
     t = tl.program_id(1)
     if t >= tl.load(TLEN + b):
@@ -248,8 +266,9 @@ def _df_kernel(DH, F, G, OFF, TLEN, YLEN, DF, seed, p, scale, T, U1, Hd,
         m2 = mu[:, None] & mc[None, :]
         gv = tl.load(G + (b * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], mask=m2, other=0.0).to(tl.float32)
         x = (fv[None, :] + gv).to(tl.bfloat16).to(tl.float32)
-        ptr = DH + rows[:, None].to(tl.int64) * Hd + cols[None, :]
-        d = tl.where(x > 0.0, tl.load(ptr, mask=m2, other=0.0), 0.0)
+        ptr = GM + rows[:, None].to(tl.int64) * K + cols[None, :]
+        sr = tl.load(S + rows, mask=mu, other=0.0)
+        d = tl.where(x > 0.0, tl.load(ptr, mask=m2, other=0.0) * sr[:, None], 0.0)
         if DROP:
             r = tl.rand(seed, (rows[:, None] * Hd + cols[None, :]).to(tl.int32))
             d = tl.where(r >= p, d * scale, 0.0)
@@ -259,7 +278,7 @@ def _df_kernel(DH, F, G, OFF, TLEN, YLEN, DF, seed, p, scale, T, U1, Hd,
 
 
 @triton.jit
-def _dg_kernel(DH, OFF, TLEN, YLEN, DG, U1, Hd, BH: tl.constexpr):
+def _dg_kernel(DH, OFF, TLEN, YLEN, DG, U1, Hd, K, BH: tl.constexpr):
     # per (b, u, h-block): dg[b, u] = sum over t, in t order (deterministic)
     b = tl.program_id(0)
     u = tl.program_id(1)
@@ -272,7 +291,7 @@ def _dg_kernel(DH, OFF, TLEN, YLEN, DG, U1, Hd, BH: tl.constexpr):
     mc = cols < Hd
     acc = tl.zeros([BH], tl.float32)
     for t in range(0, tb):
-        acc += tl.load(DH + (row + t * ub1).to(tl.int64) * Hd + cols, mask=mc, other=0.0)
+        acc += tl.load(DH + (row + t * ub1).to(tl.int64) * K + cols, mask=mc, other=0.0)
     tl.store(DG + (b * U1 + u).to(tl.int64) * Hd + cols, acc, mask=mc)
 
 
@@ -348,14 +367,14 @@ class _RNNTJoint(torch.autograd.Function):
                               BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need, num_warps=4)
         nll = -(1.0 + lam) * ll                                 # NeMo's numba reports cost (1 + lambda) * -ll
         if need:
-            ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, lpb, lpy, alpha, beta, ll)
+            ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll)
             ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V)
         ctx.mark_non_differentiable(nll)
         return nll.mean(), nll
 
     @staticmethod
     def backward(ctx, gout, _g_nll):
-        f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, lpb, lpy, alpha, beta, ll = ctx.saved_tensors
+        f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll = ctx.saved_tensors
         fdt, gdt, wdt, bdt, lam, p, seed, V = ctx.cfg
         B, T, Hd = f.shape
         U1 = g.shape[1]
@@ -364,40 +383,36 @@ class _RNNTJoint(torch.autograd.Function):
         dev = f.device
         w = (gout.float() / B).reshape(1)                       # mean_batch, no host sync
         GB, GY, S = (torch.empty(N, device=dev, dtype=torch.float32) for _ in range(3))
+        XS = torch.empty_like(X)
         BU = min(32, triton.next_power_of_2(U1))
-        _rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, ll, w, lse, crow, off, tlen, ylen, GB, GY, S, 1.0 + lam,
-                                BU=BU, num_warps=4)
-        DH = torch.empty(N, Hd, device=dev, dtype=torch.float32)
+        _rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, ll, w, lse, crow, off, tlen, ylen, GB, GY, S, X, XS, 1.0 + lam,
+                                K, _HS, BU=BU, BK=64, num_warps=4)
+        GM = torch.empty(N, K, device=dev, dtype=torch.float32)       # E' @ W_aug, then dX in place
         gw = torch.zeros(VS, K, device=dev, dtype=torch.float32)
-        C = max(1024, min(N, _G_BUDGET // (K * 4)))
-        if E is None:
-            C = max(1024, min(C, _E_BUDGET // (VS * 2)))
+        BR = 256
+
+        def grads(Ec, i, M):
+            _fix_e_kernel[(triton.cdiv(M, BR),)](Ec, LAB, tgt, blk, crow, lse, GB, GY, i, M, VS, V - 1, BR,
+                                                 num_warps=4)
+            torch.mm(Ec, Wa, out_dtype=torch.float32, out=GM[i:i + M])
+            # s X can sit far below bf16's normal range: XS carries it lifted by an exact power of two
+            torch.addmm(gw, Ec.t(), XS[i:i + M], alpha=1.0 / _HS, out_dtype=torch.float32, out=gw)
+
+        if E is not None:
+            grads(E, 0, N)                                           # E is consumed (one backward per forward)
+        else:
+            C = max(1024, min(N, _E_BUDGET // (VS * 2)))
             Ebuf = torch.empty(min(C, N), VS, device=dev, dtype=torch.bfloat16)
-        BH = 128
-        for i in range(0, N, C):
-            Xc, Lc = X[i:i + C], LAB[i:i + C]
-            M = Xc.shape[0]
-            if E is not None:
-                Ec = E[i:i + M]
-            else:
-                Ec = Ebuf[:M]
-                _stats(Xc, Wa, Lc, V - 1, True, Ec)
-            gm = torch.mm(Ec, Wa, out_dtype=torch.float32)
-            _gh_kernel[(M, triton.cdiv(Hd, BH))](gm, S[i:i + M], Wa, Lc, GB[i:i + M], GY[i:i + M], DH[i:i + M],
-                                                 Hd, K, V - 1, BH, num_warps=4)
-            del gm
-            xs = torch.empty_like(Xc)
-            _scale_rows_kernel[(M, triton.cdiv(K, BH))](Xc, S[i:i + M], xs, K, _HS, BH, num_warps=4)
-            torch.addmm(gw, Ec.t(), xs, alpha=1.0 / _HS, out_dtype=torch.float32, out=gw)
-            labs, rows = torch.sort(torch.where(Lc >= 0, Lc, V), stable=True)
-            _scatter_kernel[(M, triton.cdiv(K, BH))](gw, labs, rows, Xc, GY[i:i + M], M, V, K, BH, num_warps=4)
-        # blank column: gW[blank] -= sum_r gb_r X_r (gb through bf16, as NeMo's bf16 dlogits are)
-        gw[V - 1] -= torch.mm(GB.to(torch.bfloat16)[None], X, out_dtype=torch.float32)[0]
+            for i in range(0, N, C):
+                M = min(C, N - i)
+                _stats(X[i:i + M], Wa, LAB[i:i + M], V - 1, True, Ebuf[:M])
+                grads(Ebuf[:M], i, M)
         df = torch.zeros(B, T, Hd, device=dev, dtype=torch.float32)
         dg = torch.zeros(B, U1, Hd, device=dev, dtype=torch.float32)
-        _df_kernel[(B, T, triton.cdiv(Hd, BH))](DH, f, g, off, tlen, ylen, df, seed, p, 1.0 / (1.0 - p), T, U1, Hd,
-                                               BU=BU, BH=BH, DROP=p > 0, num_warps=4)
-        _dg_kernel[(B, U1, triton.cdiv(Hd, BH))](DH, off, tlen, ylen, dg, U1, Hd, BH, num_warps=4)
+        BH = 128
+        _df_kernel[(B, T, triton.cdiv(Hd, BH))](GM, S, f, g, off, tlen, ylen, df, seed, p, 1.0 / (1.0 - p), T, U1, Hd,
+                                               K, BU=BU, BH=BH, DROP=p > 0, num_warps=4)
+        _dg_kernel[(B, U1, triton.cdiv(Hd, BH))](GM, off, tlen, ylen, dg, U1, Hd, K, BH, num_warps=4)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
                 None, None, None, None, None, None, None)
 
