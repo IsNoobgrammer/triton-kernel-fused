@@ -57,7 +57,7 @@ def _keep(seed, bh, offs_m, offs_n, T, p_drop):
 
 
 @triton.jit
-def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
+def _rpa_fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
          sqb, sqt, sqh, spr, sph,
          BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
          PREC: tl.constexpr, PRECG: tl.constexpr):
@@ -267,7 +267,7 @@ class _RelPosAttn(torch.autograd.Function):
         lse = torch.empty(B, H, T, device=q.device, dtype=torch.float32)
         BP = triton.next_power_of_2(_BM + _BN - 1)
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
-        _fwd[(triton.cdiv(T, _BM), B * H)](q, k, v, p, u, vb, o, lse, lengths, seed, p_drop, T, H, CH, LC,
+        _rpa_fwd[(triton.cdiv(T, _BM), B * H)](q, k, v, p, u, vb, o, lse, lengths, seed, p_drop, T, H, CH, LC,
                                            D ** -0.5, *st, BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0,
                                            PREC=prec, PRECG=precg, num_warps=4, num_stages=1)
         ctx.save_for_backward(q, k, v, p, u, vb, o, lse, lengths)
