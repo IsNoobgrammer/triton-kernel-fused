@@ -233,7 +233,7 @@ def _dp_reduce(DPQ, DP, T, H, NM, NR, B, CH, LC, BM: tl.constexpr, BR: tl.conste
     tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
 
 
-_BM, _BN = 64, 64
+_BM, _BN = int(__import__("os").environ.get("RPA_BM", 64)), int(__import__("os").environ.get("RPA_BN", 64))
 
 
 class _RelPosAttn(torch.autograd.Function):
@@ -250,7 +250,7 @@ class _RelPosAttn(torch.autograd.Function):
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         _fwd[(triton.cdiv(T, _BM), B * H)](q, k, v, p, u, vb, o, lse, lengths, seed, p_drop, T, H, CH, LC,
                                            D ** -0.5, *st, BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0,
-                                           IEEE=ieee, num_warps=4)
+                                           IEEE=ieee, num_warps=4, num_stages=1)
         ctx.save_for_backward(q, k, v, p, u, vb, o, lse, lengths)
         ctx.cfg = (CH, LC, p_drop, seed, ieee)
         return o
@@ -269,7 +269,7 @@ class _RelPosAttn(torch.autograd.Function):
         dqu, dqv, dk, dv = (torch.empty_like(q) for _ in range(4))
         dpq = torch.zeros(B * H * NM * NR * D, device=q.device, dtype=torch.float32)
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
-        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, IEEE=ieee, num_warps=4)
+        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, IEEE=ieee, num_warps=4, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
                             D ** -0.5, NR, *st, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
