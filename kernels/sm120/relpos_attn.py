@@ -14,7 +14,7 @@ band of BM + BN - 1 rows of p, so G = (q + v) @ p_band^T (one tensor-core dot) a
 (tl.gather: the skew). The backward is the same gather in reverse: dG[a, m] = dS[a, m - BM + 1 + a].
   forward  : o (B, T, H, D) fp32, lse (B, H, T)
   backward : query-major kernel -> dq (split into the u and v paths: du, dv_bias sums) + per-block private
-             partials of dp (the position table), key-major kernel -> dk, dv, then a fixed-order reduction of dp.
+             partials of dp (the position table), key-major kernel -> dk, dv, then a fixed-order torch reduction of dp.
 Deterministic (no atomics). Dots run 3xTF32 (as accurate as NeMo's cuBLAS TF32; prec="ieee" for the gradient check).
 Masked scores: NeMo fills -10000 and zeroes fully-masked rows after softmax; here masked pairs are skipped and
 fully-masked (padding) query rows give o = 0, grads 0 -- the same numbers.
@@ -210,25 +210,6 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
     tl.store(DV + kp, dv, mask=offs_n[:, None] < T)
 
 
-@triton.jit
-def _dp_reduce(DPQ, DP, T, H, NM, NR, B, CH, LC, BM: tl.constexpr, BR: tl.constexpr, D: tl.constexpr):
-    # dp[r, h] = sum over b, query blocks of the private partials covering r (fixed order: deterministic)
-    pid_r = tl.program_id(0)
-    h = tl.program_id(1)
-    r = pid_r * BR + tl.arange(0, BR)
-    offs_d = tl.arange(0, D)
-    acc = tl.zeros([BR, D], tl.float32)
-    for m in range(0, NM):
-        i0 = m * BM
-        jlo = tl.maximum(0, (i0 // CH - LC) * CH)
-        rr = r - (jlo - i0 - (BM - 1) + T - 1)
-        ok = (rr >= 0) & (rr < NR) & (r < 2 * T - 1)
-        for b in range(0, B):
-            ptr = DPQ + ((b * H + h) * NM + m).to(tl.int64) * NR * D + rr[:, None] * D + offs_d[None, :]
-            acc += tl.load(ptr, mask=ok[:, None], other=0.0)
-    tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
-
-
 _BM, _BN = int(__import__("os").environ.get("RPA_BM", 32)), int(__import__("os").environ.get("RPA_BN", 32))
 
 
@@ -270,9 +251,16 @@ class _RelPosAttn(torch.autograd.Function):
                             D ** -0.5, NR, *st, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
                                               H, CH, LC, D ** -0.5, *st, **common)
-        dp = torch.empty_like(p)
-        BR = 32
-        _dp_reduce[(triton.cdiv(2 * T - 1, BR), H)](dpq, dp, T, H, NM, NR, B, CH, LC, BM=_BM, BR=BR, D=D, num_warps=4)
+        # dp[r] = sum over b and query blocks of the private partials; block m's rows start at r = off(m).
+        # One deterministic torch sum over b, then NM shifted slice-adds (a serial in-kernel loop over B*NM was ~3 ms).
+        part = dpq.view(B, H, NM, NR, D).sum(0)                       # (H, NM, NR, D)
+        dp = torch.zeros_like(p)
+        for m in range(NM):
+            i0 = m * _BM
+            off = max(0, (i0 // CH - LC) * CH) - i0 - (_BM - 1) + T - 1
+            lo, hi = max(off, 0), min(off + NR, 2 * T - 1)
+            if hi > lo:
+                dp[lo:hi] += part[:, m, lo - off:hi - off].transpose(0, 1)
         du = dqu.sum((0, 1))
         dvb = dqv.sum((0, 1))
         return dqu + dqv, dk, dv, dp, du, dvb, None, None, None, None, None, None
