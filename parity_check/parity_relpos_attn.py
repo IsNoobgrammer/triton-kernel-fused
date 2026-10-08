@@ -23,6 +23,7 @@ from kernels.sm120.relpos_attn import relpos_attention
 
 dev = "cuda"
 PREC = os.environ.get("RPA_PREC", "tf32x3")
+PRECG = os.environ.get("RPA_PRECG") or None
 ok = True
 
 
@@ -102,7 +103,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         nf = grads(lambda *a: nemo_core(*a, mask), xs, W, torch.float32)
         torch.backends.cuda.matmul.allow_tf32 = False
-        ours = lambda *a: relpos_attention(*a, lengths, left, right, prec=PREC)
+        ours = lambda *a: relpos_attention(*a, lengths, left, right, prec=PREC, precg=PRECG)
         ou = grads(ours, xs, W, torch.float32)
         bad = []
         for n, a, e, g in zip(NAMES, ou, nf, gt):

@@ -60,7 +60,7 @@ def _keep(seed, bh, offs_m, offs_n, T, p_drop):
 def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
          sqb, sqt, sqh, spr, sph,
          BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-         PREC: tl.constexpr):
+         PREC: tl.constexpr, PRECG: tl.constexpr):
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
@@ -94,7 +94,7 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
                 pe = tl.where(_keep(seed, bh, offs_m, offs_n, T, p_drop), pe * (1.0 / (1.0 - p_drop)), 0.0)
             v = tl.load(V + b * sqb + offs_n[:, None] * sqt + h * sqh + offs_d[None, :], mask=offs_n[:, None] < L,
                         other=0.0)
-            acc = acc * alpha[:, None] + tl.dot(pe, v, input_precision=PREC)
+            acc = acc * alpha[:, None] + tl.dot(pe, v, input_precision=PRECG)
             m_i = m_new
     live = l_i > 0.0
     o = tl.where(live[:, None], acc / tl.where(live, l_i, 1.0)[:, None], 0.0)
@@ -107,7 +107,7 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
 def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, T, H, CH, LC, scale, NT,
            sqb, sqt, sqh, spr, sph,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-           PREC: tl.constexpr):
+           PREC: tl.constexpr, PRECG: tl.constexpr):
     # query-major: dq (u path and v path separately), and per key tile its partial of d p, each in its own slot
     # (written once: a load-add-store per tile behind a barrier made this kernel 4x the key-major one)
     pid_m = tl.program_id(0)
@@ -141,16 +141,16 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
             offs_n = j0 + tl.arange(0, BN)
             v = tl.load(V + b * sqb + offs_n[:, None] * sqt + h * sqh + offs_d[None, :], mask=offs_n[:, None] < L,
                         other=0.0)
-            dp = tl.dot(do, tl.trans(v), input_precision=PREC)
+            dp = tl.dot(do, tl.trans(v), input_precision=PRECG)
             if DROP:
                 dp = tl.where(_keep(seed, bh, offs_m, offs_n, T, p_drop), dp * (1.0 / (1.0 - p_drop)), 0.0)
             ds = tl.where(ok, p * (dp - delta[:, None]), 0.0) * scale
-            dqu += tl.dot(ds, k, input_precision=PREC)
+            dqu += tl.dot(ds, k, input_precision=PRECG)
             # skew back: dg[a, m] = ds[a, m - (BM - 1) + a]
             mm = tl.arange(0, BP)[None, :] - (BM - 1) + tl.arange(0, BM)[:, None]
             dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
-            dqv += tl.dot(dg, pband, input_precision=PREC)
-            dpb = tl.dot(tl.trans(dg), qv, input_precision=PREC)            # (BP, D) rows rbase .. rbase+BP-1
+            dqv += tl.dot(dg, pband, input_precision=PRECG)
+            dpb = tl.dot(tl.trans(dg), qv, input_precision=PRECG)            # (BP, D) rows rbase .. rbase+BP-1
             t = (j0 - jlo) // BN
             tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
     tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
@@ -161,7 +161,7 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
 def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, CH, LC, scale,
             sqb, sqt, sqh, spr, sph,
             BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-            PREC: tl.constexpr):
+            PREC: tl.constexpr, PRECG: tl.constexpr):
     # key-major: for this block of keys, every query tile whose band reaches it
     pid_n = tl.program_id(0)
     bh = tl.program_id(1)
@@ -193,16 +193,16 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
             delta = tl.load(DELTA + bh * T + offs_m, mask=offs_m < T, other=0.0)
             p = tl.exp(s - lse[:, None])
             do = tl.load(DO + qp, mask=offs_m[:, None] < T, other=0.0)
-            dp = tl.dot(do, tl.trans(v), input_precision=PREC)
+            dp = tl.dot(do, tl.trans(v), input_precision=PRECG)
             if DROP:
                 keep = _keep(seed, bh, offs_m, offs_n, T, p_drop)
                 pd = tl.where(keep, p * (1.0 / (1.0 - p_drop)), 0.0)
                 dp = tl.where(keep, dp * (1.0 / (1.0 - p_drop)), 0.0)
             else:
                 pd = p
-            dv += tl.dot(tl.trans(pd), do, input_precision=PREC)
+            dv += tl.dot(tl.trans(pd), do, input_precision=PRECG)
             ds = tl.where(ok, p * (dp - delta[:, None]), 0.0) * scale
-            dk += tl.dot(tl.trans(ds), qu, input_precision=PREC)
+            dk += tl.dot(tl.trans(ds), qu, input_precision=PRECG)
     tl.store(DK + kp, dk, mask=offs_n[:, None] < T)
     tl.store(DV + kp, dv, mask=offs_n[:, None] < T)
 
@@ -232,7 +232,7 @@ _BM, _BN = int(__import__("os").environ.get("RPA_BM", 32)), int(__import__("os")
 
 class _RelPosAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, p, u, vb, lengths, CH, LC, p_drop, seed, prec):
+    def forward(ctx, q, k, v, p, u, vb, lengths, CH, LC, p_drop, seed, prec, precg):
         B, T, H, D = q.shape
         q, k, v = (t.float().contiguous() for t in (q, k, v))
         p, u, vb = p.float().contiguous(), u.float().contiguous(), vb.float().contiguous()
@@ -244,15 +244,15 @@ class _RelPosAttn(torch.autograd.Function):
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         _fwd[(triton.cdiv(T, _BM), B * H)](q, k, v, p, u, vb, o, lse, lengths, seed, p_drop, T, H, CH, LC,
                                            D ** -0.5, *st, BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0,
-                                           PREC=prec, num_warps=4, num_stages=1)
+                                           PREC=prec, PRECG=precg, num_warps=4, num_stages=1)
         ctx.save_for_backward(q, k, v, p, u, vb, o, lse, lengths)
-        ctx.cfg = (CH, LC, p_drop, seed, prec)
+        ctx.cfg = (CH, LC, p_drop, seed, prec, precg)
         return o
 
     @staticmethod
     def backward(ctx, do):
         q, k, v, p, u, vb, o, lse, lengths = ctx.saved_tensors
-        CH, LC, p_drop, seed, prec = ctx.cfg
+        CH, LC, p_drop, seed, prec, precg = ctx.cfg
         B, T, H, D = q.shape
         do = do.float().contiguous()
         delta = (do * o).sum(-1).permute(0, 2, 1).contiguous()          # (B, H, T)
@@ -263,7 +263,7 @@ class _RelPosAttn(torch.autograd.Function):
         dqu, dqv, dk, dv = (torch.empty_like(q) for _ in range(4))
         dpq = torch.zeros(B * H * NM * NT * BP * D, device=q.device, dtype=torch.float32)
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
-        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, num_warps=4, num_stages=1)
+        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_warps=4, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
                             D ** -0.5, NT, *st, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
@@ -275,16 +275,17 @@ class _RelPosAttn(torch.autograd.Function):
                                                     num_warps=4)
         du = dqu.sum((0, 1))
         dvb = dqv.sum((0, 1))
-        return dqu + dqv, dk, dv, dp, du, dvb, None, None, None, None, None, None
+        return dqu + dqv, dk, dv, dp, du, dvb, None, None, None, None, None, None, None
 
 
-def relpos_attention(q, k, v, p, pos_bias_u, pos_bias_v, lengths, left, right, dropout=0.0, seed=None, prec="tf32x3"):
+def relpos_attention(q, k, v, p, pos_bias_u, pos_bias_v, lengths, left, right, dropout=0.0, seed=None, prec="tf32x3", precg=None):
     """softmax(((q+u) k^T + rel_shift((q+v) p^T)) / sqrt(d), chunked_limited mask [left, right]) @ v -> (B, T, H, D).
     dropout = the caller's attention dropout (0 in eval). prec: tl.dot input precision -- "tf32x3" (default: as accurate as
-    NeMo's cuBLAS TF32 matmuls; plain "tf32" was 4-7x less accurate in parity), "tf32", or "ieee"."""
+    NeMo's cuBLAS TF32 matmuls; plain "tf32" was 4-7x less accurate in parity), "tf32", or "ieee"; precg: the
+    p@v / gradient dots (default = prec). Score dots feed exp(), so they need the precision most."""
     assert right >= 0, "chunked_limited with a right context (right == -1 is the plain band: not implemented)"
     CH = right + 1
     LC = left // CH if left >= 0 else 1 << 20
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))
-    return _RelPosAttn.apply(q, k, v, p, pos_bias_u, pos_bias_v, lengths, CH, LC, float(dropout), seed, prec)
+    return _RelPosAttn.apply(q, k, v, p, pos_bias_u, pos_bias_v, lengths, CH, LC, float(dropout), seed, prec, precg or prec)
