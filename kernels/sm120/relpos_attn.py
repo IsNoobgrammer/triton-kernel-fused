@@ -108,7 +108,7 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
            sqb, sqt, sqh, spr, sph,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
            PREC: tl.constexpr, PRECG: tl.constexpr, WIDE: tl.constexpr,
-           SKIP: tl.constexpr = 0):
+           SKIP: tl.constexpr = 0, PRECP: tl.constexpr = "tf32x3"):
     # query-major: dq (u path and v path separately), and per key tile its partial of d p, each in its own slot
     # (written once: a load-add-store per tile behind a barrier made this kernel 4x the key-major one)
     pid_m = tl.program_id(0)
@@ -163,7 +163,7 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
                 mt = tl.arange(0, BP)[:, None] - (BM - 1) + tl.arange(0, BM)[None, :]          # (BP, BM)
                 dgt = tl.where((mt >= 0) & (mt < BN),
                                tl.gather(tl.trans(ds), tl.minimum(tl.maximum(mt, 0), BN - 1), axis=0), 0.0)
-                dpb = tl.dot(dgt, qv, input_precision=PRECG)                 # (BP, D) rows rbase .. rbase+BP-1
+                dpb = tl.dot(dgt, qv, input_precision=PRECP)                 # (BP, D) rows rbase .. rbase+BP-1
                 t = (j0 - jlo) // BN
                 if SKIP == -1:                                               # debug: the dot without its store
                     dqv += tl.sum(dpb, 0)[None, :] * 1e-30
@@ -285,7 +285,8 @@ class _RelPosAttn(torch.autograd.Function):
         common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
                             D ** -0.5, NT, *st, num_warps=_WQ, WIDE=_WIDE and BP == 2 * _BN,
-                            SKIP=int(__import__("os").environ.get("RPA_SKIP", 0)), **common)
+                            SKIP=int(__import__("os").environ.get("RPA_SKIP", 0)),
+                            PRECP=__import__("os").environ.get("RPA_PRECP", precg), **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
                                               H, CH, LC, D ** -0.5, *st, num_warps=_WKV, **common)
         part = dpq.view(B, H * NM * NT * BP * D).sum(0)                # deterministic sum over b
