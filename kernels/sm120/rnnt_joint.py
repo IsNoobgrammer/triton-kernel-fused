@@ -22,7 +22,8 @@ plan: 3 GEMMs per step); above that the backward recomputes E per chunk (4 GEMMs
 
     loss, nll = rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.005, dropout=0.2)
 f: (B, T, H) projected encoder, g: (B, U+1, H) projected prednet, weight (V, H), bias (V,), blank = V - 1.
-loss = mean over the batch of -log P(y|x) (NeMo's rnnt_reduction 'mean_batch'); nll = per-utterance, detached.
+loss = mean over the batch of (1 + lambda) * -log P(y|x), exactly NeMo's reported value (its FastEmit scales the
+cost, the gradient is the formula above); nll = per-utterance, detached.
 """
 import torch
 import triton
@@ -342,7 +343,7 @@ class _RNNTJoint(torch.autograd.Function):
         ll = torch.empty(B, device=f.device, dtype=torch.float32)
         _lattice_kernel[(B,)](lpb, lpy, off, tlen, ylen, alpha, beta, ll,
                               BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need, num_warps=4)
-        nll = -ll
+        nll = -(1.0 + lam) * ll                                 # NeMo's numba reports cost (1 + lambda) * -ll
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, lpb, lpy, alpha, beta, ll)
             ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed)
