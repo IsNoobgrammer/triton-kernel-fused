@@ -71,10 +71,11 @@ def _bwd(DROUT, DY, RIN, W, MEAN, RSTD, DRES, DX, DWP, DBP, R, C, seed, p, scale
     g = dy * w[None, :]
     c1 = tl.sum(g * xhat, axis=1) / C
     c2 = tl.sum(g, axis=1) / C
-    dr = rstd[:, None] * (g - xhat * c1[:, None] - c2[:, None])
+    # eager rounds twice in bf16: layer_norm's input grad is written in the input dtype, then autograd's
+    # accumulation adds the residual-stream grad in that dtype. One rounding would be MORE accurate = a model change.
+    dr = (rstd[:, None] * (g - xhat * c1[:, None] - c2[:, None])).to(DRES.dtype.element_ty)
     if HAS_DROUT:
-        dr += tl.load(DROUT + off, mask=m2, other=0.0).to(tl.float32)
-    dr = dr.to(DRES.dtype.element_ty)
+        dr = (dr.to(tl.float32) + tl.load(DROUT + off, mask=m2, other=0.0).to(tl.float32)).to(DRES.dtype.element_ty)
     tl.store(DRES + off, dr, mask=m2)
     if HAS_X:
         xt = DX.dtype.element_ty
