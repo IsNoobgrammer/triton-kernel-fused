@@ -97,7 +97,8 @@ def _cfg(C, which):
     BC = triton.next_power_of_2(C)
     if _CFG[which]:
         return _CFG[which][0], BC, _CFG[which][1]
-    return (max(1, min(16, 8192 // BC)), BC, 4) if which == "fwd" else (max(1, min(4, 2048 // BC)), BC, 4)
+    # swept at 15000 x 512 (bench_res_drop_ln.py): fwd 1 row / 4 warps 83 us, bwd 8 rows / 4 warps 114 us (eager 122 / 208)
+    return (1, BC, 4) if which == "fwd" else (max(1, min(8, 4096 // BC)), BC, 4)
 
 
 class _ResDropLN(torch.autograd.Function):
