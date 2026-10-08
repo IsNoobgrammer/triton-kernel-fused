@@ -158,11 +158,14 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
             if SKIP < 2:
                 dqv += tl.dot(dg, pband, input_precision=PRECG)
             if SKIP < 1:
-                # dp_band^T = qv^T @ dg: transpose the loaded qv, not the gathered dg (that layout conversion was
-                # 75% of this kernel); stored through swapped strides
-                dpbt = tl.dot(tl.trans(qv), dg, input_precision=PRECG)       # (D, BP): rows rbase .. rbase+BP-1
+                # dg^T gathered directly from ds^T (axis 0): tl.trans of the gathered dg before the dot was 75% of
+                # this kernel; ds^T is a plain register tile
+                mt = tl.arange(0, BP)[:, None] - (BM - 1) + tl.arange(0, BM)[None, :]          # (BP, BM)
+                dgt = tl.where((mt >= 0) & (mt < BN),
+                               tl.gather(tl.trans(ds), tl.minimum(tl.maximum(mt, 0), BN - 1), axis=0), 0.0)
+                dpb = tl.dot(dgt, qv, input_precision=PRECG)                 # (BP, D) rows rbase .. rbase+BP-1
                 t = (j0 - jlo) // BN
-                tl.store(dbase + (t * BP + tl.arange(0, BP)[None, :]) * D + offs_d[:, None], dpbt, mask=t < NT)
+                tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
     tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
     tl.store(DQV + qp, dqv, mask=offs_m[:, None] < T)
 
