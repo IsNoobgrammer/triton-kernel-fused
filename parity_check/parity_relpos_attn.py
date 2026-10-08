@@ -22,6 +22,7 @@ import torch
 from kernels.sm120.relpos_attn import relpos_attention
 
 dev = "cuda"
+PREC = os.environ.get("RPA_PREC", "tf32x3")
 ok = True
 
 
@@ -101,7 +102,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         nf = grads(lambda *a: nemo_core(*a, mask), xs, W, torch.float32)
         torch.backends.cuda.matmul.allow_tf32 = False
-        ours = lambda *a: relpos_attention(*a, lengths, left, right)
+        ours = lambda *a: relpos_attention(*a, lengths, left, right, prec=PREC)
         ou = grads(ours, xs, W, torch.float32)
         bad = []
         for n, a, e, g in zip(NAMES, ou, nf, gt):
@@ -116,7 +117,7 @@ def main():
         check("4 padding rows = 0", bool((ou[0][padrows] == 0).all()), f"{int(padrows.sum())} rows")
 
     print("\n== dropout 0.1, context [70, 13], IEEE dots", flush=True)
-    f = lambda *a: relpos_attention(*a, lengths, 70, 13, dropout=0.1, seed=99, ieee=True)
+    f = lambda *a: relpos_attention(*a, lengths, 70, 13, dropout=0.1, seed=99, prec="ieee")
     g0 = grads(f, xs, W, torch.float32)
     gen = torch.Generator(device=dev).manual_seed(5)
     dirs = [torch.randn(x.shape, device=dev, generator=gen) for x in xs]
@@ -127,7 +128,7 @@ def main():
     fd = (fp - fm) / (2 * eps)
     an = sum((gr * d).sum().item() for gr, d in zip(g0[1:], dirs))
     check("3 dropout fwd/bwd consistent", abs(fd - an) / abs(an) < 2e-3, f"finite diff {fd:.4f} autograd {an:.4f}")
-    o_nd = grads(lambda *a: relpos_attention(*a, lengths, 70, 13, ieee=True), xs, W, torch.float32)[0]
+    o_nd = grads(lambda *a: relpos_attention(*a, lengths, 70, 13, prec="ieee"), xs, W, torch.float32)[0]
     check("3 dropout changes the output", rel(g0[0], o_nd) > 1e-2, f"rel {rel(g0[0], o_nd):.2e}")
     print("\nALL PASS" if ok else "\nFAILED", flush=True)
     sys.exit(0 if ok else 1)

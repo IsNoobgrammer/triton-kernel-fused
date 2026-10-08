@@ -15,7 +15,7 @@ band of BM + BN - 1 rows of p, so G = (q + v) @ p_band^T (one tensor-core dot) a
   forward  : o (B, T, H, D) fp32, lse (B, H, T)
   backward : query-major kernel -> dq (split into the u and v paths: du, dv_bias sums) + per-block private
              partials of dp (the position table), key-major kernel -> dk, dv, then a fixed-order reduction of dp.
-Deterministic (no atomics). Dots run TF32 like NeMo's fp32 matmuls (IEEE=True for the gradient check).
+Deterministic (no atomics). Dots run 3xTF32 (as accurate as NeMo's cuBLAS TF32; prec="ieee" for the gradient check).
 Masked scores: NeMo fills -10000 and zeroes fully-masked rows after softmax; here masked pairs are skipped and
 fully-masked (padding) query rows give o = 0, grads 0 -- the same numbers.
 
@@ -31,20 +31,19 @@ __all__ = ["relpos_attention"]
 
 @triton.jit
 def _scores(qu, qv, K, P, b, h, i0, j0, T, L, CH, LC, scale, skb, skt, skh, spr, sph,
-            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, IEEE: tl.constexpr):
+            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, PREC: tl.constexpr):
     """masked scaled scores (BM, BN) for queries i0.., keys j0..; also returns the p band and the gather index."""
     offs_m = i0 + tl.arange(0, BM)
     offs_n = j0 + tl.arange(0, BN)
     offs_d = tl.arange(0, D)
     k = tl.load(K + b * skb + offs_n[:, None] * skt + h * skh + offs_d[None, :], mask=offs_n[:, None] < L, other=0.0)
-    prec: tl.constexpr = "ieee" if IEEE else "tf32"
-    s = tl.dot(qu, tl.trans(k), input_precision=prec)
+    s = tl.dot(qu, tl.trans(k), input_precision=PREC)
     rbase = j0 - i0 - (BM - 1) + T - 1
     pr = rbase + tl.arange(0, BP)
     pband = tl.load(P + pr[:, None] * spr + h * sph + offs_d[None, :],
                     mask=(pr[:, None] >= 0) & (pr[:, None] < 2 * T - 1) & (tl.arange(0, BP)[:, None] < BM + BN - 1),
                     other=0.0)
-    g = tl.dot(qv, tl.trans(pband), input_precision=prec)                          # (BM, BP)
+    g = tl.dot(qv, tl.trans(pband), input_precision=PREC)                          # (BM, BP)
     idx = tl.arange(0, BN)[None, :] - tl.arange(0, BM)[:, None] + (BM - 1)         # (BM, BN) in [0, BM+BN-2]
     s = (s + tl.gather(g, idx, axis=1)) * scale
     d = offs_m[:, None] // CH - offs_n[None, :] // CH
@@ -61,7 +60,7 @@ def _keep(seed, bh, offs_m, offs_n, T, p_drop):
 def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
          sqb, sqt, sqh, spr, sph,
          BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-         IEEE: tl.constexpr):
+         PREC: tl.constexpr):
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
@@ -77,7 +76,6 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
     m_i = tl.full([BM], float("-inf"), tl.float32)
     l_i = tl.zeros([BM], tl.float32)
     acc = tl.zeros([BM, D], tl.float32)
-    prec: tl.constexpr = "ieee" if IEEE else "tf32"
     if i0 < L:
         ci0 = i0 // CH
         ci1 = (tl.minimum(i0 + BM, L) - 1) // CH
@@ -85,7 +83,7 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
         jhi = tl.minimum(L, (ci1 + 1) * CH)
         for j0 in range(jlo, jhi, BN):
             s, ok, k, _ = _scores(qu, qv, K, P, b, h, i0, j0, T, L, CH, LC, scale, sqb, sqt, sqh, spr, sph,
-                                  BM, BN, BP, D, IEEE)
+                                  BM, BN, BP, D, PREC)
             m_new = tl.maximum(m_i, tl.max(s, 1))
             m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
             alpha = tl.exp(m_i - m_safe)
@@ -96,7 +94,7 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
                 pe = tl.where(_keep(seed, bh, offs_m, offs_n, T, p_drop), pe * (1.0 / (1.0 - p_drop)), 0.0)
             v = tl.load(V + b * sqb + offs_n[:, None] * sqt + h * sqh + offs_d[None, :], mask=offs_n[:, None] < L,
                         other=0.0)
-            acc = acc * alpha[:, None] + tl.dot(pe, v, input_precision=prec)
+            acc = acc * alpha[:, None] + tl.dot(pe, v, input_precision=PREC)
             m_i = m_new
     live = l_i > 0.0
     o = tl.where(live[:, None], acc / tl.where(live, l_i, 1.0)[:, None], 0.0)
@@ -109,7 +107,7 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
 def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, T, H, CH, LC, scale, NR,
            sqb, sqt, sqh, spr, sph,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-           IEEE: tl.constexpr):
+           PREC: tl.constexpr):
     # query-major: dq (u path and v path separately), and this block's private partial of d p (rows from rbase0)
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
@@ -123,7 +121,6 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
     qp = b * sqb + offs_m[:, None] * sqt + h * sqh + offs_d[None, :]
     dqu = tl.zeros([BM, D], tl.float32)
     dqv = tl.zeros([BM, D], tl.float32)
-    prec: tl.constexpr = "ieee" if IEEE else "tf32"
     if i0 < L:
         q = tl.load(Q + qp, mask=offs_m[:, None] < T, other=0.0)
         qu = q + tl.load(U + h * D + offs_d)[None, :]
@@ -139,21 +136,21 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
         dbase = DPQ + (bh * nm + pid_m).to(tl.int64) * NR * D
         for j0 in range(jlo, jhi, BN):
             s, ok, k, pband = _scores(qu, qv, K, P, b, h, i0, j0, T, L, CH, LC, scale, sqb, sqt, sqh, spr, sph,
-                                      BM, BN, BP, D, IEEE)
+                                      BM, BN, BP, D, PREC)
             p = tl.exp(s - lse[:, None])                                     # 0 where masked
             offs_n = j0 + tl.arange(0, BN)
             v = tl.load(V + b * sqb + offs_n[:, None] * sqt + h * sqh + offs_d[None, :], mask=offs_n[:, None] < L,
                         other=0.0)
-            dp = tl.dot(do, tl.trans(v), input_precision=prec)
+            dp = tl.dot(do, tl.trans(v), input_precision=PREC)
             if DROP:
                 dp = tl.where(_keep(seed, bh, offs_m, offs_n, T, p_drop), dp * (1.0 / (1.0 - p_drop)), 0.0)
             ds = tl.where(ok, p * (dp - delta[:, None]), 0.0) * scale
-            dqu += tl.dot(ds, k, input_precision=prec)
+            dqu += tl.dot(ds, k, input_precision=PREC)
             # skew back: dg[a, m] = ds[a, m - (BM - 1) + a]
             mm = tl.arange(0, BP)[None, :] - (BM - 1) + tl.arange(0, BM)[:, None]
             dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
-            dqv += tl.dot(dg, pband, input_precision=prec)
-            dpb = tl.dot(tl.trans(dg), qv, input_precision=prec)            # (BP, D) rows rbase .. rbase+BP-1
+            dqv += tl.dot(dg, pband, input_precision=PREC)
+            dpb = tl.dot(tl.trans(dg), qv, input_precision=PREC)            # (BP, D) rows rbase .. rbase+BP-1
             rr = (j0 - jlo) + tl.arange(0, BP)
             ptr = dbase + rr[:, None] * D + offs_d[None, :]
             tl.debug_barrier()                                               # the previous tile's rows are visible
@@ -167,7 +164,7 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
 def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, CH, LC, scale,
             sqb, sqt, sqh, spr, sph,
             BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-            IEEE: tl.constexpr):
+            PREC: tl.constexpr):
     # key-major: for this block of keys, every query tile whose band reaches it
     pid_n = tl.program_id(0)
     bh = tl.program_id(1)
@@ -180,7 +177,6 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
     kp = b * sqb + offs_n[:, None] * sqt + h * sqh + offs_d[None, :]
     dk = tl.zeros([BN, D], tl.float32)
     dv = tl.zeros([BN, D], tl.float32)
-    prec: tl.constexpr = "ieee" if IEEE else "tf32"
     if j0 < L:
         v = tl.load(V + kp, mask=offs_n[:, None] < L, other=0.0)
         cj0 = j0 // CH
@@ -195,21 +191,21 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
             qu = q + tl.load(U + h * D + offs_d)[None, :]
             qv = q + tl.load(VB + h * D + offs_d)[None, :]
             s, ok, k, _ = _scores(qu, qv, K, P, b, h, i0, j0, T, L, CH, LC, scale, sqb, sqt, sqh, spr, sph,
-                                  BM, BN, BP, D, IEEE)
+                                  BM, BN, BP, D, PREC)
             lse = tl.load(LSE + bh * T + offs_m, mask=offs_m < T, other=float("inf"))
             delta = tl.load(DELTA + bh * T + offs_m, mask=offs_m < T, other=0.0)
             p = tl.exp(s - lse[:, None])
             do = tl.load(DO + qp, mask=offs_m[:, None] < T, other=0.0)
-            dp = tl.dot(do, tl.trans(v), input_precision=prec)
+            dp = tl.dot(do, tl.trans(v), input_precision=PREC)
             if DROP:
                 keep = _keep(seed, bh, offs_m, offs_n, T, p_drop)
                 pd = tl.where(keep, p * (1.0 / (1.0 - p_drop)), 0.0)
                 dp = tl.where(keep, dp * (1.0 / (1.0 - p_drop)), 0.0)
             else:
                 pd = p
-            dv += tl.dot(tl.trans(pd), do, input_precision=prec)
+            dv += tl.dot(tl.trans(pd), do, input_precision=PREC)
             ds = tl.where(ok, p * (dp - delta[:, None]), 0.0) * scale
-            dk += tl.dot(tl.trans(ds), qu, input_precision=prec)
+            dk += tl.dot(tl.trans(ds), qu, input_precision=PREC)
     tl.store(DK + kp, dk, mask=offs_n[:, None] < T)
     tl.store(DV + kp, dv, mask=offs_n[:, None] < T)
 
@@ -233,12 +229,12 @@ def _dp_reduce(DPQ, DP, T, H, NM, NR, B, CH, LC, BM: tl.constexpr, BR: tl.conste
     tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
 
 
-_BM, _BN = int(__import__("os").environ.get("RPA_BM", 64)), int(__import__("os").environ.get("RPA_BN", 64))
+_BM, _BN = int(__import__("os").environ.get("RPA_BM", 32)), int(__import__("os").environ.get("RPA_BN", 32))
 
 
 class _RelPosAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, p, u, vb, lengths, CH, LC, p_drop, seed, ieee):
+    def forward(ctx, q, k, v, p, u, vb, lengths, CH, LC, p_drop, seed, prec):
         B, T, H, D = q.shape
         q, k, v = (t.float().contiguous() for t in (q, k, v))
         p, u, vb = p.float().contiguous(), u.float().contiguous(), vb.float().contiguous()
@@ -250,15 +246,15 @@ class _RelPosAttn(torch.autograd.Function):
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         _fwd[(triton.cdiv(T, _BM), B * H)](q, k, v, p, u, vb, o, lse, lengths, seed, p_drop, T, H, CH, LC,
                                            D ** -0.5, *st, BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0,
-                                           IEEE=ieee, num_warps=4, num_stages=1)
+                                           PREC=prec, num_warps=4, num_stages=1)
         ctx.save_for_backward(q, k, v, p, u, vb, o, lse, lengths)
-        ctx.cfg = (CH, LC, p_drop, seed, ieee)
+        ctx.cfg = (CH, LC, p_drop, seed, prec)
         return o
 
     @staticmethod
     def backward(ctx, do):
         q, k, v, p, u, vb, o, lse, lengths = ctx.saved_tensors
-        CH, LC, p_drop, seed, ieee = ctx.cfg
+        CH, LC, p_drop, seed, prec = ctx.cfg
         B, T, H, D = q.shape
         do = do.float().contiguous()
         delta = (do * o).sum(-1).permute(0, 2, 1).contiguous()          # (B, H, T)
@@ -269,7 +265,7 @@ class _RelPosAttn(torch.autograd.Function):
         dqu, dqv, dk, dv = (torch.empty_like(q) for _ in range(4))
         dpq = torch.zeros(B * H * NM * NR * D, device=q.device, dtype=torch.float32)
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
-        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, IEEE=ieee, num_warps=4, num_stages=1)
+        common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, num_warps=4, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
                             D ** -0.5, NR, *st, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
@@ -282,12 +278,13 @@ class _RelPosAttn(torch.autograd.Function):
         return dqu + dqv, dk, dv, dp, du, dvb, None, None, None, None, None, None
 
 
-def relpos_attention(q, k, v, p, pos_bias_u, pos_bias_v, lengths, left, right, dropout=0.0, seed=None, ieee=False):
+def relpos_attention(q, k, v, p, pos_bias_u, pos_bias_v, lengths, left, right, dropout=0.0, seed=None, prec="tf32x3"):
     """softmax(((q+u) k^T + rel_shift((q+v) p^T)) / sqrt(d), chunked_limited mask [left, right]) @ v -> (B, T, H, D).
-    dropout = the caller's attention dropout (0 in eval)."""
+    dropout = the caller's attention dropout (0 in eval). prec: tl.dot input precision -- "tf32x3" (default: as accurate as
+    NeMo's cuBLAS TF32 matmuls; plain "tf32" was 4-7x less accurate in parity), "tf32", or "ieee"."""
     assert right >= 0, "chunked_limited with a right context (right == -1 is the plain band: not implemented)"
     CH = right + 1
     LC = left // CH if left >= 0 else 1 << 20
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))
-    return _RelPosAttn.apply(q, k, v, p, pos_bias_u, pos_bias_v, lengths, CH, LC, float(dropout), seed, ieee)
+    return _RelPosAttn.apply(q, k, v, p, pos_bias_u, pos_bias_v, lengths, CH, LC, float(dropout), seed, prec)
