@@ -107,7 +107,7 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
 def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, T, H, CH, LC, scale, NT,
            sqb, sqt, sqh, spr, sph,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
-           PREC: tl.constexpr, PRECG: tl.constexpr):
+           PREC: tl.constexpr, PRECG: tl.constexpr, WIDE: tl.constexpr):
     # query-major: dq (u path and v path separately), and per key tile its partial of d p, each in its own slot
     # (written once: a load-add-store per tile behind a barrier made this kernel 4x the key-major one)
     pid_m = tl.program_id(0)
@@ -148,7 +148,12 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
             dqu += tl.dot(ds, k, input_precision=PRECG)
             # skew back: dg[a, m] = ds[a, m - (BM - 1) + a]
             mm = tl.arange(0, BP)[None, :] - (BM - 1) + tl.arange(0, BM)[:, None]
-            dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
+            if WIDE:
+                # same-shape gather: ds interleaved with zeros to (BM, 2 BN) = (BM, BP); out-of-range -> a zero slot
+                wide = tl.reshape(tl.join(ds, tl.zeros_like(ds)), (BM, 2 * BN))
+                dg = tl.gather(wide, tl.where((mm >= 0) & (mm < BN), 2 * mm, 1), axis=1)
+            else:
+                dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
             dqv += tl.dot(dg, pband, input_precision=PRECG)
             dpb = tl.dot(tl.trans(dg), qv, input_precision=PRECG)            # (BP, D) rows rbase .. rbase+BP-1
             t = (j0 - jlo) // BN
@@ -227,6 +232,7 @@ def _dp_reduce(PART, DP, T, H, NM, NT, CH, LC, BM: tl.constexpr, BN: tl.constexp
     tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
 
 
+_WIDE = __import__("os").environ.get("RPA_WIDE", "1") == "1"
 _WQ = int(__import__("os").environ.get("RPA_WQ", 4))
 _WKV = int(__import__("os").environ.get("RPA_WKV", 4))
 _BM, _BN = int(__import__("os").environ.get("RPA_BM", 32)), int(__import__("os").environ.get("RPA_BN", 32))
@@ -267,7 +273,7 @@ class _RelPosAttn(torch.autograd.Function):
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, PRECG=precg, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
-                            D ** -0.5, NT, *st, num_warps=_WQ, **common)
+                            D ** -0.5, NT, *st, num_warps=_WQ, WIDE=_WIDE and BP == 2 * _BN, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
                                               H, CH, LC, D ** -0.5, *st, num_warps=_WKV, **common)
         part = dpq.view(B, H * NM * NT * BP * D).sum(0)                # deterministic sum over b
