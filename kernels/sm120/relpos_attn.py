@@ -104,11 +104,12 @@ def _fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
 
 
 @triton.jit
-def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, T, H, CH, LC, scale, NR,
+def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, T, H, CH, LC, scale, NT,
            sqb, sqt, sqh, spr, sph,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
            PREC: tl.constexpr):
-    # query-major: dq (u path and v path separately), and this block's private partial of d p (rows from rbase0)
+    # query-major: dq (u path and v path separately), and per key tile its partial of d p, each in its own slot
+    # (written once: a load-add-store per tile behind a barrier made this kernel 4x the key-major one)
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
     nm = tl.num_programs(0)
@@ -132,8 +133,7 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
         ci1 = (tl.minimum(i0 + BM, L) - 1) // CH
         jlo = tl.maximum(0, (ci0 - LC) * CH)
         jhi = tl.minimum(L, (ci1 + 1) * CH)
-        rbase0 = jlo - i0 - (BM - 1) + T - 1
-        dbase = DPQ + (bh * nm + pid_m).to(tl.int64) * NR * D
+        dbase = DPQ + (bh * nm + pid_m).to(tl.int64) * NT * BP * D
         for j0 in range(jlo, jhi, BN):
             s, ok, k, pband = _scores(qu, qv, K, P, b, h, i0, j0, T, L, CH, LC, scale, sqb, sqt, sqh, spr, sph,
                                       BM, BN, BP, D, PREC)
@@ -151,11 +151,8 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DPQ, LEN, seed, p_drop, 
             dg = tl.where((mm >= 0) & (mm < BN), tl.gather(ds, tl.minimum(tl.maximum(mm, 0), BN - 1), axis=1), 0.0)
             dqv += tl.dot(dg, pband, input_precision=PREC)
             dpb = tl.dot(tl.trans(dg), qv, input_precision=PREC)            # (BP, D) rows rbase .. rbase+BP-1
-            rr = (j0 - jlo) + tl.arange(0, BP)
-            ptr = dbase + rr[:, None] * D + offs_d[None, :]
-            tl.debug_barrier()                                               # the previous tile's rows are visible
-            rm = (rr < NR)[:, None]
-            tl.store(ptr, tl.load(ptr, mask=rm, other=0.0) + dpb, mask=rm)
+            t = (j0 - jlo) // BN
+            tl.store(dbase + (t * BP + tl.arange(0, BP)[:, None]) * D + offs_d[None, :], dpb, mask=t < NT)
     tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
     tl.store(DQV + qp, dqv, mask=offs_m[:, None] < T)
 
@@ -210,6 +207,26 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
     tl.store(DV + kp, dv, mask=offs_n[:, None] < T)
 
 
+@triton.jit
+def _dp_reduce(PART, DP, T, H, NM, NT, CH, LC, BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr,
+               BR: tl.constexpr, D: tl.constexpr):
+    # dp[r, h] = sum over (query block m, key tile t) of part[h, m, t, r - off(m) - t BN]; fixed order
+    pid_r = tl.program_id(0)
+    h = tl.program_id(1)
+    r = pid_r * BR + tl.arange(0, BR)
+    offs_d = tl.arange(0, D)
+    acc = tl.zeros([BR, D], tl.float32)
+    for m in range(0, NM):
+        i0 = m * BM
+        off = tl.maximum(0, (i0 // CH - LC) * CH) - i0 - (BM - 1) + T - 1
+        for t in range(0, NT):
+            rr = r - off - t * BN
+            ok = (rr >= 0) & (rr < BP) & (r < 2 * T - 1)
+            ptr = PART + (((h * NM + m) * NT + t) * BP + rr[:, None]).to(tl.int64) * D + offs_d[None, :]
+            acc += tl.load(ptr, mask=ok[:, None], other=0.0)
+    tl.store(DP + r[:, None] * (H * D) + h * D + offs_d[None, :], acc, mask=(r < 2 * T - 1)[:, None])
+
+
 _BM, _BN = int(__import__("os").environ.get("RPA_BM", 32)), int(__import__("os").environ.get("RPA_BN", 32))
 
 
@@ -242,25 +259,20 @@ class _RelPosAttn(torch.autograd.Function):
         BP = triton.next_power_of_2(_BM + _BN - 1)
         NM = triton.cdiv(T, _BM)
         jspan = (LC + 2) * CH + _BM            # widest key range of one query block (it can straddle BM/CH + 1 chunks)
-        NR = triton.cdiv(jspan, _BN) * _BN + BP
+        NT = triton.cdiv(jspan, _BN) + 1
         dqu, dqv, dk, dv = (torch.empty_like(q) for _ in range(4))
-        dpq = torch.zeros(B * H * NM * NR * D, device=q.device, dtype=torch.float32)
+        dpq = torch.zeros(B * H * NM * NT * BP * D, device=q.device, dtype=torch.float32)
         st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
         common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, num_warps=4, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dpq, lengths, seed, p_drop, T, H, CH, LC,
-                            D ** -0.5, NR, *st, **common)
+                            D ** -0.5, NT, *st, **common)
         _bwd_kv[(triton.cdiv(T, _BN), B * H)](q, k, v, p, u, vb, do, lse, delta, dk, dv, lengths, seed, p_drop, T,
                                               H, CH, LC, D ** -0.5, *st, **common)
-        # dp[r] = sum over b and query blocks of the private partials; block m's rows start at r = off(m).
-        # One deterministic torch sum over b, then NM shifted slice-adds (a serial in-kernel loop over B*NM was ~3 ms).
-        part = dpq.view(B, H, NM, NR, D).sum(0)                       # (H, NM, NR, D)
-        dp = torch.zeros_like(p)
-        for m in range(NM):
-            i0 = m * _BM
-            off = max(0, (i0 // CH - LC) * CH) - i0 - (_BM - 1) + T - 1
-            lo, hi = max(off, 0), min(off + NR, 2 * T - 1)
-            if hi > lo:
-                dp[lo:hi] += part[:, m, lo - off:hi - off].transpose(0, 1)
+        part = dpq.view(B, H * NM * NT * BP * D).sum(0)                # deterministic sum over b
+        dp = torch.empty_like(p)
+        BR = 32
+        _dp_reduce[(triton.cdiv(2 * T - 1, BR), H)](part, dp, T, H, NM, NT, CH, LC, BM=_BM, BN=_BN, BP=BP, BR=BR, D=D,
+                                                    num_warps=4)
         du = dqu.sum((0, 1))
         dvb = dqv.sum((0, 1))
         return dqu + dqv, dk, dv, dp, du, dvb, None, None, None, None, None, None
