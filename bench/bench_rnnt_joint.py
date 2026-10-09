@@ -105,9 +105,7 @@ def main():
         print(f"\n== {name}: B={B} T<={T} U<={U}  {audio:.0f} s audio, {pts / 1e6:.2f}M lattice points", flush=True)
         print(f"  {'path':12s} {'fwd ms':>8s} {'bwd ms':>8s} {'total':>8s} {'peak GB':>8s} {'loss':>9s}", flush=True)
         base = None
-        for label, fn in (("nemo fbs=2", nemo_fwd(2)), ("nemo fbs=B", nemo_fwd(None)), ("ours triton", ours_fwd),
-                          ("ours", ours_fwd)):
-            rj._CUBLAS_LOGITS = label != "ours triton"           # the logits GEMM: Triton kernel vs cuBLAS + rows
+        for label, fn in (("nemo fbs=2", nemo_fwd(2)), ("nemo fbs=B", nemo_fwd(None)), ("ours", ours_fwd)):
             try:
                 fw, bw, mem, loss = timeit(fn, args, a.iters)
             except torch.OutOfMemoryError:
