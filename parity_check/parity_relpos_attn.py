@@ -119,6 +119,17 @@ def main():
                   f"worst {worst[0]}: ours {rel(worst[1], worst[3]):.1e} nemo {rel(worst[2], worst[3]):.1e}")
             ou2 = grads(ours, xs_m, W, dt, torch.float32)
             check("2 repeatable", all(torch.equal(a, b) for a, b in zip(ou, ou2)), "bitwise")
+            def packed(q, k, v, *rest):                                  # q, k, v = views of one QKV GEMM output
+                qkv = torch.stack([q, k, v], 2).detach().requires_grad_()
+                o = relpos_attention(*qkv.unbind(2), *rest, lengths, left, right, prec=PREC)
+                return o, qkv
+
+            xs_p = [x.detach().to(dt if i < 4 else torch.float32).clone().requires_grad_() for i, x in enumerate(xs_m)]
+            o_p, qkv = packed(*xs_p)
+            (o_p.float() * W).sum().backward()
+            same = torch.equal(o_p, ou[0]) and all(torch.equal(qkv.grad[:, :, i], ou[1 + i]) for i in range(3)) \
+                and torch.equal(xs_p[3].grad, ou[4])
+            check("5 packed qkv views == contiguous", same, "bitwise (o, dq, dk, dv, dp)")
             padrows = torch.arange(T, device=dev)[None, :] >= lengths[:, None]
             check("4 padding rows = 0", bool((ou[0][padrows] == 0).all()), f"{int(padrows.sum())} rows")
 

@@ -101,7 +101,7 @@ def _qbias(Q, U, VB, qp, offs_m, offs_d, h, T, D: tl.constexpr, LOWP: tl.constex
 
 @triton.jit
 def _rpa_fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
-             sqb, sqt, sqh, spr, sph,
+             sqb, sqt, sqh, spr, sph, sob, sot, soh,
              BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
              PREC: tl.constexpr, LOWP: tl.constexpr):
     pid_m = tl.program_id(0)
@@ -136,7 +136,8 @@ def _rpa_fwd(Q, K, V, P, U, VB, O, LSE, LEN, seed, p_drop, T, H, CH, LC, scale,
             m_i = m_new
     live = l_i > 0.0
     o = tl.where(live[:, None], acc / tl.where(live, l_i, 1.0)[:, None], 0.0)
-    tl.store(O + qp, o.to(O.dtype.element_ty), mask=offs_m[:, None] < T)
+    op = b * sob + offs_m[:, None] * sot + h * soh + offs_d[None, :]
+    tl.store(O + op, o.to(O.dtype.element_ty), mask=offs_m[:, None] < T)
     tl.store(LSE + bh * T + offs_m, tl.where(live, m_i + tl.log(tl.where(live, l_i, 1.0)), float("inf")),
              mask=offs_m < T)
 
@@ -159,7 +160,7 @@ def _ds(s, ok, lse, delta, do, v, seed, bh, offs_m, offs_n, T, p_drop, scale,
 
 @triton.jit
 def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DSB, LEN, seed, p_drop, T, H, CH, LC, scale, NT,
-           sqb, sqt, sqh, spr, sph,
+           sqb, sqt, sqh, spr, sph, sob, sot, soh,
            BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
            PREC: tl.constexpr, LOWP: tl.constexpr):
     # query-major: dq (u path and v path separately); every scaled dS tile stored (its own slot) for _dp_diag
@@ -173,11 +174,12 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DSB, LEN, seed, p_drop, 
     offs_m = i0 + tl.arange(0, BM)
     offs_d = tl.arange(0, D)
     qp = b * sqb + offs_m[:, None] * sqt + h * sqh + offs_d[None, :]
+    op = b * sob + offs_m[:, None] * sot + h * soh + offs_d[None, :]
     dqu = tl.zeros([BM, D], tl.float32)
     dqv = tl.zeros([BM, D], tl.float32)
     if i0 < L:
         qu, qv = _qbias(Q, U, VB, qp, offs_m, offs_d, h, T, D, LOWP)
-        do = tl.load(DO + qp, mask=offs_m[:, None] < T, other=0.0).to(tl.float32)
+        do = tl.load(DO + op, mask=offs_m[:, None] < T, other=0.0).to(tl.float32)
         lse = tl.load(LSE + bh * T + offs_m, mask=offs_m < T, other=float("inf"))
         delta = tl.load(DELTA + bh * T + offs_m, mask=offs_m < T, other=0.0)
         jlo, jhi = _band(i0, L, CH, LC, BM)
@@ -201,13 +203,13 @@ def _bwd_q(Q, K, V, P, U, VB, DO, LSE, DELTA, DQU, DQV, DSB, LEN, seed, p_drop, 
             t = (j0 - jlo) // BN
             tl.store(sbase + (t * BM + tl.arange(0, BM)[:, None]) * BN + tl.arange(0, BN)[None, :],
                      ds.to(DSB.dtype.element_ty), mask=t < NT)
-    tl.store(DQU + qp, dqu, mask=offs_m[:, None] < T)
-    tl.store(DQV + qp, dqv, mask=offs_m[:, None] < T)
+    tl.store(DQU + op, dqu, mask=offs_m[:, None] < T)
+    tl.store(DQV + op, dqv, mask=offs_m[:, None] < T)
 
 
 @triton.jit
 def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, CH, LC, scale,
-            sqb, sqt, sqh, spr, sph,
+            sqb, sqt, sqh, spr, sph, sob, sot, soh,
             BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr, D: tl.constexpr, DROP: tl.constexpr,
             PREC: tl.constexpr, LOWP: tl.constexpr):
     # key-major: for this block of keys, every query tile whose band reaches it
@@ -235,12 +237,14 @@ def _bwd_kv(Q, K, V, P, U, VB, DO, LSE, DELTA, DK, DV, LEN, seed, p_drop, T, H, 
                                BM, BN, BP, D, PREC, LOWP)
             lse = tl.load(LSE + bh * T + offs_m, mask=offs_m < T, other=float("inf"))
             delta = tl.load(DELTA + bh * T + offs_m, mask=offs_m < T, other=0.0)
-            do = tl.load(DO + qp, mask=offs_m[:, None] < T, other=0.0).to(tl.float32)
+            do = tl.load(DO + b * sob + offs_m[:, None] * sot + h * soh + offs_d[None, :], mask=offs_m[:, None] < T,
+                         other=0.0).to(tl.float32)
             pd, ds = _ds(s, ok, lse, delta, do, v, seed, bh, offs_m, offs_n, T, p_drop, scale, DROP, PREC, LOWP)
             dv += _mm(tl.trans(pd), do, PREC, LOWP)
             dk += _mm(tl.trans(ds), qu, PREC, LOWP)
-    tl.store(DK + kp, dk.to(DK.dtype.element_ty), mask=offs_n[:, None] < T)
-    tl.store(DV + kp, dv.to(DV.dtype.element_ty), mask=offs_n[:, None] < T)
+    kop = b * sob + offs_n[:, None] * sot + h * soh + offs_d[None, :]
+    tl.store(DK + kop, dk.to(DK.dtype.element_ty), mask=offs_n[:, None] < T)
+    tl.store(DV + kop, dv.to(DV.dtype.element_ty), mask=offs_n[:, None] < T)
 
 
 @triton.jit
@@ -283,14 +287,17 @@ class _RelPosAttn(torch.autograd.Function):
         B, T, H, D = q.shape
         lowp = q.dtype == torch.bfloat16
         dt = torch.bfloat16 if lowp else torch.float32
-        q, k, v, p = (t.to(dt).contiguous() for t in (q, k, v, p))
+        q, k, v = (t.to(dt) for t in (q, k, v))
+        if not (q.stride() == k.stride() == v.stride() and q.stride(-1) == 1):   # strided views (one QKV GEMM) are
+            q, k, v = (t.contiguous() for t in (q, k, v))                        # read in place; outputs contiguous
+        p = p.to(dt).contiguous()
         u, vb = u.float().contiguous(), vb.float().contiguous()
         assert k.shape == q.shape and v.shape == q.shape and p.shape == (2 * T - 1, H, D), (q.shape, p.shape)
         lengths = lengths.to(torch.int32).contiguous()
-        o = torch.empty_like(q)
+        o = torch.empty(B, T, H, D, device=q.device, dtype=dt)
         lse = torch.empty(B, H, T, device=q.device, dtype=torch.float32)
         BP = triton.next_power_of_2(_BM + _BN - 1)
-        st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
+        st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1)) + o.stride()[:3]
         _rpa_fwd[(triton.cdiv(T, _BM), B * H)](q, k, v, p, u, vb, o, lse, lengths, seed, p_drop, T, H, CH, LC,
                                                D ** -0.5, *st, BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0,
                                                PREC=prec, LOWP=lowp, num_warps=4, num_stages=1)
@@ -311,9 +318,9 @@ class _RelPosAttn(torch.autograd.Function):
         NT = min(triton.cdiv(jspan, _BN), triton.cdiv(T, _BN)) + 1    # key tiles per query block (short clips: few)
         dqu = torch.empty(B, T, H, D, device=q.device, dtype=torch.float32)
         dqv = torch.empty_like(dqu)
-        dk, dv = torch.empty_like(q), torch.empty_like(q)
+        dk, dv = torch.empty_like(do), torch.empty_like(do)
         dsb = torch.empty(B * H * NM * NT * _BM * _BN, device=q.device, dtype=q.dtype)   # dS tiles
-        st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1))
+        st = (q.stride(0), q.stride(1), q.stride(2), p.stride(0), p.stride(1)) + do.stride()[:3]
         common = dict(BM=_BM, BN=_BN, BP=BP, D=D, DROP=p_drop > 0, PREC=prec, LOWP=lowp, num_warps=4, num_stages=1)
         _bwd_q[(NM, B * H)](q, k, v, p, u, vb, do, lse, delta, dqu, dqv, dsb, lengths, seed, p_drop, T, H, CH, LC,
                             D ** -0.5, NT, *st, **common)
