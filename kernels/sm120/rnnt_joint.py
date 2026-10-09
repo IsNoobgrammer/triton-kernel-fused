@@ -305,12 +305,39 @@ def _combine_rows_kernel(PA, PB, LSE, MX, CROW, M, NT, BR: tl.constexpr, BT: tl.
         tl.store(MX + r, tl.max(tl.load(PB + off, mask=m2, other=-float("inf")), 1), mask=mr)
 
 
+@triton.jit
+def _rows_kernel(E, LAB, TGT, BLK, LSE, CROW, V, VS, BLANK, LO, HI, BV: tl.constexpr):
+    # E holds the bf16 logits (cuBLAS): one row per program, whole row in registers -> E = exp(L - c) in place
+    # (zeros past V), c = max if it is out of [LO, HI] else 0, lse = c + log(sum e) over the fp32 e, label / blank logit
+    r = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BV)
+    x = tl.load(E + r * VS + cols, mask=cols < V, other=-float("inf")).to(tl.float32)
+    mx = tl.max(x, 0)
+    c = tl.where((mx < LO) | (mx > HI), mx, 0.0)
+    e = tl.exp(x - c)
+    tl.store(E + r * VS + cols, e.to(tl.bfloat16), mask=cols < VS)
+    tl.store(LSE + r, c + tl.log(tl.sum(e, 0)))
+    tl.store(CROW + r, c)
+    lab = tl.load(LAB + r)
+    tl.store(TGT + r, tl.where(lab >= 0, tl.sum(tl.where(cols == lab, x, 0.0), 0), 0.0))
+    tl.store(BLK + r, tl.sum(tl.where(cols == BLANK, x, 0.0), 0))
+
+
+_CUBLAS_LOGITS = True                   # store_e: cuBLAS GEMM into E + _rows_kernel (bench_rnnt_joint.py A/B knob)
+
+
 def _stats(X, Wa, lab, blank, store_e, E=None):
-    """logits pass -> (lse, logit[label], logit[blank], crow). With store_e, E = exp(L - crow) is filled and the
-    out-of-window rows got a second, exact pass; without it crow is what that pass WOULD use (for a recompute)."""
+    """logits pass -> (lse, logit[label], logit[blank], crow). With store_e, E = exp(L - crow) is filled (exact for
+    out-of-window rows too); without it crow is what that pass WOULD use (for a recompute)."""
     M, K = X.shape
     VS = Wa.shape[0]
     V = blank + 1
+    if store_e and _CUBLAS_LOGITS:
+        torch.mm(X, Wa.t(), out=E)
+        lse, crow, tgt, blk = (torch.empty(M, device=X.device, dtype=torch.float32) for _ in range(4))
+        _rows_kernel[(M,)](E, lab, tgt, blk, lse, crow, V, VS, blank, _LO, _HI, BV=triton.next_power_of_2(VS),
+                           num_warps=8)
+        return lse, tgt, blk, crow
     BM, BN, BK, G, nw, ns = _LCFG or _lcfg(K)
     NT = triton.cdiv(VS, BN)
     dev = X.device
