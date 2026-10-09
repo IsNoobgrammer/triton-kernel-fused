@@ -42,7 +42,7 @@ def nemo_conv(g, pad, cw, cb, lw, lb, eps, left):
     x = F.pad(x, (left, cw.shape[-1] - 1 - left))
     x = F.conv1d(x, cw, cb, groups=cw.shape[0])
     x = F.layer_norm(x.transpose(1, 2), (x.shape[1],), lw, lb, eps)
-    return F.silu(x)
+    return F.silu(x).to(g.dtype)                    # pointwise_conv2's autocast cast: y and its grad in g's dtype
 
 
 def run(fn, g, params, W, gdt, amp):
