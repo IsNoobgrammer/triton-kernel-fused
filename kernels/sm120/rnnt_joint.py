@@ -345,7 +345,7 @@ def _pack(f, g, y, tlen, ylen, p, seed):
     n = tlen * (ylen + 1)
     off = torch.cumsum(n, 0) - n
     N = int(n.sum())                                            # the op's one host sync
-    assert N * Hd < 2 ** 31, "dropout offsets are int32"
+    assert p == 0 or N * Hd < 2 ** 31, "dropout offsets are int32"   # eval (p=0): no rand, no limit
     X = torch.empty(N, K, device=f.device, dtype=torch.bfloat16)
     LAB = torch.empty(N, device=f.device, dtype=torch.int64)
     _hidden_kernel[(B, T)](f, g, y, off, tlen, ylen, X, LAB, seed, p, 1.0 / (1.0 - p), T, U1, y.stride(0), Hd, K,
