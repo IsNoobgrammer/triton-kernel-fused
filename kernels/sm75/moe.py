@@ -266,8 +266,6 @@ def _glu_bwd_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Rms_ptr, S_ptr, Alpha_ptr,
     r = tl.load(Rms_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
     sv = tl.load(S_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
     aa = tl.load(Alpha_ptr + offs_m * s_ap, mask=mask_m, other=1.0).to(tl.float32)[:, None]
-    r = tl.load(Rms_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)[:, None]
-    sv = tl.load(S_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
     gn = gate / r
     z = aa * gn
     sig = 1.0 / (1.0 + tl.exp(-z))
@@ -366,7 +364,7 @@ def _glu_bwd_rowloop_kernel(GradOut_ptr, GateUp_ptr, Act_ptr, Alpha_ptr,
         df = sig * (1.0 + z * (1.0 - sig))
         gu_ = go * u
         sa += tl.where(m, gu_ * df * gn, 0.0)
-        tt += tl.where(m & (at == 8) | (at == 10), gu_ * f, 0.0)
+        tt += tl.where(m & ((at == 8) | (at == 10)), gu_ * f, 0.0)
     SA = tl.sum(sa)
     T = tl.sum(tt)
     S = tl.where(is_norm, SA, 0.0)

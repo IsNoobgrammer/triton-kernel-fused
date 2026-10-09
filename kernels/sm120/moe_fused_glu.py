@@ -74,7 +74,9 @@ def gemm_supported(hidden, gate_up_proj, codes):
 
 
 def fused_supported(hidden, gate_up_proj, codes):
-    return gemm_supported(hidden, gate_up_proj, codes) and codes[0] == 0
+    # the fused path's backward (_dinter_glu_bwd_kernel) tiles I by _BBN = 256 with no column mask
+    return (gemm_supported(hidden, gate_up_proj, codes) and codes[0] == 0
+            and (gate_up_proj.shape[1] // 2) % _BBN == 0)
 
 
 def build_tile_map(counts, counts_t, device, bm=None, m_rows=None):
