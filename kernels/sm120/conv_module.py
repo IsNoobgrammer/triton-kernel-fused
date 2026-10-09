@@ -127,12 +127,15 @@ def _cm_bwd_g(G, PAD, CW, DZ, DG, CWP, T, C,
     tl.store(DG + goff + C, (dh * a * ((1.0 - s) * s)).to(DG.dtype.element_ty), mask=mg)
 
 
-_CFG = {"bt": None, "warps": None}                 # override for bench_conv_module.py
+_CFG = {"fwd": None, "bwd": None}                 # (rows per program, warps) override for bench_conv_module.py
 
 
-def _cfg(C):
+def _cfg(C, which):
     BC = triton.next_power_of_2(C)
-    return BC, _CFG["bt"] or max(1, min(16, 8192 // BC)), _CFG["warps"] or 4
+    if _CFG[which]:
+        return (BC,) + _CFG[which]
+    # swept at 30400 frames x 512 (bench_conv_module.py --sweep): fwd 4 rows / 8 warps, bwd 16 rows / 8 warps
+    return (BC, max(1, 2048 // BC), 8) if which == "fwd" else (BC, max(1, 8192 // BC), 8)
 
 
 class _ConvModule(torch.autograd.Function):
@@ -146,7 +149,7 @@ class _ConvModule(torch.autograd.Function):
         y = torch.empty(B, T, C, device=g.device, dtype=odt or g.dtype)
         mean = torch.empty(B * T, device=g.device, dtype=torch.float32)
         rstd = torch.empty_like(mean)
-        BC, BT, NW = _cfg(C)
+        BC, BT, NW = _cfg(C, "fwd")
         has_pad = pad is not None
         pad8 = pad.contiguous().view(torch.uint8) if has_pad else g
         _cm_fwd[(triton.cdiv(T, BT), B)](g, pad8, cw2, cb, lw, lb, z, y, mean, rstd, T, C, eps,
@@ -161,7 +164,7 @@ class _ConvModule(torch.autograd.Function):
         has_pad, left, cws, cwdt, cbdt, lwdt, lbdt = ctx.cfg
         B, T, C = z.shape
         K = cw2.shape[1]
-        BC, BT, NW = _cfg(C)
+        BC, BT, NW = _cfg(C, "bwd")
         grid = (triton.cdiv(T, BT), B)
         np_ = grid[0] * B
         dz = torch.empty_like(z)

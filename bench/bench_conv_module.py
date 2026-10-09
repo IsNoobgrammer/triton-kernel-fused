@@ -51,11 +51,11 @@ def main():
     ef, eb = bench(lambda g_, *p: eager_conv(g_, pad, *p), [g] + ps, dy)
     if "--sweep" in sys.argv:
         for bt in (4, 8, 16, 32):
-            for nw in (2, 4, 8):
-                cm._CFG.update(bt=bt, warps=nw)
+            for nw in (4, 8, 16):
+                cm._CFG.update(fwd=(bt, nw), bwd=(bt, nw))
                 f, fb = bench(ours, [g] + ps, dy)
-                print(f"  BT {bt:2d} warps {nw}: fwd {f:6.0f} us  fwd+bwd {fb:6.0f} us", flush=True)
-        cm._CFG.update(bt=None, warps=None)
+                print(f"  BT {bt:2d} warps {nw:2d}: fwd {f:6.0f} us  bwd {fb - f:6.0f} us", flush=True)
+        cm._CFG.update(fwd=None, bwd=None)
     of, ob = bench(ours, [g] + ps, dy)
     print(f"conv_module B={B} T={T} ({B * T} frames): eager fwd {ef:.0f} us fwd+bwd {eb:.0f} us | "
           f"ours fwd {of:.0f} us ({ef / of:.2f}x) fwd+bwd {ob:.0f} us ({eb / ob:.2f}x)")
