@@ -208,7 +208,7 @@ class _Pass(torch.autograd.Function):
         V0 = ctx.v0
         dx = (dz @ wo).reshape(B, T, d).to(ctx.xdtype)
         dw_out = (dz.t() @ xb)[:V0].float()
-        db = dz.float().sum(0)[:V0]
+        db = torch.sum(dz, 0, dtype=torch.float32)[:V0]               # no fp32 copy of the whole dz
         dw_fb = (dq.t() @ p)[:, :V0].float() if has_fb else None
         return dx, dw_out, db, dw_fb, None, None, None, None
 
