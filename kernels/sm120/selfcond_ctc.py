@@ -4,9 +4,10 @@ One pass of a self-conditioned CTC head (BiBo voice/asr/ctc_heads.py SelfCondN):
 vocabulary, the CTC loss on log_softmax(z), and -- for every pass but the last -- the feedback q = softmax(z) W_fb^T
 (W_fb = [W_cur; W_prev], (2d, V): the caller adds q[:, :d] + shift_t(q[:, d:]) to the features of the next pass).
 
-    nll, q = selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank)
+    nll, q, logits = selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank)
         x (B, T, d) any float dtype (bf16 math), w_out (V, d), b_out (V,), w_fb (2d, V) or None (last pass)
-        -> nll (B,) fp32 (torch ctc_loss reduction='none', zero_infinity) and q (B, T, 2d) bf16 or None
+        -> nll (B,) fp32 (torch ctc_loss reduction='none', zero_infinity), q (B, T, 2d) bf16 or None, and the
+           logits z (B, T, V) bf16 without gradient (for WER / decoding)
 
 Every GEMM is cuBLAS (bf16, fp32 accumulate) on a vocab padded to a multiple of 128 (aligned rows: the unpadded
 V = 2049 ran on sm75 fallback kernels). Triton does the V-wide row work:
@@ -187,10 +188,12 @@ class _Pass(torch.autograd.Function):
                         num_warps=4 if BS <= 512 else 8)
         ctx.save_for_backward(xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll)
         ctx.shape, ctx.blank, ctx.has_fb, ctx.xdtype, ctx.v0 = (B, T, d, V), blank, w_fb is not None, x.dtype, V0
-        return nll, q
+        zl = z.view(B, T, V)[..., :V0]                                    # the logits, for WER / decoding (no grad)
+        ctx.mark_non_differentiable(zl)
+        return nll, q, zl
 
     @staticmethod
-    def backward(ctx, gnll, gq):
+    def backward(ctx, gnll, gq, gz=None):
         xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll = ctx.saved_tensors
         B, T, d, V = ctx.shape
         has_fb = ctx.has_fb and gq is not None
@@ -214,5 +217,6 @@ class _Pass(torch.autograd.Function):
 
 
 def selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank):
-    """One self-conditioned CTC pass; see the module docstring. Returns (nll (B,) fp32, q (B, T, 2d) bf16 or None)."""
+    """One self-conditioned CTC pass; see the module docstring. Returns (nll (B,) fp32, q (B, T, 2d) bf16 or None,
+    logits (B, T, V) bf16 without gradient -- for batch WER / decoding)."""
     return _Pass.apply(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, int(blank))

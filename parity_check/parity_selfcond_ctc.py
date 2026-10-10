@@ -46,7 +46,7 @@ def run(fn, x, w_out, b, w_fb, y, tl_, ul, blank, wts, R, dt=None):
         ([w_fb.detach().clone().requires_grad_(True)] if w_fb is not None else [])
     xx, wo, bb = leaves[:3]
     wf = leaves[3] if w_fb is not None else None
-    nll, q = fn(xx, wo, bb, wf, y, tl_, ul, blank) if dt is None else fn(xx, wo, bb, wf, y, tl_, ul, blank, dt)
+    nll, q = (fn(xx, wo, bb, wf, y, tl_, ul, blank)[:2]) if dt is None else fn(xx, wo, bb, wf, y, tl_, ul, blank, dt)
     loss = (nll.double() * wts).sum() + ((q.double() * R).sum() if q is not None else 0.0)
     loss.backward()
     return [nll.detach().double()] + [l.grad.double() for l in leaves]
@@ -109,7 +109,7 @@ def bench(V, feedback):
     R = torch.randn(B, T, 2 * d, device=dev, dtype=torch.bfloat16) if feedback else None
 
     def step(fn):
-        nll, q = fn(x, w_out, b, w_fb, y, tl_, ul, V - 1)
+        nll, q = fn(x, w_out, b, w_fb, y, tl_, ul, V - 1)[:2]
         loss = nll.sum() + ((q.float() * R).sum() if q is not None else 0.0)
         loss.backward()
 
