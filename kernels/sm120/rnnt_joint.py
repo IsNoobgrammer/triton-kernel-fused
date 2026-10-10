@@ -64,7 +64,7 @@ def _hidden_kernel(F, G, Y, OFF, TLEN, YLEN, X, LAB, seed, p, scale, T, U1, YS, 
                          mask=mu[:, None] & mk[None, :], other=0.0).to(tl.float32)
             x = tl.maximum((fv[None, :] + gv).to(tl.bfloat16).to(tl.float32), 0.0)   # bf16 add, like eager
             if DROP:
-                r = tl.rand(seed, (rows[:, None] * Hd + k[None, :]).to(tl.int32))
+                r = tl.rand(seed, (rows[:, None] * Hd + k[None, :]).to(tl.int64))
                 x = tl.where(r >= p, x * scale, 0.0)
             x = tl.where(k[None, :] == Hd, 1.0, x)                                      # bias column
             tl.store(X + rows[:, None].to(tl.int64) * K + k[None, :], x.to(tl.bfloat16),
@@ -274,7 +274,7 @@ def _dfg_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NT
         d = tl.load(GM + rows[:, None].to(tl.int64) * K + cols[None, :], mask=m2, other=0.0) * sr[:, None]
         d = tl.where(m2 & (x > 0.0), d, 0.0)
         if DROP:
-            r = tl.rand(seed, (rows[:, None] * Hd + cols[None, :]).to(tl.int32))
+            r = tl.rand(seed, (rows[:, None] * Hd + cols[None, :]).to(tl.int64))
             d = tl.where(r >= p, d * scale, 0.0)
         tl.store(DF + (b * T + t).to(tl.int64) * Hd + cols, tl.sum(d, axis=0), mask=mc)
         accg += d
@@ -345,7 +345,8 @@ def _pack(f, g, y, tlen, ylen, p, seed):
     n = tlen * (ylen + 1)
     off = torch.cumsum(n, 0) - n
     N = int(n.sum())                                            # the op's one host sync
-    assert p == 0 or N * Hd < 2 ** 31, "dropout offsets are int32"   # eval (p=0): no rand, no limit
+    # dropout offsets are int64: Philox counter (lo, hi) = (offset, offset >> 32), so below 2**32 the numbers are
+    # bit-identical to the old int32 offsets and batches past 2**31 hidden elements no longer wrap
     X = torch.empty(N, K, device=f.device, dtype=torch.bfloat16)
     LAB = torch.empty(N, device=f.device, dtype=torch.int64)
     _hidden_kernel[(B, T)](f, g, y, off, tlen, ylen, X, LAB, seed, p, 1.0 / (1.0 - p), T, U1, y.stride(0), Hd, K,
