@@ -8,7 +8,8 @@ vocabulary, the CTC loss on log_softmax(z), and -- for every pass but the last -
         x (B, T, d) any float dtype (bf16 math), w_out (V, d), b_out (V,), w_fb (2d, V) or None (last pass)
         -> nll (B,) fp32 (torch ctc_loss reduction='none', zero_infinity) and q (B, T, 2d) bf16 or None
 
-Every GEMM is cuBLAS (bf16, fp32 accumulate). Triton does the V-wide row work:
+Every GEMM is cuBLAS (bf16, fp32 accumulate) on a vocab padded to a multiple of 128 (aligned rows: the unpadded
+V = 2049 ran on sm75 fallback kernels). Triton does the V-wide row work:
   _softmax_rows  z (bf16) -> p = softmax(z) (bf16, stored) and lse (fp32) per frame
   _ctc_ab_z      alpha / beta / nll reading log p = z[label] - lse (no V-wide log_softmax tensor)
   _sc_grad       one program per frame: dz = p * (g + a - <dq, q>) - g * occupancy, where g = dL/dnll of the
@@ -18,6 +19,7 @@ Then dx = dz W_out, dW_out = dz^T x, db = sum dz, dW_fb = dq^T p (cuBLAS). Deter
 Stored per pass: z and p (B*T*V bf16 each), alpha / beta (B*T*S fp32) -- ~125 MB per pass at 15k frames x 2k vocab.
 """
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -155,11 +157,16 @@ class _Pass(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_out, b_out, w_fb, y, tlen, ulen, blank):
         B, T, d = x.shape
-        V = w_out.shape[0]
+        V0 = w_out.shape[0]
+        # vocab padded to a multiple of 128: V0 = 2049 / 4097 (tokens + blank) leaves the rows of z / p unaligned and
+        # cuBLAS fell back to sm75 kernels (63% of the pass). Padded logits get bias -inf -> softmax exactly 0, padded
+        # feedback columns weight 0, padded gradient rows are sliced off.
+        V = (V0 + 127) // 128 * 128
         bf = torch.bfloat16
         xb = x.reshape(B * T, d).to(bf)
-        wo = w_out.to(bf)
-        z = torch.addmm(b_out.to(bf), xb, wo.t())                         # (BT, V) bf16, cuBLAS
+        wo = F.pad(w_out.to(bf), (0, 0, 0, V - V0))
+        bo = F.pad(b_out.to(bf), (0, V - V0), value=float("-inf"))
+        z = torch.addmm(bo, xb, wo.t())                                   # (BT, V) bf16, cuBLAS
         p = torch.empty_like(z)
         lse = torch.empty(B * T, device=x.device, dtype=torch.float32)
         BV = triton.next_power_of_2(V)
@@ -167,7 +174,7 @@ class _Pass(torch.autograd.Function):
         q = None
         wf = None
         if w_fb is not None:
-            wf = w_fb.to(bf)
+            wf = F.pad(w_fb.to(bf), (0, V - V0))
             q = (p @ wf.t()).reshape(B, T, -1)                           # (B, T, 2d) bf16
         y = y.to(torch.int64).contiguous()
         tlen = tlen.to(torch.int64).contiguous()
@@ -179,7 +186,7 @@ class _Pass(torch.autograd.Function):
         _ctc_ab_z[(B,)](z, lse, y, tlen, ulen, al, be, nll, y.stride(0), T, V, blank, BS=BS,
                         num_warps=4 if BS <= 512 else 8)
         ctx.save_for_backward(xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll)
-        ctx.shape, ctx.blank, ctx.has_fb, ctx.xdtype = (B, T, d, V), blank, w_fb is not None, x.dtype
+        ctx.shape, ctx.blank, ctx.has_fb, ctx.xdtype, ctx.v0 = (B, T, d, V), blank, w_fb is not None, x.dtype, V0
         return nll, q
 
     @staticmethod
@@ -198,10 +205,11 @@ class _Pass(torch.autograd.Function):
         _sc_grad[(T, B)](z, lse, p, a if has_fb else z, qdq if has_fb else lse, y, tlen, ulen, al, be, nll, gout, dz,
                          y.stride(0), T, V, ctx.blank, BS=al.shape[2], BV=triton.next_power_of_2(V),
                          BU=triton.next_power_of_2(max(U, 1)), CJ=32, HAS_FB=has_fb, num_warps=8)
+        V0 = ctx.v0
         dx = (dz @ wo).reshape(B, T, d).to(ctx.xdtype)
-        dw_out = (dz.t() @ xb).float()
-        db = dz.float().sum(0)
-        dw_fb = (dq.t() @ p).float() if has_fb else None
+        dw_out = (dz.t() @ xb)[:V0].float()
+        db = dz.float().sum(0)[:V0]
+        dw_fb = (dq.t() @ p)[:, :V0].float() if has_fb else None
         return dx, dw_out, db, dw_fb, None, None, None, None
 
 
