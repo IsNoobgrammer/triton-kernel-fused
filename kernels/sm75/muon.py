@@ -32,6 +32,22 @@ def newton_schulz(G, coeffs=_DSV4_COEFFS, ns_dtype=_NS_DTYPE, eps=1e-7):
     return X.to(orig_dtype)
 
 
+def muon_rc(p):
+    """The (rows, cols) matrix a parameter is orthogonalised as. Default: its trailing 2D slice (any leading dim is a
+    batch). A parameter may carry `p.muon_rc = (r, c)` to be viewed as (numel // (r*c), r, c) instead -- e.g. a
+    pointwise conv (out, in, 1) -> (out, in), or a gate-stacked LSTM weight (4H, in) -> 4 x (H, in)."""
+    rc = getattr(p, "muon_rc", None)
+    if rc is None:
+        return p.shape[-2], p.shape[-1]
+    r, c = int(rc[0]), int(rc[1])
+    assert p.numel() % (r * c) == 0 and p.is_contiguous(), (tuple(p.shape), rc)
+    return r, c
+
+
+def muon_ok(p):
+    return p.ndim in (2, 3) or getattr(p, "muon_rc", None) is not None
+
+
 class FusedMuon(optim.Optimizer):
     """Muon for 2D/3D matrices (3D = batched per leading index, e.g. MoE expert stacks).
 
@@ -116,7 +132,7 @@ class FusedMuon(optim.Optimizer):
             return cache[key]
         buckets = defaultdict(list)
         for p in params:
-            buckets[(p.shape[-2], p.shape[-1])].append(p)
+            buckets[muon_rc(p)].append(p)
         plan = []
         for (r, c), ps in buckets.items():
             members, off = [], 0
@@ -182,7 +198,7 @@ class FusedMuon(optim.Optimizer):
             return self._gwork
         work, decay = [], []
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
+            params = [p for p in group["params"] if p.grad is not None and muon_ok(p)]
             if not params:
                 continue
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
@@ -275,7 +291,7 @@ class FusedMuon(optim.Optimizer):
 
         var = self.variant
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
+            params = [p for p in group["params"] if p.grad is not None and muon_ok(p)]
             if not params:
                 continue
             lr, momentum, wd, nesterov = (group["lr"], group["momentum"],
@@ -356,6 +372,8 @@ class DistributedMuon(FusedMuon):
         out = []
         for g in self.param_groups:
             for p in g["params"]:
+                if getattr(p, "muon_rc", None) is not None:
+                    raise NotImplementedError("muon_rc (reshaped matrices) is FusedMuon-only, not DistributedMuon")
                 if p.ndim in (2, 3):
                     out.append((p, g))
         return out
