@@ -2,8 +2,8 @@
 
 Reference = NeMo's own ops (rel_shift by pad/view/slice, mask from ConformerEncoder._create_masks 'chunked_limited',
 masked_fill -10000, softmax, masked_fill 0, @ v) in fp64 (ground truth) and in fp32 with TF32 matmuls (what NeMo runs,
-torch.set_float32_matmul_precision('high')). Every training context [70,13] [70,6] [70,1] [70,0], padded lengths,
-T not a multiple of the tile.
+torch.set_float32_matmul_precision('high')). Every training context [70,13] [70,6] [70,1] [70,0] and full context [-1,-1] (T 150 and
+376), padded lengths, T not a multiple of the tile.
 Gates:
   1. o, dq, dk, dv, dp, du, dv_bias: ours at least as close to fp64 as NeMo-fp32 (x1.1, or rel < 2e-4)
   2. bitwise repeatable
@@ -35,11 +35,12 @@ def check(tag, cond, msg):
 def nemo_mask(T, lengths, left, right):
     """True = masked, exactly as ConformerEncoder._create_masks (chunked_limited) + the padding mask."""
     att = torch.ones(1, T, T, dtype=torch.bool, device=dev)
-    chunk = right + 1
-    lc = left // chunk
-    ci = torch.div(torch.arange(T, device=dev, dtype=torch.int), chunk, rounding_mode="trunc")
-    d = ci.unsqueeze(1) - ci.unsqueeze(0)
-    att = att & ((d <= lc) & (d >= 0)).unsqueeze(0)
+    if right >= 0:                                                     # [-1, -1] = full context: no chunk mask
+        chunk = right + 1
+        lc = left // chunk
+        ci = torch.div(torch.arange(T, device=dev, dtype=torch.int), chunk, rounding_mode="trunc")
+        d = ci.unsqueeze(1) - ci.unsqueeze(0)
+        att = att & ((d <= lc) & (d >= 0)).unsqueeze(0)
     pad = torch.arange(T, device=dev)[None, :] < lengths[:, None]
     both = pad.unsqueeze(1) & pad.unsqueeze(2)
     return ~(att & both)                                               # (B, T, T)
@@ -95,10 +96,14 @@ NAMES = ["o", "dq", "dk", "dv", "dp", "du", "dv_bias"]
 
 
 def main():
-    B, T, H, D = 3, 150, 8, 64
-    xs, lengths, W = data(B, T, H, D)
+    H, D = 8, 64
+    # every training context incl. full context [-1, -1] at T 150; full context again at T 376 (30 s clips), where it
+    # differs most from the bands
+    cases = [(150, c) for c in ((70, 13), (70, 6), (70, 1), (70, 0), (-1, -1))] + [(376, (-1, -1))]
     for mode in ("bf16", "fp32"):
-        for left, right in ((70, 13), (70, 6), (70, 1), (70, 0)):
+        for T, (left, right) in cases:
+            B = 3 if T <= 150 else 2
+            xs, lengths, W = data(B, T, H, D)
             print(f"\n== {mode}: context [{left}, {right}], B={B} T={T} H={H} D={D}, lengths {lengths.tolist()}",
                   flush=True)
             mask = nemo_mask(T, lengths, left, right)
@@ -133,6 +138,8 @@ def main():
             padrows = torch.arange(T, device=dev)[None, :] >= lengths[:, None]
             check("4 padding rows = 0", bool((ou[0][padrows] == 0).all()), f"{int(padrows.sum())} rows")
 
+    B, T = 3, 150
+    xs, lengths, W = data(B, T, H, D)
     print("\n== dropout 0.1, context [70, 13], IEEE dots", flush=True)
     f = lambda *a: relpos_attention(*a, lengths, 70, 13, dropout=0.1, seed=99, prec="ieee")
     g0 = grads(f, xs, W, torch.float32)

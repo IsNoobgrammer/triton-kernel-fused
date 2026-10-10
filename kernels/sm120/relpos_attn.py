@@ -338,9 +338,12 @@ def relpos_attention(q, k, v, p, pos_bias_u, pos_bias_v, lengths, left, right, d
     """softmax(((q+u) k^T + rel_shift((q+v) p^T)) / sqrt(d), chunked_limited mask [left, right]) @ v -> (B, T, H, D),
     in q's dtype. dropout = the caller's attention dropout (0 in eval). prec: fp32 inputs only -- the tl.dot input
     precision ("tf32x3" default, "tf32", "ieee")."""
-    assert right >= 0, "chunked_limited with a right context (right == -1 is the plain band: not implemented)"
-    CH = right + 1
-    LC = left // CH if left >= 0 else 1 << 20
+    if left < 0 and right < 0:                   # [-1, -1] = full context (NeMo's offline mode): ONE chunk = the
+        CH, LC = q.shape[1], 0                   # whole padded sequence; padding still masked by `lengths`
+    else:
+        assert right >= 0, "chunked_limited with a right context (right == -1 with left >= 0: not implemented)"
+        CH = right + 1
+        LC = left // CH if left >= 0 else 1 << 20
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))
     return _RelPosAttn.apply(q, k, v, p, pos_bias_u, pos_bias_v, lengths, CH, LC, float(dropout), seed, prec)
