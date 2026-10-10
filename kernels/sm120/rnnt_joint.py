@@ -337,14 +337,16 @@ def _stats(X, Wa, lab, blank, store_e, E=None):
     return lse, tgt, blk, crow
 
 
-def _pack(f, g, y, tlen, ylen, p, seed):
-    """-> X (N, K) bf16 packed hidden rows with the bias column, LAB (N,) int64 (-1 = no label), off (B,), N."""
+def _pack(f, g, y, tlen, ylen, p, seed, n_rows=None):
+    """-> X (N, K) bf16 packed hidden rows with the bias column, LAB (N,) int64 (-1 = no label), off (B,), N.
+    n_rows: the caller's N = sum(tlen * (ylen + 1)) computed on the HOST from lengths it already has there -- skips the
+    op's only host sync (int(n.sum())), so the CPU can keep queueing the step."""
     B, T, Hd = f.shape
     U1 = g.shape[1]
     K = triton.cdiv(Hd + 1, 32) * 32
     n = tlen * (ylen + 1)
     off = torch.cumsum(n, 0) - n
-    N = int(n.sum())                                            # the op's one host sync
+    N = int(n.sum()) if n_rows is None else int(n_rows)        # n.sum() = the op's one host sync
     # dropout offsets are int64: Philox counter (lo, hi) = (offset, offset >> 32), so below 2**32 the numbers are
     # bit-identical to the old int32 offsets and batches past 2**31 hidden elements no longer wrap
     X = torch.empty(N, K, device=f.device, dtype=torch.bfloat16)
@@ -356,14 +358,14 @@ def _pack(f, g, y, tlen, ylen, p, seed):
 
 class _RNNTJoint(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget):
+    def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows):
         fdt, gdt = f.dtype, g.dtype
         f = f.to(torch.bfloat16).contiguous()
         g = g.to(torch.bfloat16).contiguous()
         B, T, Hd = f.shape
         V = weight.shape[0]
         tlen, ylen = tlen.to(torch.int64), ylen.to(torch.int64)
-        X, LAB, off, N = _pack(f, g, y.to(torch.int64), tlen, ylen, p, seed)
+        X, LAB, off, N = _pack(f, g, y.to(torch.int64), tlen, ylen, p, seed, n_rows)
         K = X.shape[1]
         Wa = torch.zeros(triton.cdiv(V, 64) * 64, K, device=f.device, dtype=torch.bfloat16)
         Wa[:V, :Hd] = weight
@@ -431,14 +433,15 @@ class _RNNTJoint(torch.autograd.Function):
                                                   T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
         dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
-                None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None)
 
 
 def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.0, dropout=0.0, seed=None,
-                    e_budget=_E_BUDGET):
+                    e_budget=_E_BUDGET, n_rows=None):
     """NeMo joint (relu -> dropout -> linear) + warprnnt_numba loss, mean over the batch. Returns (loss, nll).
-    dropout is the caller's (pass 0 in eval, like nn.Dropout outside training)."""
+    dropout is the caller's (pass 0 in eval, like nn.Dropout outside training). n_rows: sum(f_len * (y_len + 1)) if the
+    caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same)."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
     return _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda), float(dropout),
-                            seed, e_budget)
+                            seed, e_budget, n_rows)

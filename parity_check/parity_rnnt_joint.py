@@ -11,6 +11,7 @@ Gates (each at dropout 0 and 0.2, FastEmit 0.005, one empty transcript in the ba
   2. bitwise repeatable
   3. E recomputed in the backward (e_budget=0, 1024-row chunks) still meets gate 1 (its dW sums in another order)
   4. no-grad loss == grad-path loss (to fp32 rounding: the no-grad pass max-shifts its sums)
+  5. a host-computed n_rows (the no-sync path) gives a bitwise-identical loss and grads
   5. out-of-window logits (weights x200, forces the FIX pass) still meet gate 1
 
     python parity_check/parity_rnnt_joint.py [--big]
@@ -142,12 +143,12 @@ def nemo_path(f, g, W, b, y, tl, yl, keep, amp):
     return loss.detach(), f.grad, g.grad, W.grad, b.grad
 
 
-def ours(f, g, W, b, y, tl, yl, p, seed, e_budget=rj._E_BUDGET, grad=True):
+def ours(f, g, W, b, y, tl, yl, p, seed, e_budget=rj._E_BUDGET, grad=True, n_rows=None):
     f, g = (x.detach().clone().requires_grad_(grad) for x in (f, g))
     W, b = (x.detach().clone().requires_grad_(grad) for x in (W, b))
     with AMP, torch.set_grad_enabled(grad):
         loss, _ = rj.rnnt_joint_loss(f, g, W, b, y, tl, yl, fastemit_lambda=LAM, dropout=p, seed=seed,
-                                     e_budget=e_budget)
+                                     e_budget=e_budget, n_rows=n_rows)
     if not grad:
         return (loss.detach(),)
     loss.backward()
@@ -193,6 +194,9 @@ def case(name, B, T, U, H, V, p, wscale=1.0):
     e3 = [rel(a, r) for a, r in zip(o3, gt)]
     check("3 recompute meets gate 1", all(a <= max(c * 1.05, 2e-3) for a, c in zip(e3, en)),
           " ".join(f"{n} {e:.1e}" for n, e in zip(NAMES, e3)))
+    n_host = int((tl.cpu().long() * (yl.cpu().long() + 1)).sum())          # what a caller computes on the host
+    o5 = ours(f, g, W, b, y, tl, yl, p, seed, n_rows=n_host)
+    check("5 host n_rows (no sync) == default", all(torch.equal(a, c) for a, c in zip(o5, o)), "bitwise")
     o4 = ours(f, g, W, b, y, tl, yl, 0.0, seed, grad=False)
     if p == 0:
         check("4 no-grad loss", rel(o4[0], o[0]) < 1e-6, f"{o4[0].item():.7f} vs {o[0].item():.7f}")
