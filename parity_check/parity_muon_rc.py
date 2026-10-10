@@ -2,7 +2,8 @@
 like a real parameter of that matrix shape (same grads, same steps).
 
 Cases (the ASR model's): pointwise Conv1d (out, in, 1) -> (out, in); pointwise Conv2d (out, in, 1, 1) -> (out, in);
-gate-stacked LSTM (4H, in) -> 4 x (H, in) (compared with a real (4, H, in) parameter). Variants aurora (default) and
+gate-stacked LSTM (4H, in) -> 4 x (H, in) (compared with a real (4, H, in) parameter); attention q/k/v per head
+(512, 512) -> 8 x (64, 512). Variants aurora (default) and
 muown, fused tail on / off, nesterov, weight decay. Gate: bitwise equal weights after 5 steps.
 
     python parity_check/parity_muon_rc.py
@@ -38,7 +39,8 @@ def main():
     global ok
     cases = [("pointwise Conv1d (1024,512,1) as (1024,512)", (1024, 512, 1), (1024, 512), (1024, 512)),
              ("pointwise Conv2d (256,256,1,1) as (256,256)", (256, 256, 1, 1), (256, 256), (256, 256)),
-             ("LSTM (2560,640) as 4 x (640,640)", (2560, 640), (640, 640), (4, 640, 640))]
+             ("LSTM (2560,640) as 4 x (640,640)", (2560, 640), (640, 640), (4, 640, 640)),
+             ("attention per head (512,512) as 8 x (64,512)", (512, 512), (64, 512), (8, 64, 512))]
     for variant in ("aurora", "muown"):
         for ft in (True, False):
             for name, stored, rc, ref in cases:
