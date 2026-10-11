@@ -114,6 +114,26 @@ class FusedMuon(optim.Optimizer):
             for i, (_p, o) in enumerate(po):
                 out[o:o + n] = wht[i].view(n, r, c).to(out.dtype)
 
+    # Resume must be exact (Oct 11 2026: a resumed ASR run restarted Adam's t at 0 and kept fp32 momentum).
+    # _step_count is Muown's Adam t and the xorth warm-up clock: it rides in the state dict. torch's load_state_dict
+    # casts every floating state tensor to its PARAMETER's dtype, which turned the ns_dtype momentum into fp32 for
+    # the rest of the run: cast it back. Cached graph work holds the old state tensors: drop it.
+    def state_dict(self):
+        sd = super().state_dict()
+        sd["fused_muon"] = {"step_count": self._step_count}
+        return sd
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        extra = state_dict.pop("fused_muon", None)
+        super().load_state_dict(state_dict)
+        if extra is not None:
+            self._step_count = extra["step_count"]
+        for st in self.state.values():
+            if "muon_mom" in st:
+                st["muon_mom"] = st["muon_mom"].to(self.ns_dtype)
+        self._graph, self._gwork, self._gstep = None, None, 0
+
     def _xorth_state(self, p, n):
         st = self.state[p]
         if "xorth_cema" not in st:
