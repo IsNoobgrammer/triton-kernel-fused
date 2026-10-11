@@ -42,6 +42,31 @@ class FusedMuon(_FusedMuon75):
                                   gram_restarts=gram_restarts, pinned=ns_pinned, probe_steps=ns_probe_steps)
         self._ns_fixed = None if ns_backend == "auto" else self.ns_router.fixed(ns_backend)
 
+    # The router's decisions ride in the state dict (Oct 11 2026: a resumed ASR run matched the uninterrupted one at
+    # its first step and diverged from the second). Without them a resumed run probes again for ns_probe_steps:
+    # cuBLAS applied meanwhile and a per-process timing re-decision after, so its NS numerics are not the run's.
+    # Keys go out as plain lists (shape, dtype name): no sets or dtype objects in a checkpoint.
+    def state_dict(self):
+        sd = super().state_dict()
+        r = self.ns_router
+        sd["ns_router"] = {
+            "choice": [[list(k[0]), str(k[1]).removeprefix("torch."), v] for k, v in r.choice.items()],
+            "stats": [[list(k[0]), str(k[1]).removeprefix("torch."),
+                       {n: (sorted(s) if n == "_seen" else s) for n, s in st.items()}] for k, st in r._stats.items()],
+        }
+        return sd
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        saved = state_dict.pop("ns_router", None)
+        super().load_state_dict(state_dict)
+        if saved is not None:
+            r = self.ns_router
+            key = lambda shape, dt: (tuple(shape), getattr(torch, dt))
+            r.choice = {key(s, d): v for s, d, v in saved["choice"]}
+            r._stats = {key(s, d): {n: (set(v) if n == "_seen" else v) for n, v in st.items()}
+                        for s, d, st in saved["stats"]}
+
     @staticmethod
     def _tail_pre(grads, gbuf, mom, momentum, nesterov):
         return tail_pre(grads, gbuf, mom, momentum, nesterov)
