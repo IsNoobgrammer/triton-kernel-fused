@@ -32,7 +32,7 @@ import triton
 import triton.language as tl
 
 from kernels.sm120.ce_factored import _HS
-from kernels.sm120.rnnt_joint import (_E_BUDGET, _NEG, _comb, _dfg_kernel, _fix_e_kernel, _lae, _pack, _stats,
+from kernels.sm120.rnnt_joint import (_E_BUDGET, _NEG, _comb, _fix_e_kernel, _lae, _pack, _stats,
                                       rnnt_joint_loss)
 
 __all__ = ["tdt_joint_loss"]
@@ -176,6 +176,55 @@ def _tdt_rowgrad_kernel(ALPHA, BETA, LPB, LPY, LPD, DUR, LL, WB, LSE, CROW, OFF,
             tl.store(XS + off, (x * sh[:, None]).to(tl.bfloat16), mask=m2)
 
 
+@triton.jit
+def _tdt_dfg_kernel(GM, S, DZ, WD, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NTB, Hd, K,
+                    ND: tl.constexpr, TB: tl.constexpr, BU: tl.constexpr, BH: tl.constexpr, DROP: tl.constexpr):
+    # rnnt_joint._dfg_kernel + the duration head in-register: dX = s (E' W) + sum_d dZ[r, d] W_d (D = 5 FMAs per
+    # element) -- one pass over GM, as for RNN-T (the first version scaled GM and added dZ W_d in two extra passes)
+    b = tl.program_id(0)
+    tbi = tl.program_id(1)
+    tb = tl.load(TLEN + b).to(tl.int32)
+    t0 = tbi * TB
+    if t0 >= tb:
+        return
+    ub1 = tl.load(YLEN + b).to(tl.int32) + 1
+    base = tl.load(OFF + b)
+    cols = tl.program_id(2) * BH + tl.arange(0, BH)
+    mc = cols < Hd
+    u = tl.arange(0, BU)
+    mu = u < ub1
+    m2 = mu[:, None] & mc[None, :]
+    gv = tl.load(G + (b * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+    accg = tl.zeros([BU, BH], tl.float32)
+    for t in range(t0, tl.minimum(t0 + TB, tb)):
+        rows = base + t * ub1 + u
+        fv = tl.load(F + (b * T + t).to(tl.int64) * Hd + cols, mask=mc, other=0.0).to(tl.float32)
+        x = (fv[None, :] + gv).to(tl.bfloat16).to(tl.float32)
+        sr = tl.load(S + rows, mask=mu, other=0.0)
+        d = tl.load(GM + rows[:, None].to(tl.int64) * K + cols[None, :], mask=m2, other=0.0) * sr[:, None]
+        for i in tl.static_range(ND):
+            dz = tl.load(DZ + rows * ND + i, mask=mu, other=0.0)
+            wd = tl.load(WD + i * K + cols, mask=mc, other=0.0)
+            d += dz[:, None] * wd[None, :]
+        d = tl.where(m2 & (x > 0.0), d, 0.0)
+        if DROP:
+            r = tl.rand(seed, (rows[:, None] * Hd + cols[None, :]).to(tl.int64))
+            d = tl.where(r >= p, d * scale, 0.0)
+        tl.store(DF + (b * T + t).to(tl.int64) * Hd + cols, tl.sum(d, axis=0), mask=mc)
+        accg += d
+    tl.store(DGP + ((b * NTB + tbi) * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], accg, mask=m2)
+
+
+_DUR = {}
+
+
+def _dur_tensor(durations, dev):
+    key = (durations, str(dev))
+    if key not in _DUR:
+        _DUR[key] = torch.tensor(durations, device=dev, dtype=torch.int32)
+    return _DUR[key]
+
+
 class _TDTJoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, f, g, weight, bias, y, tlen, ylen, durations, sigma, p, seed, e_budget, n_rows):
@@ -203,7 +252,7 @@ class _TDTJoint(torch.autograd.Function):
         lpd = torch.log_softmax(Z, -1).contiguous()
         lpb = blk - lse - sigma
         lpy = torch.where(LAB >= 0, tgt - lse - sigma, _NEG)
-        dur = torch.tensor(durations, device=dev, dtype=torch.int32)
+        dur = _dur_tensor(tuple(durations), dev)                     # cached: a per-call H2D copy is a host sync
         alpha = torch.empty(N, device=dev, dtype=torch.float32)
         ll = torch.empty(B, device=dev, dtype=torch.float32)
         BU = triton.next_power_of_2(g.shape[1])
@@ -255,21 +304,18 @@ class _TDTJoint(torch.autograd.Function):
                 _stats(X[i:i + M], Wa, LAB[i:i + M], V - 1, True, Ebuf[:M])
                 grads(Ebuf[:M], i, M)
         # durations: dL/dZ = occ softmax(Z) - gd (occ = gb + gy = sum_d gd); dX = s (E' W) + dZ W_d, dW_d = dZ^T X
-        dZ = (GB + GY)[:, None] * torch.softmax(Z, -1) - GD
-        GM.mul_(S[:, None])
-        GM.addmm_(dZ, Wd.float())
-        gwd = torch.zeros(ND, K, device=dev, dtype=torch.float32)
-        for i in range(0, N, 1 << 18):                              # fp32 dZ^T X without an (N, K) fp32 copy of X
-            gwd.addmm_(dZ[i:i + (1 << 18)].t(), X[i:i + (1 << 18)].float())
-        ones = torch.ones(N, device=dev, dtype=torch.float32)
+        dZ = ((GB + GY)[:, None] * torch.softmax(Z, -1) - GD).contiguous()
+        # dW_d = dZ^T X: one GEMM on bf16 operands, fp32 accumulate (the token rows' dW uses bf16 E' the same way)
+        gwd = torch.mm(dZ.t().to(torch.bfloat16), X, out_dtype=torch.float32)
         df = torch.zeros(B, T, Hd, device=dev, dtype=torch.float32)
         BUg = triton.next_power_of_2(U1)
         BH = max(16, min(128, 8192 // BUg))
         TB = 16
         NTB = triton.cdiv(T, TB)
         dgp = torch.zeros(B, NTB, U1, Hd, device=dev, dtype=torch.float32)
-        _dfg_kernel[(B, NTB, triton.cdiv(Hd, BH))](GM, ones, f, g, off, tlen, ylen, df, dgp, seed, p, 1.0 / (1.0 - p),
-                                                  T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
+        _tdt_dfg_kernel[(B, NTB, triton.cdiv(Hd, BH))](GM, S, dZ, Wd.float().contiguous(), f, g, off, tlen, ylen, df,
+                                                      dgp, seed, p, 1.0 / (1.0 - p), T, U1, NTB, Hd, K, ND=ND, TB=TB,
+                                                      BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
         dg = dgp.sum(1)
         dW = torch.cat([gw[:V, :Hd], gwd[:, :Hd]], 0)
         db = torch.cat([gw[:V, Hd], gwd[:, Hd]], 0)
