@@ -215,6 +215,16 @@ def _tdt_dfg_kernel(GM, S, DZ, WD, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scal
     tl.store(DGP + ((b * NTB + tbi) * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], accg, mask=m2)
 
 
+_DUR = {}
+
+
+def _dur_tensor(durations, dev):
+    key = (durations, str(dev))
+    if key not in _DUR:
+        _DUR[key] = torch.tensor(durations, device=dev, dtype=torch.int32)
+    return _DUR[key]
+
+
 class _TDTJoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, f, g, weight, bias, y, tlen, ylen, durations, sigma, p, seed, e_budget, n_rows):
@@ -242,7 +252,7 @@ class _TDTJoint(torch.autograd.Function):
         lpd = torch.log_softmax(Z, -1).contiguous()
         lpb = blk - lse - sigma
         lpy = torch.where(LAB >= 0, tgt - lse - sigma, _NEG)
-        dur = torch.tensor(durations, device=dev, dtype=torch.int32)
+        dur = _dur_tensor(tuple(durations), dev)                     # cached: a per-call H2D copy is a host sync
         alpha = torch.empty(N, device=dev, dtype=torch.float32)
         ll = torch.empty(B, device=dev, dtype=torch.float32)
         BU = triton.next_power_of_2(g.shape[1])
