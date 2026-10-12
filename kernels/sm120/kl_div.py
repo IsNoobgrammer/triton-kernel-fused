@@ -11,6 +11,7 @@ Per row i (s' = s / T, t' = t / T, q = softmax(s'), p = softmax(t')):
          dKL_i / ds_v = (q_v - p_v) / T
   top-k  KL_i = sum_k p_k (log p_k - log q_k) + r (log r - log q_rest),     q_rest = 1 - sum_k q_k
          dKL_i / ds_v = (q_v - p_v) / T for v in the top-k,  q_v (1 - r / q_rest) / T otherwise
+         (backward: the rest value written for the whole row, then the k entries overwritten after a barrier)
 Forward: one pass over the row (online log-sum-exps, rescaled accumulator), per-row loss (N,) fp32 and the student /
 teacher lse saved; nothing N x V is stored. Backward: recompute q (and p) from the saved lse, write ds in s's dtype,
 scaled by the incoming per-row grad (so masks / weights / sums are the caller's: loss = (kl * w).sum()).
@@ -141,27 +142,32 @@ def _topk_fwd(S, IDX, LP, LOSS, LSES, QREST, V, ss, inv_T, K: tl.constexpr, KP: 
 
 
 @triton.jit
-def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr, KP: tl.constexpr, BV: tl.constexpr):
+def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr, KB: tl.constexpr, BV: tl.constexpr):
+    # pass 1: every v gets the rest-bucket grad q_v (1 - r / q_rest); barrier; pass 2: the k teacher entries are
+    # overwritten with q_v - p_v (any k; no v x k membership tile)
     i = tl.program_id(0).to(tl.int64)
     lse_s = tl.load(LSES + i)
     q_rest = tl.load(QREST + i)
     g = tl.load(G + i).to(tl.float32) * inv_T
-    k = tl.arange(0, KP)
-    mkk = k < K
-    ix = tl.load(IDX + i * K + k, mask=mkk, other=-1)
-    lp = tl.load(LP + i * K + k, mask=mkk, other=float("-inf")).to(tl.float32)
-    p = tl.where(mkk, tl.exp(lp), 0.0)
-    r = tl.maximum(1.0 - tl.sum(p, 0), 0.0)
+    psum = tl.zeros((), tl.float32)
+    for k0 in range(0, K, KB):
+        k = k0 + tl.arange(0, KB)
+        psum += tl.sum(tl.exp(tl.load(LP + i * K + k, mask=k < K, other=float("-inf")).to(tl.float32)), 0)
+    r = tl.maximum(1.0 - psum, 0.0)
     rest = 1.0 - r / q_rest
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
         mk = v < V
         q = tl.exp(tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T - lse_s)
-        hit = v[:, None] == ix[None, :]                                  # (BV, KP): is v one of the top-k?
-        in_k = tl.max(hit.to(tl.int32), 1) > 0
-        pv = tl.sum(tl.where(hit, p[None, :], 0.0), 1)
-        d = tl.where(in_k, q - pv, q * rest) * g
-        tl.store(DS + i * sd + v, d.to(DS.dtype.element_ty), mask=mk)
+        tl.store(DS + i * sd + v, (q * rest * g).to(DS.dtype.element_ty), mask=mk)
+    tl.debug_barrier()
+    for k0 in range(0, K, KB):
+        k = k0 + tl.arange(0, KB)
+        mkk = k < K
+        ix = tl.load(IDX + i * K + k, mask=mkk, other=0)
+        pv = tl.exp(tl.load(LP + i * K + k, mask=mkk, other=float("-inf")).to(tl.float32))
+        q = tl.exp(tl.load(S + i * ss + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T - lse_s)
+        tl.store(DS + i * sd + ix, ((q - pv) * g).to(DS.dtype.element_ty), mask=mkk)
 
 
 class _TopK(torch.autograd.Function):
@@ -187,7 +193,7 @@ class _TopK(torch.autograd.Function):
         ds = torch.empty_like(s)
         if N:
             _topk_bwd[(N,)](s, idx, logp, lse_s, q_rest, g.contiguous(), ds, V, s.stride(0), ds.stride(0), 1.0 / ctx.T,
-                            K=ctx.K, KP=ctx.KP, BV=min(_bv(V), 1024), num_warps=8)
+                            K=ctx.K, KB=min(ctx.KP, 1024), BV=_bv(V), num_warps=8)
         return ds, None, None, None
 
 
