@@ -4,7 +4,7 @@ NeMo's ConformerLayer does this 4 times per layer (ff1 -> attn -> conv -> ff2 ->
 layer_norm forward, and in the backward layer_norm's input grad, its GammaBeta weight-grad kernel, the add / mul /
 dropout grads. Here: one forward kernel (reads residual and x once, writes r' and y, keeps mean / rstd per row) and
 one backward kernel (grad from the residual stream + the LN grad -> d_residual and dx, with the dropout mask
-regenerated from the seed; LN weight / bias grads accumulated per persistent program, then summed in a fixed order).
+regenerated from the seed; LN weight / bias grads as per-block partial column sums, summed in a fixed order).
 
 Rounding follows eager exactly: dropout's output is rounded to x's dtype (bf16), times factor in that dtype, the add
 in the residual's dtype (fp32 under autocast: LayerNorm outputs fp32 there; bf16 with --bf16_master). The LN runs in
@@ -53,58 +53,41 @@ def _fwd(RES, X, W, B, ROUT, Y, MEAN, RSTD, R, C, eps, seed, p, scale, factor,
 
 
 @triton.jit
-def _bwd(DROUT, DY, RIN, W, MEAN, RSTD, DRES, DX, DWP, DBP, R, C, NB, seed, p, scale, factor,
+def _bwd(DROUT, DY, RIN, W, MEAN, RSTD, DRES, DX, DWP, DBP, R, C, seed, p, scale, factor,
          BR: tl.constexpr, BC: tl.constexpr, HAS_X: tl.constexpr, HAS_DROUT: tl.constexpr, DROP: tl.constexpr,
          SCALE_F: tl.constexpr):
-    # persistent: program i takes row blocks i, i + P, i + 2P, ... (fixed order) and keeps its weight-grad column sums
-    # in registers, so the partials are P x C (not one row per block: those were ~16 MB per call, read back by a sum)
     pid = tl.program_id(0)
+    rows = pid * BR + tl.arange(0, BR)
     cols = tl.arange(0, BC)
+    mr = rows < R
     mc = cols < C
+    m2 = mr[:, None] & mc[None, :]
+    off = rows[:, None].to(tl.int64) * C + cols[None, :]
+    mean = tl.load(MEAN + rows, mask=mr, other=0.0)
+    rstd = tl.load(RSTD + rows, mask=mr, other=0.0)
+    xhat = tl.where(m2, (tl.load(RIN + off, mask=m2, other=0.0).to(tl.float32) - mean[:, None]) * rstd[:, None], 0.0)
+    dy = tl.load(DY + off, mask=m2, other=0.0).to(tl.float32)
     w = tl.load(W + cols, mask=mc, other=0.0).to(tl.float32)
-    dw_acc = tl.zeros((BC,), tl.float32)
-    db_acc = tl.zeros((BC,), tl.float32)
-    for blk in range(pid, NB, tl.num_programs(0)):
-        rows = blk * BR + tl.arange(0, BR)
-        mr = rows < R
-        m2 = mr[:, None] & mc[None, :]
-        off = rows[:, None].to(tl.int64) * C + cols[None, :]
-        mean = tl.load(MEAN + rows, mask=mr, other=0.0)
-        rstd = tl.load(RSTD + rows, mask=mr, other=0.0)
-        xhat = tl.where(m2, (tl.load(RIN + off, mask=m2, other=0.0).to(tl.float32) - mean[:, None]) * rstd[:, None], 0.0)
-        dy = tl.load(DY + off, mask=m2, other=0.0).to(tl.float32)
-        g = dy * w[None, :]
-        c1 = tl.sum(g * xhat, axis=1) / C
-        c2 = tl.sum(g, axis=1) / C
-        # eager rounds twice in bf16: layer_norm's input grad is written in the input dtype, then autograd's
-        # accumulation adds the residual-stream grad in that dtype. One rounding would be MORE accurate = a model change.
-        dr = (rstd[:, None] * (g - xhat * c1[:, None] - c2[:, None])).to(DRES.dtype.element_ty)
-        if HAS_DROUT:
-            dr = (dr.to(tl.float32) + tl.load(DROUT + off, mask=m2, other=0.0).to(tl.float32)).to(DRES.dtype.element_ty)
-        tl.store(DRES + off, dr, mask=m2)
-        if HAS_X:
-            xt = DX.dtype.element_ty
-            dx = dr.to(xt).to(tl.float32)
-            if SCALE_F:
-                dx = (dx * factor).to(xt).to(tl.float32)
-            if DROP:
-                keep = tl.rand(seed, (rows[:, None] * C + cols[None, :]).to(tl.int32)) >= p
-                dx = tl.where(keep, dx * scale, 0.0)
-            tl.store(DX + off, dx.to(xt), mask=m2)
-        dw_acc += tl.sum(dy * xhat, axis=0)
-        db_acc += tl.sum(dy, axis=0)
-    tl.store(DWP + pid * C + cols, dw_acc, mask=mc)
-    tl.store(DBP + pid * C + cols, db_acc, mask=mc)
-
-
-_NPROG = {}
-
-
-def _nprog(dev):
-    """persistent grid size: 4 programs per SM (fixed per device, so the summation order is too)"""
-    if dev not in _NPROG:
-        _NPROG[dev] = 4 * torch.cuda.get_device_properties(dev).multi_processor_count
-    return _NPROG[dev]
+    g = dy * w[None, :]
+    c1 = tl.sum(g * xhat, axis=1) / C
+    c2 = tl.sum(g, axis=1) / C
+    # eager rounds twice in bf16: layer_norm's input grad is written in the input dtype, then autograd's
+    # accumulation adds the residual-stream grad in that dtype. One rounding would be MORE accurate = a model change.
+    dr = (rstd[:, None] * (g - xhat * c1[:, None] - c2[:, None])).to(DRES.dtype.element_ty)
+    if HAS_DROUT:
+        dr = (dr.to(tl.float32) + tl.load(DROUT + off, mask=m2, other=0.0).to(tl.float32)).to(DRES.dtype.element_ty)
+    tl.store(DRES + off, dr, mask=m2)
+    if HAS_X:
+        xt = DX.dtype.element_ty
+        dx = dr.to(xt).to(tl.float32)
+        if SCALE_F:
+            dx = (dx * factor).to(xt).to(tl.float32)
+        if DROP:
+            keep = tl.rand(seed, (rows[:, None] * C + cols[None, :]).to(tl.int32)) >= p
+            dx = tl.where(keep, dx * scale, 0.0)
+        tl.store(DX + off, dx.to(xt), mask=m2)
+    tl.store(DWP + pid * C + cols, tl.sum(dy * xhat, axis=0), mask=mc)
+    tl.store(DBP + pid * C + cols, tl.sum(dy, axis=0), mask=mc)
 
 
 _CFG = {"fwd": None, "bwd": None}                 # (rows per program, warps) override for bench_res_drop_ln.py
@@ -151,10 +134,9 @@ class _ResDropLN(torch.autograd.Function):
         dr_in = drout.reshape(-1, C).contiguous() if has_dr else dy
         dres = torch.empty_like(rout)
         dx = torch.empty(R, C, device=rout.device, dtype=xdt) if has_x else dres
-        npr = min(nb, _nprog(rout.device))
-        dwp = torch.empty(npr, C, device=rout.device, dtype=torch.float32)
+        dwp = torch.empty(nb, C, device=rout.device, dtype=torch.float32)
         dbp = torch.empty_like(dwp)
-        _bwd[(npr,)](dr_in, dy, rout, w, mean, rstd, dres, dx, dwp, dbp, R, C, nb, seed, p, 1.0 / (1.0 - p), factor,
+        _bwd[(nb,)](dr_in, dy, rout, w, mean, rstd, dres, dx, dwp, dbp, R, C, seed, p, 1.0 / (1.0 - p), factor,
                     BR=BR, BC=BC, HAS_X=has_x, HAS_DROUT=has_dr, DROP=has_x and p > 0, SCALE_F=factor != 1.0,
                     num_warps=NW)
         return (dres.view(shp), dx.view(shp) if has_x else None, dwp.sum(0).to(wdt), dbp.sum(0).to(bdt),
