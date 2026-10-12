@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["conv_module"]
+__all__ = ["conv_module", "conv_module_bn"]
 
 
 @triton.jit
@@ -186,3 +186,184 @@ def conv_module(g, pad_mask, conv_weight, conv_bias, ln_weight, ln_bias, eps, le
     assert conv_bias is not None and conv_weight.shape[-1] - 1 - left_pad >= 0
     return _ConvModule.apply(g, pad_mask, conv_weight, conv_bias, ln_weight, ln_bias, float(eps), int(left_pad),
                              out_dtype)
+
+
+# ---- BatchNorm variant (conv_norm_type batch_norm: Parakeet / FastConformer offline models), training mode ----
+#   y = Swish(BatchNorm1d(DepthwiseConv1d(masked_fill(GLU(g), pad, 0))))
+# Batch statistics per channel over all B*T frames (padded frames included, as nn.BatchNorm1d sees them): conv -> z
+# with per-program partial sums, a second pass for sum (z - mean)^2 (two-pass variance), then normalise + Swish.
+# Rounding as eager under bf16 autocast: BN output in z's dtype, Swish on it, its grad rounded; BN stats, weight grads
+# and the BN input grad's reductions in fp32. Running stats updated like nn.BatchNorm1d (momentum, unbiased var).
+
+@triton.jit
+def _cmb_fwd_z(G, PAD, CW, CB, Z, S1P, T, C,
+               LEFT: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, HAS_PAD: tl.constexpr):
+    tb = tl.program_id(0)
+    b = tl.program_id(1)
+    pid = b * tl.num_programs(0) + tb
+    t = tb * BT + tl.arange(0, BT)
+    c = tl.arange(0, BC)
+    mc = c < C
+    dt = G.dtype.element_ty
+    gb = G + b.to(tl.int64) * T * 2 * C
+    acc = tl.zeros((BT, BC), tl.float32)
+    for k in tl.static_range(K):
+        ts = t - LEFT + k
+        ok = (ts >= 0) & (ts < T)
+        if HAS_PAD:
+            ok &= tl.load(PAD + b * T + ts, mask=ok, other=1) == 0
+        m2 = ok[:, None] & mc[None, :]
+        a = tl.load(gb + ts[:, None] * 2 * C + c[None, :], mask=m2, other=0.0).to(tl.float32)
+        s = tl.load(gb + ts[:, None] * 2 * C + C + c[None, :], mask=m2, other=0.0).to(tl.float32)
+        h = (a * _sig(s)).to(dt).to(tl.float32)
+        w = tl.load(CW + c * K + k, mask=mc, other=0.0).to(dt).to(tl.float32)
+        acc += tl.where(m2, h, 0.0) * w[None, :]
+    mt = t < T
+    m2 = mt[:, None] & mc[None, :]
+    z = (acc + tl.load(CB + c, mask=mc, other=0.0).to(dt).to(tl.float32)[None, :]).to(dt)
+    off = (b.to(tl.int64) * T + t)[:, None] * C + c[None, :]
+    tl.store(Z + off, z, mask=m2)
+    tl.store(S1P + pid * C + c, tl.sum(tl.where(m2, z.to(tl.float32), 0.0), axis=0), mask=mc)
+
+
+@triton.jit
+def _cmb_stat2(Z, MEAN, S2P, T, C, BT: tl.constexpr, BC: tl.constexpr):
+    tb = tl.program_id(0)
+    b = tl.program_id(1)
+    pid = b * tl.num_programs(0) + tb
+    t = tb * BT + tl.arange(0, BT)
+    c = tl.arange(0, BC)
+    mc = c < C
+    m2 = (t < T)[:, None] & mc[None, :]
+    off = (b.to(tl.int64) * T + t)[:, None] * C + c[None, :]
+    d = tl.where(m2, tl.load(Z + off, mask=m2, other=0.0).to(tl.float32)
+                 - tl.load(MEAN + c, mask=mc, other=0.0)[None, :], 0.0)
+    tl.store(S2P + pid * C + c, tl.sum(d * d, axis=0), mask=mc)
+
+
+@triton.jit
+def _cmb_norm(Z, MEAN, RSTD, BW, BB, T, C, b, t, c):
+    """-> (mask, offsets, xhat fp32, n = BN output rounded to z's dtype, as fp32)"""
+    mc = c < C
+    m2 = (t < T)[:, None] & mc[None, :]
+    off = (b.to(tl.int64) * T + t)[:, None] * C + c[None, :]
+    z = tl.load(Z + off, mask=m2, other=0.0).to(tl.float32)
+    xhat = tl.where(m2, (z - tl.load(MEAN + c, mask=mc, other=0.0)[None, :])
+                    * tl.load(RSTD + c, mask=mc, other=0.0)[None, :], 0.0)
+    n = xhat * tl.load(BW + c, mask=mc, other=0.0)[None, :] + tl.load(BB + c, mask=mc, other=0.0)[None, :]
+    return m2, off, xhat, n.to(Z.dtype.element_ty).to(tl.float32)
+
+
+@triton.jit
+def _cmb_fwd_y(Z, MEAN, RSTD, BW, BB, Y, T, C, BT: tl.constexpr, BC: tl.constexpr):
+    tb = tl.program_id(0)
+    b = tl.program_id(1)
+    t = tb * BT + tl.arange(0, BT)
+    c = tl.arange(0, BC)
+    m2, off, xhat, n = _cmb_norm(Z, MEAN, RSTD, BW, BB, T, C, b, t, c)
+    tl.store(Y + off, (n * _sig(n)).to(Y.dtype.element_ty), mask=m2)
+
+
+@triton.jit
+def _cmb_dn(DY, Z, MEAN, RSTD, BW, BB, T, C, b, t, c):
+    m2, off, xhat, n = _cmb_norm(Z, MEAN, RSTD, BW, BB, T, C, b, t, c)
+    s = _sig(n)
+    dy = tl.load(DY + off, mask=m2, other=0.0).to(tl.float32)
+    dn = tl.where(m2, (dy * s * (1.0 + n * (1.0 - s))).to(Z.dtype.element_ty).to(tl.float32), 0.0)  # silu bwd, rounded
+    return m2, off, xhat, dn
+
+
+@triton.jit
+def _cmb_bwd_p(DY, Z, MEAN, RSTD, BW, BB, P1, P2, T, C, BT: tl.constexpr, BC: tl.constexpr):
+    tb = tl.program_id(0)
+    b = tl.program_id(1)
+    pid = b * tl.num_programs(0) + tb
+    t = tb * BT + tl.arange(0, BT)
+    c = tl.arange(0, BC)
+    m2, off, xhat, dn = _cmb_dn(DY, Z, MEAN, RSTD, BW, BB, T, C, b, t, c)
+    tl.store(P1 + pid * C + c, tl.sum(dn, axis=0), mask=c < C)
+    tl.store(P2 + pid * C + c, tl.sum(dn * xhat, axis=0), mask=c < C)
+
+
+@triton.jit
+def _cmb_bwd_z(DY, Z, MEAN, RSTD, BW, BB, SDN, SDNX, DZ, CBP, inv_n, T, C, BT: tl.constexpr, BC: tl.constexpr):
+    tb = tl.program_id(0)
+    b = tl.program_id(1)
+    pid = b * tl.num_programs(0) + tb
+    t = tb * BT + tl.arange(0, BT)
+    c = tl.arange(0, BC)
+    mc = c < C
+    m2, off, xhat, dn = _cmb_dn(DY, Z, MEAN, RSTD, BW, BB, T, C, b, t, c)
+    k = tl.load(BW + c, mask=mc, other=0.0) * tl.load(RSTD + c, mask=mc, other=0.0)
+    sdn = tl.load(SDN + c, mask=mc, other=0.0) * inv_n
+    sdnx = tl.load(SDNX + c, mask=mc, other=0.0) * inv_n
+    dz = (k[None, :] * (dn - sdn[None, :] - xhat * sdnx[None, :])).to(DZ.dtype.element_ty)
+    tl.store(DZ + off, dz, mask=m2)
+    tl.store(CBP + pid * C + c, tl.sum(tl.where(m2, dz.to(tl.float32), 0.0), axis=0), mask=mc)
+
+
+class _ConvModuleBN(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, g, pad, cw, cb, bw, bb, run_mean, run_var, momentum, eps, left, odt):
+        B, T, C2 = g.shape
+        C, K = C2 // 2, cw.shape[-1]
+        g = g.contiguous()
+        cw2 = cw.reshape(C, K).contiguous()
+        z = torch.empty(B, T, C, device=g.device, dtype=g.dtype)
+        y = torch.empty(B, T, C, device=g.device, dtype=odt or g.dtype)
+        has_pad = pad is not None
+        pad8 = pad.contiguous().view(torch.uint8) if has_pad else g
+        BC, BT, NW = _cfg(C, "fwd")
+        grid = (triton.cdiv(T, BT), B)
+        s1 = torch.empty(grid[0] * B, C, device=g.device, dtype=torch.float32)
+        _cmb_fwd_z[grid](g, pad8, cw2, cb, z, s1, T, C, LEFT=left, K=K, BT=BT, BC=BC, HAS_PAD=has_pad, num_warps=NW)
+        n = B * T
+        mean = s1.sum(0) / n
+        BC2, BT2, NW2 = _cfg(C, "bwd")
+        grid2 = (triton.cdiv(T, BT2), B)
+        s2 = torch.empty(grid2[0] * B, C, device=g.device, dtype=torch.float32)
+        _cmb_stat2[grid2](z, mean, s2, T, C, BT=BT2, BC=BC2, num_warps=NW2)
+        var = s2.sum(0) / n
+        rstd = torch.rsqrt(var + eps)
+        _cmb_fwd_y[grid2](z, mean, rstd, bw, bb, y, T, C, BT=BT2, BC=BC2, num_warps=NW2)
+        if run_mean is not None:                            # nn.BatchNorm1d: the running var is the unbiased one
+            with torch.no_grad():
+                run_mean.mul_(1 - momentum).add_(mean.to(run_mean.dtype), alpha=momentum)
+                run_var.mul_(1 - momentum).add_((var * (n / max(n - 1, 1))).to(run_var.dtype), alpha=momentum)
+        ctx.save_for_backward(g, pad8, cw2, bw, bb, z, mean, rstd)
+        ctx.cfg = (has_pad, left, cw.shape, cw.dtype, cb.dtype, bw.dtype, bb.dtype)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        g, pad8, cw2, bw, bb, z, mean, rstd = ctx.saved_tensors
+        has_pad, left, cws, cwdt, cbdt, bwdt, bbdt = ctx.cfg
+        B, T, C = z.shape
+        K = cw2.shape[1]
+        BC, BT, NW = _cfg(C, "bwd")
+        grid = (triton.cdiv(T, BT), B)
+        np_ = grid[0] * B
+        dy = dy.contiguous()
+        p1 = torch.empty(np_, C, device=g.device, dtype=torch.float32)
+        p2 = torch.empty_like(p1)
+        _cmb_bwd_p[grid](dy, z, mean, rstd, bw, bb, p1, p2, T, C, BT=BT, BC=BC, num_warps=NW)
+        sdn, sdnx = p1.sum(0), p2.sum(0)
+        dz = torch.empty_like(z)
+        cbp = torch.empty_like(p1)
+        _cmb_bwd_z[grid](dy, z, mean, rstd, bw, bb, sdn, sdnx, dz, cbp, 1.0 / (B * T), T, C, BT=BT, BC=BC, num_warps=NW)
+        dg = torch.empty_like(g)
+        cwp = torch.empty(np_, K, C, device=g.device, dtype=torch.float32)
+        _cm_bwd_g[grid](g, pad8, cw2, dz, dg, cwp, T, C, LEFT=left, K=K, BT=BT, BC=BC, HAS_PAD=has_pad, num_warps=NW)
+        dt = g.dtype
+        dcw = cwp.sum(0).t().to(dt).to(cwdt).reshape(cws)
+        dcb = cbp.sum(0).to(dt).to(cbdt)
+        return dg, None, dcw, dcb, sdnx.to(bwdt), sdn.to(bbdt), None, None, None, None, None, None
+
+
+def conv_module_bn(g, pad_mask, conv_weight, conv_bias, bn_weight, bn_bias, running_mean, running_var, momentum, eps,
+                   left_pad, out_dtype=None):
+    """Training-mode BatchNorm variant of conv_module (batch statistics; running stats updated in place when given,
+    as nn.BatchNorm1d). conv_bias may be a zero tensor for bias-free convs."""
+    assert conv_bias is not None and conv_weight.shape[-1] - 1 - left_pad >= 0 and momentum is not None
+    return _ConvModuleBN.apply(g, pad_mask, conv_weight, conv_bias, bn_weight, bn_bias, running_mean, running_var,
+                               float(momentum), float(eps), int(left_pad), out_dtype)

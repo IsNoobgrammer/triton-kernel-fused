@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn.functional as F
 
-from kernels.sm120.conv_module import conv_module
+from kernels.sm120.conv_module import conv_module, conv_module_bn
 from kernels.sm120.silu_dropout import silu_dropout
 
 dev = "cuda"
@@ -43,6 +43,15 @@ def nemo_conv(g, pad, cw, cb, lw, lb, eps, left):
     x = F.conv1d(x, cw, cb, groups=cw.shape[0])
     x = F.layer_norm(x.transpose(1, 2), (x.shape[1],), lw, lb, eps)
     return F.silu(x).to(g.dtype)                    # pointwise_conv2's autocast cast: y and its grad in g's dtype
+
+
+def nemo_conv_bn(g, pad, cw, cb, bw, bb, rm, rv, momentum, eps, left):
+    x = F.glu(g, dim=-1).transpose(1, 2)
+    x = x.masked_fill(pad.unsqueeze(1), 0.0)
+    x = F.pad(x, (left, cw.shape[-1] - 1 - left))
+    x = F.conv1d(x, cw, cb, groups=cw.shape[0])
+    x = F.batch_norm(x, rm, rv, bw, bb, training=True, momentum=momentum, eps=eps)
+    return F.silu(x).transpose(1, 2).to(g.dtype)
 
 
 def run(fn, g, params, W, gdt, amp):
@@ -92,6 +101,49 @@ def main():
         if left == K - 1:
             keep[:, T - 5:] = False
         check("3 mask / causality", torch.equal(y1[keep], y2[keep]), "unchanged where it must be")
+
+    bw = 1 + 0.1 * torch.randn(C, device=dev, generator=gen)
+    bb = 0.1 * torch.randn(C, device=dev, generator=gen)
+    rm0, rv0 = 0.1 * torch.randn(C, device=dev, generator=gen), 1 + 0.1 * torch.rand(C, device=dev, generator=gen)
+    names_bn = ["y", "dg", "d conv w", "d conv b", "d bn w", "d bn b"]
+    for left in (K - 1, (K - 1) // 2):
+        print(f"\n== conv_module_bn (training BatchNorm) B={B} T={T} C={C} K={K} left pad {left}", flush=True)
+        gb = g.bfloat16()
+        params = [cw, cb, bw, bb]
+        stats = {}
+
+        def ref(gg, a, b_, c_, d, tag):
+            rm, rv = (s.to(c_.dtype).clone() for s in (rm0, rv0))
+            out = nemo_conv_bn(gg, pad, a, b_, c_, d, rm, rv, 0.1, eps, left)
+            stats[tag] = (rm, rv)
+            return out
+
+        def ours(gg, a, b_, c_, d, tag):
+            rm, rv = rm0.clone(), rv0.clone()
+            out = conv_module_bn(gg, pad, a, b_, c_, d, rm, rv, 0.1, eps, left, out_dtype=torch.bfloat16)
+            stats[tag] = (rm, rv)
+            return out
+
+        gt = run(lambda *x: ref(*x, "gt"), gb, [p.double() for p in params], W.double(), torch.float64, False)
+        ea = run(lambda *x: ref(*x, "ea"), gb, params, W, torch.bfloat16, True)
+        ou = run(lambda *x: ours(*x, "ou"), gb, params, W, torch.bfloat16, True)
+        bad = [f"{n} ours {rel(a, t):.2e} eager {rel(e, t):.2e}" for n, a, e, t in zip(names_bn, ou, ea, gt)
+               if rel(a, t) > max(1.25 * rel(e, t), 1e-3)]
+        check("1 vs fp64 <= eager bf16 x1.25", not bad, "; ".join(bad) or
+              "  ".join(f"{n} {rel(a, t):.1e}/{rel(e, t):.1e}" for n, a, e, t in zip(names_bn, ou, ea, gt)))
+        print("     ours vs eager: " + "  ".join(f"{n} {rel(a, e):.1e}" for n, a, e in zip(names_bn, ou, ea)))
+        sr = [rel(stats["ou"][i], stats["gt"][i]) for i in range(2)]
+        se = [rel(stats["ea"][i], stats["gt"][i]) for i in range(2)]
+        check("1b running mean / var vs fp64", all(o <= max(1.25 * e, 1e-5) for o, e in zip(sr, se)),
+              f"mean {sr[0]:.1e}/{se[0]:.1e}  var {sr[1]:.1e}/{se[1]:.1e} (ours/eager)")
+        ou2 = run(lambda *x: ours(*x, "ou2"), gb, params, W, torch.bfloat16, True)
+        check("2 repeatable", all(torch.equal(a, b) for a, b in zip(ou, ou2)), "bitwise")
+        g2 = gb.clone()
+        g2[pad] += 1.0                                                    # masked before the conv: nothing may move
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            y1 = conv_module_bn(gb, pad, *params, None, None, 0.1, eps, left, out_dtype=torch.bfloat16)
+            y2 = conv_module_bn(g2, pad, *params, None, None, 0.1, eps, left, out_dtype=torch.bfloat16)
+        check("3 padded g masked", torch.equal(y1, y2), "padded frames change nothing")
 
     print("\n== silu_dropout (B*T, 2048) bf16", flush=True)
     x = torch.randn(3000, 2048, device=dev, generator=gen).bfloat16()
