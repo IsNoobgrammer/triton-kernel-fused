@@ -396,7 +396,7 @@ def tdt_joint_pos_targets(f, g, weight, bias, targets, f_len, y_len, durations=(
     pbar = torch.zeros(B * U1, V, device=dev, dtype=torch.float32)
     for i in range(0, keep.numel(), 65536):
         r = keep[i:i + 65536]
-        z = (X[r] @ Wa[:V].t()).float()
+        z = torch.mm(X[r], Wa[:V].t(), out_dtype=torch.float32)   # fp32 logits: bf16-rounded ones move p by ~1e-2
         z[:, V - 1] = _NEG                                   # p(v | not blank)
         pbar.index_add_(0, rowb[r] * U1 + uu[r], torch.softmax(z, -1) * GY[r, None])
     return pbar.view(B, U1, V)[:, :U1 - 1], -ll
