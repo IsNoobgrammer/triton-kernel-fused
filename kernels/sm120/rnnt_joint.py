@@ -230,7 +230,7 @@ def _frame_targets_kernel(ALPHA, BETA, LPY, LL, LAB, OFF, TLEN, YLEN, IDX, LOGP,
 
 @triton.jit
 def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, GB, GY, S, X, XS, lam1, K, HS,
-                    TPB, TPY, TOT, KW, BU: tl.constexpr, BK: tl.constexpr, KD: tl.constexpr):
+                    TPB, TPY, TOT, KW, BU: tl.constexpr, BK: tl.constexpr, KD: tl.constexpr, HARD: tl.constexpr):
     # per (b, t): the two lattice weights of every row, s = (gb + gy) e^(c - lse), and XS = bf16(X s HS) for dW.
     # KD (collapsed 3-way distillation, every node): dKL/dlogit = p * a - gbk [blank] - gyk [label] with
     # r = P_rest / q_rest, a = 1 - r, gbk = P_b - p_b r, gyk = P_y - p_y r -- the same factored form, so the row's
@@ -242,20 +242,24 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
         return
     ub1 = tl.load(YLEN + b).to(tl.int32) + 1
     row0 = tl.load(OFF + b) + t * ub1
-    ll = tl.load(LL + b)
     w = tl.load(WB)
     for u0 in range(0, ub1, BU):
         u = u0 + tl.arange(0, BU)
         mu = u < ub1
         rows = row0 + u
-        a = tl.load(ALPHA + rows, mask=mu, other=0.0)
-        bt = tl.load(BETA + rows + ub1, mask=mu & (t < tb - 1), other=float("-inf"))
-        bt = tl.where((t == tb - 1) & (u == ub1 - 1), 0.0, bt)
-        bu = tl.load(BETA + rows + 1, mask=mu & (u < ub1 - 1), other=float("-inf"))
         lpb = tl.load(LPB + rows, mask=mu, other=0.0)
         lpy = tl.load(LPY + rows, mask=mu, other=0.0)
-        gb = w * tl.exp(a + lpb + bt - ll)
-        gy = w * lam1 * tl.exp(a + lpy + bu - ll)
+        if HARD:
+            ll = tl.load(LL + b)
+            a = tl.load(ALPHA + rows, mask=mu, other=0.0)
+            bt = tl.load(BETA + rows + ub1, mask=mu & (t < tb - 1), other=float("-inf"))
+            bt = tl.where((t == tb - 1) & (u == ub1 - 1), 0.0, bt)
+            bu = tl.load(BETA + rows + 1, mask=mu & (u < ub1 - 1), other=float("-inf"))
+            gb = w * tl.exp(a + lpb + bt - ll)
+            gy = w * lam1 * tl.exp(a + lpy + bu - ll)
+        else:                                                    # hard weight 0: no lattice, KD only
+            gb = tl.zeros([BU], tl.float32)
+            gy = tl.zeros([BU], tl.float32)
         tot = gb + gy
         if KD:
             kw = tl.load(KW)
@@ -442,18 +446,23 @@ class _RNNTJoint(torch.autograd.Function):
         lse, tgt, blk, crow = _stats(X, Wa, LAB, V - 1, store_e, E)
         lpb = blk - lse
         lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
-        alpha = torch.empty(N, device=f.device, dtype=torch.float32)
-        beta = torch.empty(N, device=f.device, dtype=torch.float32) if need or frame_k else alpha
-        ll = torch.empty(B, device=f.device, dtype=torch.float32)
-        _lattice_kernel[(B,)](lpb, lpy, off, tlen, ylen, alpha, beta, ll,
-                              BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need or frame_k > 0, num_warps=4)
+        kd = tpb is not None
+        hard = not (kd and hard_w == 0.0)                       # KD only: no alpha / beta lattice at all
+        if hard or frame_k:
+            alpha = torch.empty(N, device=f.device, dtype=torch.float32)
+            beta = torch.empty(N, device=f.device, dtype=torch.float32) if need or frame_k else alpha
+            ll = torch.empty(B, device=f.device, dtype=torch.float32)
+            _lattice_kernel[(B,)](lpb, lpy, off, tlen, ylen, alpha, beta, ll,
+                                  BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need or frame_k > 0, num_warps=4)
+        else:
+            alpha = beta = lpb
+            ll = torch.zeros(B, device=f.device, dtype=torch.float32)
         nll = -(1.0 + lam) * ll                                 # NeMo's numba reports cost (1 + lambda) * -ll
         idx = torch.full((B, T, max(frame_k, 1)), V - 1, device=f.device, dtype=torch.int32)
         flp = torch.full((B, T, max(frame_k, 1)), _NEG, device=f.device, dtype=torch.float32)
         if frame_k:                                             # per-frame teacher targets for a CTC head
             _frame_targets_kernel[(B, T)](alpha, beta, lpy, ll, LAB, off, tlen, ylen, idx, flp, T, V - 1,
                                           K=frame_k, BU=triton.next_power_of_2(g.shape[1]), num_warps=4)
-        kd = tpb is not None
         if kd:                                                  # collapsed KL(teacher || student) per node, summed
             assert tpb.shape == (N,) and tpy.shape == (N,), "teacher node log-probs must use the student's packing"
             pb, py = lpb.exp(), lpy.exp()
@@ -471,7 +480,7 @@ class _RNNTJoint(torch.autograd.Function):
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll,
                                   tpb if kd else lpb, tpy if kd else lpy)
-            ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w))
+            ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w), hard)
         ctx.mark_non_differentiable(nll, idx, flp, kdu)
         loss = nll.mean() if not kd and hard_w == 1.0 else hard_w * nll.mean() + kd_w * kdu.mean()
         return loss, nll, idx, flp, kdu
@@ -479,7 +488,7 @@ class _RNNTJoint(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gout, _g_nll, _g_idx, _g_flp, _g_kd):
         f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll, tpb, tpy = ctx.saved_tensors
-        fdt, gdt, wdt, bdt, lam, p, seed, V, kd, hard_w, kd_w = ctx.cfg
+        fdt, gdt, wdt, bdt, lam, p, seed, V, kd, hard_w, kd_w, hard = ctx.cfg
         B, T, Hd = f.shape
         U1 = g.shape[1]
         N, K = X.shape
@@ -493,7 +502,7 @@ class _RNNTJoint(torch.autograd.Function):
         XS = torch.empty_like(X)
         BU = min(32, triton.next_power_of_2(U1))
         _rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, ll, w, lse, crow, off, tlen, ylen, GB, GY, S, X, XS, 1.0 + lam,
-                                K, _HS, tpb, tpy, TOT, kw, BU=BU, BK=64, KD=kd, num_warps=4)
+                                K, _HS, tpb, tpy, TOT, kw, BU=BU, BK=64, KD=kd, HARD=hard, num_warps=4)
         GM = torch.empty(N, K, device=dev, dtype=torch.float32)       # E' @ W_aug, then dX in place
         gw = torch.zeros(VS, K, device=dev, dtype=torch.float32)
         BR = 256

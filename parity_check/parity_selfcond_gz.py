@@ -60,6 +60,20 @@ def main():
     errs = [rel(gt, wt) for gt, wt in zip(got, want)]
     check("1 grad of sum(z R) joins the backward", max(errs) <= 2e-2,
           f"dx {errs[0]:.1e}  dW {errs[1]:.1e}  db {errs[2]:.1e}")
+
+    # 3. ctc=False (hard weight 0): no CTC at all; loss = sum(z R) + sum(q Rq) through the feedback, vs fp32 eager
+    wf0 = torch.randn(2 * d, V, device="cuda", generator=gen) / 8
+    Rq = torch.randn(B, T, 2 * d, device="cuda", generator=gen)
+    xs, ws, bs, wfs = (t.clone().requires_grad_() for t in (x, w, b, wf0))
+    nll, q, z = selfcond_ctc_pass(xs, ws, bs, wfs, y, tl_, ul, V - 1, ctc=False)
+    ((z.float() * R).sum() + (q.float() * Rq).sum()).backward()
+    xr, wr, br, wfr = (t.bfloat16().float().clone().requires_grad_() for t in (x, w, b, wf0))
+    zr = xr.reshape(B * T, d) @ wr.t() + br
+    qr = zr.softmax(-1) @ wfr.t()
+    ((zr * R.reshape(B * T, V)).sum() + (qr * Rq.reshape(B * T, -1)).sum()).backward()
+    e3 = [rel(a, c) for a, c in ((xs.grad, xr.grad), (ws.grad, wr.grad), (bs.grad, br.grad), (wfs.grad, wfr.grad))]
+    check("3 ctc=False: only the logit / feedback losses", max(e3) <= 2e-2 and bool((nll == 0).all()),
+          f"dx {e3[0]:.1e}  dW {e3[1]:.1e}  db {e3[2]:.1e}  dWfb {e3[3]:.1e}  nll {nll.abs().max().item():.0f}")
     print("\nALL PASS" if ok else "\nFAILED", flush=True)
     sys.exit(0 if ok else 1)
 

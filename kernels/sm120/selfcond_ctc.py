@@ -157,7 +157,7 @@ def _sc_grad(Z, LSE, P, A, QDQ, Y, TLEN, ULEN, AL, BE, NLL, GOUT, DZ, sy, T, V, 
 
 class _Pass(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w_out, b_out, w_fb, y, tlen, ulen, blank):
+    def forward(ctx, x, w_out, b_out, w_fb, y, tlen, ulen, blank, ctc=True):
         B, T, d = x.shape
         V0 = w_out.shape[0]
         # vocab padded to a multiple of 128: V0 = 2049 / 4097 (tokens + blank) leaves the rows of z / p unaligned and
@@ -181,12 +181,17 @@ class _Pass(torch.autograd.Function):
         y = y.to(torch.int64).contiguous()
         tlen = tlen.to(torch.int64).contiguous()
         ulen = ulen.to(torch.int64).contiguous()
-        BS = triton.next_power_of_2(2 * y.shape[1] + 1)
-        al = torch.empty(B, T, BS, device=x.device, dtype=torch.float32)
-        be = torch.empty_like(al)
-        nll = torch.empty(B, device=x.device, dtype=torch.float32)
-        _ctc_ab_z[(B,)](z, lse, y, tlen, ulen, al, be, nll, y.stride(0), T, V, blank, BS=BS,
-                        num_warps=4 if BS <= 512 else 8)
+        if ctc:
+            BS = triton.next_power_of_2(2 * y.shape[1] + 1)
+            al = torch.empty(B, T, BS, device=x.device, dtype=torch.float32)
+            be = torch.empty_like(al)
+            nll = torch.empty(B, device=x.device, dtype=torch.float32)
+            _ctc_ab_z[(B,)](z, lse, y, tlen, ulen, al, be, nll, y.stride(0), T, V, blank, BS=BS,
+                            num_warps=4 if BS <= 512 else 8)
+        else:                                   # hard weight 0 (teacher KD only): no CTC lattice at all
+            al = be = lse
+            nll = torch.zeros(B, device=x.device, dtype=torch.float32)
+        ctx.ctc = ctc
         ctx.save_for_backward(xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll)
         ctx.shape, ctx.blank, ctx.has_fb, ctx.xdtype, ctx.v0 = (B, T, d, V), blank, w_fb is not None, x.dtype, V0
         zl = z.view(B, T, V)[..., :V0]          # the logits: WER / decoding, and differentiable for an extra loss on
@@ -202,12 +207,17 @@ class _Pass(torch.autograd.Function):
             dq = gq.reshape(B * T, -1).to(torch.bfloat16)
             a = dq @ wf                                                   # (BT, V) bf16
             qdq = (q.reshape(B * T, -1).float() * dq.float()).sum(-1)     # (BT,) fp32
-        dz = torch.empty_like(z)
-        U = y.shape[1]
-        gout = (gnll if gnll is not None else torch.zeros(B, device=z.device)).float().contiguous()
-        _sc_grad[(T, B)](z, lse, p, a if has_fb else z, qdq if has_fb else lse, y, tlen, ulen, al, be, nll, gout, dz,
-                         y.stride(0), T, V, ctx.blank, BS=al.shape[2], BV=triton.next_power_of_2(V),
-                         BU=triton.next_power_of_2(max(U, 1)), CJ=32, HAS_FB=has_fb, num_warps=8)
+        if ctx.ctc:
+            dz = torch.empty_like(z)
+            U = y.shape[1]
+            gout = (gnll if gnll is not None else torch.zeros(B, device=z.device)).float().contiguous()
+            _sc_grad[(T, B)](z, lse, p, a if has_fb else z, qdq if has_fb else lse, y, tlen, ulen, al, be, nll, gout,
+                             dz, y.stride(0), T, V, ctx.blank, BS=al.shape[2], BV=triton.next_power_of_2(V),
+                             BU=triton.next_power_of_2(max(U, 1)), CJ=32, HAS_FB=has_fb, num_warps=8)
+        elif has_fb:                            # only the feedback q = softmax(z) W_fb^T: dz = p (a - <p, a>)
+            dz = (p.float() * (a.float() - qdq[:, None])).to(z.dtype)
+        else:
+            dz = torch.zeros_like(z)
         V0 = ctx.v0
         if gz is not None:                      # a loss on the logits themselves (e.g. kl_div_topk): same fused backward
             dz.view(B, T, V)[..., :V0] += gz.to(dz.dtype)
@@ -215,10 +225,11 @@ class _Pass(torch.autograd.Function):
         dw_out = (dz.t() @ xb)[:V0].float()
         db = torch.sum(dz, 0, dtype=torch.float32)[:V0]               # no fp32 copy of the whole dz
         dw_fb = (dq.t() @ p)[:, :V0].float() if has_fb else None
-        return dx, dw_out, db, dw_fb, None, None, None, None
+        return dx, dw_out, db, dw_fb, None, None, None, None, None
 
 
-def selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank):
+def selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank, ctc=True):
     """One self-conditioned CTC pass; see the module docstring. Returns (nll (B,) fp32, q (B, T, 2d) bf16 or None,
-    logits (B, T, V) bf16 -- batch WER / decoding, or a differentiable extra loss)."""
-    return _Pass.apply(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, int(blank))
+    logits (B, T, V) bf16 -- batch WER / decoding, or a differentiable extra loss). ctc=False: no CTC loss at all
+    (nll = 0, its lattice skipped) -- a head trained only by a loss on the logits (teacher KD, hard weight 0)."""
+    return _Pass.apply(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, int(blank), bool(ctc))

@@ -115,6 +115,11 @@ def case(name, B, T, U, H, V, blank_bias=0.0):
     check("2 0.3 nll + 0.7 kd vs fp64", max(e) <= 1e-2, " ".join(f"{n} {x:.1e}" for n, x in zip(pj.NAMES, e))
           + f"  (kd mean {kdu.mean().item():.3f} vs {kref[0].item():.3f})")
 
+    kdo, _ = ours(f, g, W, b, y, tl, yl, (tpb, tpy), 1.0, 0.0)          # hard weight 0: no lattice at all
+    e5 = [pj.rel(a, r) for a, r in zip(kdo, kref)]
+    check("5 kd only (hard 0, lattice skipped) vs fp64", max(e5) <= 1e-2,
+          " ".join(f"{n} {x:.1e}" for n, x in zip(pj.NAMES, e5)))
+
     plain, _ = ours(f, g, W, b, y, tl, yl, None, 0.0, 1.0)
     zero, _ = ours(f, g, W, b, y, tl, yl, (tpb, tpy), 0.0, 1.0)
     e3 = [pj.rel(a, r) for a, r in zip(zero, plain)]
