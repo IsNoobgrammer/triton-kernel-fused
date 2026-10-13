@@ -683,9 +683,15 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
     Wa = torch.zeros(triton.cdiv(V, 64) * 64, K, device=f.device, dtype=torch.bfloat16)
     Wa[:V, :Hd] = weight
     Wa[:V, Hd] = bias
-    lse, tgt, blk, _ = _stats(X, Wa, LAB, V - 1, False)
-    lpb = blk - lse
-    lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
+    # token log-probs from plain fp32 logits in chunks: the training-side _stats pass left the teacher's lattice ~2e-4
+    # relative off fp64, which moved per-position targets up to 1e-2 in blank-dominated lattices (parity_tdt_pos)
+    lpb = torch.empty(N, device=f.device, dtype=torch.float32)
+    lpy = torch.empty(N, device=f.device, dtype=torch.float32)
+    for i in range(0, N, 65536):
+        z = torch.mm(X[i:i + 65536], Wa[:V].t(), out_dtype=torch.float32).log_softmax(-1)
+        lab = LAB[i:i + 65536]
+        lpb[i:i + 65536] = z[:, V - 1]
+        lpy[i:i + 65536] = torch.where(lab >= 0, z.gather(1, lab.clamp_min(0)[:, None]).squeeze(1), _NEG)
     if blank_penalty:
         z = torch.log1p(-lpb.exp() * (-math.expm1(-float(blank_penalty))))     # log Z, Z = 1 - p_b (1 - e^-bp)
         lpb, lpy = lpb - float(blank_penalty) - z, lpy - z
@@ -718,7 +724,7 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
     pbar = torch.zeros(B * U1, V, device=f.device, dtype=torch.float32)
     for i in range(0, keep.numel(), 65536):
         r = keep[i:i + 65536]
-        z = (X[r] @ Wa[:V].t()).float()                        # (R, V) logits of the kept rows
+        z = torch.mm(X[r], Wa[:V].t(), out_dtype=torch.float32)   # (R, V) fp32 logits of the kept rows
         z[:, V - 1] = _NEG                                     # p(v | not blank): a softmax over the non-blank
         pbar.index_add_(0, rowb[r] * U1 + uu[r], torch.softmax(z, -1) * gam[r, None])   # logits, exact
     return lpb, lpy, -ll, ft, pbar.view(B, U1, V)[:, :U1 - 1]
