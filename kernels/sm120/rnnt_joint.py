@@ -239,8 +239,8 @@ def _frame_align_kernel(ALPHA, BETA, LPY, OFF, TLEN, YLEN, Y, YS, F, IDX, T, K: 
 
 @triton.jit
 def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, GB, GY, S, X, XS, lam1, K, HS,
-                    TPB, TPY, TOT, KW, BU: tl.constexpr, BK: tl.constexpr, KD: tl.constexpr, HARD: tl.constexpr,
-                    KD_PF: tl.constexpr):
+                    TPB, TPY, TOT, KW, GAM, KP, BU: tl.constexpr, BK: tl.constexpr, KD: tl.constexpr,
+                    HARD: tl.constexpr, KD_PF: tl.constexpr, POS: tl.constexpr):
     # per (b, t): the two lattice weights of every row, s = (gb + gy) e^(c - lse), and XS = bf16(X s HS) for dW.
     # KD (collapsed 3-way distillation, every node): dKL/dlogit = p * a - gbk [blank] - gyk [label] with
     # r = P_rest / q_rest, a = 1 - r, gbk = P_b - p_b r, gyk = P_y - p_y r -- the same factored form, so the row's
@@ -288,6 +288,18 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
             # 1e-3 of the row's one-hot weight as softmax-shaped noise, and never moves a plain row (tot = gb + gy)
             lo = 1e-3 * (tl.abs(gb) + tl.abs(gy))
             tot = tl.where(tl.abs(tot) < lo, tl.where(tot < 0, -lo, lo), tot)
+        if POS:
+            # per-position KD at this node, weighted by the student's own occupancy g = P(emit label u at t):
+            # d/dz_v of g KL(P_u || q_nb) = g (p_v / (1 - p_b) - P_u(v)) for v != blank, 0 for blank. The
+            # softmax-shaped part (scale sp = kp g / (1 - p_b), blank one-hot sp p_b) folds into E like the rest;
+            # the dense -kp g P_u part is added in the backward (dfg kernel + one dW GEMM), GAM = kp g.
+            kp = tl.load(KP)
+            gam = tl.exp(a + lpy + bu - ll)
+            pbv = tl.exp(lpb)
+            sp = kp * gam / tl.maximum(1.0 - pbv, 1e-6)
+            tot = tot + sp
+            gb = gb + sp * pbv
+            tl.store(GAM + rows, kp * gam, mask=mu)
         s = tot * tl.exp(tl.load(CROW + rows, mask=mu, other=0.0) - tl.load(LSE + rows, mask=mu, other=0.0))
         tl.store(GB + rows, gb, mask=mu)
         tl.store(GY + rows, gy, mask=mu)
@@ -328,8 +340,8 @@ def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, TOT, r0, M, VS, BLANK, BR
 
 
 @triton.jit
-def _dfg_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NTB, Hd, K,
-                TB: tl.constexpr, BU: tl.constexpr, BH: tl.constexpr, DROP: tl.constexpr):
+def _dfg_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NTB, Hd, K, PW, GAM,
+                TB: tl.constexpr, BU: tl.constexpr, BH: tl.constexpr, DROP: tl.constexpr, POS: tl.constexpr):
     # per (b, block of TB frames, h-block), every u at once: dX = s (E' @ W) read ONCE from the GEMM output,
     # relu + dropout backward, df[b, t] = sum over u (complete per t), dg partial over this block's t (summed after)
     b = tl.program_id(0)
@@ -346,6 +358,8 @@ def _dfg_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NT
     mu = u < ub1
     m2 = mu[:, None] & mc[None, :]
     gv = tl.load(G + (b * U1 + u[:, None]).to(tl.int64) * Hd + cols[None, :], mask=m2, other=0.0).to(tl.float32)
+    if POS:                                                     # (P_u @ W_aug)[b, u, cols]: per-position KD target
+        pw = tl.load(PW + (b * U1 + u[:, None]).to(tl.int64) * K + cols[None, :], mask=m2, other=0.0)
     accg = tl.zeros([BU, BH], tl.float32)
     for t in range(t0, tl.minimum(t0 + TB, tb)):
         rows = base + t * ub1 + u
@@ -353,6 +367,8 @@ def _dfg_kernel(GM, S, F, G, OFF, TLEN, YLEN, DF, DGP, seed, p, scale, T, U1, NT
         x = (fv[None, :] + gv).to(tl.bfloat16).to(tl.float32)
         sr = tl.load(S + rows, mask=mu, other=0.0)
         d = tl.load(GM + rows[:, None].to(tl.int64) * K + cols[None, :], mask=m2, other=0.0) * sr[:, None]
+        if POS:
+            d = d - tl.load(GAM + rows, mask=mu, other=0.0)[:, None] * pw
         d = tl.where(m2 & (x > 0.0), d, 0.0)
         if DROP:
             r = tl.rand(seed, (rows[:, None] * Hd + cols[None, :]).to(tl.int64))
@@ -440,7 +456,7 @@ def _pack(f, g, y, tlen, ylen, p, seed, n_rows=None):
 class _RNNTJoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows, tpb=None, tpy=None,
-                hard_w=1.0, kd_w=0.0, kd_pf=True, tnll=None, fs_w=0.0):
+                hard_w=1.0, kd_w=0.0, kd_pf=True, tnll=None, fs_w=0.0, pbar=None, pos_w=0.0):
         fdt, gdt = f.dtype, g.dtype
         f = f.to(torch.bfloat16).contiguous()
         g = g.to(torch.bfloat16).contiguous()
@@ -493,14 +509,40 @@ class _RNNTJoint(torch.autograd.Function):
             dlt = nll - tnll.float()
             kdu = dlt.abs()
             uttc = hard_w + fs_w * torch.sign(dlt)              # d/dnll of hard * nll + fs * |nll - tnll|
+        pos = pbar is not None
+        if pos:                                                 # per-position KD: loss value per utterance
+            assert not kd and not fs and hard, "per-position KD: the student's own lattice (hard path), alone"
+            assert need, "per-position KD needs the student's beta (a grad-enabled call)"
+            Ub1 = g.shape[1]
+            pbar = pbar.float().contiguous()
+            assert pbar.shape == (B, Ub1 - 1, V), f"pbar {tuple(pbar.shape)} != (B, U, V) {(B, Ub1 - 1, V)}"
+            Pw = torch.zeros(B, Ub1, K, device=f.device, dtype=torch.float32)
+            Pw[:, :Ub1 - 1] = pbar @ Wa[:V].float()             # P_u @ W_aug (bias column included)
+            negent = torch.where(pbar > 0, pbar * pbar.clamp_min(1e-30).log(), torch.zeros_like(pbar)).sum(-1)
+            rowb = torch.repeat_interleave(torch.arange(B, device=f.device), tlen * (ylen + 1), output_size=N)
+            local = torch.arange(N, device=f.device) - off[rowb]
+            uu = local % (ylen[rowb] + 1)
+            bshift = torch.cat([beta[1:], beta.new_full((1,), _NEG)])
+            gam = torch.exp(alpha + lpy + bshift - ll[rowb])     # P(emit label u at t | x, y); 0 on u = U
+            lse_nb = lse + torch.log1p(-lpb.exp()).clamp_min(-30.0)   # log sum over non-blank of e^z
+            pwx = (Pw[rowb, uu] * X.float()).sum(-1)             # P_u . z (bias via X's ones column)
+            contrib = gam * (lse_nb - pwx)
+            cs = torch.cumsum(contrib.double(), 0)
+            end = off + tlen * (ylen + 1) - 1
+            kdu = (cs[end] - torch.where(off > 0, cs[(off - 1).clamp_min(0)], torch.zeros_like(cs[end]))).float()
+            umask = torch.arange(Ub1 - 1, device=f.device)[None, :] < ylen[:, None]
+            kdu = kdu + (negent * umask).sum(1)
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll,
                                   tpb if kd else lpb, tpy if kd else lpy)
             ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w), hard, kd_pf)
             ctx.uttc = uttc
+            ctx.pos = (Pw, pbar, pos_w) if pos else None
         ctx.mark_non_differentiable(nll, kdu)
         if fs:
             loss = hard_w * nll.mean() + fs_w * kdu.mean()
+        elif pos:
+            loss = hard_w * nll.mean() + pos_w * kdu.mean()
         else:
             loss = nll.mean() if not kd and hard_w == 1.0 else hard_w * nll.mean() + kd_w * kdu.mean()
         return loss, nll, kdu
@@ -525,8 +567,12 @@ class _RNNTJoint(torch.autograd.Function):
         GB, GY, S, TOT = (torch.empty(N, device=dev, dtype=torch.float32) for _ in range(4))
         XS = torch.empty_like(X)
         BU = min(32, triton.next_power_of_2(U1))
+        pos = ctx.pos is not None
+        GAMK = torch.zeros(N, device=dev, dtype=torch.float32) if pos else TOT
+        kp = (gout.float() / B).reshape(1) * ctx.pos[2] if pos else kw
         _rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, ll, w, lse, crow, off, tlen, ylen, GB, GY, S, X, XS, 1.0 + lam,
-                                K, _HS, tpb, tpy, TOT, kw, BU=BU, BK=64, KD=kd, HARD=hard, KD_PF=bool(kd_pf), num_warps=4)
+                                K, _HS, tpb, tpy, TOT, kw, GAMK, kp, BU=BU, BK=64, KD=kd, HARD=hard,
+                                KD_PF=bool(kd_pf), POS=pos, num_warps=4)
         GM = torch.empty(N, K, device=dev, dtype=torch.float32)       # E' @ W_aug, then dX in place
         gw = torch.zeros(VS, K, device=dev, dtype=torch.float32)
         BR = 256
@@ -547,6 +593,13 @@ class _RNNTJoint(torch.autograd.Function):
                 M = min(C, N - i)
                 _stats(X[i:i + M], Wa, LAB[i:i + M], V - 1, True, Ebuf[:M])
                 grads(Ebuf[:M], i, M)
+        if pos:                                                 # dense dW part: - sum_(b,u) P_u (sum_t kp g X)
+            Pw, pbar, _ = ctx.pos
+            rowb = torch.repeat_interleave(torch.arange(B, device=dev), tlen * (ylen + 1), output_size=N)
+            uu = (torch.arange(N, device=dev) - off[rowb]) % (ylen[rowb] + 1)
+            xbar = torch.zeros(B * U1, K, device=dev, dtype=torch.float32)
+            xbar.index_add_(0, rowb * U1 + uu, X.float() * GAMK[:, None])   # u = U rows carry GAMK = 0
+            gw[:V] -= pbar.reshape(B * (U1 - 1), V).t() @ xbar.view(B, U1, K)[:, :U1 - 1].reshape(-1, K)
         df = torch.zeros(B, T, Hd, device=dev, dtype=torch.float32)
         BUg = triton.next_power_of_2(U1)
         BH = max(16, min(128, 8192 // BUg))                     # the (u, h) dg accumulator stays in registers
@@ -554,15 +607,16 @@ class _RNNTJoint(torch.autograd.Function):
         NTB = triton.cdiv(T, TB)
         dgp = torch.zeros(B, NTB, U1, Hd, device=dev, dtype=torch.float32)
         _dfg_kernel[(B, NTB, triton.cdiv(Hd, BH))](GM, S, f, g, off, tlen, ylen, df, dgp, seed, p, 1.0 / (1.0 - p),
-                                                  T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
+                                                  T, U1, NTB, Hd, K, ctx.pos[0] if pos else GM, GAMK, TB=TB, BU=BUg,
+                                                  BH=BH, DROP=p > 0, POS=pos, num_warps=8)
         dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.0, dropout=0.0, seed=None,
                     e_budget=_E_BUDGET, n_rows=None, kd=None, kd_weight=0.0, hard_weight=1.0, kd_per_frame=True,
-                    fs=None):
+                    fs=None, pos=None):
     """NeMo joint (relu -> dropout -> linear) + warprnnt_numba loss, mean over the batch. Returns (loss, nll).
     dropout is the caller's (pass 0 in eval, like nn.Dropout outside training). n_rows: sum(f_len * (y_len + 1)) if the
     caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same).
@@ -575,19 +629,25 @@ def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0
     fs=teacher_nll (B,): full-sum (sequence-level) KD instead (arXiv 2303.05958): loss = hard_weight * mean(nll) +
     kd_weight * mean(|nll - teacher_nll|), both -log P(Y|X) summed over ALL alignments -- no frame / node timing is
     matched, so teacher and student may emit at different times. The gradient is the nll's own, weighted per
-    utterance by hard_weight + kd_weight * sign(nll - teacher_nll). Returns (loss, nll, |nll - teacher_nll|)."""
+    utterance by hard_weight + kd_weight * sign(nll - teacher_nll). Returns (loss, nll, |nll - teacher_nll|).
+    pos=P (B, U, V): per-position KD (the teacher's full-vocabulary distribution of token u, frames marginalised,
+    from rnnt_joint_node_logp(pos_targets=True)): loss = hard_weight * mean(nll) + kd_weight * mean(sum_u sum_t
+    g(t,u) KL(P_u || q(. | t, u, not blank))), g = the student's own (detached) probability of emitting u at t.
+    Blank is excluded on both sides: no timing is imposed. Returns (loss, nll, per-utterance KD)."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
     tpb, tpy = kd if kd is not None else (None, None)
     loss, nll, kdu = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
                                       float(dropout), seed, e_budget, n_rows, tpb, tpy, float(hard_weight),
-                                      0.0 if fs is not None else float(kd_weight), bool(kd_per_frame), fs,
-                                      float(kd_weight) if fs is not None else 0.0)
-    return (loss, nll, kdu) if (kd is not None or fs is not None) else (loss, nll)
+                                      float(kd_weight) if kd is not None else 0.0, bool(kd_per_frame), fs,
+                                      float(kd_weight) if fs is not None else 0.0, pos,
+                                      float(kd_weight) if pos is not None else 0.0)
+    return (loss, nll, kdu) if (kd is not None or fs is not None or pos is not None) else (loss, nll)
 
 
 @torch.no_grad()
-def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None, frame_targets=0, blank_penalty=0.0):
+def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None, frame_targets=0, blank_penalty=0.0,
+                         pos_targets=False):
     """Teacher side (no grad, no dropout): per lattice node log P(blank), log P(next label) (-inf on u = U), packed in
     rnnt_joint_loss's row order, plus the teacher's per-utterance nll and, with frame_targets=K, its per-frame (idx,
     logp) for a CTC student: the teacher's alignment, ONE token or blank per frame (_frame_align_kernel), slot 0 =
@@ -611,11 +671,12 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
     if blank_penalty:
         z = torch.log1p(-lpb.exp() * (-math.expm1(-float(blank_penalty))))     # log Z, Z = 1 - p_b (1 - e^-bp)
         lpb, lpy = lpb - float(blank_penalty) - z, lpy - z
+    want_beta = bool(frame_targets) or pos_targets
     alpha = torch.empty(N, device=f.device, dtype=torch.float32)
-    beta = torch.empty(N, device=f.device, dtype=torch.float32) if frame_targets else alpha
+    beta = torch.empty(N, device=f.device, dtype=torch.float32) if want_beta else alpha
     ll = torch.empty(B, device=f.device, dtype=torch.float32)
     _lattice_kernel[(B,)](lpb, lpy, off, tlen, ylen, alpha, beta, ll,
-                          BU=triton.next_power_of_2(g.shape[1]), BETA_ON=frame_targets > 0, num_warps=4)
+                          BU=triton.next_power_of_2(g.shape[1]), BETA_ON=want_beta, num_warps=4)
     ft = None
     if frame_targets:
         idx = torch.full((B, T, frame_targets), V - 1, device=f.device, dtype=torch.int32)
@@ -627,4 +688,20 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
         _frame_align_kernel[(B,)](alpha, beta, lpy, off, tlen, ylen, y64, y64.stride(0), fbuf, idx, T,
                                   K=frame_targets, BU=BU, num_warps=4)
         ft = (idx, flp)
-    return lpb, lpy, -ll, ft
+    if not pos_targets:
+        return lpb, lpy, -ll, ft
+    # per-position targets: P_u(v) = sum_t P(emit u at t) p(v | t, u, not blank), the frame dimension marginalised
+    U1 = g.shape[1]
+    rowb = torch.repeat_interleave(torch.arange(B, device=f.device), tlen * (ylen + 1), output_size=N)
+    uu = (torch.arange(N, device=f.device) - off[rowb]) % (ylen[rowb] + 1)
+    bshift = torch.cat([beta[1:], beta.new_full((1,), _NEG)])
+    gam = torch.exp(alpha + lpy + bshift - ll[rowb])          # 0 on u = U
+    wrow = gam * torch.exp(-lse) / (1.0 - lpb.exp()).clamp_min(1e-6)
+    keep = (gam > 1e-6).nonzero().squeeze(1)                  # rows that carry mass (host sync: teacher side only)
+    pbar = torch.zeros(B * U1, V, device=f.device, dtype=torch.float32)
+    for i in range(0, keep.numel(), 65536):
+        r = keep[i:i + 65536]
+        z = (X[r] @ Wa[:V].t()).float()                        # (R, V) logits of the kept rows
+        z[:, V - 1] = _NEG                                     # blank excluded: p(v | not blank)
+        pbar.index_add_(0, rowb[r] * U1 + uu[r], torch.exp(z) * wrow[r, None])
+    return lpb, lpy, -ll, ft, pbar.view(B, U1, V)[:, :U1 - 1]
