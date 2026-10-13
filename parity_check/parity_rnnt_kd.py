@@ -111,6 +111,16 @@ def case(name, B, T, U, H, V, blank_bias=0.0):
     eb = max((a.exp() - r.cpu().exp()).abs().max().item() for a, r in zip(unpack(tpb, tl, yl), rb))
     ey = max((a.exp() - r.cpu().exp()).abs().max().item() for a, r in zip(unpack(tpy, tl, yl), ry))
     check("1 teacher node probabilities", max(eb, ey) < 5e-3, f"blank {eb:.1e}  label {ey:.1e}")
+    with AMP:                                                   # 1b. teacher blank penalty == blank bias - bp
+        qpb, qpy, _, _ = rj.rnnt_joint_node_logp(ft, gt, Wt, bt, y, tl, yl, blank_penalty=1.0)
+    btp = bt.bfloat16().double().clone()
+    btp[-1] -= 1.0
+    with torch.no_grad():
+        pb_, py_ = node_lp(ft.double(), gt.double(), Wt.bfloat16().double(), btp, y, tl, yl)
+    eb = max((a.exp() - r.cpu().exp()).abs().max().item() for a, r in zip(unpack(qpb, tl, yl), pb_))
+    ey = max((a.exp() - r.cpu().exp()).abs().max().item() for a, r in zip(unpack(qpy, tl, yl), py_))
+    check("1b teacher blank penalty 1.0 == blank logit - 1, renormalised", max(eb, ey) < 5e-3,
+          f"blank {eb:.1e}  label {ey:.1e}")
 
     hw, kw = 0.3, 0.7
     Wb, bb = W.bfloat16().float(), b.bfloat16().float()          # the kernel's joint weights are bf16

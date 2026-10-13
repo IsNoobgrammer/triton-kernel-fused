@@ -26,6 +26,8 @@ f: (B, T, H) projected encoder, g: (B, U+1, H) projected prednet, weight (V, H),
 loss = mean over the batch of (1 + lambda) * -log P(y|x), exactly NeMo's reported value (its FastEmit scales the
 cost, the gradient is the formula above); nll = per-utterance, detached.
 """
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -568,10 +570,12 @@ def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0
 
 
 @torch.no_grad()
-def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None, frame_targets=0):
+def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None, frame_targets=0, blank_penalty=0.0):
     """Teacher side (no grad, no dropout): per lattice node log P(blank), log P(next label) (-inf on u = U), packed in
     rnnt_joint_loss's row order, plus the teacher's per-utterance nll and, with frame_targets=K, its per-frame (idx,
-    logp) for a CTC student. -> (lpb, lpy, nll, (idx, logp) or None)"""
+    logp) for a CTC student. -> (lpb, lpy, nll, (idx, logp) or None). blank_penalty bp: each node's distribution as
+    the teacher DECODES with a blank penalty -- blank logit - bp, renormalised (p_b e^-bp / Z, p_v / Z,
+    Z = 1 - p_b + p_b e^-bp) -- applied before the lattice, so the frame targets see it too."""
     f = f.to(torch.bfloat16).contiguous()
     g = g.to(torch.bfloat16).contiguous()
     B, T, Hd = f.shape
@@ -585,6 +589,9 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
     lse, tgt, blk, _ = _stats(X, Wa, LAB, V - 1, False)
     lpb = blk - lse
     lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
+    if blank_penalty:
+        z = torch.log1p(-lpb.exp() * (-math.expm1(-float(blank_penalty))))     # log Z, Z = 1 - p_b (1 - e^-bp)
+        lpb, lpy = lpb - float(blank_penalty) - z, lpy - z
     alpha = torch.empty(N, device=f.device, dtype=torch.float32)
     beta = torch.empty(N, device=f.device, dtype=torch.float32) if frame_targets else alpha
     ll = torch.empty(B, device=f.device, dtype=torch.float32)
