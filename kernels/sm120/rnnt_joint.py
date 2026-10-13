@@ -252,7 +252,7 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
         return
     ub1 = tl.load(YLEN + b).to(tl.int32) + 1
     row0 = tl.load(OFF + b) + t * ub1
-    w = tl.load(WB)
+    w = tl.load(WB + b)                                          # per-utterance weight
     for u0 in range(0, ub1, BU):
         u = u0 + tl.arange(0, BU)
         mu = u < ub1
@@ -440,7 +440,7 @@ def _pack(f, g, y, tlen, ylen, p, seed, n_rows=None):
 class _RNNTJoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows, tpb=None, tpy=None,
-                hard_w=1.0, kd_w=0.0, kd_pf=True):
+                hard_w=1.0, kd_w=0.0, kd_pf=True, tnll=None, fs_w=0.0):
         fdt, gdt = f.dtype, g.dtype
         f = f.to(torch.bfloat16).contiguous()
         g = g.to(torch.bfloat16).contiguous()
@@ -486,12 +486,23 @@ class _RNNTJoint(torch.autograd.Function):
                 kdu = kdu / (ylen + 1).float()
         else:
             kdu = torch.zeros(B, device=f.device, dtype=torch.float32)
+        fs = tnll is not None
+        uttc = None
+        if fs:                                                  # full-sum (sequence-level) KD: |nll - teacher nll|
+            assert not kd and lam == 0.0, "full-sum KD: no node KD, no FastEmit"
+            dlt = nll - tnll.float()
+            kdu = dlt.abs()
+            uttc = hard_w + fs_w * torch.sign(dlt)              # d/dnll of hard * nll + fs * |nll - tnll|
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll,
                                   tpb if kd else lpb, tpy if kd else lpy)
             ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w), hard, kd_pf)
+            ctx.uttc = uttc
         ctx.mark_non_differentiable(nll, kdu)
-        loss = nll.mean() if not kd and hard_w == 1.0 else hard_w * nll.mean() + kd_w * kdu.mean()
+        if fs:
+            loss = hard_w * nll.mean() + fs_w * kdu.mean()
+        else:
+            loss = nll.mean() if not kd and hard_w == 1.0 else hard_w * nll.mean() + kd_w * kdu.mean()
         return loss, nll, kdu
 
     @staticmethod
@@ -505,8 +516,12 @@ class _RNNTJoint(torch.autograd.Function):
         dev = f.device
         w = (gout.float() / B).reshape(1)                       # mean_batch, no host sync
         kw = w * kd_w
-        if hard_w != 1.0:
-            w = w * hard_w
+        if ctx.uttc is not None:                                # full-sum KD: each utterance its own weight
+            w = (w * ctx.uttc).contiguous()
+        else:
+            if hard_w != 1.0:
+                w = w * hard_w
+            w = w.expand(B).contiguous()                        # same value per utterance (bitwise as before)
         GB, GY, S, TOT = (torch.empty(N, device=dev, dtype=torch.float32) for _ in range(4))
         XS = torch.empty_like(X)
         BU = min(32, triton.next_power_of_2(U1))
@@ -542,11 +557,12 @@ class _RNNTJoint(torch.autograd.Function):
                                                   T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
         dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
-                None, None, None, None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.0, dropout=0.0, seed=None,
-                    e_budget=_E_BUDGET, n_rows=None, kd=None, kd_weight=0.0, hard_weight=1.0, kd_per_frame=True):
+                    e_budget=_E_BUDGET, n_rows=None, kd=None, kd_weight=0.0, hard_weight=1.0, kd_per_frame=True,
+                    fs=None):
     """NeMo joint (relu -> dropout -> linear) + warprnnt_numba loss, mean over the batch. Returns (loss, nll).
     dropout is the caller's (pass 0 in eval, like nn.Dropout outside training). n_rows: sum(f_len * (y_len + 1)) if the
     caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same).
@@ -555,14 +571,19 @@ def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0
     utterance = sum over every lattice node of KL over {label, blank, rest} (Panchapagesan et al. 2021, "Efficient
     knowledge distillation for RNN-transducer models"); the student's rest mass is clamped at 1e-6. Returns
     (loss, nll, kd). kd_per_frame (default): kd per utterance / (U + 1) -- the node sum is ~30x the nll on real batches
-    (probe Oct 13 2026), / (U + 1) puts it on a per-frame scale like the CTC losses."""
+    (probe Oct 13 2026), / (U + 1) puts it on a per-frame scale like the CTC losses.
+    fs=teacher_nll (B,): full-sum (sequence-level) KD instead (arXiv 2303.05958): loss = hard_weight * mean(nll) +
+    kd_weight * mean(|nll - teacher_nll|), both -log P(Y|X) summed over ALL alignments -- no frame / node timing is
+    matched, so teacher and student may emit at different times. The gradient is the nll's own, weighted per
+    utterance by hard_weight + kd_weight * sign(nll - teacher_nll). Returns (loss, nll, |nll - teacher_nll|)."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
     tpb, tpy = kd if kd is not None else (None, None)
     loss, nll, kdu = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
                                       float(dropout), seed, e_budget, n_rows, tpb, tpy, float(hard_weight),
-                                      float(kd_weight), bool(kd_per_frame))
-    return (loss, nll, kdu) if kd is not None else (loss, nll)
+                                      0.0 if fs is not None else float(kd_weight), bool(kd_per_frame), fs,
+                                      float(kd_weight) if fs is not None else 0.0)
+    return (loss, nll, kdu) if (kd is not None or fs is not None) else (loss, nll)
 
 
 @torch.no_grad()

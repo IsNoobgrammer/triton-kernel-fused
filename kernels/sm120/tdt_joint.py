@@ -288,8 +288,9 @@ class _TDTJoint(torch.autograd.Function):
         gw = torch.zeros(VS, K, device=dev, dtype=torch.float32)
         BR = 256
 
+        TOT = GB + GY                                           # _fix_e_kernel's row scale (as it computed before)
         def grads(Ec, i, M):
-            _fix_e_kernel[(triton.cdiv(M, BR),)](Ec, LAB, tgt, blk, crow, lse, GB, GY, i, M, VS, V - 1, BR,
+            _fix_e_kernel[(triton.cdiv(M, BR),)](Ec, LAB, tgt, blk, crow, lse, GB, GY, TOT, i, M, VS, V - 1, BR,
                                                  num_warps=4)
             torch.mm(Ec, Wa, out_dtype=torch.float32, out=GM[i:i + M])
             torch.addmm(gw, Ec.t(), XS[i:i + M], alpha=1.0 / _HS, out_dtype=torch.float32, out=gw)
