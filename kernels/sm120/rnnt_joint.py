@@ -230,7 +230,8 @@ def _frame_targets_kernel(ALPHA, BETA, LPY, LL, LAB, OFF, TLEN, YLEN, IDX, LOGP,
 
 @triton.jit
 def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, GB, GY, S, X, XS, lam1, K, HS,
-                    TPB, TPY, TOT, KW, BU: tl.constexpr, BK: tl.constexpr, KD: tl.constexpr, HARD: tl.constexpr):
+                    TPB, TPY, TOT, KW, BU: tl.constexpr, BK: tl.constexpr, KD: tl.constexpr, HARD: tl.constexpr,
+                    KD_PF: tl.constexpr):
     # per (b, t): the two lattice weights of every row, s = (gb + gy) e^(c - lse), and XS = bf16(X s HS) for dW.
     # KD (collapsed 3-way distillation, every node): dKL/dlogit = p * a - gbk [blank] - gyk [label] with
     # r = P_rest / q_rest, a = 1 - r, gbk = P_b - p_b r, gyk = P_y - p_y r -- the same factored form, so the row's
@@ -263,6 +264,8 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
         tot = gb + gy
         if KD:
             kw = tl.load(KW)
+            if KD_PF:                                            # per-frame scale: KD / (U + 1)
+                kw = kw / ub1.to(tl.float32)
             pb = tl.exp(lpb)
             py = tl.exp(lpy)                                     # 0 on u = U (lpy = -inf there)
             tpb = tl.exp(tl.load(TPB + rows, mask=mu, other=0.0))
@@ -428,7 +431,7 @@ def _pack(f, g, y, tlen, ylen, p, seed, n_rows=None):
 class _RNNTJoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows, frame_k, tpb=None, tpy=None,
-                hard_w=1.0, kd_w=0.0):
+                hard_w=1.0, kd_w=0.0, kd_pf=True):
         fdt, gdt = f.dtype, g.dtype
         f = f.to(torch.bfloat16).contiguous()
         g = g.to(torch.bfloat16).contiguous()
@@ -475,12 +478,14 @@ class _RNNTJoint(torch.autograd.Function):
             cs = torch.cumsum(kl.double(), 0)                   # per-utterance segment sums (deterministic)
             end = off + tlen * (ylen + 1) - 1
             kdu = (cs[end] - torch.where(off > 0, cs[(off - 1).clamp_min(0)], torch.zeros_like(cs[end]))).float()
+            if kd_pf:                                           # sum over nodes / (U + 1): the scale of a per-frame loss
+                kdu = kdu / (ylen + 1).float()
         else:
             kdu = torch.zeros(B, device=f.device, dtype=torch.float32)
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll,
                                   tpb if kd else lpb, tpy if kd else lpy)
-            ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w), hard)
+            ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w), hard, kd_pf)
         ctx.mark_non_differentiable(nll, idx, flp, kdu)
         loss = nll.mean() if not kd and hard_w == 1.0 else hard_w * nll.mean() + kd_w * kdu.mean()
         return loss, nll, idx, flp, kdu
@@ -488,7 +493,7 @@ class _RNNTJoint(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gout, _g_nll, _g_idx, _g_flp, _g_kd):
         f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll, tpb, tpy = ctx.saved_tensors
-        fdt, gdt, wdt, bdt, lam, p, seed, V, kd, hard_w, kd_w, hard = ctx.cfg
+        fdt, gdt, wdt, bdt, lam, p, seed, V, kd, hard_w, kd_w, hard, kd_pf = ctx.cfg
         B, T, Hd = f.shape
         U1 = g.shape[1]
         N, K = X.shape
@@ -502,7 +507,7 @@ class _RNNTJoint(torch.autograd.Function):
         XS = torch.empty_like(X)
         BU = min(32, triton.next_power_of_2(U1))
         _rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, ll, w, lse, crow, off, tlen, ylen, GB, GY, S, X, XS, 1.0 + lam,
-                                K, _HS, tpb, tpy, TOT, kw, BU=BU, BK=64, KD=kd, HARD=hard, num_warps=4)
+                                K, _HS, tpb, tpy, TOT, kw, BU=BU, BK=64, KD=kd, HARD=hard, KD_PF=bool(kd_pf), num_warps=4)
         GM = torch.empty(N, K, device=dev, dtype=torch.float32)       # E' @ W_aug, then dX in place
         gw = torch.zeros(VS, K, device=dev, dtype=torch.float32)
         BR = 256
@@ -533,11 +538,12 @@ class _RNNTJoint(torch.autograd.Function):
                                                   T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
         dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
-                None, None, None, None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.0, dropout=0.0, seed=None,
-                    e_budget=_E_BUDGET, n_rows=None, frame_targets=0, kd=None, kd_weight=0.0, hard_weight=1.0):
+                    e_budget=_E_BUDGET, n_rows=None, frame_targets=0, kd=None, kd_weight=0.0, hard_weight=1.0,
+                    kd_per_frame=True):
     """NeMo joint (relu -> dropout -> linear) + warprnnt_numba loss, mean over the batch. Returns (loss, nll).
     dropout is the caller's (pass 0 in eval, like nn.Dropout outside training). n_rows: sum(f_len * (y_len + 1)) if the
     caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same).
@@ -548,13 +554,14 @@ def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0
     rnnt_joint_node_logp on the same lengths / targets): loss = hard_weight * mean(nll) + kd_weight * mean(kd), kd per
     utterance = sum over every lattice node of KL over {label, blank, rest} (Panchapagesan et al. 2021, "Efficient
     knowledge distillation for RNN-transducer models"); the student's rest mass is clamped at 1e-6. Returns
-    (loss, nll, (idx, logp) or None, kd)."""
+    (loss, nll, (idx, logp) or None, kd). kd_per_frame (default): kd per utterance / (U + 1) -- the node sum is ~30x
+    the nll on real batches (probe Oct 13 2026), / (U + 1) puts it on a per-frame scale like the CTC losses."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
     tpb, tpy = kd if kd is not None else (None, None)
     loss, nll, idx, flp, kdu = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
                                                 float(dropout), seed, e_budget, n_rows, int(frame_targets),
-                                                tpb, tpy, float(hard_weight), float(kd_weight))
+                                                tpb, tpy, float(hard_weight), float(kd_weight), bool(kd_per_frame))
     if kd is not None:
         return loss, nll, ((idx, flp) if frame_targets else None), kdu
     return (loss, nll, (idx, flp)) if frame_targets else (loss, nll)

@@ -83,7 +83,7 @@ def kd_ref(f, g, W, b, y, tl, yl, tpb, tpy, amp=False):
         kl = (torch.where(Pb > 0, Pb * (tb[i].to(dev) - lb[i]), z)
               + torch.where(Py > 0, Py * (ty[i].to(dev) - torch.where(Py > 0, ly[i], z)), z)
               + torch.where(Pr > 0, Pr * (Pr.clamp_min(1e-300).log() - qr.log()), z))
-        kds.append(kl.sum())
+        kds.append(kl.sum() / kl.shape[1])               # kd_per_frame: node sum / (U + 1)
     kd = torch.stack(kds).mean()
     kd.backward()
     return kd.detach(), f.grad, g.grad, W.grad, b.grad
