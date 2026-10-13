@@ -6,6 +6,7 @@ Gates:
   1. teacher P == fp64 within 5e-3 abs, rows sum to 1 (u < U)
   2. 0.3 nll + 0.7 pos-KD: loss / df / dg / dW / dbias no worse than eager bf16 vs fp64 (or rel <= 1e-2)
   3. kd weight 0 == plain loss (bitwise)
+  5. a confident-blank, large-logit case (p_blank rounds to 1 on real batches: the first real probe went NaN)
   4. teacher == student (P from the student itself): the KD value equals the student's own entropy term only
      (KL >= 0, ~ Jensen gap) and its gradient is small vs the nll gradient
 
@@ -113,10 +114,12 @@ def plain(f, g, W, b, y, tl, yl):
     return loss.detach(), f.grad, g.grad, W.grad, b.grad
 
 
-def case(name, B, T, U, H, V):
-    print(f"{name}: B {B} T {T} U {U} V {V}", flush=True)
-    f, g, W, b, y, tl, yl = pj.data(B, T, U, H, V, seed=7)
-    ft, gt, Wt, bt, *_ = pj.data(B, T, U, H, V, seed=8)
+def case(name, B, T, U, H, V, blank_bias=0.0, wscale=1.0):
+    print(f"{name}: B {B} T {T} U {U} V {V} blank bias {blank_bias} wscale {wscale}", flush=True)
+    f, g, W, b, y, tl, yl = pj.data(B, T, U, H, V, wscale=wscale, seed=7)
+    ft, gt, Wt, bt, *_ = pj.data(B, T, U, H, V, wscale=wscale, seed=8)
+    b[-1] += blank_bias
+    bt[-1] += blank_bias
     with AMP:
         *_, P = rj.rnnt_joint_node_logp(ft, gt, Wt, bt, y, tl, yl, pos_targets=True)
     Pr = teacher_ref(ft, gt, Wt, bt, y, tl, yl)
@@ -131,6 +134,7 @@ def case(name, B, T, U, H, V):
     kref = pos_ref(f, g, Wb, bb, y, tl, yl, P)
     gt_ = [hw * h + kw * k for h, k in zip(hard, kref)]
     o, kdu = ours(f, g, W, b, y, tl, yl, P, kw, hw)
+    check("0 finite (no NaN / inf)", all(bool(torch.isfinite(x).all()) for x in o) and bool(torch.isfinite(kdu).all()) and bool(torch.isfinite(P).all()), "loss, grads, KD, targets")
     e = [pj.rel(a, r) for a, r in zip(o, gt_)]
     nb = pj.nemo_path(f, g, Wb, bb, y, tl, yl, None, True)
     eb = [pj.rel(hw * h.double() + kw * k.double(), r) for h, k, r in zip(nb, pos_ref(f, g, Wb, bb, y, tl, yl, P, True), gt_)]
@@ -151,6 +155,7 @@ def case(name, B, T, U, H, V):
 def main():
     case("small", 4, 30, 10, 64, 129)
     case("wide", 3, 40, 12, 128, 1025)
+    case("real-like: confident blank, large logits", 4, 30, 10, 64, 129, blank_bias=20.0, wscale=6.0)
     print("\nALL PASS" if ok else "\nFAILED", flush=True)
     sys.exit(0 if ok else 1)
 

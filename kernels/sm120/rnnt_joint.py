@@ -524,7 +524,9 @@ class _RNNTJoint(torch.autograd.Function):
             uu = local % (ylen[rowb] + 1)
             bshift = torch.cat([beta[1:], beta.new_full((1,), _NEG)])
             gam = torch.exp(alpha + lpy + bshift - ll[rowb])     # P(emit label u at t | x, y); 0 on u = U
-            lse_nb = lse + torch.log1p(-lpb.exp()).clamp_min(-30.0)   # log sum over non-blank of e^z
+            # log sum over non-blank of e^z; p_blank can round to >= 1 on blank-dominated rows (log1p -> NaN): clamp as
+            # the backward does (1 - p_blank >= 1e-6)
+            lse_nb = lse + torch.log((1.0 - lpb.exp()).clamp_min(1e-6))
             pwx = (Pw[rowb, uu] * X.float()).sum(-1)             # P_u . z (bias via X's ones column)
             contrib = gam * (lse_nb - pwx)
             cs = torch.cumsum(contrib.double(), 0)
@@ -696,12 +698,12 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
     uu = (torch.arange(N, device=f.device) - off[rowb]) % (ylen[rowb] + 1)
     bshift = torch.cat([beta[1:], beta.new_full((1,), _NEG)])
     gam = torch.exp(alpha + lpy + bshift - ll[rowb])          # 0 on u = U
-    wrow = gam * torch.exp(-lse) / (1.0 - lpb.exp()).clamp_min(1e-6)
+    wrow = gam / (1.0 - lpb.exp()).clamp_min(1e-6)
     keep = (gam > 1e-6).nonzero().squeeze(1)                  # rows that carry mass (host sync: teacher side only)
     pbar = torch.zeros(B * U1, V, device=f.device, dtype=torch.float32)
     for i in range(0, keep.numel(), 65536):
         r = keep[i:i + 65536]
-        z = (X[r] @ Wa[:V].t()).float()                        # (R, V) logits of the kept rows
+        z = (X[r] @ Wa[:V].t()).float() - lse[r, None]        # (R, V) log-softmax of the kept rows (no overflow)
         z[:, V - 1] = _NEG                                     # blank excluded: p(v | not blank)
         pbar.index_add_(0, rowb[r] * U1 + uu[r], torch.exp(z) * wrow[r, None])
     return lpb, lpy, -ll, ft, pbar.view(B, U1, V)[:, :U1 - 1]
