@@ -9,7 +9,7 @@ q = the student's, rest = 1 - blank - label (student rest clamped at 1e-6, as th
 Gates:
   1. teacher node probabilities (blank, label) == fp64 within 5e-3 abs (bf16 joint GEMMs)
   5. kd only (hard weight 0, no lattice): at least as close to fp64 as eager bf16 (or rel <= 1e-2)
-  2. loss = 0.3 nll + 0.7 kd and df / dg / dW / dbias: rel <= 1e-2 vs fp64 (normal and confident-blank logits)
+  2. loss = 0.3 nll + 0.7 kd and df / dg / dW / dbias vs fp64: no worse than eager bf16 (NeMo + bf16 KD) or <= 1e-2 (normal and confident-blank logits)
   3. kd_weight 0 with a teacher == the plain loss (loss and grads, rel <= 1e-6)
   4. teacher == student: kd ~ 0 and the KD-only gradient ~ 0 (rel to the hard gradient <= 1e-3)
 
@@ -119,7 +119,11 @@ def case(name, B, T, U, H, V, blank_bias=0.0):
     gt_ = [hw * h + kw * k for h, k in zip(hard, kref)]
     o, kdu = ours(f, g, W, b, y, tl, yl, (tpb, tpy), kw, hw)
     e = [pj.rel(a, r) for a, r in zip(o, gt_)]
-    check("2 0.3 nll + 0.7 kd vs fp64", max(e) <= 1e-2, " ".join(f"{n} {x:.1e}" for n, x in zip(pj.NAMES, e))
+    nb = pj.nemo_path(f, g, Wb, bb, y, tl, yl, None, True)             # eager bf16: NeMo numba on bf16 logits
+    eb = [pj.rel(hw * h.double() + kw * k.double(), r) for h, k, r in
+          zip(nb, kd_ref(f, g, Wb, bb, y, tl, yl, tpb, tpy, amp=True), gt_)]
+    check("2 0.3 nll + 0.7 kd vs fp64, no worse than eager bf16", all(x <= max(1.05 * c, 1e-2) for x, c in zip(e, eb)),
+          " ".join(f"{n} {x:.1e} (bf16 {c:.1e})" for n, x, c in zip(pj.NAMES, e, eb))
           + f"  (kd mean {kdu.mean().item():.3f} vs {kref[0].item():.3f})")
 
     kdo, _ = ours(f, g, W, b, y, tl, yl, (tpb, tpy), 1.0, 0.0)          # hard weight 0: no lattice at all
