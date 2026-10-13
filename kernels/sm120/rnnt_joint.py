@@ -186,6 +186,49 @@ def _lattice_kernel(LPB, LPY, OFF, TLEN, YLEN, ALPHA, BETA, LL, BU: tl.constexpr
 
 
 @triton.jit
+def _frame_targets_kernel(ALPHA, BETA, LPY, LL, LAB, OFF, TLEN, YLEN, IDX, LOGP, T, BLANK,
+                          K: tl.constexpr, BU: tl.constexpr):
+    # per (b, t): the transducer's own per-frame emission distribution from the lattice posteriors -- no decoding:
+    #   py(u) = P(emit y_(u+1) at frame t | x, y) = exp(alpha(t,u) + lpy(t,u) + beta(t,u+1) - ll)
+    # as a CTC-frame target: q(token) = sum of py over every u with that token / max(1, sum py), q(blank) =
+    # max(0, 1 - sum py). Written as blank + the top K-1 tokens (log-probs; -inf = empty slot); the tokens not kept
+    # are kl_div_topk's rest bucket. Duplicate tokens across u are merged before the top-k.
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    tb = tl.load(TLEN + b).to(tl.int32)
+    if t >= tb:
+        return
+    ub1 = tl.load(YLEN + b).to(tl.int32) + 1
+    row0 = tl.load(OFF + b) + t * ub1
+    ll = tl.load(LL + b)
+    u = tl.arange(0, BU)
+    mu = u < ub1 - 1                                            # a label transition leaves every u < U
+    rows = row0 + u
+    a = tl.load(ALPHA + rows, mask=mu, other=float("-inf"))
+    bu = tl.load(BETA + rows + 1, mask=mu, other=float("-inf"))
+    lp = tl.load(LPY + rows, mask=mu, other=float("-inf"))
+    py = tl.where(mu, tl.exp(a + lp + bu - ll), 0.0)
+    lab = tl.load(LAB + rows, mask=mu, other=-1)
+    tot = tl.sum(py, 0)
+    den = tl.maximum(tot, 1.0)
+    base = (b * T + t).to(tl.int64) * K
+    pb = tl.maximum(1.0 - tot, 0.0)
+    tl.store(IDX + base, BLANK)
+    tl.store(LOGP + base, tl.where(pb > 0, tl.log(tl.maximum(pb, 1e-30)), float("-inf")))
+    rem = py
+    for k in tl.static_range(1, K):
+        mx = tl.max(rem, 0)
+        j = tl.argmax(rem, 0)
+        lj = tl.sum(tl.where(u == j, lab, 0), 0)
+        same = (lab == lj) & mu
+        v = tl.sum(tl.where(same, rem, 0.0), 0)
+        rem = tl.where(same, 0.0, rem)
+        ok = mx > 0
+        tl.store(IDX + base + k, tl.where(ok, lj, BLANK).to(tl.int32))
+        tl.store(LOGP + base + k, tl.where(ok, tl.log(tl.maximum(v / den, 1e-30)), float("-inf")))
+
+
+@triton.jit
 def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, GB, GY, S, X, XS, lam1, K, HS,
                     BU: tl.constexpr, BK: tl.constexpr):
     # per (b, t): the two lattice weights of every row, s = (gb + gy) e^(c - lse), and XS = bf16(X s HS) for dW
@@ -358,7 +401,7 @@ def _pack(f, g, y, tlen, ylen, p, seed, n_rows=None):
 
 class _RNNTJoint(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows):
+    def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows, frame_k):
         fdt, gdt = f.dtype, g.dtype
         f = f.to(torch.bfloat16).contiguous()
         g = g.to(torch.bfloat16).contiguous()
@@ -377,19 +420,24 @@ class _RNNTJoint(torch.autograd.Function):
         lpb = blk - lse
         lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
         alpha = torch.empty(N, device=f.device, dtype=torch.float32)
-        beta = torch.empty(N, device=f.device, dtype=torch.float32) if need else alpha
+        beta = torch.empty(N, device=f.device, dtype=torch.float32) if need or frame_k else alpha
         ll = torch.empty(B, device=f.device, dtype=torch.float32)
         _lattice_kernel[(B,)](lpb, lpy, off, tlen, ylen, alpha, beta, ll,
-                              BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need, num_warps=4)
+                              BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need or frame_k > 0, num_warps=4)
         nll = -(1.0 + lam) * ll                                 # NeMo's numba reports cost (1 + lambda) * -ll
+        idx = torch.full((B, T, max(frame_k, 1)), V - 1, device=f.device, dtype=torch.int32)
+        flp = torch.full((B, T, max(frame_k, 1)), _NEG, device=f.device, dtype=torch.float32)
+        if frame_k:                                             # per-frame teacher targets for a CTC head
+            _frame_targets_kernel[(B, T)](alpha, beta, lpy, ll, LAB, off, tlen, ylen, idx, flp, T, V - 1,
+                                          K=frame_k, BU=triton.next_power_of_2(g.shape[1]), num_warps=4)
         if need:
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll)
             ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V)
-        ctx.mark_non_differentiable(nll)
-        return nll.mean(), nll
+        ctx.mark_non_differentiable(nll, idx, flp)
+        return nll.mean(), nll, idx, flp
 
     @staticmethod
-    def backward(ctx, gout, _g_nll):
+    def backward(ctx, gout, _g_nll, _g_idx, _g_flp):
         f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll = ctx.saved_tensors
         fdt, gdt, wdt, bdt, lam, p, seed, V = ctx.cfg
         B, T, Hd = f.shape
@@ -433,15 +481,19 @@ class _RNNTJoint(torch.autograd.Function):
                                                   T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
         dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
-                None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None)
 
 
 def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.0, dropout=0.0, seed=None,
-                    e_budget=_E_BUDGET, n_rows=None):
+                    e_budget=_E_BUDGET, n_rows=None, frame_targets=0):
     """NeMo joint (relu -> dropout -> linear) + warprnnt_numba loss, mean over the batch. Returns (loss, nll).
     dropout is the caller's (pass 0 in eval, like nn.Dropout outside training). n_rows: sum(f_len * (y_len + 1)) if the
-    caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same)."""
+    caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same).
+    frame_targets=K > 0: also return (idx, logp), each (B, T, K): the transducer's per-frame emission distribution from
+    the lattice posteriors (blank + the top K-1 tokens, log-probs, -inf = empty), a CTC distillation target for
+    kl_div_topk -- no decoding, computed from alpha / beta the loss already has."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
-    return _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda), float(dropout),
-                            seed, e_budget, n_rows)
+    loss, nll, idx, flp = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
+                                           float(dropout), seed, e_budget, n_rows, int(frame_targets))
+    return (loss, nll, (idx, flp)) if frame_targets else (loss, nll)

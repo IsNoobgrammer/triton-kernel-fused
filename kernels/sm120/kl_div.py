@@ -2,7 +2,7 @@
 
 Two teacher forms:
   kl_div_dense(s, t, T)          teacher LOGITS t (N, V), same vocabulary as the student logits s (N, V)
-  kl_div_topk(s, idx, logp, T)   teacher as its top-k: token ids idx (N, k) and their log-probs logp (N, k) under the
+  kl_div_topk(s, idx, logp, T)   teacher as its top-k (logp = -inf marks an empty slot): token ids idx (N, k) and their log-probs logp (N, k) under the
                                  FULL teacher softmax (at temperature T); the remaining mass r = 1 - sum exp(logp) is
                                  one "rest" bucket matched to the student's mass outside the top-k (a stored teacher
                                  dump never needs densifying)
@@ -128,6 +128,7 @@ def _topk_fwd(S, IDX, LP, LOSS, LSES, QREST, V, ss, inv_T, K: tl.constexpr, KP: 
     mkk = k < K
     ix = tl.load(IDX + i * K + k, mask=mkk, other=0)
     lp = tl.load(LP + i * K + k, mask=mkk, other=float("-inf")).to(tl.float32)
+    mkk = mkk & (lp > float("-inf"))                                  # -inf = an empty slot (no target entry)
     sk = tl.load(sr + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T
     lq = sk - lse_s                                                     # student log q at the teacher's top-k
     p = tl.where(mkk, tl.exp(lp), 0.0)
@@ -165,7 +166,9 @@ def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr,
         k = k0 + tl.arange(0, KB)
         mkk = k < K
         ix = tl.load(IDX + i * K + k, mask=mkk, other=0)
-        pv = tl.exp(tl.load(LP + i * K + k, mask=mkk, other=float("-inf")).to(tl.float32))
+        lpk = tl.load(LP + i * K + k, mask=mkk, other=float("-inf")).to(tl.float32)
+        mkk = mkk & (lpk > float("-inf"))                             # empty slots must not overwrite a real one
+        pv = tl.exp(lpk)
         q = tl.exp(tl.load(S + i * ss + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T - lse_s)
         tl.store(DS + i * sd + ix, ((q - pv) * g).to(DS.dtype.element_ty), mask=mkk)
 
