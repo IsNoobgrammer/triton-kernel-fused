@@ -371,10 +371,18 @@ def tdt_joint_pos_targets(f, g, weight, bias, targets, f_len, y_len, durations=(
     Wd = torch.zeros(ND, K, device=dev, dtype=torch.bfloat16)
     Wd[:, :Hd] = weight[V:]
     Wd[:, Hd] = bias[V:]
-    lse, tgt, blk, crow = _stats(X, Wa, LAB, V - 1, False)
+    # token log-probs from plain fp32 logits in chunks (the training-side _stats pass put the teacher's lattice ~2e-4
+    # relative off fp64, enough to move label posteriors 1e-2 in blank-dominated lattices)
+    lpb = torch.empty(N, device=dev, dtype=torch.float32)
+    lpy = torch.empty(N, device=dev, dtype=torch.float32)
+    for i in range(0, N, 65536):
+        z = torch.mm(X[i:i + 65536], Wa[:V].t(), out_dtype=torch.float32).log_softmax(-1)
+        lab = LAB[i:i + 65536]
+        lpb[i:i + 65536] = z[:, V - 1]
+        lpy[i:i + 65536] = torch.where(lab >= 0, z.gather(1, lab.clamp_min(0)[:, None]).squeeze(1), _NEG)
+    lse = torch.zeros(N, device=dev, dtype=torch.float32)          # rowgrad's S output is unused here
+    crow = lse
     lpd = torch.log_softmax(torch.mm(X, Wd.t(), out_dtype=torch.float32), -1).contiguous()
-    lpb = blk - lse
-    lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
     dur = _dur_tensor(tuple(durations), dev)
     alpha = torch.empty(N, device=dev, dtype=torch.float32)
     beta = torch.empty(N, device=dev, dtype=torch.float32)
