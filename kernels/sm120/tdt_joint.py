@@ -35,7 +35,7 @@ from kernels.sm120.ce_factored import _HS
 from kernels.sm120.rnnt_joint import (_E_BUDGET, _NEG, _comb, _fix_e_kernel, _lae, _pack, _stats,
                                       rnnt_joint_loss)
 
-__all__ = ["tdt_joint_loss"]
+__all__ = ["tdt_joint_loss", "tdt_joint_pos_targets"]
 
 
 @triton.jit
@@ -343,3 +343,60 @@ def tdt_joint_loss(f, g, weight, bias, targets, f_len, y_len, durations=(0, 1, 2
         return loss + 0.0 * (weight[V:].sum() + bias[V:].sum()), nll  # durations in the graph, zero gradient
     return _TDTJoint.apply(f, g, weight, bias, targets, f_len, y_len, durations, float(sigma), float(dropout), seed,
                            e_budget, n_rows)
+
+
+@torch.no_grad()
+def tdt_joint_pos_targets(f, g, weight, bias, targets, f_len, y_len, durations=(0, 1, 2, 3, 4), n_rows=None):
+    """Teacher side (no grad, no dropout, sigma 0 = as it decodes): per-TOKEN-position targets of a TDT teacher forced
+    through the reference, the frame dimension marginalised --
+        P_u(v) = sum_t gy(t, u) p(v | t, u, not blank),   gy = the posterior mass of the label arc y_u at (t, u)
+    summed over its durations (each label is emitted exactly once, so sum_t gy = 1 and P_u sums to 1).
+    Same contract as rnnt_joint_node_logp(pos_targets=True)'s last output: (B, U, V) fp32 over the V token classes
+    (blank = V - 1, always 0). Also returns the teacher's per-utterance nll."""
+    durations = [int(d) for d in durations]
+    assert durations == sorted(durations) and durations[0] in (0, 1), durations
+    f = f.to(torch.bfloat16).contiguous()
+    g = g.to(torch.bfloat16).contiguous()
+    B, T, Hd = f.shape
+    U1 = g.shape[1]
+    ND = len(durations)
+    V = weight.shape[0] - ND
+    dev = f.device
+    tlen, ylen = f_len.to(torch.int64), y_len.to(torch.int64)
+    X, LAB, off, N = _pack(f, g, targets.to(torch.int64), tlen, ylen, 0.0, 0, n_rows)
+    K = X.shape[1]
+    Wa = torch.zeros(triton.cdiv(V, 64) * 64, K, device=dev, dtype=torch.bfloat16)
+    Wa[:V, :Hd] = weight[:V]
+    Wa[:V, Hd] = bias[:V]
+    Wd = torch.zeros(ND, K, device=dev, dtype=torch.bfloat16)
+    Wd[:, :Hd] = weight[V:]
+    Wd[:, Hd] = bias[V:]
+    lse, tgt, blk, crow = _stats(X, Wa, LAB, V - 1, False)
+    lpd = torch.log_softmax(torch.mm(X, Wd.t(), out_dtype=torch.float32), -1).contiguous()
+    lpb = blk - lse
+    lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
+    dur = _dur_tensor(tuple(durations), dev)
+    alpha = torch.empty(N, device=dev, dtype=torch.float32)
+    beta = torch.empty(N, device=dev, dtype=torch.float32)
+    ll = torch.empty(B, device=dev, dtype=torch.float32)
+    BU = triton.next_power_of_2(U1)
+    has0 = durations[0] == 0
+    _tdt_alpha_kernel[(B,)](lpb, lpy, lpd, dur, off, tlen, ylen, alpha, ll, ND=ND, HAS0=has0, BU=BU, num_warps=4)
+    _tdt_beta_kernel[(B,)](lpb, lpy, lpd, dur, off, tlen, ylen, beta, ND=ND, HAS0=has0, BU=BU, num_warps=4)
+    one = torch.ones(1, device=dev, dtype=torch.float32)
+    GB, GY, S = (torch.empty(N, device=dev, dtype=torch.float32) for _ in range(3))
+    GD = torch.empty(N, ND, device=dev, dtype=torch.float32)
+    XS = torch.empty_like(X)
+    _tdt_rowgrad_kernel[(B, T)](alpha, beta, lpb, lpy, lpd, dur, ll, one, lse, crow, off, tlen, ylen, GB, GY, GD, S,
+                                X, XS, K, _HS, ND=ND, BU=min(32, triton.next_power_of_2(U1)), BK=64, num_warps=4)
+    del XS, S, GD
+    rowb = torch.repeat_interleave(torch.arange(B, device=dev), tlen * (ylen + 1), output_size=N)
+    uu = (torch.arange(N, device=dev) - off[rowb]) % (ylen[rowb] + 1)
+    keep = (GY > 1e-6).nonzero().squeeze(1)                 # rows that carry label mass (host sync: teacher only)
+    pbar = torch.zeros(B * U1, V, device=dev, dtype=torch.float32)
+    for i in range(0, keep.numel(), 65536):
+        r = keep[i:i + 65536]
+        z = (X[r] @ Wa[:V].t()).float()
+        z[:, V - 1] = _NEG                                   # p(v | not blank)
+        pbar.index_add_(0, rowb[r] * U1 + uu[r], torch.softmax(z, -1) * GY[r, None])
+    return pbar.view(B, U1, V)[:, :U1 - 1], -ll
