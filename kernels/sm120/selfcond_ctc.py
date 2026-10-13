@@ -7,7 +7,8 @@ vocabulary, the CTC loss on log_softmax(z), and -- for every pass but the last -
     nll, q, logits = selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank)
         x (B, T, d) any float dtype (bf16 math), w_out (V, d), b_out (V,), w_fb (2d, V) or None (last pass)
         -> nll (B,) fp32 (torch ctc_loss reduction='none', zero_infinity), q (B, T, 2d) bf16 or None, and the
-           logits z (B, T, V) bf16 without gradient (for WER / decoding)
+           logits z (B, T, V) bf16 (WER / decoding; differentiable: a loss on them, e.g. kl_div_topk, adds its grad
+           into dz before the fused backward's GEMMs)
 
 Every GEMM is cuBLAS (bf16, fp32 accumulate) on a vocab padded to a multiple of 128 (aligned rows: the unpadded
 V = 2049 ran on sm75 fallback kernels). Triton does the V-wide row work:
@@ -188,9 +189,8 @@ class _Pass(torch.autograd.Function):
                         num_warps=4 if BS <= 512 else 8)
         ctx.save_for_backward(xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll)
         ctx.shape, ctx.blank, ctx.has_fb, ctx.xdtype, ctx.v0 = (B, T, d, V), blank, w_fb is not None, x.dtype, V0
-        zl = z.view(B, T, V)[..., :V0]                                    # the logits, for WER / decoding (no grad)
-        ctx.mark_non_differentiable(zl)
-        return nll, q, zl
+        zl = z.view(B, T, V)[..., :V0]          # the logits: WER / decoding, and differentiable for an extra loss on
+        return nll, q, zl                       # them (lattice KL distillation): its grad joins dz in the backward
 
     @staticmethod
     def backward(ctx, gnll, gq, gz=None):
@@ -209,6 +209,8 @@ class _Pass(torch.autograd.Function):
                          y.stride(0), T, V, ctx.blank, BS=al.shape[2], BV=triton.next_power_of_2(V),
                          BU=triton.next_power_of_2(max(U, 1)), CJ=32, HAS_FB=has_fb, num_warps=8)
         V0 = ctx.v0
+        if gz is not None:                      # a loss on the logits themselves (e.g. kl_div_topk): same fused backward
+            dz.view(B, T, V)[..., :V0] += gz.to(dz.dtype)
         dx = (dz @ wo).reshape(B, T, d).to(ctx.xdtype)
         dw_out = (dz.t() @ xb)[:V0].float()
         db = torch.sum(dz, 0, dtype=torch.float32)[:V0]               # no fp32 copy of the whole dz
@@ -218,5 +220,5 @@ class _Pass(torch.autograd.Function):
 
 def selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank):
     """One self-conditioned CTC pass; see the module docstring. Returns (nll (B,) fp32, q (B, T, 2d) bf16 or None,
-    logits (B, T, V) bf16 without gradient -- for batch WER / decoding)."""
+    logits (B, T, V) bf16 -- batch WER / decoding, or a differentiable extra loss)."""
     return _Pass.apply(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, int(blank))
