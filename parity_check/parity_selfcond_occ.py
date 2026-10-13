@@ -1,8 +1,7 @@
 """selfcond_ctc_pass(..., want_occ=True): the CTC label occupancy occ (B, T, U) vs fp64.
 
-Reference: an explicit fp64 CTC forward-backward (torch.ctc_loss's backward returns exp(log_probs) - occupancy, a
-which equals the per-position occupancy when every utterance's tokens are distinct (the test draws them so), on the
-same bf16 logits the pass uses.
+Reference: an explicit fp64 CTC forward-backward on the pass's own (bf16) logits, so only the occupancy math is
+under test (torch.ctc_loss's backward returns exp(log_probs) - occupancy, not - occupancy).
 Gates:
   1. occ == fp64 occupancy (abs <= 2e-3)
   2. per frame: sum_u occ + blank occupancy == 1; per token: sum_t occ >= 1 - 1e-3
@@ -39,8 +38,8 @@ def main():
     ul = torch.tensor([U, U - 3, 6, 4], device="cuda")
     nll, _, z, occ = selfcond_ctc_pass(x, w, b, None, y, tl_, ul, V - 1, want_occ=True)
     # fp64 reference on the same bf16 logits
-    zr = (x.reshape(B * T, d).bfloat16() @ w.bfloat16().t() + b.bfloat16()).double().view(B, T, V)
-    lp = zr.log_softmax(-1).cpu()
+    lp = z.detach().double().log_softmax(-1).cpu()                     # the pass's OWN bf16 logits: the occupancy
+                                                                        # math alone is under test
     ref = torch.zeros(B, T, U, dtype=torch.float64)
     bocc = torch.zeros(B, T, dtype=torch.float64)                      # blank-state occupancy per frame
     NEG = float("-inf")
