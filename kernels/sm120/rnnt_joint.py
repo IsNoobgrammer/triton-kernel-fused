@@ -268,7 +268,10 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
             gb = gb + kw * (tpb - pb * r)
             gy = gy + kw * (tpy - py * r)
             tot = tot + kw * (1.0 - r)
-            tot = tl.where(tl.abs(tot) < 1e-6, tl.where(tot < 0, -1e-6, 1e-6), tot)   # factorable: tot != 0
+            # factorable: |tot| >= 1e-3 (|gb| + |gy|), so E'[y] = ... - gy / tot stays finite in bf16; adds at most
+            # 1e-3 of the row's one-hot weight as softmax-shaped noise, and never moves a plain row (tot = gb + gy)
+            lo = 1e-3 * (tl.abs(gb) + tl.abs(gy))
+            tot = tl.where(tl.abs(tot) < lo, tl.where(tot < 0, -lo, lo), tot)
         s = tot * tl.exp(tl.load(CROW + rows, mask=mu, other=0.0) - tl.load(LSE + rows, mask=mu, other=0.0))
         tl.store(GB + rows, gb, mask=mu)
         tl.store(GY + rows, gy, mask=mu)

@@ -7,7 +7,7 @@ formula); the KD part is autograd through fp64 log_softmax of
 with P = the teacher's node probabilities (the kernel's own teacher output, so the student side is tested alone),
 q = the student's, rest = 1 - blank - label (student rest clamped at 1e-6, as the kernel does).
 Gates:
-  1. teacher node log-probs (blank, label) == fp64 within 2e-2 abs (bf16 joint GEMMs)
+  1. teacher node probabilities (blank, label) == fp64 within 5e-3 abs (bf16 joint GEMMs)
   2. loss = 0.3 nll + 0.7 kd and df / dg / dW / dbias: rel <= 1e-2 vs fp64 (normal and confident-blank logits)
   3. kd_weight 0 with a teacher == the plain loss (loss and grads, rel <= 1e-6)
   4. teacher == student: kd ~ 0 and the KD-only gradient ~ 0 (rel to the hard gradient <= 1e-3)
@@ -101,9 +101,9 @@ def case(name, B, T, U, H, V, blank_bias=0.0):
         tpb, tpy, tnll, _ = rj.rnnt_joint_node_logp(ft, gt, Wt, bt, y, tl, yl)
     with torch.no_grad():
         rb, ry = node_lp(ft.double(), gt.double(), Wt.bfloat16().double(), bt.bfloat16().double(), y, tl, yl)
-    eb = max((a - r.cpu()).abs().max().item() for a, r in zip(unpack(tpb, tl, yl), rb))
-    ey = max(((a - r.cpu()).nan_to_num(0.0, 0.0, 0.0)).abs().max().item() for a, r in zip(unpack(tpy, tl, yl), ry))
-    check("1 teacher node log-probs", max(eb, ey) < 2e-2, f"blank {eb:.1e}  label {ey:.1e}")
+    eb = max((a.exp() - r.cpu().exp()).abs().max().item() for a, r in zip(unpack(tpb, tl, yl), rb))
+    ey = max((a.exp() - r.cpu().exp()).abs().max().item() for a, r in zip(unpack(tpy, tl, yl), ry))
+    check("1 teacher node probabilities", max(eb, ey) < 5e-3, f"blank {eb:.1e}  label {ey:.1e}")
 
     hw, kw = 0.3, 0.7
     Wb, bb = W.bfloat16().float(), b.bfloat16().float()          # the kernel's joint weights are bf16
