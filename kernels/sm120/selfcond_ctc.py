@@ -157,7 +157,7 @@ def _sc_grad(Z, LSE, P, A, QDQ, Y, TLEN, ULEN, AL, BE, NLL, GOUT, DZ, sy, T, V, 
 
 class _Pass(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w_out, b_out, w_fb, y, tlen, ulen, blank, ctc=True):
+    def forward(ctx, x, w_out, b_out, w_fb, y, tlen, ulen, blank, ctc=True, want_occ=False):
         B, T, d = x.shape
         V0 = w_out.shape[0]
         # vocab padded to a multiple of 128: V0 = 2049 / 4097 (tokens + blank) leaves the rows of z / p unaligned and
@@ -192,13 +192,25 @@ class _Pass(torch.autograd.Function):
             al = be = lse
             nll = torch.zeros(B, device=x.device, dtype=torch.float32)
         ctx.ctc = ctc
+        occ = torch.zeros(0, device=x.device)
+        if want_occ:                            # P(in label state u at frame t | x, y): alpha, beta both include
+            assert ctc, "want_occ needs the CTC lattice"   # frame t's emission -> - lp(t, y_u)
+            U = y.shape[1]
+            lab_s = al[:, :, 1:2 * U:2]                                   # (B, T, U) alpha at the label states
+            lab_b = be[:, :, 1:2 * U:2]
+            zl_y = z.view(B, T, V).gather(2, y[:, None, :].expand(B, T, U)).float() - lse.view(B, T, 1)
+            occ = torch.exp(lab_s + lab_b - zl_y + nll.view(B, 1, 1))
+            tm = torch.arange(T, device=x.device)[None, :, None] < tlen[:, None, None]
+            um = torch.arange(U, device=x.device)[None, None, :] < ulen[:, None, None]
+            occ = torch.where(tm & um & torch.isfinite(occ), occ, torch.zeros_like(occ))
         ctx.save_for_backward(xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll)
         ctx.shape, ctx.blank, ctx.has_fb, ctx.xdtype, ctx.v0 = (B, T, d, V), blank, w_fb is not None, x.dtype, V0
         zl = z.view(B, T, V)[..., :V0]          # the logits: WER / decoding, and differentiable for an extra loss on
-        return nll, q, zl                       # them (lattice KL distillation): its grad joins dz in the backward
+        ctx.mark_non_differentiable(occ)        # them (teacher KL distillation): its grad joins dz in the backward
+        return nll, q, zl, occ
 
     @staticmethod
-    def backward(ctx, gnll, gq, gz=None):
+    def backward(ctx, gnll, gq, gz=None, _gocc=None):
         xb, wo, wf, z, p, lse, q, y, tlen, ulen, al, be, nll = ctx.saved_tensors
         B, T, d, V = ctx.shape
         has_fb = ctx.has_fb and gq is not None
@@ -225,11 +237,16 @@ class _Pass(torch.autograd.Function):
         dw_out = (dz.t() @ xb)[:V0].float()
         db = torch.sum(dz, 0, dtype=torch.float32)[:V0]               # no fp32 copy of the whole dz
         dw_fb = (dq.t() @ p)[:, :V0].float() if has_fb else None
-        return dx, dw_out, db, dw_fb, None, None, None, None, None
+        return dx, dw_out, db, dw_fb, None, None, None, None, None, None
 
 
-def selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank, ctc=True):
+def selfcond_ctc_pass(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, blank, ctc=True, want_occ=False):
     """One self-conditioned CTC pass; see the module docstring. Returns (nll (B,) fp32, q (B, T, 2d) bf16 or None,
     logits (B, T, V) bf16 -- batch WER / decoding, or a differentiable extra loss). ctc=False: no CTC loss at all
-    (nll = 0, its lattice skipped) -- a head trained only by a loss on the logits (teacher KD, hard weight 0)."""
-    return _Pass.apply(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, int(blank), bool(ctc))
+    (nll = 0, its lattice skipped) -- a head trained only by a loss on the logits (teacher KD, hard weight 0).
+    want_occ=True: also the CTC label occupancy occ (B, T, U), P(in label state u at frame t | x, y) from the pass's
+    own alpha / beta (no grad) -- the student's own alignment, for per-token teacher KD on a CTC head.
+    -> (nll, q, logits) or (nll, q, logits, occ)"""
+    nll, q, zl, occ = _Pass.apply(x, w_out, b_out, w_fb, targets, input_lengths, target_lengths, int(blank), bool(ctc),
+                                  bool(want_occ))
+    return (nll, q, zl, occ) if want_occ else (nll, q, zl)
