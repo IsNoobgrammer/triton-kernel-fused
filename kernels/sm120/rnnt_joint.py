@@ -188,46 +188,53 @@ def _lattice_kernel(LPB, LPY, OFF, TLEN, YLEN, ALPHA, BETA, LL, BU: tl.constexpr
 
 
 @triton.jit
-def _frame_targets_kernel(ALPHA, BETA, LPY, LL, LAB, OFF, TLEN, YLEN, IDX, LOGP, T, BLANK,
-                          K: tl.constexpr, BU: tl.constexpr):
-    # per (b, t): the transducer's own per-frame emission distribution from the lattice posteriors -- no decoding:
-    #   py(u) = P(emit y_(u+1) at frame t | x, y) = exp(alpha(t,u) + lpy(t,u) + beta(t,u+1) - ll)
-    # as a CTC-frame target: q(token) = sum of py over every u with that token / max(1, sum py), q(blank) =
-    # max(0, 1 - sum py). Written as blank + the top K-1 tokens (log-probs; -inf = empty slot); the tokens not kept
-    # are kl_div_topk's rest bucket. Duplicate tokens across u are merged before the top-k.
+def _frame_align_kernel(ALPHA, BETA, LPY, OFF, TLEN, YLEN, Y, YS, F, IDX, T, K: tl.constexpr, BU: tl.constexpr):
+    # one program per utterance: the teacher's CTC alignment from its lattice, one token per frame.
+    # A streaming transducer emits tokens in bursts (several on one frame) and smears a token's timing over frames;
+    # the old per-frame merge of label posteriors made 33% of the targets' own greedy decode deletions (84% frame
+    # collisions, 15% smeared; kd_target_diag2, Oct 13 2026). Here each token u goes to its most likely emission frame
+    #   argmax_t P(emit y_(u+1) at t | x, y) = argmax_t alpha(t,u) + lpy(t,u) + beta(t,u+1)
+    # then forward: f(u) >= f(u-1) + 1 (+1 more between identical neighbours: CTC needs a blank to repeat a token),
+    # backward: f(u) <= f(u+1) - 1 (- 1) and >= 0, so no token falls off the last frame. IDX[b, f(u), 0] = y_u.
     b = tl.program_id(0)
-    t = tl.program_id(1)
     tb = tl.load(TLEN + b).to(tl.int32)
-    if t >= tb:
-        return
-    ub1 = tl.load(YLEN + b).to(tl.int32) + 1
-    row0 = tl.load(OFF + b) + t * ub1
-    ll = tl.load(LL + b)
+    U = tl.load(YLEN + b).to(tl.int32)
+    ub1 = U + 1
+    row0 = tl.load(OFF + b)
     u = tl.arange(0, BU)
-    mu = u < ub1 - 1                                            # a label transition leaves every u < U
-    rows = row0 + u
-    a = tl.load(ALPHA + rows, mask=mu, other=float("-inf"))
-    bu = tl.load(BETA + rows + 1, mask=mu, other=float("-inf"))
-    lp = tl.load(LPY + rows, mask=mu, other=float("-inf"))
-    py = tl.where(mu, tl.exp(a + lp + bu - ll), 0.0)
-    lab = tl.load(LAB + rows, mask=mu, other=-1)
-    tot = tl.sum(py, 0)
-    den = tl.maximum(tot, 1.0)
-    base = (b * T + t).to(tl.int64) * K
-    pb = tl.maximum(1.0 - tot, 0.0)
-    tl.store(IDX + base, BLANK)
-    tl.store(LOGP + base, tl.where(pb > 0, tl.log(tl.maximum(pb, 1e-30)), float("-inf")))
-    rem = py
-    for k in tl.static_range(1, K):
-        mx = tl.max(rem, 0)
-        j = tl.argmax(rem, 0)
-        lj = tl.sum(tl.where(u == j, lab, 0), 0)
-        same = (lab == lj) & mu
-        v = tl.sum(tl.where(same, rem, 0.0), 0)
-        rem = tl.where(same, 0.0, rem)
-        ok = mx > 0
-        tl.store(IDX + base + k, tl.where(ok, lj, BLANK).to(tl.int32))
-        tl.store(LOGP + base + k, tl.where(ok, tl.log(tl.maximum(v / den, 1e-30)), float("-inf")))
+    mu = u < U
+    best = tl.full([BU], float("-inf"), tl.float32)
+    arg = tl.zeros([BU], dtype=tl.int32)
+    for t in range(0, tb):
+        rows = row0 + t * ub1 + u
+        v = (tl.load(ALPHA + rows, mask=mu, other=float("-inf")) + tl.load(LPY + rows, mask=mu, other=float("-inf"))
+             + tl.load(BETA + rows + 1, mask=mu, other=float("-inf")))
+        upd = v > best
+        best = tl.where(upd, v, best)
+        arg = tl.where(upd, t, arg)
+    fb = F + b.to(tl.int64) * BU
+    yb = Y + b.to(tl.int64) * YS
+    tl.store(fb + u, arg, mask=mu)
+    last = tl.full([], -1, tl.int32)
+    prev = tl.full([], -1, tl.int32)
+    for i in range(0, U):
+        yi = tl.load(yb + i).to(tl.int32)
+        ft = tl.maximum(tl.load(fb + i), last + 1 + (yi == prev).to(tl.int32))
+        tl.store(fb + i, ft)
+        last = ft
+        prev = yi
+    nxt = tb
+    nyi = tl.full([], -1, tl.int32)
+    for j in range(0, U):
+        i = U - 1 - j
+        yi = tl.load(yb + i).to(tl.int32)
+        ft = tl.maximum(tl.minimum(tl.load(fb + i), nxt - 1 - (yi == nyi).to(tl.int32)), 0)
+        tl.store(fb + i, ft)
+        nxt = ft
+        nyi = yi
+    for i in range(0, U):
+        ft = tl.load(fb + i)
+        tl.store(IDX + (b * T + ft).to(tl.int64) * K, tl.load(yb + i).to(tl.int32))
 
 
 @triton.jit
@@ -432,7 +439,7 @@ def _pack(f, g, y, tlen, ylen, p, seed, n_rows=None):
 
 class _RNNTJoint(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows, frame_k, tpb=None, tpy=None,
+    def forward(ctx, f, g, weight, bias, y, tlen, ylen, lam, p, seed, e_budget, n_rows, tpb=None, tpy=None,
                 hard_w=1.0, kd_w=0.0, kd_pf=True):
         fdt, gdt = f.dtype, g.dtype
         f = f.to(torch.bfloat16).contiguous()
@@ -453,21 +460,16 @@ class _RNNTJoint(torch.autograd.Function):
         lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
         kd = tpb is not None
         hard = not (kd and hard_w == 0.0)                       # KD only: no alpha / beta lattice at all
-        if hard or frame_k:
+        if hard:
             alpha = torch.empty(N, device=f.device, dtype=torch.float32)
-            beta = torch.empty(N, device=f.device, dtype=torch.float32) if need or frame_k else alpha
+            beta = torch.empty(N, device=f.device, dtype=torch.float32) if need else alpha
             ll = torch.empty(B, device=f.device, dtype=torch.float32)
             _lattice_kernel[(B,)](lpb, lpy, off, tlen, ylen, alpha, beta, ll,
-                                  BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need or frame_k > 0, num_warps=4)
+                                  BU=triton.next_power_of_2(g.shape[1]), BETA_ON=need, num_warps=4)
         else:
             alpha = beta = lpb
             ll = torch.zeros(B, device=f.device, dtype=torch.float32)
         nll = -(1.0 + lam) * ll                                 # NeMo's numba reports cost (1 + lambda) * -ll
-        idx = torch.full((B, T, max(frame_k, 1)), V - 1, device=f.device, dtype=torch.int32)
-        flp = torch.full((B, T, max(frame_k, 1)), _NEG, device=f.device, dtype=torch.float32)
-        if frame_k:                                             # per-frame teacher targets for a CTC head
-            _frame_targets_kernel[(B, T)](alpha, beta, lpy, ll, LAB, off, tlen, ylen, idx, flp, T, V - 1,
-                                          K=frame_k, BU=triton.next_power_of_2(g.shape[1]), num_warps=4)
         if kd:                                                  # collapsed KL(teacher || student) per node, summed
             assert tpb.shape == (N,) and tpy.shape == (N,), "teacher node log-probs must use the student's packing"
             pb, py = lpb.exp(), lpy.exp()
@@ -488,12 +490,12 @@ class _RNNTJoint(torch.autograd.Function):
             ctx.save_for_backward(f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll,
                                   tpb if kd else lpb, tpy if kd else lpy)
             ctx.cfg = (fdt, gdt, weight.dtype, bias.dtype, lam, p, seed, V, kd, float(hard_w), float(kd_w), hard, kd_pf)
-        ctx.mark_non_differentiable(nll, idx, flp, kdu)
+        ctx.mark_non_differentiable(nll, kdu)
         loss = nll.mean() if not kd and hard_w == 1.0 else hard_w * nll.mean() + kd_w * kdu.mean()
-        return loss, nll, idx, flp, kdu
+        return loss, nll, kdu
 
     @staticmethod
-    def backward(ctx, gout, _g_nll, _g_idx, _g_flp, _g_kd):
+    def backward(ctx, gout, _g_nll, _g_kd):
         f, g, X, LAB, off, tlen, ylen, Wa, E, lse, crow, tgt, blk, lpb, lpy, alpha, beta, ll, tpb, tpy = ctx.saved_tensors
         fdt, gdt, wdt, bdt, lam, p, seed, V, kd, hard_w, kd_w, hard, kd_pf = ctx.cfg
         B, T, Hd = f.shape
@@ -540,40 +542,36 @@ class _RNNTJoint(torch.autograd.Function):
                                                   T, U1, NTB, Hd, K, TB=TB, BU=BUg, BH=BH, DROP=p > 0, num_warps=8)
         dg = dgp.sum(1)
         return (df.to(fdt), dg.to(gdt), gw[:V, :Hd].to(wdt), gw[:V, Hd].to(bdt),
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0.0, dropout=0.0, seed=None,
-                    e_budget=_E_BUDGET, n_rows=None, frame_targets=0, kd=None, kd_weight=0.0, hard_weight=1.0,
-                    kd_per_frame=True):
+                    e_budget=_E_BUDGET, n_rows=None, kd=None, kd_weight=0.0, hard_weight=1.0, kd_per_frame=True):
     """NeMo joint (relu -> dropout -> linear) + warprnnt_numba loss, mean over the batch. Returns (loss, nll).
     dropout is the caller's (pass 0 in eval, like nn.Dropout outside training). n_rows: sum(f_len * (y_len + 1)) if the
     caller knows it on the host (no sync); it MUST be exact (the parity test checks the result is bitwise the same).
-    frame_targets=K > 0: also return (idx, logp), each (B, T, K): the transducer's per-frame emission distribution from
-    the lattice posteriors (blank + the top K-1 tokens, log-probs, -inf = empty), a CTC distillation target for
-    kl_div_topk -- no decoding, computed from alpha / beta the loss already has.
     kd=(tpb, tpy): a teacher transducer's per-node log P(blank), log P(next label), packed like this lattice (from
     rnnt_joint_node_logp on the same lengths / targets): loss = hard_weight * mean(nll) + kd_weight * mean(kd), kd per
     utterance = sum over every lattice node of KL over {label, blank, rest} (Panchapagesan et al. 2021, "Efficient
     knowledge distillation for RNN-transducer models"); the student's rest mass is clamped at 1e-6. Returns
-    (loss, nll, (idx, logp) or None, kd). kd_per_frame (default): kd per utterance / (U + 1) -- the node sum is ~30x
-    the nll on real batches (probe Oct 13 2026), / (U + 1) puts it on a per-frame scale like the CTC losses."""
+    (loss, nll, kd). kd_per_frame (default): kd per utterance / (U + 1) -- the node sum is ~30x the nll on real batches
+    (probe Oct 13 2026), / (U + 1) puts it on a per-frame scale like the CTC losses."""
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
     tpb, tpy = kd if kd is not None else (None, None)
-    loss, nll, idx, flp, kdu = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
-                                                float(dropout), seed, e_budget, n_rows, int(frame_targets),
-                                                tpb, tpy, float(hard_weight), float(kd_weight), bool(kd_per_frame))
-    if kd is not None:
-        return loss, nll, ((idx, flp) if frame_targets else None), kdu
-    return (loss, nll, (idx, flp)) if frame_targets else (loss, nll)
+    loss, nll, kdu = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
+                                      float(dropout), seed, e_budget, n_rows, tpb, tpy, float(hard_weight),
+                                      float(kd_weight), bool(kd_per_frame))
+    return (loss, nll, kdu) if kd is not None else (loss, nll)
 
 
 @torch.no_grad()
 def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None, frame_targets=0, blank_penalty=0.0):
     """Teacher side (no grad, no dropout): per lattice node log P(blank), log P(next label) (-inf on u = U), packed in
     rnnt_joint_loss's row order, plus the teacher's per-utterance nll and, with frame_targets=K, its per-frame (idx,
-    logp) for a CTC student. -> (lpb, lpy, nll, (idx, logp) or None). blank_penalty bp: each node's distribution as
+    logp) for a CTC student: the teacher's alignment, ONE token or blank per frame (_frame_align_kernel), slot 0 =
+    that symbol with log-prob 0, slots 1..K-1 empty (-inf). -> (lpb, lpy, nll, (idx, logp) or None).
+    blank_penalty bp: each node's distribution as
     the teacher DECODES with a blank penalty -- blank logit - bp, renormalised (p_b e^-bp / Z, p_v / Z,
     Z = 1 - p_b + p_b e^-bp) -- applied before the lattice, so the frame targets see it too."""
     f = f.to(torch.bfloat16).contiguous()
@@ -601,7 +599,11 @@ def rnnt_joint_node_logp(f, g, weight, bias, targets, f_len, y_len, n_rows=None,
     if frame_targets:
         idx = torch.full((B, T, frame_targets), V - 1, device=f.device, dtype=torch.int32)
         flp = torch.full((B, T, frame_targets), _NEG, device=f.device, dtype=torch.float32)
-        _frame_targets_kernel[(B, T)](alpha, beta, lpy, ll, LAB, off, tlen, ylen, idx, flp, T, V - 1,
-                                      K=frame_targets, BU=triton.next_power_of_2(g.shape[1]), num_warps=4)
+        flp[..., 0] = 0.0
+        y64 = targets.to(torch.int64).contiguous()
+        BU = triton.next_power_of_2(max(int(g.shape[1]) - 1, 1))
+        fbuf = torch.empty(B, BU, device=f.device, dtype=torch.int32)
+        _frame_align_kernel[(B,)](alpha, beta, lpy, off, tlen, ylen, y64, y64.stride(0), fbuf, idx, T,
+                                  K=frame_targets, BU=BU, num_warps=4)
         ft = (idx, flp)
     return lpb, lpy, -ll, ft

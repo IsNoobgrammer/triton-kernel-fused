@@ -95,7 +95,7 @@ def ours(f, g, W, b, y, tl, yl, kd, kw, hw):
     with AMP:
         out = rj.rnnt_joint_loss(f, g, W, b, y, tl, yl, kd=kd, kd_weight=kw, hard_weight=hw)
     out[0].backward()
-    return (out[0].detach(), f.grad, g.grad, W.grad, b.grad), (out[3] if kd is not None else None)
+    return (out[0].detach(), f.grad, g.grad, W.grad, b.grad), (out[2] if kd is not None else None)
 
 
 def case(name, B, T, U, H, V, blank_bias=0.0):
