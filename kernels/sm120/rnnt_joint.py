@@ -652,12 +652,15 @@ def rnnt_joint_loss(f, g, weight, bias, targets, f_len, y_len, fastemit_lambda=0
     if seed is None:
         seed = int(torch.randint(0, 2 ** 31 - 1, ()))           # CPU generator: no device sync
     tpb, tpy = kd if kd is not None else (None, None)
+    want_pos = pos is not None
+    if want_pos and float(kd_weight) == 0.0:                    # weight 0: exactly the plain loss (no pos path)
+        pos = None
     loss, nll, kdu = _RNNTJoint.apply(f, g, weight, bias, targets, f_len, y_len, float(fastemit_lambda),
                                       float(dropout), seed, e_budget, n_rows, tpb, tpy, float(hard_weight),
                                       float(kd_weight) if kd is not None else 0.0, bool(kd_per_frame), fs,
                                       float(kd_weight) if fs is not None else 0.0, pos,
                                       float(kd_weight) if pos is not None else 0.0)
-    return (loss, nll, kdu) if (kd is not None or fs is not None or pos is not None) else (loss, nll)
+    return (loss, nll, kdu) if (kd is not None or fs is not None or want_pos) else (loss, nll)
 
 
 @torch.no_grad()
