@@ -316,8 +316,8 @@ def _rowgrad_kernel(ALPHA, BETA, LPB, LPY, LL, WB, LSE, CROW, OFF, TLEN, YLEN, G
 
 
 @triton.jit
-def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, TOT, TOTH, r0, M, VS, BLANK, BR: tl.constexpr,
-                  POS: tl.constexpr):
+def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, TOT, TOTH, REST, r0, M, VS, BLANK, BR: tl.constexpr,
+                  POS: tl.constexpr, KD: tl.constexpr = False):
     # fold the one-hot terms into E so the two GEMMs give the whole gradient (no scatter, no GEMV):
     #   s E'[r, v] = s E[r, v] - gy [v = label] - gb [v = blank],  E'[y] = e^(L_y - c) - (gy / (gb + gy)) e^(lse - c)
     # computed in fp32 from the bf16 logit and rounded ONCE (NeMo rounds its fp32 dlogits to bf16 the same way)
@@ -341,8 +341,52 @@ def _fix_e_kernel(E, LAB, TGT, BLK, CROW, LSE, GB, GY, TOT, TOTH, r0, M, VS, BLA
         eb = (toth * tl.exp(tl.load(BLK + r, mask=mi, other=0.0) - c) - gb * big) * inv
     else:
         eb = tl.exp(tl.load(BLK + r, mask=mi, other=0.0) - c) - gb * inv * big
+    # Softmax Collapse fix (arXiv 2610.31642): a DOMINANT column (p > 1/2; blank on most lattice points) has
+    # tot p ~ g, so tot p - g cancels to 0 / noise once p rounds to 1 in fp32. There use the zero-sum identity
+    #   tot p_b - gb = (tot - gb) - tot (1 - p_b),   1 - p_b = p_y + p_rest   (and the same for the label),
+    # with tot - gb = gy (= gb for the label) exactly on hard rows and p_rest the exact sum of the other columns
+    # (REST, from _rest_kernel): small numbers only, nothing near 1 is subtracted.
+    pb = tl.exp(tl.load(BLK + r, mask=mi, other=0.0) - tl.load(LSE + r, mask=mi, other=0.0))
+    py = tl.where(lab >= 0, tl.exp(tl.load(TGT + r, mask=mi, other=0.0) - tl.load(LSE + r, mask=mi, other=0.0)), 0.0)
+    prest = tl.load(REST + r, mask=mi, other=0.0) * tl.exp(c - tl.load(LSE + r, mask=mi, other=0.0))
+    if POS:
+        # blank uses the hard scale toth = gb + gy; the label's scale tot = toth + sp (sp: the KD softmax part)
+        eb_z = (gy - toth * (py + prest)) * inv * big
+        ey_z = ((gb + (tot - toth)) - tot * (pb + prest)) * inv * big
+    elif KD:
+        eb_z = ((tot - gb) - tot * (py + prest)) * inv * big
+        ey_z = ((tot - gy) - tot * (pb + prest)) * inv * big
+    else:
+        eb_z = (gy - tot * (py + prest)) * inv * big
+        ey_z = (gb - tot * (pb + prest)) * inv * big
+    eb = tl.where(pb > 0.5, eb_z, eb)
+    ey = tl.where(py > 0.5, ey_z, ey)
     tl.store(erow + tl.maximum(lab, 0), ey.to(tl.bfloat16), mask=live & (lab >= 0))
     tl.store(erow + BLANK, eb.to(tl.bfloat16), mask=live)
+
+
+@triton.jit
+def _rest_kernel(E, PA, LAB, REST, M, VS, NT, BLANK, BR: tl.constexpr, BN: tl.constexpr, BT: tl.constexpr):
+    # per row: sum of E over every column but blank and label (in E's units, e^(L - c)). Tiles holding neither come
+    # from the logits pass's partials; the blank tile and the label tile are redone from the stored E (2 x BN reads)
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    mr = r < M
+    t = tl.arange(0, BT)
+    pa = tl.load(PA + r[:, None].to(tl.int64) * NT + t[None, :], mask=mr[:, None] & (t[None, :] < NT), other=0.0)
+    lab = tl.load(LAB + r, mask=mr, other=-1)
+    tb = BLANK // BN
+    tlab = tl.where(lab >= 0, lab // BN, -1)
+    base = tl.sum(tl.where((t[None, :] != tb) & (t[None, :] != tlab[:, None]), pa, 0.0), 1)
+    cc = tl.arange(0, BN)
+    erow = E + r[:, None].to(tl.int64) * VS
+    cb = tb * BN + cc
+    eb = tl.load(erow + cb[None, :], mask=mr[:, None] & (cb[None, :] < VS), other=0.0).to(tl.float32)
+    sb = tl.sum(tl.where((cb[None, :] != BLANK) & (cb[None, :] != lab[:, None]), eb, 0.0), 1)
+    cl = tl.maximum(tlab, 0)[:, None] * BN + cc[None, :]
+    ml = mr[:, None] & (tlab[:, None] >= 0) & (tlab[:, None] != tb) & (cl < VS)
+    el = tl.load(erow + cl, mask=ml, other=0.0).to(tl.float32)
+    sl = tl.sum(tl.where(cl != lab[:, None], el, 0.0), 1)
+    tl.store(REST + r, base + sb + sl, mask=mr)
 
 
 @triton.jit
@@ -408,7 +452,7 @@ def _combine_rows_kernel(PA, PB, LSE, MX, CROW, M, NT, BR: tl.constexpr, BT: tl.
         tl.store(MX + r, tl.max(tl.load(PB + off, mask=m2, other=-float("inf")), 1), mask=mr)
 
 
-def _stats(X, Wa, lab, blank, store_e, E=None):
+def _stats(X, Wa, lab, blank, store_e, E=None, rest=None):
     """logits pass -> (lse, logit[label], logit[blank], crow). With store_e, E = exp(L - crow) is filled and the
     out-of-window rows got a second, exact pass; without it crow is what that pass WOULD use (for a recompute)."""
     M, K = X.shape
@@ -437,6 +481,9 @@ def _stats(X, Wa, lab, blank, store_e, E=None):
                              BM, BN, BK, G, True, True, **ev)
         _combine_rows_kernel[cgrid](PA, PB, lse, mx, crow, M, NT, 128, triton.next_power_of_2(NT), True, True,
                                     num_warps=4)
+        if rest is not None:                                     # the other columns' mass, for _fix_e's zero-sum form
+            _rest_kernel[(triton.cdiv(M, 32),)](E, PA, lab, rest, M, VS, NT, blank, 32, BN, triton.next_power_of_2(NT),
+                                                num_warps=4)
     return lse, tgt, blk, crow
 
 
@@ -477,7 +524,9 @@ class _RNNTJoint(torch.autograd.Function):
         need = any(ctx.needs_input_grad[:4])
         store_e = need and N * V * 2 <= e_budget
         E = torch.empty(N, Wa.shape[0], device=f.device, dtype=torch.bfloat16) if store_e else None
-        lse, tgt, blk, crow = _stats(X, Wa, LAB, V - 1, store_e, E)
+        REST = torch.zeros(N, device=f.device, dtype=torch.float32) if need else None
+        lse, tgt, blk, crow = _stats(X, Wa, LAB, V - 1, store_e, E, REST if store_e else None)
+        ctx.rest = REST
         lpb = blk - lse
         lpy = torch.where(LAB >= 0, tgt - lse, _NEG)
         kd = tpb is not None
@@ -593,8 +642,8 @@ class _RNNTJoint(torch.autograd.Function):
         BR = 256
 
         def grads(Ec, i, M):
-            _fix_e_kernel[(triton.cdiv(M, BR),)](Ec, LAB, tgt, blk, crow, lse, GB, GY, TOT, TOTH, i, M, VS, V - 1, BR,
-                                                 POS=pos, num_warps=4)
+            _fix_e_kernel[(triton.cdiv(M, BR),)](Ec, LAB, tgt, blk, crow, lse, GB, GY, TOT, TOTH, ctx.rest, i, M, VS,
+                                                 V - 1, BR, POS=pos, KD=kd, num_warps=4)
             torch.mm(Ec, Wa, out_dtype=torch.float32, out=GM[i:i + M])
             # s X can sit far below bf16's normal range: XS carries it lifted by an exact power of two
             torch.addmm(gw, Ec.t(), XS[i:i + M], alpha=1.0 / _HS, out_dtype=torch.float32, out=gw)
@@ -606,7 +655,7 @@ class _RNNTJoint(torch.autograd.Function):
             Ebuf = torch.empty(min(C, N), VS, device=dev, dtype=torch.bfloat16)
             for i in range(0, N, C):
                 M = min(C, N - i)
-                _stats(X[i:i + M], Wa, LAB[i:i + M], V - 1, True, Ebuf[:M])
+                _stats(X[i:i + M], Wa, LAB[i:i + M], V - 1, True, Ebuf[:M], ctx.rest[i:i + M])
                 grads(Ebuf[:M], i, M)
         if pos:                                                 # dense dW part: - sum_(b,u) P_u (sum_t kp g X)
             Pw, pbar, _, _ = ctx.pos
