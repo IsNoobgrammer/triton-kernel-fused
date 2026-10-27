@@ -5,7 +5,7 @@ the kernel sees (L = bf16(h W^T)) and does the softmax in fp64, so the test isol
 math from the GEMM rounding. Per margin bucket it reports the relative error of the row's hidden gradient gh and of
 the loss, and the sign agreement of the label's own coefficient (gh . W[label] vs the reference).
 
-    python -m parity_check.parity_ce_softmax_fix            # GPU
+    python -m parity_check.parity_ce_softmax_fix [--kernel chunked]   # GPU
     TRITON_INTERPRET=1 python -m parity_check.parity_ce_softmax_fix --cpu   # small shapes, Triton interpreter
 """
 import argparse
@@ -48,6 +48,7 @@ def reference(x, W, lab):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--kernel", choices=["factored", "chunked"], default="factored")
     a = ap.parse_args()
     dev = "cpu" if a.cpu else "cuda"
     if a.cpu and "out_dtype" not in (torch.mm.__doc__ or ""):        # old torch: fp32-accumulate shim
@@ -58,7 +59,11 @@ def main():
     n, v, h = (256, 384, 64) if a.cpu else (4096, 81920, 512)
     x, W, lab = make(n, v, h, dev)
     xr, Wr = x.clone().requires_grad_(), W.clone().requires_grad_()
-    loss = cf.fused_linear_cross_entropy(xr, Wr, lab)
+    if a.kernel == "factored":
+        loss = cf.fused_linear_cross_entropy(xr, Wr, lab)
+    else:
+        from kernels.sm120.cross_entropy import fused_linear_cross_entropy as chunked
+        loss = chunked(xr, Wr, lab)
     loss.backward()
     nll_ref, gh_ref, gw_ref, m = reference(x, W, lab)
     gh = xr.grad.double().cpu()

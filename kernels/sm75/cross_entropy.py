@@ -8,8 +8,10 @@ _BWD_LOGITS_BUDGET = 192 * 1024 * 1024
 
 
 @triton.jit
-def _grad_logits_kernel(L_ptr, Lse_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
+def _grad_logits_kernel(L_ptr, Lse_ptr, Lso_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
                         s_lm, s_lv, BLOCK_M: tl.constexpr, BLOCK_V: tl.constexpr):
+    # Softmax Collapse fix (arXiv 2610.31642): the label's grad is -e^(lso - lse) (lso = log-sum-exp without the
+    # label), not p - 1, which rounds to 0 once p_label > 1 - 2^-24 while the other entries stay > 0.
     pid_m = tl.program_id(0)
     pid_v = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -22,37 +24,44 @@ def _grad_logits_kernel(L_ptr, Lse_ptr, Lab_ptr, Nv_ptr, M, Vv, ignore_index,
     lab = tl.load(Lab_ptr + offs_m, mask=mask_m, other=ignore_index)
     lptr = L_ptr + offs_m[:, None] * s_lm + offs_v[None, :] * s_lv
     logit = tl.load(lptr, mask=mask, other=0.0).to(tl.float32)
+    lso = tl.load(Lso_ptr + offs_m, mask=mask_m, other=0.0)
     p = tl.exp(logit - lse[:, None])
-    g = (p - tl.where(offs_v[None, :] == lab[:, None], 1.0, 0.0)) * scale
+    g = tl.where(offs_v[None, :] == lab[:, None], -tl.exp(lso - lse)[:, None], p) * scale
     g = tl.where(lab[:, None] != ignore_index, g, 0.0)
     tl.store(lptr, g.to(L_ptr.dtype.element_ty), mask=mask)
 
 
-def _grad_logits_inplace(logits, lse, labels, nv, ignore_index):
+def _grad_logits_inplace(logits, lse, lso, labels, nv, ignore_index):
     M, Vv = logits.shape
     # swept on the RTX PRO 6000 at a 6553 x 81920 chunk (bench_ce_combine.py): 1.571 ms vs 1.624 for
     # the old 8/1024/4w. Elementwise, so the config never changes a bit.
     BLOCK_M, BLOCK_V = 1, 512
     _grad_logits_kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(Vv, BLOCK_V))](
-        logits, lse, labels, nv, M, Vv, ignore_index,
+        logits, lse, lso, labels, nv, M, Vv, ignore_index,
         logits.stride(0), logits.stride(1), BLOCK_M=BLOCK_M, BLOCK_V=BLOCK_V, num_warps=8)
     return logits
 
 
 @triton.jit
-def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_index,
+def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Lso_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_index,
                        BLOCK_V: tl.constexpr):
+    # lse and lso (the same without the label) in the one pass
     row = tl.program_id(0)
     lab = tl.load(Lab_ptr + row)
     m = -float("inf")
     s = 0.0
+    so = 0.0
     for v0 in range(0, V, BLOCK_V):
         offs = v0 + tl.arange(0, BLOCK_V)
         x = tl.load(L_ptr + row * s_n + offs * s_v, mask=offs < V, other=-float("inf")).to(tl.float32)
         m_new = tl.maximum(m, tl.max(x, 0))
-        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), 0)
+        ex = tl.exp(x - m_new)
+        f = tl.exp(m - m_new)
+        s = s * f + tl.sum(ex, 0)
+        so = so * f + tl.sum(tl.where(offs == lab, 0.0, ex), 0)
         m = m_new
     tl.store(Lse_ptr + row, m + tl.log(s))
+    tl.store(Lso_ptr + row, m + tl.log(so))
     safe_lab = tl.where(lab == ignore_index, 0, lab)
     tl.store(Tgt_ptr + row, tl.load(L_ptr + row * s_n + safe_lab * s_v).to(tl.float32))
 
@@ -99,6 +108,22 @@ def _logits_lse_kernel(X, W, L, PM, PS, M, V, NT, K: tl.constexpr,
 
 
 @triton.jit
+def _label_tile_stats(L, PM, PS, LAB, V, NT, BN: tl.constexpr):
+    # one program per row: redo the label tile's (max, sum exp) without the label, so _lse_combine over the
+    # patched partials gives lso. Only BN logits per row are re-read.
+    r = tl.program_id(0)
+    lab = tl.load(LAB + r)
+    if lab >= 0:
+        t = lab // BN
+        cols = t * BN + tl.arange(0, BN)
+        x = tl.load(L + r.to(tl.int64) * V + cols, mask=cols < V, other=-float("inf")).to(tl.float32)
+        x = tl.where(cols == lab, -float("inf"), x)
+        m = tl.max(x, 0)
+        tl.store(PM + r * NT + t, m)
+        tl.store(PS + r * NT + t, tl.where(m == -float("inf"), 0.0, tl.sum(tl.exp(x - m), 0)))
+
+
+@triton.jit
 def _lse_combine(PM, PS, LSE, M, NT, BT: tl.constexpr):
     r = tl.program_id(0)
     t = tl.arange(0, BT)
@@ -110,8 +135,9 @@ def _lse_combine(PM, PS, LSE, M, NT, BT: tl.constexpr):
 
 
 
-def _logits_and_lse(hc, weight, lse_out):
-    """logits (bf16, cuBLAS-identical) and the row logsumexp into lse_out; None if not tileable."""
+def _logits_and_lse(hc, weight, lse_out, labels=None, lso_out=None):
+    """logits (bf16, cuBLAS-identical) and the row logsumexp into lse_out (and, with labels, the logsumexp without
+    the label into lso_out); None if not tileable."""
     BM, BN, BK, G, nw, ns = _LSE_CFG
     M, K = hc.shape
     V = weight.shape[0]
@@ -125,6 +151,9 @@ def _logits_and_lse(hc, weight, lse_out):
     _logits_lse_kernel[(triton.cdiv(M, BM) * NT,)](hc, weight, L, PM, PS, M, V, NT, K, BM, BN, BK, G,
                                                    num_warps=nw, num_stages=ns)
     _lse_combine[(M,)](PM, PS, lse_out, M, NT, triton.next_power_of_2(NT), num_warps=4)
+    if lso_out is not None:
+        _label_tile_stats[(M,)](L, PM, PS, labels, V, NT, BN, num_warps=4)
+        _lse_combine[(M,)](PM, PS, lso_out, M, NT, triton.next_power_of_2(NT), num_warps=4)
     return L
 
 
@@ -148,6 +177,7 @@ class _CEFusedFwdBwd(torch.autograd.Function):
         n_valid = valid.sum().clamp(min=1)
         nv = n_valid.to(torch.float32)
         lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
+        lso = torch.empty(N, device=hidden.device, dtype=torch.float32)
         tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
         gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype) if need_gh else None
         # FP32 OUTPUTS for both backward GEMMs (then one rounding). With a bf16 C, cuBLAS split-K
@@ -159,23 +189,24 @@ class _CEFusedFwdBwd(torch.autograd.Function):
         for i in range(0, N, C):
             cl = min(C, N - i)
             hc = hidden[i:i + C]
-            logits = _logits_and_lse(hc, weight, lse[i:i + C])
+            lab = labels[i:i + C]
+            logits = _logits_and_lse(hc, weight, lse[i:i + C], torch.where(lab == ignore_index, -1, lab),
+                                     lso[i:i + C])
             if logits is not None:
-                lab = labels[i:i + C]
                 safe = torch.where(lab == ignore_index, 0, lab)
                 tgt[i:i + C] = logits.gather(1, safe[:, None]).squeeze(1).float()
             else:
                 logits = torch.mm(hc, weight.t())
-                _fwd_reduce_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], tgt[i:i + C],
+                _fwd_reduce_kernel[(cl,)](logits, labels[i:i + C], lse[i:i + C], lso[i:i + C], tgt[i:i + C],
                                           cl, V, logits.stride(0), logits.stride(1), ignore_index,
                                           BLOCK_V=2048, num_warps=16)   # swept: 0.832 vs 0.901 ms/chunk
             if need_grad:
-                _grad_logits_inplace(logits, lse[i:i + C], labels[i:i + C], nv, ignore_index)
+                _grad_logits_inplace(logits, lse[i:i + C], lso[i:i + C], labels[i:i + C], nv, ignore_index)
                 if need_gh:
                     gh[i:i + C] = torch.mm(logits, weight, out_dtype=torch.float32)
                 if need_gw:
                     torch.addmm(gw, logits.t(), hc, out_dtype=torch.float32, out=gw)
-        loss = ((lse - tgt) * valid).sum() / n_valid
+        loss = (torch.nn.functional.softplus(lso - tgt) * valid).sum() / n_valid   # no 1 + e^-m formed
         ctx.save_for_backward(gh, gw)
         return loss
 
