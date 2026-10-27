@@ -135,6 +135,20 @@ def _ctc_grad(LP, Y, TLEN, ULEN, AL, BE, NLL, GOUT, G, slb, slt, slv, sy, sgb, s
         first &= tl.sum((same & (jj[None, :] < j[:, None])).to(tl.int32), 1) == 0
     lpj = tl.load(lpp + yj * slv, mask=mj, other=0.0).to(tl.float32)
     tl.store(gp + yj, ((tl.exp(lpj) - q) * go).to(G.dtype.element_ty), mask=first)
+    # Softmax Collapse fix (arXiv 2610.31642): the frame's dominant class (blank on most frames) has p ~ 1 and
+    # occupancy ~ 1, so p - occ cancels to 0 (or noise) once both round to 1. Its gradient is instead minus the sum of
+    # every other class's: (sum of the other classes' occupancies) - (sum of the other classes' p), both sums of
+    # small numbers. Rows still sum to exactly 0 in exact arithmetic, and nothing near 1 is subtracted.
+    tl.debug_barrier()
+    am = tl.argmax(tl.where(mk, lp, float("-inf")), 0)
+    p_other = tl.sum(tl.where(mk & (k != am), tl.exp(lp), 0.0), 0)
+    odd = (s % 2) == 1
+    tok = tl.where(odd, tl.load(Y + b.to(tl.int64) * sy + s // 2, mask=(s < S) & odd, other=0), BLANK)
+    lps = tl.load(lpp + tok * slv, mask=s < S, other=0.0).to(tl.float32)
+    gam = tl.where(s < S, tl.exp(tl.load(ab + s, mask=s < S, other=float("-inf"))
+                                 + tl.load(bb + s, mask=s < S, other=float("-inf")) + nll - lps), 0.0)
+    g_other = tl.sum(tl.where(tok != am, gam, 0.0), 0)
+    tl.store(gp + am, ((g_other - p_other) * go).to(G.dtype.element_ty))
 
 
 class _CTC(torch.autograd.Function):

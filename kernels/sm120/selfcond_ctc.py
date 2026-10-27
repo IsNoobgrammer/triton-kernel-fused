@@ -106,7 +106,10 @@ def _sc_grad(Z, LSE, P, A, QDQ, Y, TLEN, ULEN, AL, BE, NLL, GOUT, DZ, sy, T, V, 
     ub = tl.load(ULEN + b).to(tl.int32)
     k = tl.arange(0, BV)
     mk = k < V
-    p = tl.load(P + row * V + k, mask=mk, other=0.0).to(tl.float32)
+    # p in fp32 from z and lse for the GRADIENT (the stored bf16 p rounds p_blank to exactly 1.0 past margin ~5.5,
+    # zeroing the dominant class's gradient: Softmax Collapse at the bf16 cliff). P stays bf16 for the feedback GEMM.
+    zrow = tl.load(Z + row * V + k, mask=mk, other=float("-inf")).to(tl.float32)
+    p = tl.exp(zrow - tl.load(LSE + row))
     fb = tl.zeros([BV], tl.float32)
     if HAS_FB:                                         # d/dz of <dq, softmax(z) W_fb^T> = p * (a - <dq, q>)
         fb = tl.load(A + row * V + k, mask=mk, other=0.0).to(tl.float32) - tl.load(QDQ + row)
@@ -148,11 +151,24 @@ def _sc_grad(Z, LSE, P, A, QDQ, Y, TLEN, ULEN, AL, BE, NLL, GOUT, DZ, sy, T, V, 
             same = (yj[:, None] == yjj[None, :]) & mjj[None, :]
             q += tl.sum(tl.where(same, e[None, :], 0.0), 1)
             first &= tl.sum((same & (jj[None, :] < j[:, None])).to(tl.int32), 1) == 0
-        pj = tl.load(P + row * V + yj, mask=mj, other=0.0).to(tl.float32)
+        pj = tl.exp(tl.load(zr + yj, mask=mj, other=0.0).to(tl.float32) - lse)
         fj = tl.zeros([BU], tl.float32)
         if HAS_FB:
             fj = tl.load(A + row * V + yj, mask=mj, other=0.0).to(tl.float32) - tl.load(QDQ + row)
         tl.store(DZ + row * V + yj, (pj * (go + fj) - q * go).to(DZ.dtype.element_ty), mask=first)
+        # dominant class: minus the sum of the other classes' CTC terms (see ctc_loss.py), plus its own feedback term
+        tl.debug_barrier()
+        am = tl.argmax(tl.where(mk, zrow, float("-inf")), 0)
+        p_other = tl.sum(tl.where(mk & (k != am), p, 0.0), 0)
+        odd = (s % 2) == 1
+        tok = tl.where(odd, tl.load(Y + b.to(tl.int64) * sy + s // 2, mask=(s < S) & odd, other=0), BLANK)
+        lps = tl.load(zr + tok, mask=s < S, other=0.0).to(tl.float32) - lse
+        gam = tl.where(s < S, tl.exp(tl.load(ab + s, mask=s < S, other=float("-inf"))
+                                     + tl.load(bb + s, mask=s < S, other=float("-inf")) + nll - lps), 0.0)
+        g_other = tl.sum(tl.where(tok != am, gam, 0.0), 0)
+        p_am = tl.sum(tl.where(k == am, p, 0.0), 0)
+        f_am = tl.sum(tl.where(k == am, fb, 0.0), 0)
+        tl.store(DZ + row * V + am, ((g_other - p_other) * go + p_am * f_am).to(DZ.dtype.element_ty))
 
 
 class _Pass(torch.autograd.Function):
