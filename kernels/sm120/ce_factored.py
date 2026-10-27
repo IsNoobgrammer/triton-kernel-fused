@@ -93,26 +93,41 @@ def _logits_kernel(X, W, E, PA, PB, PO, TGT, LAB, ORDER, CROW, M, V, NT, K,
     if not EVEN_V:
         xf = tl.where(mn[None, :], xf, -float("inf"))
     mx = tl.max(xf, axis=1)
-    lab = tl.load(LAB + rm, mask=mm, other=-1)
-    hit = rn[None, :] == lab[:, None]
     if STORE_E:
+        # epilogue as before the fix; the label's column is zeroed and its tile's sum redone by _label_tile_kernel
         if FIX:
             e = tl.exp(xf - c[:, None])
         else:
             e = tl.exp(xf)                           # c = 0
-        eb = tl.where(hit, 0.0, e).to(tl.bfloat16)   # label column stored as 0 (its grad is set exactly)
-        tl.store(E + rm[:, None].to(tl.int64) * V + rn[None, :], eb, mask=mm[:, None] & mn[None, :])
-        # one reduction, as before: the sum of exactly the E the grads use (the label's e^(L - c) is added back
-        # in _combine from its logit, so lse needs no second sum)
-        tl.store(PA + rm * NT + pn, tl.sum(eb.to(tl.float32), axis=1), mask=mm)
+        tl.store(E + rm[:, None].to(tl.int64) * V + rn[None, :], e.to(tl.bfloat16),
+                 mask=mm[:, None] & mn[None, :])
+        tl.store(PA + rm * NT + pn, tl.sum(e, axis=1), mask=mm)
     else:
+        lab0 = tl.load(LAB + rm, mask=mm, other=-1)
         ex = tl.exp(xf - mx[:, None])
         tl.store(PA + rm * NT + pn, tl.sum(ex, axis=1), mask=mm)
-        tl.store(PO + rm * NT + pn, tl.sum(tl.where(hit, 0.0, ex), axis=1), mask=mm)
+        tl.store(PO + rm * NT + pn, tl.sum(tl.where(rn[None, :] == lab0[:, None], 0.0, ex), axis=1), mask=mm)
     if not FIX:
         tl.store(PB + rm * NT + pn, mx, mask=mm)
+        lab = tl.load(LAB + rm, mask=mm, other=-1)
+        hit = rn[None, :] == lab[:, None]
         tl.store(TGT + rm, tl.sum(tl.where(hit, xf, 0.0), axis=1),
                  mask=mm & (lab >= pn * BN) & (lab < pn * BN + BN))
+
+
+@triton.jit
+def _label_tile_kernel(E, PA, LAB, V, NT, BN: tl.constexpr):
+    # one program per row: E[r, label] = 0 and the label tile's partial sum redone without it (from the stored bf16
+    # E, BN entries). Every other tile is untouched, so the GEMM epilogue keeps its pre-fix cost.
+    r = tl.program_id(0)
+    lab = tl.load(LAB + r)
+    if lab >= 0:
+        t = lab // BN
+        cols = t * BN + tl.arange(0, BN)
+        ptr = E + r.to(tl.int64) * V + cols
+        ev = tl.load(ptr, mask=cols < V, other=0.0).to(tl.float32)
+        tl.store(PA + r * NT + t, tl.sum(tl.where(cols == lab, 0.0, ev), 0))
+        tl.store(E + r.to(tl.int64) * V + lab, tl.zeros((), E.dtype.element_ty))
 
 
 @triton.jit
@@ -224,6 +239,7 @@ def _stats(hc, W, lab, store_e, E=None):
     crow = torch.where((mx < _LO) | (mx > _HI), mx, torch.zeros_like(mx))
     order = torch.argsort((crow != 0).to(torch.int8), descending=True, stable=True)
     _logits_kernel[grid](hc, W, E, PA, PB, PO, tgt, lab, order, crow, M, V, NT, K, BM, BN, BK, G, True, True, **ev)
+    _label_tile_kernel[(M,)](E, PA, lab, V, NT, BN, num_warps=1)
     _combine_kernel[(M,)](PA, PB, PO, tgt, lab, lse, lso, prs, mx, crow, NT, triton.next_power_of_2(NT), True, True,
                           num_warps=4)
     return lse, lso, prs, tgt, crow
