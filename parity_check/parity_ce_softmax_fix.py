@@ -26,7 +26,10 @@ def make(n, v, h, dev, seed=0):
 
 
 def reference(x, W, lab):
-    L = (x.float() @ W.float().t()).to(torch.bfloat16).double()     # the bf16 logits every path sees
+    # the bf16 logits every path sees, rounded by the same device GEMM (a CPU matmul rounds a few entries one bf16
+    # ulp apart, which at logit 35 is 0.25 nats = a 28% change in e^-m)
+    L = (x @ W.t()).double().cpu()
+    W, lab = W.cpu(), lab.cpu()
     n = L.shape[0]
     lse = torch.logsumexp(L, 1)
     others = L.clone()
@@ -56,7 +59,7 @@ def main():
     xr, Wr = x.clone().requires_grad_(), W.clone().requires_grad_()
     loss = cf.fused_linear_cross_entropy(xr, Wr, lab)
     loss.backward()
-    nll_ref, gh_ref, m = reference(x.cpu(), W.cpu(), lab.cpu())
+    nll_ref, gh_ref, m = reference(x, W, lab)
     gh = xr.grad.double().cpu()
     Wd = W.double().cpu()
     lab_c = lab.cpu()
