@@ -9,8 +9,9 @@ Two teacher forms:
 Per row i (s' = s / T, t' = t / T, q = softmax(s'), p = softmax(t')):
   dense  KL_i = sum_v p_v (log p_v - log q_v) = a / z_t - lse_t + lse_s,   a = sum_v e^(t'_v - m) (t'_v - s'_v)
          dKL_i / ds_v = (q_v - p_v) / T
-  top-k  KL_i = sum_k p_k (log p_k - log q_k) + r (log r - log q_rest),     q_rest = 1 - sum_k q_k
+  top-k  KL_i = sum_k p_k (log p_k - log q_k) + r (log r - log q_rest),     q_rest = mass outside the top-k
          dKL_i / ds_v = (q_v - p_v) / T for v in the top-k,  q_v (1 - r / q_rest) / T otherwise
+         (log q_rest = log-sum-exp of the non-top-k logits - lse, r = -expm1(lse_k log p_k): no 1 - sum, see _topk_fwd)
          (backward: the rest value written for the whole row, then the k entries overwritten after a barrier)
 Forward: one pass over the row (online log-sum-exps, rescaled accumulator), per-row loss (N,) fp32 and the student /
 teacher lse saved; nothing N x V is stored. Backward: recompute q (and p) from the saved lse, write ds in s's dtype,
@@ -32,7 +33,7 @@ def _bv(V):
 
 
 @triton.jit
-def _dense_fwd(S, Tl, LOSS, LSES, LSET, V, ss, st, inv_T, BV: tl.constexpr):
+def _dense_fwd(S, Tl, LOSS, LSES, LSET, M1, V, ss, st, inv_T, BV: tl.constexpr):
     i = tl.program_id(0).to(tl.int64)
     sr, tr = S + i * ss, Tl + i * st
     m_s = tl.full((), float("-inf"), tl.float32)
@@ -61,20 +62,45 @@ def _dense_fwd(S, Tl, LOSS, LSES, LSET, V, ss, st, inv_T, BV: tl.constexpr):
     tl.store(LOSS + i, acc / z_t - lse_t + lse_s)
     tl.store(LSES + i, lse_s)
     tl.store(LSET + i, lse_t)
+    tl.store(M1 + i, -acc / z_t)                     # sum_v p_v (s'_v - t'_v)
 
 
 @triton.jit
-def _dense_bwd(S, Tl, LSES, LSET, G, DS, V, ss, st, sd, inv_T, BV: tl.constexpr):
+def _dense_bwd(S, Tl, LSES, LSET, M1, G, DS, V, ss, st, sd, inv_T, BV: tl.constexpr):
+    # Softmax Cancellation fix (arXiv 2610.31642, eq. 9): q - p from the logit difference in log space, never as
+    # exp(s - lse_s) - exp(t - lse_t) (two separately rounded probabilities: a noise floor, and a non-zero grad at
+    # s == t). With delta = s' - t', d = delta - sum p delta, log(q/p) = d - log1p(sum p expm1(d)), u = p expm1(.);
+    # then g = u - q sum(u) removes the last drift from sum(g) = 0. Exactly 0 when s == t.
     i = tl.program_id(0).to(tl.int64)
     lse_s = tl.load(LSES + i)
     lse_t = tl.load(LSET + i)
+    m1 = tl.load(M1 + i)
     g = tl.load(G + i).to(tl.float32) * inv_T
+    c = tl.zeros((), tl.float32)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
         mk = v < V
         s = tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         t = tl.load(Tl + i * st + v, mask=mk, other=0.0).to(tl.float32) * inv_T
-        d = (tl.exp(s - lse_s) - tl.exp(t - lse_t)) * g
+        pv = tl.where(mk, tl.exp(t - lse_t), 0.0)
+        c += tl.sum(pv * tl.math.expm1((s - t) - m1), 0)
+    l1 = tl.math.log1p(tl.maximum(c, 0.0))
+    su = tl.zeros((), tl.float32)
+    for v0 in range(0, V, BV):
+        v = v0 + tl.arange(0, BV)
+        mk = v < V
+        s = tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T
+        t = tl.load(Tl + i * st + v, mask=mk, other=0.0).to(tl.float32) * inv_T
+        pv = tl.where(mk, tl.exp(t - lse_t), 0.0)
+        su += tl.sum(pv * tl.math.expm1((s - t) - m1 - l1), 0)
+    for v0 in range(0, V, BV):
+        v = v0 + tl.arange(0, BV)
+        mk = v < V
+        s = tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T
+        t = tl.load(Tl + i * st + v, mask=mk, other=0.0).to(tl.float32) * inv_T
+        pv = tl.exp(t - lse_t)
+        u = pv * tl.math.expm1((s - t) - m1 - l1)
+        d = (u - tl.exp(s - lse_s) * su) * g
         tl.store(DS + i * sd + v, d.to(DS.dtype.element_ty), mask=mk)
 
 
@@ -84,20 +110,20 @@ class _Dense(torch.autograd.Function):
         assert s.shape == t.shape and s.dim() == 2 and s.stride(1) == 1 and t.stride(1) == 1
         N, V = s.shape
         loss = torch.empty(N, device=s.device, dtype=torch.float32)
-        lse_s, lse_t = torch.empty_like(loss), torch.empty_like(loss)
+        lse_s, lse_t, m1 = torch.empty_like(loss), torch.empty_like(loss), torch.empty_like(loss)
         if N:
-            _dense_fwd[(N,)](s, t, loss, lse_s, lse_t, V, s.stride(0), t.stride(0), 1.0 / T, BV=_bv(V), num_warps=8)
-        ctx.save_for_backward(s, t, lse_s, lse_t)
+            _dense_fwd[(N,)](s, t, loss, lse_s, lse_t, m1, V, s.stride(0), t.stride(0), 1.0 / T, BV=_bv(V), num_warps=8)
+        ctx.save_for_backward(s, t, lse_s, lse_t, m1)
         ctx.T = T
         return loss
 
     @staticmethod
     def backward(ctx, g):
-        s, t, lse_s, lse_t = ctx.saved_tensors
+        s, t, lse_s, lse_t, m1 = ctx.saved_tensors
         N, V = s.shape
         ds = torch.empty_like(s)
         if N:
-            _dense_bwd[(N,)](s, t, lse_s, lse_t, g.contiguous(), ds, V, s.stride(0), t.stride(0), ds.stride(0),
+            _dense_bwd[(N,)](s, t, lse_s, lse_t, m1, g.contiguous(), ds, V, s.stride(0), t.stride(0), ds.stride(0),
                              1.0 / ctx.T, BV=_bv(V), num_warps=8)
         return ds, None, None
 
@@ -132,14 +158,26 @@ def _topk_fwd(S, IDX, LP, LOSS, LSES, QREST, V, ss, inv_T, K: tl.constexpr, KP: 
     sk = tl.load(sr + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T
     lq = sk - lse_s                                                     # student log q at the teacher's top-k
     p = tl.where(mkk, tl.exp(lp), 0.0)
-    q = tl.where(mkk, tl.exp(lq), 0.0)
-    r = tl.maximum(1.0 - tl.sum(p, 0), 0.0)
-    q_rest = tl.maximum(1.0 - tl.sum(q, 0), 1e-30)
+    # Softmax Collapse / Cancellation fix (arXiv 2610.31642): the rest masses in LOG space. q_rest = 1 - sum q
+    # cancels (and was clamped to 1e-30, so 1 - r / q_rest blew up to ~-1e23 whenever sum q rounded to 1 while the
+    # teacher kept rest mass): log q_rest is instead the log-sum-exp of the non-top-k logits, r = -expm1(lse(lp)).
+    ixm = tl.where(mkk, ix, -1)
+    z_r = tl.zeros((), tl.float32)
+    for v0 in range(0, V, 512):                                       # 512 x KP membership tile, not BV x KP
+        v = v0 + tl.arange(0, 512)
+        mk = v < V
+        s = tl.load(sr + v, mask=mk, other=0.0).to(tl.float32) * inv_T
+        inside = tl.sum((v[:, None] == ixm[None, :]).to(tl.int32), 1) > 0
+        z_r += tl.sum(tl.where(mk & ~inside, tl.exp(s - m_s), 0.0), 0)
+    lqr = m_s + tl.log(z_r) - lse_s                                     # log q_rest (-inf if the top-k is all of V)
+    mp = tl.max(tl.where(mkk, lp, float("-inf")), 0)
+    lsep = mp + tl.log(tl.sum(tl.where(mkk, tl.exp(lp - mp), 0.0), 0))
+    r = tl.maximum(-tl.math.expm1(tl.minimum(lsep, 0.0)), 0.0)
     kl = tl.sum(tl.where(mkk, p * (lp - lq), 0.0), 0)
-    kl = kl + tl.where(r > 0, r * (tl.log(tl.maximum(r, 1e-30)) - tl.log(q_rest)), 0.0)
+    kl = kl + tl.where(r > 0, r * (tl.log(tl.maximum(r, 1e-30)) - lqr), 0.0)
     tl.store(LOSS + i, kl)
     tl.store(LSES + i, lse_s)
-    tl.store(QREST + i, q_rest)
+    tl.store(QREST + i, lqr)
 
 
 @triton.jit
@@ -148,14 +186,21 @@ def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr,
     # overwritten with q_v - p_v (any k; no v x k membership tile)
     i = tl.program_id(0).to(tl.int64)
     lse_s = tl.load(LSES + i)
-    q_rest = tl.load(QREST + i)
+    lqr = tl.load(QREST + i)                                          # log q_rest (see _topk_fwd)
     g = tl.load(G + i).to(tl.float32) * inv_T
-    psum = tl.zeros((), tl.float32)
+    mp = tl.full((), float("-inf"), tl.float32)
+    zp = tl.zeros((), tl.float32)
     for k0 in range(0, K, KB):
         k = k0 + tl.arange(0, KB)
-        psum += tl.sum(tl.exp(tl.load(LP + i * K + k, mask=k < K, other=float("-inf")).to(tl.float32)), 0)
-    r = tl.maximum(1.0 - psum, 0.0)
-    rest = 1.0 - r / q_rest
+        lpk = tl.load(LP + i * K + k, mask=k < K, other=float("-inf")).to(tl.float32)
+        nm = tl.maximum(mp, tl.max(lpk, 0))
+        nms = tl.where(nm == float("-inf"), 0.0, nm)
+        zp = zp * tl.exp(mp - nms) + tl.sum(tl.exp(lpk - nms), 0)
+        mp = nm
+    lsep = mp + tl.log(zp)
+    r = tl.maximum(-tl.math.expm1(tl.minimum(lsep, 0.0)), 0.0)
+    # 1 - r / q_rest = -expm1(log r - log q_rest); no rest mass on either side -> the plain softmax grad
+    rest = tl.where(r > 0, -tl.math.expm1(tl.log(tl.maximum(r, 1e-38)) - lqr), 1.0)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
         mk = v < V
@@ -169,8 +214,8 @@ def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr,
         lpk = tl.load(LP + i * K + k, mask=mkk, other=float("-inf")).to(tl.float32)
         mkk = mkk & (lpk > float("-inf"))                             # empty slots must not overwrite a real one
         pv = tl.exp(lpk)
-        q = tl.exp(tl.load(S + i * ss + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T - lse_s)
-        tl.store(DS + i * sd + ix, ((q - pv) * g).to(DS.dtype.element_ty), mask=mkk)
+        lq = tl.load(S + i * ss + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T - lse_s
+        tl.store(DS + i * sd + ix, (pv * tl.math.expm1(lq - lpk) * g).to(DS.dtype.element_ty), mask=mkk)   # q - p
 
 
 class _TopK(torch.autograd.Function):
