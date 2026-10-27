@@ -5,9 +5,15 @@ it rewrites the (C, V) logits into dL = softmax - onehot (2 GB r+w per 1 GB chun
 gradient GEMMs. Here the logits GEMM epilogue stores E = exp(L - c) instead of L (bf16 has fp32's
 exponent range), with c a per-row constant (0 unless the row is out of window). Then, per row r:
 
-    dL    = s_r * E - w_r * onehot,          s_r = exp(c_r - lse_r) * w_r
-    gh    = s * (E @ W) - w * W[label]                     cuBLAS mm + a (C, H) row epilogue
-    gw   += E^T @ (s * h) - scatter(label, w * h)          cuBLAS addmm on a pre-scaled (C, H) h
+    dL    = s_r * E + a_r * onehot,          s_r = exp(c_r - lse_r) * w_r,   a_r = -s_r * sum_{j != label} E_j
+    gh    = s * (E @ W) + a * W[label]                     cuBLAS mm + a (C, H) row epilogue
+    gw   += E^T @ (s * h) + scatter(label, a * h)          cuBLAS addmm on a pre-scaled (C, H) h
+
+Softmax Collapse fix (Barron et al., arXiv 2610.31642): E's label column is stored as 0 and the label's gradient is
+a_r = -(sum of the row's other entries) in fp32, never s * E_label - w (= q - 1, which cancels to bf16 rounding noise
+once q > ~0.998: wrong sign, up to 1000x too large). Every row of dL sums to exactly 0 over the E actually used. The
+loss is softplus(lse_others - logit[label]) (log-sum-exp with the label left out), not lse - logit[label], which
+rounds to 0 past the fp32 cliff.
 
 w_r is the per-row loss weight (valid / n_valid for plain CE; head_weight_k / n_valid_k for MTP heads
 concatenated into one call). No grad pass, all three big GEMMs stay cuBLAS, no atomics anywhere.
@@ -40,7 +46,7 @@ def _lcfg(K):
 
 
 @triton.jit
-def _logits_kernel(X, W, E, PA, PB, TGT, LAB, ORDER, CROW, M, V, NT, K,
+def _logits_kernel(X, W, E, PA, PB, PO, TGT, LAB, ORDER, CROW, M, V, NT, K,
                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP: tl.constexpr,
                    STORE_E: tl.constexpr, FIX: tl.constexpr, EVEN_K: tl.constexpr, EVEN_V: tl.constexpr):
     # FIX: second pass over the out-of-window rows only (sorted first by ORDER), E = exp(L - c_row).
@@ -88,6 +94,7 @@ def _logits_kernel(X, W, E, PA, PB, TGT, LAB, ORDER, CROW, M, V, NT, K,
         xf = tl.where(mn[None, :], xf, -float("inf"))
     mx = tl.max(xf, axis=1)
     if STORE_E:
+        # epilogue as before the fix; the label's column is zeroed and its tile's sum redone by _label_tile_kernel
         if FIX:
             e = tl.exp(xf - c[:, None])
         else:
@@ -96,7 +103,10 @@ def _logits_kernel(X, W, E, PA, PB, TGT, LAB, ORDER, CROW, M, V, NT, K,
                  mask=mm[:, None] & mn[None, :])
         tl.store(PA + rm * NT + pn, tl.sum(e, axis=1), mask=mm)
     else:
-        tl.store(PA + rm * NT + pn, tl.sum(tl.exp(xf - mx[:, None]), axis=1), mask=mm)
+        lab0 = tl.load(LAB + rm, mask=mm, other=-1)
+        ex = tl.exp(xf - mx[:, None])
+        tl.store(PA + rm * NT + pn, tl.sum(ex, axis=1), mask=mm)
+        tl.store(PO + rm * NT + pn, tl.sum(tl.where(rn[None, :] == lab0[:, None], 0.0, ex), axis=1), mask=mm)
     if not FIX:
         tl.store(PB + rm * NT + pn, mx, mask=mm)
         lab = tl.load(LAB + rm, mask=mm, other=-1)
@@ -106,20 +116,46 @@ def _logits_kernel(X, W, E, PA, PB, TGT, LAB, ORDER, CROW, M, V, NT, K,
 
 
 @triton.jit
-def _combine_kernel(PA, PB, LSE, MX, CROW, NT, BT: tl.constexpr, STORE_E: tl.constexpr, FIX: tl.constexpr):
+def _label_tile_kernel(E, PA, LAB, V, NT, BN: tl.constexpr):
+    # one program per row: E[r, label] = 0 and the label tile's partial sum redone without it (from the stored bf16
+    # E, BN entries). Every other tile is untouched, so the GEMM epilogue keeps its pre-fix cost.
+    r = tl.program_id(0)
+    lab = tl.load(LAB + r)
+    if lab >= 0:
+        t = lab // BN
+        cols = t * BN + tl.arange(0, BN)
+        ptr = E + r.to(tl.int64) * V + cols
+        ev = tl.load(ptr, mask=cols < V, other=0.0).to(tl.float32)
+        tl.store(PA + r * NT + t, tl.sum(tl.where(cols == lab, 0.0, ev), 0))
+        tl.store(E + r.to(tl.int64) * V + lab, tl.zeros((), E.dtype.element_ty))
+
+
+@triton.jit
+def _combine_kernel(PA, PB, PO, TGT, LAB, LSE, LSO, PRS, MX, CROW, NT, BT: tl.constexpr, STORE_E: tl.constexpr,
+                    FIX: tl.constexpr):
+    # LSE: log-sum-exp of the row; LSO: the same with the label left out; PRS: sum of the stored (bf16) E
     r = tl.program_id(0)
     t = tl.arange(0, BT)
     mk = t < NT
     a = tl.load(PA + r * NT + t, mask=mk, other=0.0)
     if STORE_E:
         if FIX:
-            tl.store(LSE + r, tl.load(CROW + r) + tl.log(tl.sum(a, 0)))
+            c = tl.load(CROW + r)
         else:
-            tl.store(LSE + r, tl.log(tl.sum(a, 0)))
+            c = 0.0
+        prs = tl.sum(a, 0)
+        lab = tl.load(LAB + r)
+        et = tl.where(lab >= 0, tl.exp(tl.load(TGT + r) - c), 0.0)    # ignored rows: label not in the row
+        tl.store(LSE + r, c + tl.log(prs + et))
+        tl.store(LSO + r, c + tl.log(prs))
+        tl.store(PRS + r, prs)
     else:
+        o = tl.load(PO + r * NT + t, mask=mk, other=0.0)
         b = tl.load(PB + r * NT + t, mask=mk, other=-float("inf"))
         mx = tl.max(b, 0)
-        tl.store(LSE + r, mx + tl.log(tl.sum(a * tl.exp(b - mx), 0)))
+        f = tl.exp(b - mx)
+        tl.store(LSE + r, mx + tl.log(tl.sum(a * f, 0)))
+        tl.store(LSO + r, mx + tl.log(tl.sum(o * f, 0)))
     if not FIX:
         tl.store(MX + r, tl.max(tl.load(PB + r * NT + t, mask=mk, other=-float("inf")), 0))
 
@@ -137,18 +173,18 @@ def _scale_rows_kernel(X, S, OUT, H, HS, BH: tl.constexpr):
 
 @triton.jit
 def _gh_epi_kernel(G, S, W, SAFE, WR, OUT, H, BH: tl.constexpr):
-    # gh = bf16(G * s - w * W[label]); G = E @ W in fp32 from cuBLAS
+    # gh = bf16(G * s + a * W[label]); G = E @ W in fp32 from cuBLAS, WR = a (the label's exact coefficient)
     r = tl.program_id(0)
     cols = tl.program_id(1) * BH + tl.arange(0, BH)
     mc = cols < H
     g = tl.load(G + r.to(tl.int64) * H + cols, mask=mc, other=0.0) * tl.load(S + r)
     wrow = tl.load(W + tl.load(SAFE + r).to(tl.int64) * H + cols, mask=mc, other=0.0).to(tl.float32)
-    tl.store(OUT + r.to(tl.int64) * H + cols, (g - wrow * tl.load(WR + r)).to(OUT.dtype.element_ty), mask=mc)
+    tl.store(OUT + r.to(tl.int64) * H + cols, (g + wrow * tl.load(WR + r)).to(OUT.dtype.element_ty), mask=mc)
 
 
 @triton.jit
 def _scatter_kernel(GW, LABS, ROWS, X, WR, n, V, H, BH: tl.constexpr):
-    # gw[label] -= sum of its rows' w*h (h read in bf16, w per row). Labels sorted (stable); the
+    # gw[label] += sum of its rows' a*h (h read in bf16, a per row). Labels sorted (stable); the
     # first row of each run sums the run in order. Deterministic, no atomics. Ignored rows carry the sentinel label V.
     i = tl.program_id(0)
     hb = tl.program_id(1)
@@ -166,7 +202,7 @@ def _scatter_kernel(GW, LABS, ROWS, X, WR, n, V, H, BH: tl.constexpr):
             j += 1
             cur = tl.load(LABS + j, mask=j < n, other=-1)
         ptr = GW + lab.to(tl.int64) * H + cols
-        tl.store(ptr, tl.load(ptr, mask=mc) - acc, mask=mc)
+        tl.store(ptr, tl.load(ptr, mask=mc) + acc, mask=mc)
 
 
 def _chunk(N, V, budget):
@@ -176,7 +212,8 @@ def _chunk(N, V, budget):
 
 
 def _stats(hc, W, lab, store_e, E=None):
-    """logits pass for one chunk -> (lse, tgt, crow). With store_e, E = exp(L - crow) is filled and
+    """logits pass for one chunk -> (lse, lso, prs, tgt, crow): row log-sum-exp, the same without the label, the
+    sum of the stored E (label column 0; None without store_e) and the label logit. With store_e, E = exp(L - crow) is filled and
     out-of-window rows got a second, exact pass (crow = their max logit; 0 elsewhere)."""
     M, K = hc.shape
     V = W.shape[0]
@@ -185,21 +222,32 @@ def _stats(hc, W, lab, store_e, E=None):
     dev = hc.device
     PA = torch.empty(M, NT, device=dev, dtype=torch.float32)
     PB = torch.empty(M, NT, device=dev, dtype=torch.float32)
+    PO = PA if store_e else torch.empty(M, NT, device=dev, dtype=torch.float32)
     tgt = torch.zeros(M, device=dev, dtype=torch.float32)
     lse = torch.empty(M, device=dev, dtype=torch.float32)
+    lso = torch.empty(M, device=dev, dtype=torch.float32)
+    prs = torch.empty(M, device=dev, dtype=torch.float32) if store_e else lso
     mx = torch.empty(M, device=dev, dtype=torch.float32)
     grid = (triton.cdiv(M, BM) * NT,)
     ev = dict(EVEN_K=K % BK == 0, EVEN_V=V % BN == 0, num_warps=nw, num_stages=ns)
-    _logits_kernel[grid](hc, W, E if store_e else PA, PA, PB, tgt, lab, lab, PA, M, V, NT, K,
+    _logits_kernel[grid](hc, W, E if store_e else PA, PA, PB, PO, tgt, lab, lab, PA, M, V, NT, K,
                          BM, BN, BK, G, store_e, False, **ev)
-    _combine_kernel[(M,)](PA, PB, lse, mx, PA, NT, triton.next_power_of_2(NT), store_e, False, num_warps=4)
+    _combine_kernel[(M,)](PA, PB, PO, tgt, lab, lse, lso, prs, mx, PA, NT, triton.next_power_of_2(NT), store_e,
+                          False, num_warps=4)
     if not store_e:
-        return lse, tgt, None
+        return lse, lso, None, tgt, None
     crow = torch.where((mx < _LO) | (mx > _HI), mx, torch.zeros_like(mx))
     order = torch.argsort((crow != 0).to(torch.int8), descending=True, stable=True)
-    _logits_kernel[grid](hc, W, E, PA, PB, tgt, lab, order, crow, M, V, NT, K, BM, BN, BK, G, True, True, **ev)
-    _combine_kernel[(M,)](PA, PB, lse, mx, crow, NT, triton.next_power_of_2(NT), True, True, num_warps=4)
-    return lse, tgt, crow
+    _logits_kernel[grid](hc, W, E, PA, PB, PO, tgt, lab, order, crow, M, V, NT, K, BM, BN, BK, G, True, True, **ev)
+    _label_tile_kernel[(M,)](E, PA, lab, V, NT, BN, num_warps=1)
+    _combine_kernel[(M,)](PA, PB, PO, tgt, lab, lse, lso, prs, mx, crow, NT, triton.next_power_of_2(NT), True, True,
+                          num_warps=4)
+    return lse, lso, prs, tgt, crow
+
+
+def _nll(lso, tgt):
+    # -log softmax(L)[label] = log(1 + e^(lso - tgt)): 1 + e^-m is never formed, exact past every precision cliff
+    return torch.nn.functional.softplus(lso - tgt)
 
 
 def _nll_nograd(hidden, weight, labels, budget):
@@ -210,8 +258,8 @@ def _nll_nograd(hidden, weight, labels, budget):
     lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
     tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
     for i in range(0, N, rows):
-        lse[i:i + rows], tgt[i:i + rows], _ = _stats(hidden[i:i + rows], weight, labels[i:i + rows], False)
-    return lse - tgt
+        _, lse[i:i + rows], _, tgt[i:i + rows], _ = _stats(hidden[i:i + rows], weight, labels[i:i + rows], False)
+    return _nll(lse, tgt)                                                  # lse holds the label-free lse here
 
 
 class _FactoredCE(torch.autograd.Function):
@@ -234,22 +282,23 @@ class _FactoredCE(torch.autograd.Function):
             hc, lab, w = hidden[i:i + C], labels[i:i + C], rw[i:i + C]
             M = hc.shape[0]
             Ec = E[:M]
-            lse, tgt, crow = _stats(hc, weight, lab, True, Ec)
-            nll[i:i + M] = lse - tgt
+            lse, lso, prs, tgt, crow = _stats(hc, weight, lab, True, Ec)
+            nll[i:i + M] = _nll(lso, tgt)
             s = torch.exp(crow - lse) * w
+            a = -s * prs                                   # the label's dL: minus the row's other entries
             valid = lab != ignore_index
             safe = torch.where(valid, lab, 0)
             BH = min(1024, triton.next_power_of_2(H))
             rg = (M, triton.cdiv(H, BH))
             g = torch.mm(Ec, weight, out_dtype=torch.float32)
-            _gh_epi_kernel[rg](g, s, weight, safe, w, gh[i:i + M], H, BH, num_warps=4)
+            _gh_epi_kernel[rg](g, s, weight, safe, a, gh[i:i + M], H, BH, num_warps=4)
             # s*h can sit far below bf16's normal range (s ~ e^-lse / n_valid): lift it by an exact
             # power of two and take it back through cuBLAS alpha
             hs = torch.empty_like(hc)
             _scale_rows_kernel[rg](hc, s, hs, H, _HS, BH, num_warps=4)
             torch.addmm(gw, Ec.t(), hs, alpha=1.0 / _HS, out_dtype=torch.float32, out=gw)
             labs, rows = torch.sort(torch.where(valid, lab, V), stable=True)
-            _scatter_kernel[rg](gw, labs, rows, hc, w, M, V, H, BH, num_warps=4)
+            _scatter_kernel[rg](gw, labs, rows, hc, a, M, V, H, BH, num_warps=4)
         ctx.save_for_backward(gh, gw)
         ctx.wdt = wdt
         ctx.mark_non_differentiable(nll)
