@@ -24,6 +24,7 @@ Math in fp32; deterministic (one program per row, no atomics). The Hinton T^2 fa
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 __all__ = ["kl_div_dense", "kl_div_topk"]
 
@@ -83,8 +84,8 @@ def _dense_bwd(S, Tl, LSES, LSET, M1, G, DS, V, ss, st, sd, inv_T, BV: tl.conste
         s = tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         t = tl.load(Tl + i * st + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         pv = tl.where(mk, tl.exp(t - lse_t), 0.0)
-        c += tl.sum(pv * tl.math.expm1((s - t) - m1), 0)
-    l1 = tl.math.log1p(tl.maximum(c, 0.0))
+        c += tl.sum(pv * libdevice.expm1((s - t) - m1), 0)
+    l1 = libdevice.log1p(tl.maximum(c, 0.0))
     su = tl.zeros((), tl.float32)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
@@ -92,14 +93,14 @@ def _dense_bwd(S, Tl, LSES, LSET, M1, G, DS, V, ss, st, sd, inv_T, BV: tl.conste
         s = tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         t = tl.load(Tl + i * st + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         pv = tl.where(mk, tl.exp(t - lse_t), 0.0)
-        su += tl.sum(pv * tl.math.expm1((s - t) - m1 - l1), 0)
+        su += tl.sum(pv * libdevice.expm1((s - t) - m1 - l1), 0)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
         mk = v < V
         s = tl.load(S + i * ss + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         t = tl.load(Tl + i * st + v, mask=mk, other=0.0).to(tl.float32) * inv_T
         pv = tl.exp(t - lse_t)
-        u = pv * tl.math.expm1((s - t) - m1 - l1)
+        u = pv * libdevice.expm1((s - t) - m1 - l1)
         d = (u - tl.exp(s - lse_s) * su) * g
         tl.store(DS + i * sd + v, d.to(DS.dtype.element_ty), mask=mk)
 
@@ -172,7 +173,7 @@ def _topk_fwd(S, IDX, LP, LOSS, LSES, QREST, V, ss, inv_T, K: tl.constexpr, KP: 
     lqr = m_s + tl.log(z_r) - lse_s                                     # log q_rest (-inf if the top-k is all of V)
     mp = tl.max(tl.where(mkk, lp, float("-inf")), 0)
     lsep = mp + tl.log(tl.sum(tl.where(mkk, tl.exp(lp - mp), 0.0), 0))
-    r = tl.maximum(-tl.math.expm1(tl.minimum(lsep, 0.0)), 0.0)
+    r = tl.maximum(-libdevice.expm1(tl.minimum(lsep, 0.0)), 0.0)
     kl = tl.sum(tl.where(mkk, p * (lp - lq), 0.0), 0)
     kl = kl + tl.where(r > 0, r * (tl.log(tl.maximum(r, 1e-30)) - lqr), 0.0)
     tl.store(LOSS + i, kl)
@@ -198,9 +199,9 @@ def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr,
         zp = zp * tl.exp(mp - nms) + tl.sum(tl.exp(lpk - nms), 0)
         mp = nm
     lsep = mp + tl.log(zp)
-    r = tl.maximum(-tl.math.expm1(tl.minimum(lsep, 0.0)), 0.0)
+    r = tl.maximum(-libdevice.expm1(tl.minimum(lsep, 0.0)), 0.0)
     # 1 - r / q_rest = -expm1(log r - log q_rest); no rest mass on either side -> the plain softmax grad
-    rest = tl.where(r > 0, -tl.math.expm1(tl.log(tl.maximum(r, 1e-38)) - lqr), 1.0)
+    rest = tl.where(r > 0, -libdevice.expm1(tl.log(tl.maximum(r, 1e-38)) - lqr), 1.0)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
         mk = v < V
@@ -215,7 +216,7 @@ def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr,
         mkk = mkk & (lpk > float("-inf"))                             # empty slots must not overwrite a real one
         pv = tl.exp(lpk)
         lq = tl.load(S + i * ss + ix, mask=mkk, other=0.0).to(tl.float32) * inv_T - lse_s
-        tl.store(DS + i * sd + ix, (pv * tl.math.expm1(lq - lpk) * g).to(DS.dtype.element_ty), mask=mkk)   # q - p
+        tl.store(DS + i * sd + ix, (pv * libdevice.expm1(lq - lpk) * g).to(DS.dtype.element_ty), mask=mkk)   # q - p
 
 
 class _TopK(torch.autograd.Function):
