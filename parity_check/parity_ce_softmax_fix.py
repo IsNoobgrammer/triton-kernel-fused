@@ -41,7 +41,8 @@ def reference(x, W, lab):
     d[torch.arange(n), lab] = -torch.exp(torch.logsumexp(others, 1) - lse)    # exact q_t - 1
     d = d / n
     gh = d @ W.double()
-    return nll, gh, m
+    gw = d.t() @ x.double().cpu()
+    return nll, gh, gw, m
 
 
 def main():
@@ -59,7 +60,7 @@ def main():
     xr, Wr = x.clone().requires_grad_(), W.clone().requires_grad_()
     loss = cf.fused_linear_cross_entropy(xr, Wr, lab)
     loss.backward()
-    nll_ref, gh_ref, m = reference(x, W, lab)
+    nll_ref, gh_ref, gw_ref, m = reference(x, W, lab)
     gh = xr.grad.double().cpu()
     Wd = W.double().cpu()
     lab_c = lab.cpu()
@@ -77,6 +78,12 @@ def main():
         err = rel[sel].max().item()
         print(f"{lo:>4}-{hi:<5} {int(sel.sum()):>5} {err:>17.3e} {sign:>19.2%} {'-':>12}")
         ok &= sign == 1.0 and err < 5e-2
+    ul = lab_c.unique()
+    gw = Wr.grad.double().cpu()[ul]
+    gwr = gw_ref[ul]
+    gw_rel = ((gw - gwr).norm(dim=1) / gwr.norm(dim=1).clamp_min(1e-300)).max().item()
+    print(f"gw (label rows) rel err max {gw_rel:.3e}")
+    ok &= gw_rel < 5e-2
     print("PASS" if ok else "FAIL")
 
 
