@@ -58,7 +58,7 @@ def main():
         live = r.abs() > 0
         print(f"{sc:>6} {e[live].median().item():>33.3e} {s[live].double().mean().item():>8.1%} "
               f"{et[live].median().item():>20.3e} {st[live].double().mean().item():>8.1%}")
-        ok &= s[live].all().item() and e[live].median().item() < 1e-2
+        ok &= s[live].all().item() and e[live].median().item() < (1e-1 if sc > 30 else 1e-3)   # true ~e^-40 at 40
     print("PASS" if ok else "FAIL")
 
 

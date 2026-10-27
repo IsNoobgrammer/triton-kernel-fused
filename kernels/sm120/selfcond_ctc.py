@@ -168,7 +168,8 @@ def _sc_grad(Z, LSE, P, A, QDQ, Y, TLEN, ULEN, AL, BE, NLL, GOUT, DZ, sy, T, V, 
         g_other = tl.sum(tl.where(tok != am, gam, 0.0), 0)
         p_am = tl.sum(tl.where(k == am, p, 0.0), 0)
         f_am = tl.sum(tl.where(k == am, fb, 0.0), 0)
-        tl.store(DZ + row * V + am, ((g_other - p_other) * go + p_am * f_am).to(DZ.dtype.element_ty))
+        tl.store(DZ + row * V + am, ((g_other - p_other) * go + p_am * f_am).to(DZ.dtype.element_ty),
+                 mask=p_other < p_am)                   # dominant only (see ctc_loss.py)
 
 
 class _Pass(torch.autograd.Function):

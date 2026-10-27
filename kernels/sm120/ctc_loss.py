@@ -148,7 +148,9 @@ def _ctc_grad(LP, Y, TLEN, ULEN, AL, BE, NLL, GOUT, G, slb, slt, slv, sy, sgb, s
     gam = tl.where(s < S, tl.exp(tl.load(ab + s, mask=s < S, other=float("-inf"))
                                  + tl.load(bb + s, mask=s < S, other=float("-inf")) + nll - lps), 0.0)
     g_other = tl.sum(tl.where(tok != am, gam, 0.0), 0)
-    tl.store(gp + am, ((g_other - p_other) * go).to(G.dtype.element_ty))
+    # only where the class dominates (p > 1/2): there the others' sums are the small side; below it the direct
+    # p - occ uses fewer lattice terms and is the more accurate one
+    tl.store(gp + am, ((g_other - p_other) * go).to(G.dtype.element_ty), mask=p_other < 1.0 - p_other)
 
 
 class _CTC(torch.autograd.Function):
