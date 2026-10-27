@@ -46,7 +46,7 @@ def _lcfg(K):
 
 
 @triton.jit
-def _logits_kernel(X, W, E, PA, PB, PO, PR, TGT, LAB, ORDER, CROW, M, V, NT, K,
+def _logits_kernel(X, W, E, PA, PB, PO, TGT, LAB, ORDER, CROW, M, V, NT, K,
                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP: tl.constexpr,
                    STORE_E: tl.constexpr, FIX: tl.constexpr, EVEN_K: tl.constexpr, EVEN_V: tl.constexpr):
     # FIX: second pass over the out-of-window rows only (sorted first by ORDER), E = exp(L - c_row).
@@ -102,9 +102,9 @@ def _logits_kernel(X, W, E, PA, PB, PO, PR, TGT, LAB, ORDER, CROW, M, V, NT, K,
             e = tl.exp(xf)                           # c = 0
         eb = tl.where(hit, 0.0, e).to(tl.bfloat16)   # label column stored as 0 (its grad is set exactly)
         tl.store(E + rm[:, None].to(tl.int64) * V + rn[None, :], eb, mask=mm[:, None] & mn[None, :])
-        tl.store(PA + rm * NT + pn, tl.sum(e, axis=1), mask=mm)
-        tl.store(PO + rm * NT + pn, tl.sum(tl.where(hit, 0.0, e), axis=1), mask=mm)
-        tl.store(PR + rm * NT + pn, tl.sum(eb.to(tl.float32), axis=1), mask=mm)   # the E the grads use
+        # one reduction, as before: the sum of exactly the E the grads use (the label's e^(L - c) is added back
+        # in _combine from its logit, so lse needs no second sum)
+        tl.store(PA + rm * NT + pn, tl.sum(eb.to(tl.float32), axis=1), mask=mm)
     else:
         ex = tl.exp(xf - mx[:, None])
         tl.store(PA + rm * NT + pn, tl.sum(ex, axis=1), mask=mm)
@@ -116,23 +116,26 @@ def _logits_kernel(X, W, E, PA, PB, PO, PR, TGT, LAB, ORDER, CROW, M, V, NT, K,
 
 
 @triton.jit
-def _combine_kernel(PA, PB, PO, PR, LSE, LSO, PRS, MX, CROW, NT, BT: tl.constexpr, STORE_E: tl.constexpr,
+def _combine_kernel(PA, PB, PO, TGT, LAB, LSE, LSO, PRS, MX, CROW, NT, BT: tl.constexpr, STORE_E: tl.constexpr,
                     FIX: tl.constexpr):
     # LSE: log-sum-exp of the row; LSO: the same with the label left out; PRS: sum of the stored (bf16) E
     r = tl.program_id(0)
     t = tl.arange(0, BT)
     mk = t < NT
     a = tl.load(PA + r * NT + t, mask=mk, other=0.0)
-    o = tl.load(PO + r * NT + t, mask=mk, other=0.0)
     if STORE_E:
         if FIX:
             c = tl.load(CROW + r)
         else:
             c = 0.0
-        tl.store(LSE + r, c + tl.log(tl.sum(a, 0)))
-        tl.store(LSO + r, c + tl.log(tl.sum(o, 0)))
-        tl.store(PRS + r, tl.sum(tl.load(PR + r * NT + t, mask=mk, other=0.0), 0))
+        prs = tl.sum(a, 0)
+        lab = tl.load(LAB + r)
+        et = tl.where(lab >= 0, tl.exp(tl.load(TGT + r) - c), 0.0)    # ignored rows: label not in the row
+        tl.store(LSE + r, c + tl.log(prs + et))
+        tl.store(LSO + r, c + tl.log(prs))
+        tl.store(PRS + r, prs)
     else:
+        o = tl.load(PO + r * NT + t, mask=mk, other=0.0)
         b = tl.load(PB + r * NT + t, mask=mk, other=-float("inf"))
         mx = tl.max(b, 0)
         f = tl.exp(b - mx)
@@ -204,8 +207,7 @@ def _stats(hc, W, lab, store_e, E=None):
     dev = hc.device
     PA = torch.empty(M, NT, device=dev, dtype=torch.float32)
     PB = torch.empty(M, NT, device=dev, dtype=torch.float32)
-    PO = torch.empty(M, NT, device=dev, dtype=torch.float32)
-    PR = torch.empty(M, NT, device=dev, dtype=torch.float32) if store_e else PO
+    PO = PA if store_e else torch.empty(M, NT, device=dev, dtype=torch.float32)
     tgt = torch.zeros(M, device=dev, dtype=torch.float32)
     lse = torch.empty(M, device=dev, dtype=torch.float32)
     lso = torch.empty(M, device=dev, dtype=torch.float32)
@@ -213,17 +215,16 @@ def _stats(hc, W, lab, store_e, E=None):
     mx = torch.empty(M, device=dev, dtype=torch.float32)
     grid = (triton.cdiv(M, BM) * NT,)
     ev = dict(EVEN_K=K % BK == 0, EVEN_V=V % BN == 0, num_warps=nw, num_stages=ns)
-    _logits_kernel[grid](hc, W, E if store_e else PA, PA, PB, PO, PR, tgt, lab, lab, PA, M, V, NT, K,
+    _logits_kernel[grid](hc, W, E if store_e else PA, PA, PB, PO, tgt, lab, lab, PA, M, V, NT, K,
                          BM, BN, BK, G, store_e, False, **ev)
-    _combine_kernel[(M,)](PA, PB, PO, PR, lse, lso, prs, mx, PA, NT, triton.next_power_of_2(NT), store_e, False,
-                          num_warps=4)
+    _combine_kernel[(M,)](PA, PB, PO, tgt, lab, lse, lso, prs, mx, PA, NT, triton.next_power_of_2(NT), store_e,
+                          False, num_warps=4)
     if not store_e:
         return lse, lso, None, tgt, None
     crow = torch.where((mx < _LO) | (mx > _HI), mx, torch.zeros_like(mx))
     order = torch.argsort((crow != 0).to(torch.int8), descending=True, stable=True)
-    _logits_kernel[grid](hc, W, E, PA, PB, PO, PR, tgt, lab, order, crow, M, V, NT, K, BM, BN, BK, G, True, True,
-                         **ev)
-    _combine_kernel[(M,)](PA, PB, PO, PR, lse, lso, prs, mx, crow, NT, triton.next_power_of_2(NT), True, True,
+    _logits_kernel[grid](hc, W, E, PA, PB, PO, tgt, lab, order, crow, M, V, NT, K, BM, BN, BK, G, True, True, **ev)
+    _combine_kernel[(M,)](PA, PB, PO, tgt, lab, lse, lso, prs, mx, crow, NT, triton.next_power_of_2(NT), True, True,
                           num_warps=4)
     return lse, lso, prs, tgt, crow
 
