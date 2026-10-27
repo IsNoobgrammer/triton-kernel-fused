@@ -174,6 +174,7 @@ def _topk_fwd(S, IDX, LP, LOSS, LSES, QREST, V, ss, inv_T, K: tl.constexpr, KP: 
     mp = tl.max(tl.where(mkk, lp, float("-inf")), 0)
     lsep = mp + tl.log(tl.sum(tl.where(mkk, tl.exp(lp - mp), 0.0), 0))
     r = tl.maximum(-libdevice.expm1(tl.minimum(lsep, 0.0)), 0.0)
+    r = tl.where(z_r > 0, r, 0.0)            # top-k covers all of V: the teacher's "rest" is only rounding
     kl = tl.sum(tl.where(mkk, p * (lp - lq), 0.0), 0)
     kl = kl + tl.where(r > 0, r * (tl.log(tl.maximum(r, 1e-30)) - lqr), 0.0)
     tl.store(LOSS + i, kl)
@@ -201,6 +202,7 @@ def _topk_bwd(S, IDX, LP, LSES, QREST, G, DS, V, ss, sd, inv_T, K: tl.constexpr,
     lsep = mp + tl.log(zp)
     r = tl.maximum(-libdevice.expm1(tl.minimum(lsep, 0.0)), 0.0)
     # 1 - r / q_rest = -expm1(log r - log q_rest); no rest mass on either side -> the plain softmax grad
+    r = tl.where(lqr > float("-inf"), r, 0.0)                         # as _topk_fwd: no student rest -> none
     rest = tl.where(r > 0, -libdevice.expm1(tl.log(tl.maximum(r, 1e-38)) - lqr), 1.0)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
